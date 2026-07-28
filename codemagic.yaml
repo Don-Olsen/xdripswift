@@ -84,6 +84,11 @@ workflows:
           ensure_profile "$XDRIP_MAIN_BUNDLE_ID.watchkitapp.xDripWatchComplication" "Codemagic xDrip4iOS Complication App Store"
           ensure_profile "$XDRIP_MAIN_BUNDLE_ID.xDripNotificationContextExtension" "Codemagic xDrip4iOS Notification App Store"
 
+          profile_source="$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"
+          profile_target="$HOME/Library/MobileDevice/Provisioning Profiles"
+          mkdir -p "$profile_target"
+          cp "$profile_source"/*.mobileprovision "$profile_target"/
+
       - name: Apply signing profiles
         script: |
           xcode-project use-profiles \
