@@ -207,6 +207,8 @@ workflows:
             -scheme "xdrip" \
             -configuration Release \
             -archivePath "$CM_BUILD_DIR/build/ios/xcarchive/xdrip.xcarchive" \
+            CODE_SIGN_STYLE=Manual \
+            DEVELOPMENT_TEAM="$XDRIP_TEAM_ID" \
             archive
 
           mkdir -p "$CM_BUILD_DIR/build/ios/ipa"
