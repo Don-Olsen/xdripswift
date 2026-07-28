@@ -1,0 +1,103 @@
+workflows:
+  xdrip-testflight:
+    name: xDrip4iOS 6.3.3 to TestFlight
+    instance_type: mac_mini_m2
+    max_build_duration: 120
+
+    integrations:
+      app_store_connect: mdi-predictor-testflight
+
+    environment:
+      xcode: 16.4
+      ios_signing:
+        certificates:
+          - mdi-predictor-apple-distribution
+      vars:
+        XDRIP_TEAM_ID: GFZ896KN66
+        XDRIP_MAIN_BUNDLE_ID: com.GFZ896KN66.xdripswift
+
+    scripts:
+      - name: Verify the xDrip4iOS release
+        script: |
+          set -euo pipefail
+          grep -q "XDRIP_MARKETING_VERSION = 6.3.3" xDrip/Version.xcconfig
+          grep -q "CURRENT_PROJECT_VERSION = 4230" xDrip/Version.xcconfig
+          printf '%s\n' \
+            "XDRIP_DEVELOPMENT_TEAM = ${XDRIP_TEAM_ID}" \
+            "XDRIP_CODE_SIGN_IDENTITY_RELEASE = Apple Distribution" \
+            > xDripConfigOverride.xcconfig
+
+      - name: Create and download App Store profiles
+        script: |
+          set -euo pipefail
+
+          resource_id() {
+            jq -r '
+              if type == "array" then (.[0].id // empty)
+              elif has("data") then (.data[0].id // empty)
+              else (.id // empty)
+              end
+            '
+          }
+
+          certificate_json="$(app-store-connect certificates list \
+            --profile-type IOS_APP_STORE \
+            --json)"
+          certificate_id="$(printf '%s' "$certificate_json" | resource_id)"
+          test -n "$certificate_id"
+
+          ensure_profile() {
+            bundle_id="$1"
+            profile_name="$2"
+
+            bundle_json="$(app-store-connect bundle-ids list \
+              --bundle-id-identifier "$bundle_id" \
+              --platform IOS \
+              --strict-match-identifier \
+              --json)"
+            bundle_resource_id="$(printf '%s' "$bundle_json" | resource_id)"
+            test -n "$bundle_resource_id"
+
+            profile_json="$(app-store-connect profiles list \
+              --type IOS_APP_STORE \
+              --state ACTIVE \
+              --name "$profile_name" \
+              --json)"
+            profile_id="$(printf '%s' "$profile_json" | resource_id)"
+
+            if test -n "$profile_id"; then
+              app-store-connect profiles get "$profile_id" --save
+            else
+              app-store-connect profiles create "$bundle_resource_id" \
+                --certificate-ids "$certificate_id" \
+                --type IOS_APP_STORE \
+                --name "$profile_name" \
+                --save
+            fi
+          }
+
+          ensure_profile "$XDRIP_MAIN_BUNDLE_ID" "Codemagic xDrip4iOS App Store"
+          ensure_profile "$XDRIP_MAIN_BUNDLE_ID.xDripWidget" "Codemagic xDrip4iOS Widget App Store"
+          ensure_profile "$XDRIP_MAIN_BUNDLE_ID.watchkitapp" "Codemagic xDrip4iOS Watch App Store"
+          ensure_profile "$XDRIP_MAIN_BUNDLE_ID.watchkitapp.xDripWatchComplication" "Codemagic xDrip4iOS Complication App Store"
+          ensure_profile "$XDRIP_MAIN_BUNDLE_ID.xDripNotificationContextExtension" "Codemagic xDrip4iOS Notification App Store"
+
+      - name: Apply signing profiles
+        script: |
+          xcode-project use-profiles \
+            --custom-export-options='{"testFlightInternalTestingOnly": true}'
+
+      - name: Build signed IPA
+        script: |
+          xcode-project build-ipa \
+            --workspace "$CM_BUILD_DIR/xdrip.xcworkspace" \
+            --scheme "xdrip"
+
+    artifacts:
+      - build/ios/ipa/*.ipa
+      - /tmp/xcodebuild_logs/*.log
+      - $HOME/Library/Developer/Xcode/DerivedData/**/Build/**/*.dSYM
+
+    publishing:
+      app_store_connect:
+        auth: integration
