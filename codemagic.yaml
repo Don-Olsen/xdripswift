@@ -8,7 +8,7 @@ workflows:
       app_store_connect: mdi-predictor-testflight
 
     environment:
-      xcode: 16.4
+      xcode: latest
       ios_signing:
         certificates:
           - mdi-predictor-apple-distribution
