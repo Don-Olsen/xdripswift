@@ -208,6 +208,7 @@ workflows:
             -configuration Release \
             -archivePath "$CM_BUILD_DIR/build/ios/xcarchive/xdrip.xcarchive" \
             CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY="Apple Distribution" \
             DEVELOPMENT_TEAM="$XDRIP_TEAM_ID" \
             archive
 
