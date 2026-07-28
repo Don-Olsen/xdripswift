@@ -89,16 +89,132 @@ workflows:
           mkdir -p "$profile_target"
           cp "$profile_source"/*.mobileprovision "$profile_target"/
 
-      - name: Apply signing profiles
+      - name: Apply signing profiles to xDrip targets
         script: |
-          xcode-project use-profiles \
-            --custom-export-options='{"testFlightInternalTestingOnly": true}'
+          set -euo pipefail
+
+          profile_source="$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"
+          fixed_profiles="$CM_BUILD_DIR/build-profiles"
+          mkdir -p "$fixed_profiles"
+
+          for profile in "$profile_source"/*.mobileprovision; do
+            profile_plist="$(mktemp)"
+            security cms -D -i "$profile" > "$profile_plist"
+            profile_name="$(/usr/libexec/PlistBuddy -c "Print :Name" "$profile_plist")"
+
+            case "$profile_name" in
+              "Codemagic xDrip4iOS App Store")
+                cp "$profile" "$fixed_profiles/main.mobileprovision"
+                ;;
+              "Codemagic xDrip4iOS Widget App Store")
+                cp "$profile" "$fixed_profiles/widget.mobileprovision"
+                ;;
+              "Codemagic xDrip4iOS Watch App Store")
+                cp "$profile" "$fixed_profiles/watch.mobileprovision"
+                ;;
+              "Codemagic xDrip4iOS Complication App Store")
+                cp "$profile" "$fixed_profiles/complication.mobileprovision"
+                ;;
+              "Codemagic xDrip4iOS Notification App Store")
+                cp "$profile" "$fixed_profiles/notification.mobileprovision"
+                ;;
+            esac
+          done
+
+          test -f "$fixed_profiles/main.mobileprovision"
+          test -f "$fixed_profiles/widget.mobileprovision"
+          test -f "$fixed_profiles/watch.mobileprovision"
+          test -f "$fixed_profiles/complication.mobileprovision"
+          test -f "$fixed_profiles/notification.mobileprovision"
+
+          fastlane run update_project_team \
+            path:"xdrip.xcodeproj" \
+            teamid:"$XDRIP_TEAM_ID"
+
+          fastlane run update_project_provisioning \
+            xcodeproj:"xdrip.xcodeproj" \
+            profile:"$fixed_profiles/main.mobileprovision" \
+            target_filter:"^xdrip$" \
+            build_configuration:"Release" \
+            code_signing_identity:"Apple Distribution"
+
+          fastlane run update_project_provisioning \
+            xcodeproj:"xdrip.xcodeproj" \
+            profile:"$fixed_profiles/widget.mobileprovision" \
+            target_filter:"^xDrip Widget Extension$" \
+            build_configuration:"Release" \
+            code_signing_identity:"Apple Distribution"
+
+          fastlane run update_project_provisioning \
+            xcodeproj:"xdrip.xcodeproj" \
+            profile:"$fixed_profiles/watch.mobileprovision" \
+            target_filter:"^xDrip Watch App$" \
+            build_configuration:"Release" \
+            code_signing_identity:"Apple Distribution"
+
+          fastlane run update_project_provisioning \
+            xcodeproj:"xdrip.xcodeproj" \
+            profile:"$fixed_profiles/complication.mobileprovision" \
+            target_filter:"^xDrip Watch Complication Extension$" \
+            build_configuration:"Release" \
+            code_signing_identity:"Apple Distribution"
+
+          fastlane run update_project_provisioning \
+            xcodeproj:"xdrip.xcodeproj" \
+            profile:"$fixed_profiles/notification.mobileprovision" \
+            target_filter:"^xDrip Notification Context Extension$" \
+            build_configuration:"Release" \
+            code_signing_identity:"Apple Distribution"
 
       - name: Build signed IPA
         script: |
-          xcode-project build-ipa \
-            --workspace "$CM_BUILD_DIR/xdrip.xcworkspace" \
-            --scheme "xdrip"
+          set -euo pipefail
+
+          cat > "$CM_BUILD_DIR/export_options.plist" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>app-store-connect</string>
+            <key>signingStyle</key>
+            <string>manual</string>
+            <key>signingCertificate</key>
+            <string>Apple Distribution</string>
+            <key>teamID</key>
+            <string>GFZ896KN66</string>
+            <key>testFlightInternalTestingOnly</key>
+            <true/>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>com.GFZ896KN66.xdripswift</key>
+              <string>Codemagic xDrip4iOS App Store</string>
+              <key>com.GFZ896KN66.xdripswift.xDripWidget</key>
+              <string>Codemagic xDrip4iOS Widget App Store</string>
+              <key>com.GFZ896KN66.xdripswift.watchkitapp</key>
+              <string>Codemagic xDrip4iOS Watch App Store</string>
+              <key>com.GFZ896KN66.xdripswift.watchkitapp.xDripWatchComplication</key>
+              <string>Codemagic xDrip4iOS Complication App Store</string>
+              <key>com.GFZ896KN66.xdripswift.xDripNotificationContextExtension</key>
+              <string>Codemagic xDrip4iOS Notification App Store</string>
+            </dict>
+          </dict>
+          </plist>
+          PLIST
+
+          xcodebuild \
+            -workspace "$CM_BUILD_DIR/xdrip.xcworkspace" \
+            -scheme "xdrip" \
+            -configuration Release \
+            -archivePath "$CM_BUILD_DIR/build/ios/xcarchive/xdrip.xcarchive" \
+            archive
+
+          mkdir -p "$CM_BUILD_DIR/build/ios/ipa"
+          xcodebuild \
+            -exportArchive \
+            -archivePath "$CM_BUILD_DIR/build/ios/xcarchive/xdrip.xcarchive" \
+            -exportPath "$CM_BUILD_DIR/build/ios/ipa" \
+            -exportOptionsPlist "$CM_BUILD_DIR/export_options.plist"
 
     artifacts:
       - build/ios/ipa/*.ipa
