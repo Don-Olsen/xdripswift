@@ -12,6 +12,8 @@ workflows:
       ios_signing:
         certificates:
           - mdi-predictor-apple-distribution
+        provisioning_profiles:
+          - mdi-predictor-app-store-profile
       vars:
         XDRIP_TEAM_ID: GFZ896KN66
         XDRIP_MAIN_BUNDLE_ID: com.GFZ896KN66.xdripswift
