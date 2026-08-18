@@ -61,8 +61,8 @@ class CGMLibre2Transmitter: BluetoothTransmitter, CGMTransmitter {
     /// sensor type
     private var libreSensorType: LibreSensorType?
 
-    /// True only while the explicit settings action is awaiting its NFC scan.
-    private var watchTestPreparationRequested = false
+    /// Bluetooth identity copied from the normal Libre NFC setup for the Watch add-on.
+    private var watchTestExpectedPeripheralName: String?
 
     /// Non-nil while the prepared sensor has deliberately been handed to Watch.
     private var watchTestOwnershipSessionID: UUID?
@@ -258,12 +258,78 @@ class CGMLibre2Transmitter: BluetoothTransmitter, CGMTransmitter {
 
     // MARK: - helpers
 
-    /// Starts the existing Libre NFC/setup flow for the explicit Watch experiment.
-    /// No second NFC implementation is introduced.
+    /// Copies the session already created by the normal iPhone Libre setup.
+    /// This add-on must not start NFC or alter the iPhone collector.
     @nonobjc func prepareLibre2PlusWatchTest() {
-        watchTestPreparationRequested = true
-        libreNFC = nil
-        _ = startScanning()
+        guard let sensorUID = UserDefaults.standard.libreSensorUID,
+              let patchInfo = UserDefaults.standard.librePatchInfo,
+              let sensorType = LibreSensorType.type(
+                  patchInfo: patchInfo.hexEncodedString().uppercased()
+              ),
+              sensorType == .libre2C6 || sensorType == .libre27F,
+              let serialNumber = sensorSerialNumber,
+              let parameters = UserDefaults.standard.libre1DerivedAlgorithmParameters,
+              parameters.serialNumber.caseInsensitiveCompare(serialNumber) == .orderedSame
+        else {
+            DispatchQueue.main.async { [weak self] in
+                self?.bluetoothTransmitterDelegate?.error(
+                    message: "Let the normal iPhone Libre 2 Plus NFC/Bluetooth setup finish first, then prepare the Watch test."
+                )
+            }
+            return
+        }
+
+        let expectedPeripheralName: String
+        if sensorType == .libre27F {
+            guard let existingIdentity = watchTestExpectedPeripheralName ?? deviceName else {
+                DispatchQueue.main.async { [weak self] in
+                    self?.bluetoothTransmitterDelegate?.error(
+                        message: "The normal iPhone collector has not stored the Libre 2 Plus Bluetooth identity yet."
+                    )
+                }
+                return
+            }
+            expectedPeripheralName = existingIdentity
+        } else {
+            expectedPeripheralName = "ABBOTT" + serialNumber
+        }
+
+        let watchParameters = LibreWatchAlgorithmParameters(
+            slopeSlope: parameters.slope_slope,
+            slopeOffset: parameters.slope_offset,
+            offsetSlope: parameters.offset_slope,
+            offsetOffset: parameters.offset_offset,
+            extraSlope: parameters.extraSlope,
+            extraOffset: parameters.extraOffset,
+            sensorSerialNumber: parameters.serialNumber
+        )
+        let session = LibreWatchTestSession(
+            sensorUID: sensorUID,
+            patchInfo: patchInfo,
+            sensorSerialNumber: serialNumber,
+            sensorTypeRawValue: sensorType.rawValue,
+            expectedPeripheralName: expectedPeripheralName,
+            unlockCode: UserDefaults.standard.libreActiveSensorUnlockCode,
+            unlockCount: UserDefaults.standard.libreActiveSensorUnlockCount,
+            algorithmParameters: watchParameters
+        )
+
+        guard session.isValid else {
+            DispatchQueue.main.async { [weak self] in
+                self?.bluetoothTransmitterDelegate?.error(
+                    message: session.validationError?.rawValue ?? "The Watch test session is invalid."
+                )
+            }
+            return
+        }
+
+        preparedWatchTestSessionID = session.id
+        NotificationCenter.default.post(name: .libreWatchTestSessionPrepared, object: session)
+        DispatchQueue.main.async { [weak self] in
+            self?.bluetoothTransmitterDelegate?.error(
+                message: "Libre 2 Plus Watch test prepared. The iPhone collector remains active until Start Direct Test is pressed on Apple Watch."
+            )
+        }
     }
 
     /// Confirms that this exact NFC-prepared session belongs to this transmitter.
@@ -494,7 +560,6 @@ extension CGMLibre2Transmitter: LibreNFCDelegate {
             if !UserDefaults.standard.nfcScanFailed {
                 UserDefaults.standard.nfcScanFailed = true
             }
-            watchTestPreparationRequested = false
         }
     }
     
@@ -503,67 +568,13 @@ extension CGMLibre2Transmitter: LibreNFCDelegate {
     }
     
     func nfcScanExpectedDevice(serialNumber: String, macAddress: String) {
-        let expectedPeripheralName: String
         if libreSensorType == .libre27F {
-            expectedPeripheralName = macAddress
+            watchTestExpectedPeripheralName = macAddress
+            updateExpectedDeviceName(name: macAddress)
         } else {
-            expectedPeripheralName = "ABBOTT" + serialNumber
-        }
-        updateExpectedDeviceName(name: expectedPeripheralName)
-
-        guard watchTestPreparationRequested else { return }
-        watchTestPreparationRequested = false
-
-        guard let sensorType = libreSensorType,
-              sensorType == .libre2C6 || sensorType == .libre27F,
-              let sensorUID = UserDefaults.standard.libreSensorUID,
-              let patchInfo = UserDefaults.standard.librePatchInfo,
-              let parameters = UserDefaults.standard.libre1DerivedAlgorithmParameters,
-              parameters.serialNumber.caseInsensitiveCompare(serialNumber) == .orderedSame
-        else {
-            DispatchQueue.main.async { [weak self] in
-                self?.bluetoothTransmitterDelegate?.error(
-                    message: "Watch test preparation requires a European Libre 2 Plus C6/7F sensor and valid NFC calibration data."
-                )
-            }
-            return
-        }
-
-        let watchParameters = LibreWatchAlgorithmParameters(
-            slopeSlope: parameters.slope_slope,
-            slopeOffset: parameters.slope_offset,
-            offsetSlope: parameters.offset_slope,
-            offsetOffset: parameters.offset_offset,
-            extraSlope: parameters.extraSlope,
-            extraOffset: parameters.extraOffset,
-            sensorSerialNumber: parameters.serialNumber
-        )
-        let session = LibreWatchTestSession(
-            sensorUID: sensorUID,
-            patchInfo: patchInfo,
-            sensorSerialNumber: serialNumber,
-            sensorTypeRawValue: sensorType.rawValue,
-            expectedPeripheralName: expectedPeripheralName,
-            unlockCode: UserDefaults.standard.libreActiveSensorUnlockCode,
-            unlockCount: UserDefaults.standard.libreActiveSensorUnlockCount,
-            algorithmParameters: watchParameters
-        )
-
-        guard session.isValid else {
-            DispatchQueue.main.async { [weak self] in
-                self?.bluetoothTransmitterDelegate?.error(
-                    message: session.validationError?.rawValue ?? "The Watch test session is invalid."
-                )
-            }
-            return
-        }
-
-        preparedWatchTestSessionID = session.id
-        NotificationCenter.default.post(name: .libreWatchTestSessionPrepared, object: session)
-        DispatchQueue.main.async { [weak self] in
-            self?.bluetoothTransmitterDelegate?.error(
-                message: "Libre 2 Plus Watch test prepared. Open Direct Sensor Test on Apple Watch and press Start Direct Test."
-            )
+            let expectedPeripheralName = "ABBOTT" + serialNumber
+            watchTestExpectedPeripheralName = expectedPeripheralName
+            updateExpectedDeviceName(name: expectedPeripheralName)
         }
     }
 }

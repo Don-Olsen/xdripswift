@@ -214,7 +214,7 @@ extension Libre2BluetoothPeripheralViewModel: BluetoothPeripheralViewModel {
         case .prepareWatchTest:
             return .askConfirmation(
                 title: "Prepare Libre 2 Plus Watch Test",
-                message: "Use only the expendable European Libre 2 Plus test sensor. Start it correctly, complete warm-up, disable LibreLink Bluetooth access, then hold iPhone at that test sensor for the existing xDrip NFC setup. The normal live sensor must not be scanned.",
+                message: "Use only the expendable European Libre 2 Plus test sensor. First let the normal xDrip iPhone NFC/Bluetooth setup finish and connect. This action only copies that existing session to Apple Watch.",
                 actionHandler: { [weak self] in
                     guard let self,
                           let manager = self.bluetoothPeripheralManager,
