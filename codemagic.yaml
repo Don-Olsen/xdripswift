@@ -58,7 +58,7 @@ workflows:
           "$test_directory/watch-libre-diagnostic-tests"
           bash Tests/check_watch_libre_phase1a_safety.sh
           xcrun swiftc -parse-as-library \
-            xDrip/Extensions/UInt16.swift \
+            Tests/UInt16LibreTestSupport.swift \
             xDrip/BluetoothTransmitter/CGM/Libre/Utilities/PreLibre2.swift \
             xDrip/Managers/Watch/LibreWatchTestSession.swift \
             xDrip/BluetoothTransmitter/CGM/Libre/Utilities/Libre2DirectAlgorithms.swift \
