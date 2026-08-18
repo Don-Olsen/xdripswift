@@ -17,17 +17,63 @@ workflows:
       vars:
         XDRIP_TEAM_ID: GFZ896KN66
         XDRIP_MAIN_BUNDLE_ID: com.GFZ896KN66.xdripswift
+        APP_STORE_APPLE_ID: 6795645396
 
     scripts:
+      - name: Initialize repository dependencies
+        script: |
+          set -euo pipefail
+          git submodule sync --recursive
+          git submodule update --init --recursive
+
       - name: Verify the xDrip4iOS release
         script: |
           set -euo pipefail
           grep -q "XDRIP_MARKETING_VERSION = 6.3.3" xDrip/Version.xcconfig
-          grep -q "CURRENT_PROJECT_VERSION = 4230" xDrip/Version.xcconfig
           printf '%s\n' \
             "XDRIP_DEVELOPMENT_TEAM = ${XDRIP_TEAM_ID}" \
             "XDRIP_CODE_SIGN_IDENTITY_RELEASE = Apple Distribution" \
             > xDripConfigOverride.xcconfig
+
+      - name: Set the next TestFlight build number
+        script: |
+          set -euo pipefail
+          latest_build_number="$(app-store-connect get-latest-testflight-build-number "$APP_STORE_APPLE_ID")"
+          test -n "$latest_build_number"
+          next_build_number="$((latest_build_number + 1))"
+          printf 'CURRENT_PROJECT_VERSION = %s\n' "$next_build_number" \
+            > xDrip/VersionOverride.xcconfig
+          echo "Using TestFlight build number $next_build_number"
+
+          for target in \
+            "xdrip" \
+            "xDrip Widget Extension" \
+            "xDrip Watch App" \
+            "xDrip Watch Complication Extension" \
+            "xDrip Notification Context Extension"; do
+            build_settings="$(xcodebuild \
+              -project xdrip.xcodeproj \
+              -target "$target" \
+              -configuration Release \
+              -showBuildSettings)"
+            resolved_build_number="$(printf '%s\n' "$build_settings" | awk -F ' = ' '
+              /CURRENT_PROJECT_VERSION =/ && value == "" { value = $2 }
+              END { print value }
+            ')"
+            test "$resolved_build_number" = "$next_build_number"
+            echo "$target uses build number $resolved_build_number"
+          done
+
+      - name: Run Watch Libre Phase 1A tests
+        script: |
+          set -euo pipefail
+          test_directory="$(mktemp -d)"
+          xcrun swiftc -parse-as-library \
+            "xDrip Watch App/DataModels/LibreWatchDiagnosticState.swift" \
+            Tests/WatchLibreDiagnosticTests.swift \
+            -o "$test_directory/watch-libre-diagnostic-tests"
+          "$test_directory/watch-libre-diagnostic-tests"
+          bash Tests/check_watch_libre_phase1a_safety.sh
 
       - name: Create and download App Store profiles
         script: |
