@@ -256,3 +256,39 @@ workflows:
     publishing:
       app_store_connect:
         auth: integration
+
+  xdrip-testflight-verify:
+    name: Verify xDrip4iOS 6.3.3 (4231) in TestFlight
+    instance_type: mac_mini_m2
+    max_build_duration: 30
+
+    integrations:
+      app_store_connect: mdi-predictor-testflight
+
+    environment:
+      xcode: latest
+      vars:
+        APP_STORE_APPLE_ID: 6795645396
+        EXPECTED_TESTFLIGHT_BUILD: 4231
+
+    scripts:
+      - name: Wait for build 4231 to appear in TestFlight
+        script: |
+          set -euo pipefail
+
+          for attempt in $(seq 1 20); do
+            latest_build_number="$(app-store-connect get-latest-testflight-build-number \
+              "$APP_STORE_APPLE_ID")"
+
+            echo "Attempt $attempt: latest TestFlight build is $latest_build_number"
+
+            if test "$latest_build_number" -ge "$EXPECTED_TESTFLIGHT_BUILD"; then
+              echo "TestFlight build $EXPECTED_TESTFLIGHT_BUILD is visible."
+              exit 0
+            fi
+
+            sleep 30
+          done
+
+          echo "TestFlight build $EXPECTED_TESTFLIGHT_BUILD did not appear within 10 minutes."
+          exit 1
