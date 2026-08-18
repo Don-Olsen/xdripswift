@@ -14,6 +14,9 @@ class Libre2BluetoothPeripheralViewModel {
         
         /// case smooth libre values
         case smoothLibreValues = 2
+
+        /// explicit foreground-only Apple Watch hardware test preparation
+        case prepareWatchTest = 3
         
     }
     
@@ -165,6 +168,12 @@ extension Libre2BluetoothPeripheralViewModel: BluetoothPeripheralViewModel {
                 // this is later used to make a cut-off in the read success calculations
                 UserDefaults.standard.smoothLibreValuesChangedAtTimeStamp = .now
             })
+
+        case .prepareWatchTest:
+            cell.textLabel?.text = "Prepare Libre 2 Plus Watch Test"
+            cell.detailTextLabel?.text = "Experimental test sensor only"
+            cell.accessoryType = .disclosureIndicator
+            cell.accessoryView = disclosureAccessoryView
         }
     }
     
@@ -201,6 +210,23 @@ extension Libre2BluetoothPeripheralViewModel: BluetoothPeripheralViewModel {
             
         case .smoothLibreValues:
             return .nothing
+
+        case .prepareWatchTest:
+            return .askConfirmation(
+                title: "Prepare Libre 2 Plus Watch Test",
+                message: "Use only the expendable European Libre 2 Plus test sensor. Start it correctly, complete warm-up, disable LibreLink Bluetooth access, then hold iPhone at that test sensor for the existing xDrip NFC setup. The normal live sensor must not be scanned.",
+                actionHandler: { [weak self] in
+                    guard let self,
+                          let manager = self.bluetoothPeripheralManager,
+                          let transmitter = manager.getBluetoothTransmitter(
+                              for: libre2,
+                              createANewOneIfNecesssary: false
+                          ) as? CGMLibre2Transmitter
+                    else { return }
+                    transmitter.prepareLibre2PlusWatchTest()
+                },
+                cancelHandler: nil
+            )
             
         }
         

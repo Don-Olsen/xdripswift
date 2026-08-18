@@ -111,6 +111,14 @@
 		D1A600012026081800000001 /* LibreWatchDiagnosticState.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1A600022026081800000001 /* LibreWatchDiagnosticState.swift */; };
 		D1A600012026081800000002 /* LibreWatchPassiveScanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1A600022026081800000002 /* LibreWatchPassiveScanner.swift */; };
 		D1A600012026081800000003 /* DirectSensorTestView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1A600022026081800000003 /* DirectSensorTestView.swift */; };
+		D1A610012026081800000001 /* LibreWatchTestSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1A610022026081800000001 /* LibreWatchTestSession.swift */; };
+		D1A610012026081800000002 /* LibreWatchTestSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1A610022026081800000001 /* LibreWatchTestSession.swift */; };
+		D1A610012026081800000003 /* Libre2DirectAlgorithms.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1A610022026081800000002 /* Libre2DirectAlgorithms.swift */; };
+		D1A610012026081800000004 /* Libre2DirectAlgorithms.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1A610022026081800000002 /* Libre2DirectAlgorithms.swift */; };
+		D1A610012026081800000005 /* LibreWatchDirectState.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1A610022026081800000003 /* LibreWatchDirectState.swift */; };
+		D1A610012026081800000006 /* LibreWatchDirectCollector.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1A610022026081800000004 /* LibreWatchDirectCollector.swift */; };
+		D1A610012026081800000007 /* PreLibre2.swift in Sources */ = {isa = PBXBuildFile; fileRef = F80D915B24F06A40006840B5 /* PreLibre2.swift */; };
+		D1A610012026081800000008 /* UInt16.swift in Sources */ = {isa = PBXBuildFile; fileRef = F898EDF3234A8A3200BFB79B /* UInt16.swift */; };
 		478A923E2B8B64DE0084C394 /* ConstantsHomeView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F8A1586622EDB8BF007F5B5D /* ConstantsHomeView.swift */; };
 		478A92422B8CCF8F0084C394 /* ConstantsLiveActivity.swift in Sources */ = {isa = PBXBuildFile; fileRef = 47B7313F2B83DC0200B0A450 /* ConstantsLiveActivity.swift */; };
 		478A92552B8FA1D80084C394 /* ConstantsBGGraphBuilder.swift in Sources */ = {isa = PBXBuildFile; fileRef = F8A1585022EDB597007F5B5D /* ConstantsBGGraphBuilder.swift */; };
@@ -923,6 +931,10 @@
 		D1A600022026081800000001 /* LibreWatchDiagnosticState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LibreWatchDiagnosticState.swift; sourceTree = "<group>"; };
 		D1A600022026081800000002 /* LibreWatchPassiveScanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LibreWatchPassiveScanner.swift; sourceTree = "<group>"; };
 		D1A600022026081800000003 /* DirectSensorTestView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DirectSensorTestView.swift; sourceTree = "<group>"; };
+		D1A610022026081800000001 /* LibreWatchTestSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LibreWatchTestSession.swift; sourceTree = "<group>"; };
+		D1A610022026081800000002 /* Libre2DirectAlgorithms.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Libre2DirectAlgorithms.swift; sourceTree = "<group>"; };
+		D1A610022026081800000003 /* LibreWatchDirectState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LibreWatchDirectState.swift; sourceTree = "<group>"; };
+		D1A610022026081800000004 /* LibreWatchDirectCollector.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LibreWatchDirectCollector.swift; sourceTree = "<group>"; };
 		478A925E2B8FB5290084C394 /* XDripWatchComplication+Entry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "XDripWatchComplication+Entry.swift"; sourceTree = "<group>"; };
 		478A92602B8FB53B0084C394 /* XDripWatchComplication+EntryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "XDripWatchComplication+EntryView.swift"; sourceTree = "<group>"; };
 		478A92622B8FB5490084C394 /* XDripWatchComplication+Provider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "XDripWatchComplication+Provider.swift"; sourceTree = "<group>"; };
@@ -1894,6 +1906,7 @@
 		472596032B76300800459D12 /* Watch */ = {
 			isa = PBXGroup;
 			children = (
+				D1A610022026081800000001 /* LibreWatchTestSession.swift */,
 				472596042B76301F00459D12 /* WatchManager.swift */,
 				47DE41AC2B863D370041DA19 /* WatchState.swift */,
 			);
@@ -2001,6 +2014,8 @@
 			children = (
 				D1A600022026081800000001 /* LibreWatchDiagnosticState.swift */,
 				D1A600022026081800000002 /* LibreWatchPassiveScanner.swift */,
+				D1A610022026081800000003 /* LibreWatchDirectState.swift */,
+				D1A610022026081800000004 /* LibreWatchDirectCollector.swift */,
 				47A6ABEE2B7949B80047A4BA /* WatchStateModel.swift */,
 				474822452C01097D0052D4FB /* NotificationController.swift */,
 			);
@@ -3452,6 +3467,7 @@
 				F8F971E823A5915900C3F17D /* CRC.swift */,
 				F8177024248ED4DE00AA3600 /* Libre1DerivedAlgorithmParameters.swift */,
 				F8A5EEAD25791F370085E660 /* Libre2BLEUtilities.swift */,
+				D1A610022026081800000002 /* Libre2DirectAlgorithms.swift */,
 				F857A329253E2D9E00951BB2 /* LibreAlgorithmThresholds.swift */,
 				F857A333253F6A7500951BB2 /* LibreCalibrationInfo.swift */,
 				F8F971E923A5915900C3F17D /* LibreDataParser.swift */,
@@ -4035,6 +4051,12 @@
 				D1A600012026081800000001 /* LibreWatchDiagnosticState.swift in Sources */,
 				D1A600012026081800000002 /* LibreWatchPassiveScanner.swift in Sources */,
 				D1A600012026081800000003 /* DirectSensorTestView.swift in Sources */,
+				D1A610012026081800000002 /* LibreWatchTestSession.swift in Sources */,
+				D1A610012026081800000004 /* Libre2DirectAlgorithms.swift in Sources */,
+				D1A610012026081800000005 /* LibreWatchDirectState.swift in Sources */,
+				D1A610012026081800000006 /* LibreWatchDirectCollector.swift in Sources */,
+				D1A610012026081800000007 /* PreLibre2.swift in Sources */,
+				D1A610012026081800000008 /* UInt16.swift in Sources */,
 				474822462C01097D0052D4FB /* NotificationController.swift in Sources */,
 				47A6AC2B2B7D3DE30047A4BA /* GlucoseChartView.swift in Sources */,
 				47DE41B52B8693CB0041DA19 /* MainViewHeaderView.swift in Sources */,
@@ -4177,6 +4199,8 @@
 				F8025E6B21F7CD7600ECF0C0 /* UIStoryboard.swift in Sources */,
 				F821CF8122A5C814005C1E43 /* RepeatingTimer.swift in Sources */,
 				F80D915C24F06A40006840B5 /* PreLibre2.swift in Sources */,
+				D1A610012026081800000001 /* LibreWatchTestSession.swift in Sources */,
+				D1A610012026081800000003 /* Libre2DirectAlgorithms.swift in Sources */,
 				477F45E6285B993200AC8475 /* GlucoseMiniChartManager.swift in Sources */,
 				F64039B5281E91500051EFFE /* TextsQuickActions.swift in Sources */,
 				F8F9722223A5915900C3F17D /* CRC.swift in Sources */,

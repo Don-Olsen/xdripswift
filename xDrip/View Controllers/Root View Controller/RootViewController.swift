@@ -1258,7 +1258,11 @@ final class RootViewController: UIViewController, ObservableObject {
         statisticsManager = StatisticsManager(coreDataManager: coreDataManager)
         
         // initialize watchManager
-        watchManager = WatchManager(coreDataManager: coreDataManager, nightscoutSyncManager: nightscoutSyncManager!)
+        watchManager = WatchManager(
+            coreDataManager: coreDataManager,
+            nightscoutSyncManager: nightscoutSyncManager!,
+            bluetoothPeripheralManager: bluetoothPeripheralManager!
+        )
         
         // initialize chartGenerator in chartOutlet
         self.chartOutlet.chartGenerator = { [weak self] (frame) in

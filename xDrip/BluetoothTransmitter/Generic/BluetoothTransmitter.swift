@@ -23,6 +23,11 @@ class BluetoothTransmitter: NSObject, CBCentralManagerDelegate, CBPeripheralDele
     // MARK: - private properties
     /// whether we should auto‑reconnect after the *next* disconnect callback (explicitly controlled)
     private var shouldReconnectOnNextDisconnect = true
+
+    /// Foreground experiments can temporarily hand a peripheral to another collector.
+    /// This is deliberately separate from disconnectAndForget: identity is retained.
+    private var isTemporarilyPaused = false
+    private var temporaryPauseCompletion: (() -> Void)?
     
     /// the address of the transmitter. If nil then transmitter never connected, so we don't know the address.
     private(set) var deviceAddress:String?
@@ -240,6 +245,63 @@ class BluetoothTransmitter: NSObject, CBCentralManagerDelegate, CBPeripheralDele
                     centralManager.cancelPeripheralConnection(peripheral)
                 }
             }
+        }
+    }
+
+    /// Stops scanning and releases the current peripheral without forgetting its identity.
+    /// The completion runs only after CoreBluetooth has released the connection (or
+    /// immediately when there was no active connection).
+    func pauseConnectionWithoutReconnect(completion: @escaping () -> Void) {
+        centralQueue.async { [weak self] in
+            guard let self = self else { return }
+            self.isTemporarilyPaused = true
+            self.shouldReconnectOnNextDisconnect = false
+            self.temporaryPauseCompletion = completion
+            self.centralManager?.stopScan()
+
+            guard let peripheral = self.peripheral,
+                  peripheral.state != .disconnected
+            else {
+                self.finishTemporaryPause()
+                return
+            }
+
+            if peripheral.state == .connected,
+               let receiveCharacteristic = self.receiveCharacteristic {
+                peripheral.setNotifyValue(false, for: receiveCharacteristic)
+            }
+            if peripheral.state != .disconnecting {
+                self.centralManager?.cancelPeripheralConnection(peripheral)
+            }
+        }
+    }
+
+    /// Restores the normal reconnect policy after a temporary hand-off.
+    func resumeConnectionAfterTemporaryPause() {
+        centralQueue.async { [weak self] in
+            guard let self = self else { return }
+            self.temporaryPauseCompletion = nil
+            self.isTemporarilyPaused = false
+            self.shouldReconnectOnNextDisconnect = true
+            guard let centralManager = self.centralManager,
+                  centralManager.state == .poweredOn
+            else { return }
+
+            if let peripheral = self.peripheral,
+               peripheral.state == .disconnected {
+                centralManager.connect(peripheral, options: self.connectOptions)
+            } else if self.peripheral == nil,
+                      !self.retrievePeripherals(centralManager) {
+                _ = self.startScanning()
+            }
+        }
+    }
+
+    private func finishTemporaryPause() {
+        let completion = temporaryPauseCompletion
+        temporaryPauseCompletion = nil
+        dispatchToMain {
+            completion?()
         }
     }
     
@@ -557,6 +619,13 @@ class BluetoothTransmitter: NSObject, CBCentralManagerDelegate, CBPeripheralDele
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         
         cancelConnectionTimer()
+
+        // A hand-off can race a connection callback. Release it before service
+        // discovery so the temporary owner gets an uncontested peripheral.
+        if isTemporarilyPaused {
+            central.cancelPeripheralConnection(peripheral)
+            return
+        }
         
         timeStampLastStatusUpdate = Date()
         
@@ -612,7 +681,11 @@ class BluetoothTransmitter: NSObject, CBCentralManagerDelegate, CBPeripheralDele
             trace("in didFailToConnect, failed to connect for peripheral with name %{public}@, will try again", log: log, category: ConstantsLog.categoryBlueToothTransmitter, type: .error, deviceName ?? "'unknown'")
         }
         
-        centralManager?.connect(peripheral, options: connectOptions)
+        if isTemporarilyPaused {
+            finishTemporaryPause()
+        } else {
+            centralManager?.connect(peripheral, options: connectOptions)
+        }
         
     }
     
@@ -630,7 +703,7 @@ class BluetoothTransmitter: NSObject, CBCentralManagerDelegate, CBPeripheralDele
         
         /// in case status changed to powered on and if device address known then try  to retrieveperipherals
         if central.state == .poweredOn {
-            if (deviceAddress != nil) {
+            if !isTemporarilyPaused, (deviceAddress != nil) {
                 
                 /// try to connect to device to which connection was successfully done previously, this attempt is done by callling retrievePeripherals(central)
                 _ = retrievePeripherals(central)
@@ -662,6 +735,12 @@ class BluetoothTransmitter: NSObject, CBCentralManagerDelegate, CBPeripheralDele
         } else {
             // Clean disconnect (rare, but handle)
             trace("in didDisconnectPeripheral, didDisconnect peripheral with name %{public}@", log: log, category: ConstantsLog.categoryBlueToothTransmitter, type: .info, deviceName ?? "'unknown'")
+        }
+
+        if isTemporarilyPaused {
+            trace("in didDisconnectPeripheral, temporary hand-off active; reconnect remains disabled", log: log, category: ConstantsLog.categoryBlueToothTransmitter, type: .info)
+            finishTemporaryPause()
+            return
         }
 
         // One-shot, subclass-requested temporary rejection (e.g., pre-auth transient on G7/ONE+)

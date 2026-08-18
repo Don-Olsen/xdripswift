@@ -4,7 +4,6 @@ set -euo pipefail
 watch_files=(
   "xDrip Watch App/DataModels/LibreWatchDiagnosticState.swift"
   "xDrip Watch App/DataModels/LibreWatchPassiveScanner.swift"
-  "xDrip Watch App/Views/DirectSensorTestView.swift"
 )
 
 for file in "${watch_files[@]}"; do
@@ -22,11 +21,7 @@ grep -Fq 'withServices: [CBUUID(string: LibreWatchDiagnosticState.serviceUUIDStr
   "xDrip Watch App/DataModels/LibreWatchPassiveScanner.swift"
 grep -Fq 'static let serviceUUIDString = "FDE3"' \
   "xDrip Watch App/DataModels/LibreWatchDiagnosticState.swift"
-grep -Fq 'scanner.viewDidDisappear()' \
-  "xDrip Watch App/Views/DirectSensorTestView.swift"
-grep -Fq 'Diagnostic only — no glucose data' \
-  "xDrip Watch App/Views/DirectSensorTestView.swift"
 grep -Fq 'WatchStateModel.swift in Sources' xdrip.xcodeproj/project.pbxproj
 grep -Fq 'NSBluetoothAlwaysUsageDescription' xDrip-Watch-App-Info.plist
 
-echo "Watch Libre Phase 1A safety checks passed"
+echo "Watch Libre Phase 1A passive-scanner isolation checks passed"

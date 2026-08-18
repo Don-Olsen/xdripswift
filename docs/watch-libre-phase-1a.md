@@ -1,5 +1,7 @@
 # Apple Watch Libre diagnostic — Phase 1A
 
+> Historical note: this describes the passive scanner shipped in TestFlight build 4231. The source remains isolated and tested, while the current **Direct Sensor Test** screen is documented in `watch-libre-direct-test.md`.
+
 ## Purpose
 
 Phase 1A determines whether Apple Watch can passively observe an advertisement for Bluetooth service `FDE3`, which the current xDrip Libre 2 implementation also identifies as the Libre 2 service. An observation is reported only as an **FDE3 candidate**; it does not establish sensor compatibility.
@@ -46,6 +48,6 @@ Open xDrip on Apple Watch. From the normal glucose screen, swipe horizontally th
 
 **No candidate observed during this scan** means that no matching advertisement reached the Watch during this particular interval. It does not mean that the sensor or Watch is unsupported; advertising timing, radio conditions, distance, and another collector may affect observation.
 
-## Planned Phase 1B
+## Later experimental build
 
-Phase 1B may add an explicit, foreground-only candidate connection and service/characteristic discovery, still with no writes. It is intentionally not implemented in this build and requires a separate safety review.
+The separately reviewed foreground direct-connection experiment is documented in `watch-libre-direct-test.md`.

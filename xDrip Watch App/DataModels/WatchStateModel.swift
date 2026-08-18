@@ -56,6 +56,11 @@ final class WatchStateModel: NSObject, ObservableObject {
     @Published var chartHoursIndex: Int = 1
     @Published var requestingDataIconColor: Color = ConstantsAppleWatch.requestingDataIconColorInactive
     @Published var lastComplicationUpdateTimeStamp: Date = .distantPast
+
+    /// A separately validated hardware-test session. It is never populated from
+    /// normal glucose/WatchState messages.
+    @Published private(set) var libreWatchTestSession: LibreWatchTestSession?
+    @Published private(set) var libreWatchTestOwnership: LibreWatchTestOwnership = .iphone
     
     // use this to track the AID/looping status
     @Published var deviceStatusIOB: Double = 0
@@ -72,6 +77,12 @@ final class WatchStateModel: NSObject, ObservableObject {
     init(session: WCSession = .default) {
         self.session = session
         super.init()
+
+        if let data = UserDefaults.standard.data(forKey: LibreWatchTestMessageKey.persistedSession),
+           let storedSession = try? JSONDecoder().decode(LibreWatchTestSession.self, from: data),
+           storedSession.isValid {
+            libreWatchTestSession = storedSession
+        }
         
         session.delegate = self
         session.activate()
@@ -406,6 +417,57 @@ final class WatchStateModel: NSObject, ObservableObject {
             }
         }
     }
+
+    func requestLibreWatchTestOwnership(completion: @escaping (Bool, String?) -> Void) {
+        guard let preparedSession = libreWatchTestSession, preparedSession.isValid else {
+            completion(false, LibreWatchDirectFailure.noTestSession.rawValue)
+            return
+        }
+        guard session.activationState == .activated, session.isReachable else {
+            completion(false, "iPhone is not reachable")
+            return
+        }
+
+        libreWatchTestOwnership = .releasingToWatch
+        sendLibreWatchTestCommand(.requestOwnership, sessionID: preparedSession.id) { [weak self] success, error in
+            self?.libreWatchTestOwnership = success ? .watch : .iphone
+            completion(success, error)
+        }
+    }
+
+    func updateLibreWatchTestUnlockCounter(_ counter: UInt16) {
+        guard var preparedSession = libreWatchTestSession else { return }
+        preparedSession.unlockCount = counter
+        libreWatchTestSession = preparedSession
+        persistLibreWatchTestSession(preparedSession)
+        sendLibreWatchTestCommand(
+            .updateUnlockCounter,
+            sessionID: preparedSession.id,
+            unlockCounter: counter,
+            queueIfUnreachable: true,
+            completion: nil
+        )
+    }
+
+    func releaseLibreWatchTestOwnership(
+        unlockCounter: UInt16?,
+        completion: ((Bool, String?) -> Void)? = nil
+    ) {
+        guard let preparedSession = libreWatchTestSession else {
+            completion?(false, LibreWatchDirectFailure.noTestSession.rawValue)
+            return
+        }
+        libreWatchTestOwnership = .releasingToPhone
+        sendLibreWatchTestCommand(
+            .releaseOwnership,
+            sessionID: preparedSession.id,
+            unlockCounter: unlockCounter,
+            queueIfUnreachable: true
+        ) { [weak self] success, error in
+            self?.libreWatchTestOwnership = success ? .iphone : .releasingToPhone
+            completion?(success, error)
+        }
+    }
     
     // MARK: - Private functions used to interact with the WCSession and prepare internal data
     
@@ -471,6 +533,84 @@ final class WatchStateModel: NSObject, ObservableObject {
             // now process the shared user defaults to get data for the WidgetKit complications
             updateComplicationData()
         }
+    }
+
+    private func processLibreWatchTestPayload(_ payload: [String: Any]) {
+        guard let data = payload[LibreWatchTestMessageKey.session] as? Data,
+              let preparedSession = try? JSONDecoder().decode(LibreWatchTestSession.self, from: data),
+              preparedSession.isValid
+        else { return }
+
+        persistLibreWatchTestSession(preparedSession)
+        libreWatchTestSession = preparedSession
+        if let rawOwnership = payload[LibreWatchTestMessageKey.ownership] as? String,
+           let ownership = LibreWatchTestOwnership(rawValue: rawOwnership) {
+            libreWatchTestOwnership = ownership
+        }
+        sendLibreWatchTestCommand(
+            .acknowledgeSession,
+            sessionID: preparedSession.id,
+            queueIfUnreachable: false,
+            completion: nil
+        )
+    }
+
+    private func persistLibreWatchTestSession(_ preparedSession: LibreWatchTestSession) {
+        guard let data = try? JSONEncoder().encode(preparedSession) else { return }
+        UserDefaults.standard.set(data, forKey: LibreWatchTestMessageKey.persistedSession)
+    }
+
+    private func sendLibreWatchTestCommand(
+        _ command: LibreWatchTestCommand,
+        sessionID: UUID,
+        unlockCounter: UInt16? = nil,
+        queueIfUnreachable: Bool = false,
+        completion: ((Bool, String?) -> Void)?
+    ) {
+        var message: [String: Any] = [
+            LibreWatchTestMessageKey.command: command.rawValue,
+            LibreWatchTestMessageKey.sessionID: sessionID.uuidString
+        ]
+        if let unlockCounter {
+            message[LibreWatchTestMessageKey.unlockCounter] = Int(unlockCounter)
+        }
+
+        guard session.activationState == .activated else {
+            session.activate()
+            if queueIfUnreachable {
+                session.transferUserInfo(message)
+                completion?(true, nil)
+            } else {
+                completion?(false, "WatchConnectivity is not activated")
+            }
+            return
+        }
+
+        guard session.isReachable else {
+            if queueIfUnreachable {
+                session.transferUserInfo(message)
+                completion?(true, nil)
+            } else {
+                completion?(false, "iPhone is not reachable")
+            }
+            return
+        }
+
+        session.sendMessage(message, replyHandler: { reply in
+            DispatchQueue.main.async {
+                let success = reply[LibreWatchTestMessageKey.success] as? Bool ?? false
+                let error = reply[LibreWatchTestMessageKey.error] as? String
+                if let rawOwnership = reply[LibreWatchTestMessageKey.ownership] as? String,
+                   let ownership = LibreWatchTestOwnership(rawValue: rawOwnership) {
+                    self.libreWatchTestOwnership = ownership
+                }
+                completion?(success, error)
+            }
+        }, errorHandler: { error in
+            DispatchQueue.main.async {
+                completion?(false, error.localizedDescription)
+            }
+        })
     }
     
     /// once we've process the state update, then save this data to the shared app group so that the complication can read it
@@ -547,24 +687,36 @@ extension WatchStateModel: WCSessionDelegate {
     func session(_: WCSession, didReceiveMessageData _: Data) {}
     
     func session(_: WCSession, didReceiveMessage message: [String: Any]) {
-        let watchStateAsDictionary = message["watchState"] as! [String: Any]
-        
         DispatchQueue.main.async {
-            self.processWatchStateFromDictionary(dictionary: watchStateAsDictionary)
-            self.requestingDataIconColor = ConstantsAppleWatch.requestingDataIconColorActive
+            self.processLibreWatchTestPayload(message)
+            if let watchStateAsDictionary = message["watchState"] as? [String: Any] {
+                self.processWatchStateFromDictionary(dictionary: watchStateAsDictionary)
+                self.requestingDataIconColor = ConstantsAppleWatch.requestingDataIconColorActive
             
-            // change the requesting icon color back after a small delay to prevent it
-            // flashing on/off too quickly
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                self.requestingDataIconColor = ConstantsAppleWatch.requestingDataIconColorInactive
+                // change the requesting icon color back after a small delay to prevent it
+                // flashing on/off too quickly
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    self.requestingDataIconColor = ConstantsAppleWatch.requestingDataIconColorInactive
+                }
             }
         }
     }
     
     func session(_: WCSession, didReceiveUserInfo userInfo: [String: Any] = [:]) {
-        let watchStateAsDictionary = userInfo["watchState"] as! [String: Any]
         DispatchQueue.main.async {
-            self.processWatchStateFromDictionary(dictionary: watchStateAsDictionary)
+            self.processLibreWatchTestPayload(userInfo)
+            if let watchStateAsDictionary = userInfo["watchState"] as? [String: Any] {
+                self.processWatchStateFromDictionary(dictionary: watchStateAsDictionary)
+            }
+        }
+    }
+
+    func session(
+        _: WCSession,
+        didReceiveApplicationContext applicationContext: [String: Any]
+    ) {
+        DispatchQueue.main.async {
+            self.processLibreWatchTestPayload(applicationContext)
         }
     }
 }

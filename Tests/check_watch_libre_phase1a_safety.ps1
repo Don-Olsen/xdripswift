@@ -5,8 +5,7 @@ Set-Location $repoRoot
 
 $watchFiles = @(
     "xDrip Watch App/DataModels/LibreWatchDiagnosticState.swift",
-    "xDrip Watch App/DataModels/LibreWatchPassiveScanner.swift",
-    "xDrip Watch App/Views/DirectSensorTestView.swift"
+    "xDrip Watch App/DataModels/LibreWatchPassiveScanner.swift"
 )
 
 foreach ($file in $watchFiles) {
@@ -41,16 +40,10 @@ Assert-FileContains `
     -Path "xDrip Watch App/DataModels/LibreWatchDiagnosticState.swift" `
     -Text 'static let serviceUUIDString = "FDE3"'
 Assert-FileContains `
-    -Path "xDrip Watch App/Views/DirectSensorTestView.swift" `
-    -Text 'scanner.viewDidDisappear()'
-Assert-FileContains `
-    -Path "xDrip Watch App/Views/DirectSensorTestView.swift" `
-    -Text 'Diagnostic only — no glucose data'
-Assert-FileContains `
     -Path "xdrip.xcodeproj/project.pbxproj" `
     -Text 'WatchStateModel.swift in Sources'
 Assert-FileContains `
     -Path "xDrip-Watch-App-Info.plist" `
     -Text 'NSBluetoothAlwaysUsageDescription'
 
-Write-Host "Watch Libre Phase 1A safety checks passed"
+Write-Host "Watch Libre Phase 1A passive-scanner isolation checks passed"

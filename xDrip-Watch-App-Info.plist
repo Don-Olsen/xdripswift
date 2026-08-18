@@ -7,6 +7,6 @@
 	<key>MainAppBundleIdentifier</key>
 	<string>$(MAIN_APP_BUNDLE_IDENTIFIER)</string>
 	<key>NSBluetoothAlwaysUsageDescription</key>
-	<string>Passively scans for nearby Libre service advertisements for a diagnostic test. It does not connect or collect glucose data.</string>
+	<string>Connects to an explicitly prepared Libre 2 Plus test sensor during a foreground diagnostic and reads its Bluetooth packets.</string>
 </dict>
 </plist>
