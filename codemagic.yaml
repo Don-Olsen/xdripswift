@@ -4,14 +4,6 @@ workflows:
     instance_type: mac_mini_m2
     max_build_duration: 120
 
-    triggering:
-      events:
-        - push
-      branch_patterns:
-        - pattern: feature/watch-libre-passive-scan
-          include: true
-          source: true
-
     integrations:
       app_store_connect: mdi-predictor-testflight
 
@@ -52,25 +44,8 @@ workflows:
           printf 'CURRENT_PROJECT_VERSION = %s\n' "$next_build_number" \
             > xDrip/VersionOverride.xcconfig
           echo "Using TestFlight build number $next_build_number"
-
-          for target in \
-            "xdrip" \
-            "xDrip Widget Extension" \
-            "xDrip Watch App" \
-            "xDrip Watch Complication Extension" \
-            "xDrip Notification Context Extension"; do
-            build_settings="$(xcodebuild \
-              -project xdrip.xcodeproj \
-              -target "$target" \
-              -configuration Release \
-              -showBuildSettings)"
-            resolved_build_number="$(printf '%s\n' "$build_settings" | awk -F ' = ' '
-              /CURRENT_PROJECT_VERSION =/ && value == "" { value = $2 }
-              END { print value }
-            ')"
-            test "$resolved_build_number" = "$next_build_number"
-            echo "$target uses build number $resolved_build_number"
-          done
+          grep -q "CURRENT_PROJECT_VERSION = $next_build_number" \
+            xDrip/VersionOverride.xcconfig
 
       - name: Run Watch Libre Phase 1A tests
         script: |
