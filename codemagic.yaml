@@ -269,6 +269,7 @@ workflows:
       xcode: latest
       vars:
         APP_STORE_APPLE_ID: 6795645396
+        EXPECTED_MARKETING_VERSION: 6.3.3
         EXPECTED_TESTFLIGHT_BUILD: 4231
 
     scripts:
@@ -283,12 +284,48 @@ workflows:
             echo "Attempt $attempt: latest TestFlight build is $latest_build_number"
 
             if test "$latest_build_number" -ge "$EXPECTED_TESTFLIGHT_BUILD"; then
-              echo "TestFlight build $EXPECTED_TESTFLIGHT_BUILD is visible."
-              exit 0
+              valid_build_json="$(app-store-connect builds list \
+                --app-id "$APP_STORE_APPLE_ID" \
+                --build-version-number "$EXPECTED_TESTFLIGHT_BUILD" \
+                --pre-release-version "$EXPECTED_MARKETING_VERSION" \
+                --processing-state VALID \
+                --platform IOS \
+                --json)"
+
+              build_id="$(printf '%s' "$valid_build_json" | jq -r '
+                if type == "array" then (.[0].id // empty)
+                elif (.data? | type) == "array" then (.data[0].id // empty)
+                elif (.data? | type) == "object" then (.data.id // empty)
+                else (.id // empty)
+                end
+              ')"
+
+              if test -n "$build_id"; then
+                beta_details_json="$(app-store-connect builds beta-details \
+                  "$build_id" \
+                  --json)"
+                internal_beta_state="$(printf '%s' "$beta_details_json" | jq -r '
+                  [.. | objects |
+                    (.internalBetaState? // .internal_beta_state? // empty)] |
+                  .[0] // empty
+                ')"
+
+                case "$internal_beta_state" in
+                  READY_FOR_BETA_TESTING|IN_BETA_TESTING)
+                    echo "TestFlight build $EXPECTED_TESTFLIGHT_BUILD is VALID with internal state $internal_beta_state."
+                    exit 0
+                    ;;
+                  *)
+                    echo "Build is VALID but internal TestFlight state is ${internal_beta_state:-not ready}."
+                    ;;
+                esac
+              else
+                echo "Build is visible but Apple processing is not VALID yet."
+              fi
             fi
 
             sleep 30
           done
 
-          echo "TestFlight build $EXPECTED_TESTFLIGHT_BUILD did not appear within 10 minutes."
+          echo "TestFlight build $EXPECTED_TESTFLIGHT_BUILD did not become ready for internal testing within 10 minutes."
           exit 1
