@@ -15,6 +15,7 @@ struct RootView: View {
         TabView{
             MainView()
             BigNumberView()
+            DirectSensorTestView()
         }
         .tabViewStyle(.carousel)
         .environmentObject(watchState)

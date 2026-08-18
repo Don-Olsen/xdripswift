@@ -6,5 +6,7 @@
 	<string>$(APP_GROUP_IDENTIFIER)</string>
 	<key>MainAppBundleIdentifier</key>
 	<string>$(MAIN_APP_BUNDLE_IDENTIFIER)</string>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>Passively scans for nearby Libre service advertisements for a diagnostic test. It does not connect or collect glucose data.</string>
 </dict>
 </plist>
