@@ -221,6 +221,7 @@ class BluetoothTransmitter: NSObject, CBCentralManagerDelegate, CBPeripheralDele
     func connect() {
         centralQueue.async { [weak self] in
             guard let self = self else { return }
+            guard !self.isTemporarilyPaused else { return }
             if let centralManager = self.centralManager, !self.retrievePeripherals(centralManager) {
                 _ = self.startScanning()
             }
@@ -258,6 +259,7 @@ class BluetoothTransmitter: NSObject, CBCentralManagerDelegate, CBPeripheralDele
             self.shouldReconnectOnNextDisconnect = false
             self.temporaryPauseCompletion = completion
             self.centralManager?.stopScan()
+            self.cancelConnectionTimer()
 
             guard let peripheral = self.peripheral,
                   peripheral.state != .disconnected
@@ -482,6 +484,7 @@ class BluetoothTransmitter: NSObject, CBCentralManagerDelegate, CBPeripheralDele
     
     /// stops scanning and connect. To be called after diddiscover
     fileprivate func stopScanAndconnect(to peripheral: CBPeripheral) {
+        guard !isTemporarilyPaused else { return }
         
         self.centralManager?.stopScan()
         self.deviceAddress = peripheral.identifier.uuidString

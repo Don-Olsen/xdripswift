@@ -6,8 +6,9 @@ state="xDrip Watch App/DataModels/LibreWatchDirectState.swift"
 session="xDrip/Managers/Watch/LibreWatchTestSession.swift"
 algorithms="xDrip/BluetoothTransmitter/CGM/Libre/Utilities/Libre2DirectAlgorithms.swift"
 view="xDrip Watch App/Views/DirectSensorTestView.swift"
+phone_bluetooth_transmitter="xDrip/BluetoothTransmitter/Generic/BluetoothTransmitter.swift"
 
-for file in "$collector" "$state" "$session" "$algorithms" "$view"; do
+for file in "$collector" "$state" "$session" "$algorithms" "$view" "$phone_bluetooth_transmitter"; do
   test -f "$file"
 done
 
@@ -22,6 +23,10 @@ grep -Fq 'source == .watchSensorF002' "$algorithms"
 grep -Fq 'guard reading.source == .watchSensorF002' "$state"
 grep -Fq 'DIRECT FROM SENSOR' "$view"
 grep -Fq 'Experimental test sensor only — do not use for treatment decisions.' "$view"
+grep -A4 -F 'func connect() {' "$phone_bluetooth_transmitter" | grep -Fq 'guard !self.isTemporarilyPaused else { return }'
+grep -A3 -F 'fileprivate func stopScanAndconnect(to peripheral: CBPeripheral) {' "$phone_bluetooth_transmitter" | grep -Fq 'guard !isTemporarilyPaused else { return }'
+grep -A9 -F 'func pauseConnectionWithoutReconnect(completion: @escaping () -> Void) {' "$phone_bluetooth_transmitter" | grep -Fq 'self.cancelConnectionTimer()'
+grep -A6 -F 'func resumeConnectionAfterTemporaryPause() {' "$phone_bluetooth_transmitter" | grep -Fq 'self.isTemporarilyPaused = false'
 
 if grep -En 'bgReadingValues|processWatchStateFromDictionary|iphoneWatchConnectivity.*DIRECT FROM SENSOR' "$collector" "$state" "$view"; then
   echo "Direct-source safety failure: normal WatchConnectivity glucose entered the direct-test path." >&2

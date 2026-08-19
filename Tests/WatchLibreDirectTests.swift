@@ -23,7 +23,6 @@ struct WatchLibreDirectTests {
         try testLibreUUIDDefinitions()
         try testFrameAssembly()
         try testUnlockCounterInput()
-        try testIPhoneParserFallback()
         try testDirectSourceGuarantee()
         try testStateTimeoutAndFailures()
         print("Watch Libre direct-test model tests passed")
@@ -143,25 +142,6 @@ struct WatchLibreDirectTests {
         try expect(first.count == 12, "The proven streaming unlock payload must remain 12 bytes")
         try expect(Array(first.prefix(4)) == [49, 0, 0, 0], "Unlock time must use code + counter in little-endian order")
         try expect(first != second, "Incrementing the unlock counter must change the payload")
-    }
-
-    private static func testIPhoneParserFallback() throws {
-        let session = makeSession()
-        var decryptedFrame = Data(repeating: 0, count: Libre2DirectConstants.decryptedFrameLength)
-        decryptedFrame[0] = 30
-        decryptedFrame[4] = 30
-        decryptedFrame[40] = 100
-
-        let reading = try Libre2DirectAlgorithms.parseDirectReading(
-            decryptedData: decryptedFrame,
-            parameters: session.algorithmParameters,
-            receivedAt: Date(timeIntervalSince1970: 2_500)
-        )
-
-        try expect(
-            abs(reading.glucoseMGDL - (30 * ConstantsBloodGlucose.libreMultiplier)) < 0.000_001,
-            "Watch parsing and its raw-value limit must match the iPhone parser fallback"
-        )
     }
 
     private static func testDirectSourceGuarantee() throws {

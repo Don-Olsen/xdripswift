@@ -15,7 +15,7 @@ enum Libre2DirectAlgorithmError: LocalizedError, Equatable {
     case badEncryptedFrameLength(Int)
     case badDecryptedFrameLength(Int)
     case crcMismatch
-    case invalidGlucose(rawGlucose: Int, rawTemperature: Int, derivedGlucose: Double, selectedGlucose: Double)
+    case invalidGlucose
 
     var errorDescription: String? {
         switch self {
@@ -29,14 +29,8 @@ enum Libre2DirectAlgorithmError: LocalizedError, Equatable {
             return "Expected 44 decrypted bytes, received \(length)"
         case .crcMismatch:
             return "BLE data decryption failed"
-        case let .invalidGlucose(rawGlucose, rawTemperature, derivedGlucose, selectedGlucose):
-            return String(
-                format: "Decoded glucose is outside the valid diagnostic range (raw=%d, temperature=%d, derived=%.1f, selected=%.1f)",
-                rawGlucose,
-                rawTemperature,
-                derivedGlucose,
-                selectedGlucose
-            )
+        case .invalidGlucose:
+            return "Decoded glucose is outside the valid diagnostic range"
         }
     }
 }
@@ -236,31 +230,18 @@ enum Libre2DirectAlgorithms {
             throw Libre2DirectAlgorithmError.badDecryptedFrameLength(decryptedData.count)
         }
 
-        let newest = glucoseSample(from: decryptedData, sampleIndex: 0, parameters: parameters)
+        let newest = glucoseMGDL(from: decryptedData, sampleIndex: 0, parameters: parameters)
         // The second transmitted sample represents the reading from two minutes ago.
-        let previous = glucoseSample(from: decryptedData, sampleIndex: 1, parameters: parameters)
-        let maximumSelectedGlucose = newest.derivedGlucose > 0
-            ? 3_000
-            : 3_000 * ConstantsBloodGlucose.libreMultiplier
-        guard newest.selectedGlucose.isFinite,
-              newest.selectedGlucose > 0,
-              newest.selectedGlucose <= maximumSelectedGlucose
-        else {
-            throw Libre2DirectAlgorithmError.invalidGlucose(
-                rawGlucose: newest.rawGlucose,
-                rawTemperature: newest.rawTemperature,
-                derivedGlucose: newest.derivedGlucose,
-                selectedGlucose: newest.selectedGlucose
-            )
+        let previous = glucoseMGDL(from: decryptedData, sampleIndex: 1, parameters: parameters)
+        guard newest.isFinite, newest > 0, newest <= 3_000 else {
+            throw Libre2DirectAlgorithmError.invalidGlucose
         }
 
         let sensorTime = UInt16(decryptedData[41], decryptedData[40])
-        let trend = previous.selectedGlucose.isFinite && previous.selectedGlucose > 0
-            ? (newest.selectedGlucose - previous.selectedGlucose) / 2
-            : nil
+        let trend = previous.isFinite && previous > 0 ? (newest - previous) / 2 : nil
 
         return Libre2DirectReading(
-            glucoseMGDL: newest.selectedGlucose,
+            glucoseMGDL: newest,
             trendMGDLPerMinute: trend,
             sensorTimeInMinutes: sensorTime,
             receivedAt: receivedAt,
@@ -268,11 +249,11 @@ enum Libre2DirectAlgorithms {
         )
     }
 
-    private static func glucoseSample(
+    private static func glucoseMGDL(
         from data: Data,
         sampleIndex: Int,
         parameters: LibreWatchAlgorithmParameters
-    ) -> (rawGlucose: Int, rawTemperature: Int, derivedGlucose: Double, selectedGlucose: Double) {
+    ) -> Double {
         let byteOffset = sampleIndex * 4
         let rawGlucose = readBits(data, byteOffset: byteOffset, bitOffset: 0, bitCount: 0xe)
         let rawTemperature = readBits(data, byteOffset: byteOffset, bitOffset: 0xe, bitCount: 0xc) << 2
@@ -294,16 +275,7 @@ enum Libre2DirectAlgorithms {
         let slope = parameters.slopeSlope * Double(rawTemperature) + parameters.offsetSlope
         let offset = parameters.slopeOffset * Double(rawTemperature) + parameters.offsetOffset
         let glucose = slope * Double(rawGlucose) + offset
-        let derivedGlucose = glucose * parameters.extraSlope + parameters.extraOffset
-
-        // Match Libre2BLEUtilities.parseBLEData exactly: the iPhone parser uses
-        // the NFC-derived value only when it is positive, otherwise it falls
-        // back to the existing Libre raw scaling instead of rejecting the frame.
-        let selectedGlucose = derivedGlucose > 0
-            ? derivedGlucose
-            : Double(rawGlucose) * ConstantsBloodGlucose.libreMultiplier
-
-        return (rawGlucose, rawTemperature, derivedGlucose, selectedGlucose)
+        return glucose * parameters.extraSlope + parameters.extraOffset
     }
 
     private static func readBits(

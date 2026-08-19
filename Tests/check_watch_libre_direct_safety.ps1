@@ -8,8 +8,9 @@ $state = "xDrip Watch App/DataModels/LibreWatchDirectState.swift"
 $session = "xDrip/Managers/Watch/LibreWatchTestSession.swift"
 $algorithms = "xDrip/BluetoothTransmitter/CGM/Libre/Utilities/Libre2DirectAlgorithms.swift"
 $view = "xDrip Watch App/Views/DirectSensorTestView.swift"
+$phoneBluetoothTransmitter = "xDrip/BluetoothTransmitter/Generic/BluetoothTransmitter.swift"
 
-foreach ($file in @($collector, $state, $session, $algorithms, $view)) {
+foreach ($file in @($collector, $state, $session, $algorithms, $view, $phoneBluetoothTransmitter)) {
     if (-not (Test-Path -LiteralPath $file)) {
         throw "Missing direct-test file: $file"
     }
@@ -43,6 +44,20 @@ Assert-FileContains -Path $state -Text 'guard reading.source == .watchSensorF002
 Assert-FileContains -Path $view -Text 'DIRECT FROM SENSOR'
 Assert-FileContains -Path $view -Text 'Experimental test sensor only — do not use for treatment decisions.'
 Assert-FileContains -Path "codemagic.yaml" -Text 'xdrip.xcworkspace'
+
+$phoneBluetoothSource = Get-Content -LiteralPath $phoneBluetoothTransmitter -Raw
+if ($phoneBluetoothSource -notmatch '(?s)func connect\(\) \{.*?guard !self\.isTemporarilyPaused else \{ return \}') {
+    throw "Phone reconnect is not suppressed during Watch ownership."
+}
+if ($phoneBluetoothSource -notmatch '(?s)fileprivate func stopScanAndconnect\(to peripheral: CBPeripheral\) \{.*?guard !isTemporarilyPaused else \{ return \}') {
+    throw "A queued phone discovery can reconnect during Watch ownership."
+}
+if ($phoneBluetoothSource -notmatch '(?s)func pauseConnectionWithoutReconnect\(completion: @escaping \(\) -> Void\) \{.*?self\.cancelConnectionTimer\(\)') {
+    throw "A pending phone connection timer can reconnect during Watch ownership."
+}
+if ($phoneBluetoothSource -notmatch '(?s)func resumeConnectionAfterTemporaryPause\(\) \{.*?self\.isTemporarilyPaused = false') {
+    throw "Phone reconnect suppression is not released on return control."
+}
 
 $directSources = (Get-Content -LiteralPath $collector, $state, $view -Raw) -join "`n"
 if ($directSources -match 'bgReadingValues|processWatchStateFromDictionary|iphoneWatchConnectivity.*DIRECT FROM SENSOR') {
