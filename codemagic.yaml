@@ -59,6 +59,7 @@ workflows:
           bash Tests/check_watch_libre_phase1a_safety.sh
           xcrun swiftc -parse-as-library \
             Tests/UInt16LibreTestSupport.swift \
+            xDrip/Constants/ConstantsBloodGlucose.swift \
             xDrip/BluetoothTransmitter/CGM/Libre/Utilities/PreLibre2.swift \
             xDrip/Managers/Watch/LibreWatchTestSession.swift \
             xDrip/BluetoothTransmitter/CGM/Libre/Utilities/Libre2DirectAlgorithms.swift \

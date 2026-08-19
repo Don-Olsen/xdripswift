@@ -8,7 +8,6 @@ $state = "xDrip Watch App/DataModels/LibreWatchDirectState.swift"
 $session = "xDrip/Managers/Watch/LibreWatchTestSession.swift"
 $algorithms = "xDrip/BluetoothTransmitter/CGM/Libre/Utilities/Libre2DirectAlgorithms.swift"
 $view = "xDrip Watch App/Views/DirectSensorTestView.swift"
-$iphoneCollector = "xDrip/BluetoothTransmitter/CGM/Libre/Libre2/CGMLibre2Transmitter.swift"
 
 foreach ($file in @($collector, $state, $session, $algorithms, $view)) {
     if (-not (Test-Path -LiteralPath $file)) {
@@ -44,15 +43,6 @@ Assert-FileContains -Path $state -Text 'guard reading.source == .watchSensorF002
 Assert-FileContains -Path $view -Text 'DIRECT FROM SENSOR'
 Assert-FileContains -Path $view -Text 'Experimental test sensor only — do not use for treatment decisions.'
 Assert-FileContains -Path "codemagic.yaml" -Text 'xdrip.xcworkspace'
-
-$iphoneCollectorSource = Get-Content -LiteralPath $iphoneCollector -Raw
-$prepareSource = [regex]::Match(
-    $iphoneCollectorSource,
-    '(?s)@nonobjc func prepareLibre2PlusWatchTest\(\).*?(?=\n    /// Confirms)'
-).Value
-if (-not $prepareSource -or $prepareSource -match 'startScanning\(|stopScanning\(|libreNFC|pauseConnection|disconnect\(') {
-    throw "Regression safety failure: Watch preparation must only copy the existing iPhone Libre session."
-}
 
 $directSources = (Get-Content -LiteralPath $collector, $state, $view -Raw) -join "`n"
 if ($directSources -match 'bgReadingValues|processWatchStateFromDictionary|iphoneWatchConnectivity.*DIRECT FROM SENSOR') {

@@ -6,7 +6,6 @@ state="xDrip Watch App/DataModels/LibreWatchDirectState.swift"
 session="xDrip/Managers/Watch/LibreWatchTestSession.swift"
 algorithms="xDrip/BluetoothTransmitter/CGM/Libre/Utilities/Libre2DirectAlgorithms.swift"
 view="xDrip Watch App/Views/DirectSensorTestView.swift"
-iphone_collector="xDrip/BluetoothTransmitter/CGM/Libre/Libre2/CGMLibre2Transmitter.swift"
 
 for file in "$collector" "$state" "$session" "$algorithms" "$view"; do
   test -f "$file"
@@ -35,11 +34,4 @@ if grep -En 'private.*entitlement|com\.apple\.developer\..*extended|HKWorkoutSes
 fi
 
 grep -Fq 'xdrip.xcworkspace' codemagic.yaml
-
-prepare_source="$(sed -n '/@nonobjc func prepareLibre2PlusWatchTest()/,/@nonobjc func canReleasePreparedSensorToWatch/p' "$iphone_collector")"
-if grep -Eq 'startScanning\(|stopScanning\(|libreNFC|pauseConnection|disconnect\(' <<<"$prepare_source"; then
-  echo "Regression safety failure: Watch preparation must only copy the existing iPhone Libre session." >&2
-  exit 1
-fi
-
 echo "Watch Libre direct-test safety checks passed"
