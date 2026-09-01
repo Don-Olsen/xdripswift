@@ -6,6 +6,7 @@ enum LibreWatchDirectStage: String, Equatable {
     case handingOff
     case scanning
     case connecting
+    case reconnecting
     case receiving
     case failed
     case returningToPhone
@@ -17,6 +18,7 @@ enum LibreWatchDirectStage: String, Equatable {
         case .handingOff: return "iPhone is releasing Libre"
         case .scanning: return "Looking for your Libre"
         case .connecting: return "Connecting to your Libre"
+        case .reconnecting: return "Reconnecting to your Libre"
         case .receiving: return "Watch receives directly"
         case .failed: return "Direct reception needs attention"
         case .returningToPhone: return "Returning Libre to iPhone"
@@ -53,7 +55,11 @@ struct LibreWatchDirectState: Equatable {
     private(set) var lastBluetoothError: String?
 
     var isReceiving: Bool {
-        [.scanning, .connecting, .receiving].contains(stage)
+        [.scanning, .connecting, .reconnecting, .receiving].contains(stage)
+    }
+
+    var connectionRecoveryIsInProgress: Bool {
+        [.scanning, .connecting, .reconnecting].contains(stage)
     }
 
     mutating func sessionAvailable(
@@ -99,6 +105,13 @@ struct LibreWatchDirectState: Equatable {
         detailText = "Exact sensor matched; establishing direct connection"
     }
 
+    mutating func reconnecting(error: String?) {
+        stage = .reconnecting
+        failure = nil
+        detailText = "Bluetooth link dropped; Watch is reconnecting automatically"
+        lastBluetoothError = error
+    }
+
     mutating func notificationsActive() {
         stage = .receiving
         failure = nil
@@ -139,10 +152,7 @@ struct LibreWatchDirectState: Equatable {
     }
 
     func directReadingIsCurrent(at date: Date) -> Bool {
-        guard stage == .receiving,
-              failure == nil,
-              let lastPacketAt
-        else { return false }
+        guard let lastPacketAt else { return false }
 
         return date.timeIntervalSince(lastPacketAt) <= Self.directReadingFreshnessInterval
     }

@@ -23,10 +23,18 @@ struct LibreDirectView: View {
                 if let reading = collector.state.directReading,
                    watchState.libreWatchOwnership == .watch {
                     let isCurrent = collector.state.directReadingIsCurrent(at: displayDate)
+                    let isRecovering = collector.state.connectionRecoveryIsInProgress
+                    let showsLiveReading = isCurrent && !isRecovering && collector.state.stage == .receiving
+                    let readingStatus: String = {
+                        if !isCurrent { return "STALE LAST DIRECT READING" }
+                        if isRecovering { return "RECONNECTING — LAST DIRECT READING" }
+                        if collector.state.stage != .receiving { return "LAST DIRECT READING" }
+                        return "DIRECT FROM SENSOR"
+                    }()
 
-                    Text(isCurrent ? "DIRECT FROM SENSOR" : "STALE LAST DIRECT READING")
+                    Text(readingStatus)
                         .font(.caption.bold())
-                        .foregroundStyle(isCurrent ? Color.green : Color.orange)
+                        .foregroundStyle(showsLiveReading ? Color.green : Color.orange)
 
                     HStack(alignment: .firstTextBaseline, spacing: 4) {
                         Text(collector.directGlucoseText(isMgDl: watchState.isMgDl))
@@ -35,7 +43,7 @@ struct LibreDirectView: View {
                         Text(reading.trendSymbol)
                             .font(.title2.bold())
                     }
-                    .foregroundStyle(isCurrent ? Color.primary : Color.orange)
+                    .foregroundStyle(showsLiveReading ? Color.primary : Color.orange)
                     Text(watchState.isMgDl ? "mg/dL" : "mmol/L")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
@@ -43,7 +51,7 @@ struct LibreDirectView: View {
                     if let ageText = collector.state.directReadingAgeText(at: displayDate) {
                         Text("Last direct reading: \(ageText)")
                             .font(.caption2)
-                            .foregroundStyle(isCurrent ? Color.secondary : Color.orange)
+                            .foregroundStyle(showsLiveReading ? Color.secondary : Color.orange)
                     }
                 }
 
@@ -56,7 +64,7 @@ struct LibreDirectView: View {
                     Text(error)
                         .font(.caption2)
                         .multilineTextAlignment(.center)
-                        .foregroundStyle(.red)
+                        .foregroundStyle(collector.state.connectionRecoveryIsInProgress ? .orange : .red)
                 }
 
                 controls
@@ -120,6 +128,7 @@ struct LibreDirectView: View {
 
     private var statusColor: Color {
         if collector.state.failure != nil { return .red }
+        if collector.state.connectionRecoveryIsInProgress { return .orange }
         if watchState.libreWatchOwnership == .watch { return .green }
         return .primary
     }
