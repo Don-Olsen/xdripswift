@@ -34,10 +34,14 @@ enum LibreWatchDirectFailure: String, Equatable {
     case characteristicNotFound = "Libre Bluetooth channel was not found"
     case notificationSetupFailed = "Libre notifications could not start"
     case unlockWriteFailed = "Libre unlock failed"
+    case noDataReceived = "No direct Libre data received"
     case invalidFrame = "Libre data could not be decoded"
 }
 
 struct LibreWatchDirectState: Equatable {
+    static let directReadingFreshnessInterval: TimeInterval = 3 * 60
+    static let noDataTimeout: TimeInterval = 3 * 60
+
     private(set) var stage: LibreWatchDirectStage = .unavailable
     private(set) var failure: LibreWatchDirectFailure?
     private(set) var detailText = "A compatible Libre 2 Plus must first be set up on iPhone"
@@ -52,7 +56,10 @@ struct LibreWatchDirectState: Equatable {
         [.scanning, .connecting, .receiving].contains(stage)
     }
 
-    mutating func sessionAvailable(_ session: LibreWatchDirectSession?) {
+    mutating func sessionAvailable(
+        _ session: LibreWatchDirectSession?,
+        preserveRuntimeState: Bool = false
+    ) {
         guard let session, session.isValid else {
             stage = .unavailable
             failure = .noSession
@@ -60,7 +67,7 @@ struct LibreWatchDirectState: Equatable {
             redactedSensorIdentity = nil
             return
         }
-        if !isReceiving {
+        if !isReceiving, (!preserveRuntimeState || stage == .unavailable) {
             stage = .ready
             failure = nil
             detailText = "Prepared for \(session.sensorTypeRawValue) sensor"
@@ -96,6 +103,7 @@ struct LibreWatchDirectState: Equatable {
         stage = .receiving
         failure = nil
         detailText = "Connected; waiting for the next Libre reading"
+        lastBluetoothError = nil
     }
 
     mutating func recordUnlockCounter(_ value: UInt16) {
@@ -108,6 +116,7 @@ struct LibreWatchDirectState: Equatable {
         stage = .receiving
         failure = nil
         detailText = "Direct reading received by Apple Watch"
+        lastBluetoothError = nil
     }
 
     mutating func beginReturn() {
@@ -127,5 +136,23 @@ struct LibreWatchDirectState: Equatable {
         self.failure = failure
         detailText = failure.rawValue
         lastBluetoothError = error
+    }
+
+    func directReadingIsCurrent(at date: Date) -> Bool {
+        guard stage == .receiving,
+              failure == nil,
+              let lastPacketAt
+        else { return false }
+
+        return date.timeIntervalSince(lastPacketAt) <= Self.directReadingFreshnessInterval
+    }
+
+    func directReadingAgeText(at date: Date) -> String? {
+        guard let lastPacketAt else { return nil }
+        let seconds = max(0, Int(date.timeIntervalSince(lastPacketAt)))
+        if seconds < 60 {
+            return "\(seconds)s ago"
+        }
+        return "\(seconds / 60)m ago"
     }
 }

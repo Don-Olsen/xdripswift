@@ -761,9 +761,15 @@ final class WatchStateModel: NSObject, ObservableObject {
 
     private func processLibreWatchPayload(_ payload: [String: Any]) {
         guard let data = payload[LibreWatchMessageKey.session] as? Data,
-              let preparedSession = try? JSONDecoder().decode(LibreWatchDirectSession.self, from: data),
+              var preparedSession = try? JSONDecoder().decode(LibreWatchDirectSession.self, from: data),
               preparedSession.isValid
         else { return }
+
+        if let currentSession = libreWatchDirectSession,
+           currentSession.representsSameSensor(as: preparedSession),
+           currentSession.unlockCount > preparedSession.unlockCount {
+            preparedSession.unlockCount = currentSession.unlockCount
+        }
 
         libreWatchDirectSession = preparedSession
         LibreWatchSessionStore.saveSession(preparedSession)

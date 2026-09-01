@@ -8,5 +8,9 @@
 	<string>$(MAIN_APP_BUNDLE_IDENTIFIER)</string>
 	<key>NSBluetoothAlwaysUsageDescription</key>
 	<string>Connects directly to your NFC-confirmed Libre sensor when you explicitly hand sensor control to Apple Watch.</string>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>bluetooth-central</string>
+	</array>
 </dict>
 </plist>

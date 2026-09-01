@@ -1,8 +1,12 @@
+import Combine
 import SwiftUI
 
 struct LibreDirectView: View {
     @EnvironmentObject private var watchState: WatchStateModel
     @ObservedObject var collector: LibreWatchDirectCollector
+    @State private var displayDate = Date()
+
+    private let displayTimer = Timer.publish(every: 15, on: .main, in: .common).autoconnect()
 
     var body: some View {
         ScrollView {
@@ -18,6 +22,12 @@ struct LibreDirectView: View {
 
                 if let reading = collector.state.directReading,
                    watchState.libreWatchOwnership == .watch {
+                    let isCurrent = collector.state.directReadingIsCurrent(at: displayDate)
+
+                    Text(isCurrent ? "DIRECT FROM SENSOR" : "STALE LAST DIRECT READING")
+                        .font(.caption.bold())
+                        .foregroundStyle(isCurrent ? Color.green : Color.orange)
+
                     HStack(alignment: .firstTextBaseline, spacing: 4) {
                         Text(collector.directGlucoseText(isMgDl: watchState.isMgDl))
                             .font(.system(size: 38, weight: .bold, design: .rounded))
@@ -25,9 +35,16 @@ struct LibreDirectView: View {
                         Text(reading.trendSymbol)
                             .font(.title2.bold())
                     }
+                    .foregroundStyle(isCurrent ? Color.primary : Color.orange)
                     Text(watchState.isMgDl ? "mg/dL" : "mmol/L")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
+
+                    if let ageText = collector.state.directReadingAgeText(at: displayDate) {
+                        Text("Last direct reading: \(ageText)")
+                            .font(.caption2)
+                            .foregroundStyle(isCurrent ? Color.secondary : Color.orange)
+                    }
                 }
 
                 Text(collector.state.detailText)
@@ -49,19 +66,18 @@ struct LibreDirectView: View {
                         .font(.caption2.monospaced())
                         .foregroundStyle(.tertiary)
                 }
+
+                Text("Experimental — do not use for treatment decisions")
+                    .font(.caption2)
+                    .multilineTextAlignment(.center)
+                    .foregroundStyle(.orange)
             }
             .frame(maxWidth: .infinity)
             .padding(.horizontal, 5)
         }
         .navigationTitle("Libre")
-        .onAppear {
-            collector.prepare(with: watchState)
-        }
-        .onChange(of: watchState.libreWatchDirectSession) { session in
-            collector.updateSession(session)
-        }
-        .onChange(of: watchState.libreWatchOwnership) { ownership in
-            collector.ownershipDidChange(ownership)
+        .onReceive(displayTimer) { date in
+            displayDate = date
         }
     }
 

@@ -19,10 +19,28 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
     private var scanIsPending = false
     private var deliberatelyDisconnecting = false
     private var returnAfterDisconnect: (() -> Void)?
+    private var dataExpectedSince: Date?
+    private var healthTimer: Timer?
+    private var watchStateObservers = Set<AnyCancellable>()
 
     func prepare(with watchState: WatchStateModel) {
-        self.watchState = watchState
+        if self.watchState !== watchState {
+            self.watchState = watchState
+            watchStateObservers.removeAll()
+
+            watchState.$libreWatchDirectSession
+                .dropFirst()
+                .sink { [weak self] session in self?.updateSession(session) }
+                .store(in: &watchStateObservers)
+
+            watchState.$libreWatchOwnership
+                .dropFirst()
+                .sink { [weak self] ownership in self?.ownershipDidChange(ownership) }
+                .store(in: &watchStateObservers)
+        }
+
         updateSession(watchState.libreWatchDirectSession)
+        startHealthMonitoring()
 
         if centralManager == nil {
             centralManager = CBCentralManager(
@@ -41,13 +59,35 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
     }
 
     func updateSession(_ session: LibreWatchDirectSession?) {
-        let sensorChanged = preparedSession?.sensorUID != session?.sensorUID
-        preparedSession = session
+        let previousSensorUID = preparedSession?.sensorUID
+        var resolvedSession = session
+
+        // A phone context may arrive with an older unlock counter than the Watch has already used.
+        // Preserve the highest counter for the same sensor so a context refresh cannot roll it back.
+        if var incoming = session,
+           let current = preparedSession,
+           current.representsSameSensor(as: incoming),
+           current.unlockCount > incoming.unlockCount {
+            incoming.unlockCount = current.unlockCount
+            resolvedSession = incoming
+        }
+
+        preparedSession = resolvedSession
+        let sensorChanged: Bool
+        if let previousSensorUID, let nextSensorUID = resolvedSession?.sensorUID {
+            sensorChanged = previousSensorUID != nextSensorUID
+        } else {
+            sensorChanged = false
+        }
+
         if sensorChanged, watchState?.libreWatchOwnership == .watch {
             returnLibreToPhone()
             return
         }
-        state.sessionAvailable(session)
+        state.sessionAvailable(
+            resolvedSession,
+            preserveRuntimeState: watchState?.libreWatchOwnership == .watch
+        )
     }
 
     func ownershipDidChange(_ ownership: LibreWatchOwnership) {
@@ -57,10 +97,13 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         case .iphone:
             deliberatelyDisconnecting = true
             returnAfterDisconnect = nil
-            stopBluetooth()
-            clearTransientBluetoothState()
-            state.returnedToPhone(session: preparedSession)
-            deliberatelyDisconnecting = false
+            scanIsPending = false
+            centralManager?.stopScan()
+            if let sensorPeripheral, sensorPeripheral.state != .disconnected {
+                centralManager?.cancelPeripheralConnection(sensorPeripheral)
+            } else {
+                finishStoppingForPhoneOwnership()
+            }
         case .releasingToWatch, .releasingToPhone, .recovery:
             break
         }
@@ -109,8 +152,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
     func returnLibreToPhone() {
         guard let watchState else { return }
         guard watchState.libreWatchOwnership == .watch else {
-            stopBluetooth()
-            state.returnedToPhone(session: preparedSession)
+            ownershipDidChange(.iphone)
             return
         }
         guard watchState.phoneIsReachable else {
@@ -125,9 +167,6 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         if mustWaitForDisconnect, let sensorPeripheral {
             returnAfterDisconnect = { [weak self] in self?.completeReturnToPhone() }
             centralManager?.cancelPeripheralConnection(sensorPeripheral)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
-                self?.finishPendingReturnAfterDisconnect()
-            }
         } else {
             completeReturnToPhone()
         }
@@ -153,6 +192,12 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         let completion = returnAfterDisconnect
         returnAfterDisconnect = nil
         completion?()
+    }
+
+    private func finishStoppingForPhoneOwnership() {
+        clearTransientBluetoothState()
+        state.returnedToPhone(session: preparedSession)
+        deliberatelyDisconnecting = false
     }
 
     func directGlucoseText(isMgDl: Bool) -> String {
@@ -195,14 +240,6 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         }
     }
 
-    private func stopBluetooth() {
-        scanIsPending = false
-        centralManager?.stopScan()
-        if let sensorPeripheral, sensorPeripheral.state != .disconnected {
-            centralManager?.cancelPeripheralConnection(sensorPeripheral)
-        }
-    }
-
     private func clearTransientBluetoothState() {
         sensorPeripheral?.delegate = nil
         sensorPeripheral = nil
@@ -210,6 +247,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         writeCharacteristic = nil
         receiveCharacteristic = nil
         frameAssembler.reset()
+        dataExpectedSince = nil
     }
 
     private func identityAndOwnershipAreConfirmed(for peripheral: CBPeripheral) -> Bool {
@@ -230,6 +268,35 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         } else {
             scheduleRescan()
         }
+    }
+
+    private func startHealthMonitoring() {
+        guard healthTimer == nil else { return }
+
+        let timer = Timer(timeInterval: 30, repeats: true) { [weak self] _ in
+            self?.evaluateConnectionHealth(at: Date())
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        healthTimer = timer
+    }
+
+    private func evaluateConnectionHealth(at date: Date) {
+        guard watchState?.libreWatchOwnership == .watch,
+              state.stage == .receiving,
+              sensorPeripheral?.state == .connected,
+              let lastActivity = state.lastPacketAt ?? dataExpectedSince,
+              date.timeIntervalSince(lastActivity) >= LibreWatchDirectState.noDataTimeout
+        else { return }
+
+        dataExpectedSince = nil
+        failAndRescan(
+            .noDataReceived,
+            error: "No direct Libre packet received for 3 minutes; reconnecting"
+        )
+    }
+
+    deinit {
+        healthTimer?.invalidate()
     }
 }
 
@@ -315,6 +382,14 @@ extension LibreWatchDirectCollector: CBCentralManagerDelegate {
         didFailToConnect _: CBPeripheral,
         error: Error?
     ) {
+        if deliberatelyDisconnecting {
+            if returnAfterDisconnect != nil {
+                finishPendingReturnAfterDisconnect()
+            } else {
+                finishStoppingForPhoneOwnership()
+            }
+            return
+        }
         state.fail(.connectionFailed, error: error?.localizedDescription)
         scheduleRescan()
     }
@@ -325,7 +400,11 @@ extension LibreWatchDirectCollector: CBCentralManagerDelegate {
         error: Error?
     ) {
         if deliberatelyDisconnecting {
-            finishPendingReturnAfterDisconnect()
+            if returnAfterDisconnect != nil {
+                finishPendingReturnAfterDisconnect()
+            } else {
+                finishStoppingForPhoneOwnership()
+            }
             return
         }
         if let error {
@@ -434,6 +513,7 @@ extension LibreWatchDirectCollector: CBPeripheralDelegate {
         if let error {
             failAndRescan(.unlockWriteFailed, error: error.localizedDescription)
         } else {
+            dataExpectedSince = Date()
             state.notificationsActive()
         }
     }

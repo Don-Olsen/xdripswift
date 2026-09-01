@@ -14,12 +14,22 @@ import WatchKit
 
 @main
 struct xDrip_Watch_AppApp: App {
-    @StateObject var watchState = WatchStateModel()
+    @StateObject private var watchState: WatchStateModel
+    @StateObject private var libreDirectCollector: LibreWatchDirectCollector
+
+    init() {
+        let watchState = WatchStateModel()
+        let libreDirectCollector = LibreWatchDirectCollector()
+        libreDirectCollector.prepare(with: watchState)
+
+        _watchState = StateObject(wrappedValue: watchState)
+        _libreDirectCollector = StateObject(wrappedValue: libreDirectCollector)
+    }
     
     var body: some Scene {
         WindowGroup {
             NavigationView {
-                RootView()
+                RootView(libreDirectCollector: libreDirectCollector)
             }.environmentObject(watchState)
         }
         
