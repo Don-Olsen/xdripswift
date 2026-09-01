@@ -1,0 +1,247 @@
+workflows:
+  xdrip-testflight:
+    name: xDrip4iOS 7.0.0 Watch takeover to TestFlight
+    instance_type: mac_mini_m2
+    max_build_duration: 120
+
+    integrations:
+      app_store_connect: mdi-predictor-testflight
+
+    environment:
+      xcode: latest
+      ios_signing:
+        certificates:
+          - mdi-predictor-apple-distribution
+        provisioning_profiles:
+          - mdi-predictor-app-store-profile
+      vars:
+        XDRIP_TEAM_ID: GFZ896KN66
+        XDRIP_MAIN_BUNDLE_ID: com.GFZ896KN66.xdripswift
+        APP_STORE_APPLE_ID: 6795645396
+
+    scripts:
+      - name: Initialize repository dependencies
+        script: |
+          set -euo pipefail
+          git submodule sync --recursive
+          git submodule update --init --recursive
+
+      - name: Verify the xDrip4iOS release
+        script: |
+          set -euo pipefail
+          grep -q "XDRIP_MARKETING_VERSION = 7.0.0" xDrip/Version.xcconfig
+          printf '%s\n' \
+            "XDRIP_DEVELOPMENT_TEAM = ${XDRIP_TEAM_ID}" \
+            "XDRIP_CODE_SIGN_IDENTITY_RELEASE = Apple Distribution" \
+            > xDripConfigOverride.xcconfig
+
+      - name: Set the next TestFlight build number
+        script: |
+          set -euo pipefail
+          latest_build_number="$(app-store-connect get-latest-testflight-build-number "$APP_STORE_APPLE_ID")"
+          test -n "$latest_build_number"
+          next_build_number="$((latest_build_number + 1))"
+          printf 'CURRENT_PROJECT_VERSION = %s\n' "$next_build_number" \
+            > xDrip/VersionOverride.xcconfig
+          echo "Using TestFlight build number $next_build_number"
+          grep -q "CURRENT_PROJECT_VERSION = $next_build_number" \
+            xDrip/VersionOverride.xcconfig
+
+      - name: Create and download App Store profiles
+        script: |
+          set -euo pipefail
+
+          resource_id() {
+            jq -r '
+              if type == "array" then (.[0].id // empty)
+              elif has("data") then (.data[0].id // empty)
+              else (.id // empty)
+              end
+            '
+          }
+
+          certificate_json="$(app-store-connect certificates list \
+            --profile-type IOS_APP_STORE \
+            --json)"
+          certificate_id="$(printf '%s' "$certificate_json" | resource_id)"
+          test -n "$certificate_id"
+
+          ensure_profile() {
+            bundle_id="$1"
+            profile_name="$2"
+
+            bundle_json="$(app-store-connect bundle-ids list \
+              --bundle-id-identifier "$bundle_id" \
+              --platform IOS \
+              --strict-match-identifier \
+              --json)"
+            bundle_resource_id="$(printf '%s' "$bundle_json" | resource_id)"
+            test -n "$bundle_resource_id"
+
+            profile_json="$(app-store-connect profiles list \
+              --type IOS_APP_STORE \
+              --state ACTIVE \
+              --name "$profile_name" \
+              --json)"
+            profile_id="$(printf '%s' "$profile_json" | resource_id)"
+
+            if test -n "$profile_id"; then
+              app-store-connect profiles get "$profile_id" --save
+            else
+              app-store-connect profiles create "$bundle_resource_id" \
+                --certificate-ids "$certificate_id" \
+                --type IOS_APP_STORE \
+                --name "$profile_name" \
+                --save
+            fi
+          }
+
+          ensure_profile "$XDRIP_MAIN_BUNDLE_ID" "Codemagic xDrip4iOS App Store"
+          ensure_profile "$XDRIP_MAIN_BUNDLE_ID.xDripWidget" "Codemagic xDrip4iOS Widget App Store"
+          ensure_profile "$XDRIP_MAIN_BUNDLE_ID.watchkitapp" "Codemagic xDrip4iOS Watch App Store"
+          ensure_profile "$XDRIP_MAIN_BUNDLE_ID.watchkitapp.xDripWatchComplication" "Codemagic xDrip4iOS Complication App Store"
+          ensure_profile "$XDRIP_MAIN_BUNDLE_ID.xDripNotificationContextExtension" "Codemagic xDrip4iOS Notification App Store"
+
+          profile_source="$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"
+          profile_target="$HOME/Library/MobileDevice/Provisioning Profiles"
+          mkdir -p "$profile_target"
+          cp "$profile_source"/*.mobileprovision "$profile_target"/
+
+      - name: Apply signing profiles to xDrip targets
+        script: |
+          set -euo pipefail
+
+          profile_source="$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"
+          fixed_profiles="$CM_BUILD_DIR/build-profiles"
+          mkdir -p "$fixed_profiles"
+
+          for profile in "$profile_source"/*.mobileprovision; do
+            profile_plist="$(mktemp)"
+            security cms -D -i "$profile" > "$profile_plist"
+            profile_name="$(/usr/libexec/PlistBuddy -c "Print :Name" "$profile_plist")"
+
+            case "$profile_name" in
+              "Codemagic xDrip4iOS App Store")
+                cp "$profile" "$fixed_profiles/main.mobileprovision"
+                ;;
+              "Codemagic xDrip4iOS Widget App Store")
+                cp "$profile" "$fixed_profiles/widget.mobileprovision"
+                ;;
+              "Codemagic xDrip4iOS Watch App Store")
+                cp "$profile" "$fixed_profiles/watch.mobileprovision"
+                ;;
+              "Codemagic xDrip4iOS Complication App Store")
+                cp "$profile" "$fixed_profiles/complication.mobileprovision"
+                ;;
+              "Codemagic xDrip4iOS Notification App Store")
+                cp "$profile" "$fixed_profiles/notification.mobileprovision"
+                ;;
+            esac
+          done
+
+          test -f "$fixed_profiles/main.mobileprovision"
+          test -f "$fixed_profiles/widget.mobileprovision"
+          test -f "$fixed_profiles/watch.mobileprovision"
+          test -f "$fixed_profiles/complication.mobileprovision"
+          test -f "$fixed_profiles/notification.mobileprovision"
+
+          fastlane run update_project_team \
+            path:"xdrip.xcodeproj" \
+            teamid:"$XDRIP_TEAM_ID"
+
+          fastlane run update_project_provisioning \
+            xcodeproj:"xdrip.xcodeproj" \
+            profile:"$fixed_profiles/main.mobileprovision" \
+            target_filter:"^xdrip$" \
+            build_configuration:"Release" \
+            code_signing_identity:"Apple Distribution"
+
+          fastlane run update_project_provisioning \
+            xcodeproj:"xdrip.xcodeproj" \
+            profile:"$fixed_profiles/widget.mobileprovision" \
+            target_filter:"^xDrip Widget Extension$" \
+            build_configuration:"Release" \
+            code_signing_identity:"Apple Distribution"
+
+          fastlane run update_project_provisioning \
+            xcodeproj:"xdrip.xcodeproj" \
+            profile:"$fixed_profiles/watch.mobileprovision" \
+            target_filter:"^xDrip Watch App$" \
+            build_configuration:"Release" \
+            code_signing_identity:"Apple Distribution"
+
+          fastlane run update_project_provisioning \
+            xcodeproj:"xdrip.xcodeproj" \
+            profile:"$fixed_profiles/complication.mobileprovision" \
+            target_filter:"^xDrip Watch Complication Extension$" \
+            build_configuration:"Release" \
+            code_signing_identity:"Apple Distribution"
+
+          fastlane run update_project_provisioning \
+            xcodeproj:"xdrip.xcodeproj" \
+            profile:"$fixed_profiles/notification.mobileprovision" \
+            target_filter:"^xDrip Notification Context Extension$" \
+            build_configuration:"Release" \
+            code_signing_identity:"Apple Distribution"
+
+      - name: Build signed IPA
+        script: |
+          set -euo pipefail
+
+          cat > "$CM_BUILD_DIR/export_options.plist" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>app-store-connect</string>
+            <key>signingStyle</key>
+            <string>manual</string>
+            <key>signingCertificate</key>
+            <string>Apple Distribution</string>
+            <key>teamID</key>
+            <string>GFZ896KN66</string>
+            <key>testFlightInternalTestingOnly</key>
+            <true/>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>com.GFZ896KN66.xdripswift</key>
+              <string>Codemagic xDrip4iOS App Store</string>
+              <key>com.GFZ896KN66.xdripswift.xDripWidget</key>
+              <string>Codemagic xDrip4iOS Widget App Store</string>
+              <key>com.GFZ896KN66.xdripswift.watchkitapp</key>
+              <string>Codemagic xDrip4iOS Watch App Store</string>
+              <key>com.GFZ896KN66.xdripswift.watchkitapp.xDripWatchComplication</key>
+              <string>Codemagic xDrip4iOS Complication App Store</string>
+              <key>com.GFZ896KN66.xdripswift.xDripNotificationContextExtension</key>
+              <string>Codemagic xDrip4iOS Notification App Store</string>
+            </dict>
+          </dict>
+          </plist>
+          PLIST
+
+          xcodebuild \
+            -workspace "$CM_BUILD_DIR/xdrip.xcworkspace" \
+            -scheme "xdrip" \
+            -configuration Release \
+            -archivePath "$CM_BUILD_DIR/build/ios/xcarchive/xdrip.xcarchive" \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY="Apple Distribution" \
+            DEVELOPMENT_TEAM="$XDRIP_TEAM_ID" \
+            archive
+
+          mkdir -p "$CM_BUILD_DIR/build/ios/ipa"
+          xcodebuild \
+            -exportArchive \
+            -archivePath "$CM_BUILD_DIR/build/ios/xcarchive/xdrip.xcarchive" \
+            -exportPath "$CM_BUILD_DIR/build/ios/ipa" \
+            -exportOptionsPlist "$CM_BUILD_DIR/export_options.plist"
+
+    artifacts:
+      - build/ios/ipa/*.ipa
+      - /tmp/xcodebuild_logs/*.log
+      - $HOME/Library/Developer/Xcode/DerivedData/**/Build/**/*.dSYM
+
+    publishing:
+      app_store_connect:
+        auth: integration

@@ -2153,10 +2153,73 @@ private extension BluetoothPeripheralDetailState {
                         action: { [weak self] in
                             self?.showLibre2SensorStartTimeInfo(libre2: libre2)
                         }
+                    ),
+                    row(
+                        id: "libre-2-watch-direct-owner",
+                        title: "Apple Watch direct connection",
+                        detail: libreWatchDirectStatusText(),
+                        detailIndicator: LibreWatchSessionStore.loadOwnership() == .watch
+                            ? SettingsIndicator(color: .green)
+                            : nil,
+                        showsDisclosure: true,
+                        action: { [weak self] in
+                            self?.handleLibreWatchDirectConnection()
+                        }
                     )
                 ]
             )
         ]
+    }
+
+    func libreWatchDirectStatusText() -> String {
+        switch LibreWatchSessionStore.loadOwnership() {
+        case .watch:
+            return "Watch receives Libre directly"
+        case .releasingToWatch:
+            return "Releasing iPhone connection"
+        case .releasingToPhone:
+            return "Returning to iPhone"
+        case .recovery:
+            return "Recovery required"
+        case .iphone:
+            return LibreWatchSessionStore.loadSession() == nil
+                ? "Available after Libre NFC setup"
+                : "Ready — take over on Watch"
+        }
+    }
+
+    func handleLibreWatchDirectConnection() {
+        guard let transmitter = bluetoothPeripheralManager?.getCGMTransmitter() as? CGMLibre2Transmitter else {
+            showInfo(title: "Apple Watch", message: "The active transmitter is not Libre 2.")
+            return
+        }
+
+        if LibreWatchSessionStore.loadOwnership() == .watch {
+            pendingAlert = BluetoothPeripheralDetailAlert(
+                title: "Take Libre back to iPhone?",
+                message: "Use this emergency action if Watch cannot return the sensor itself. Watch direct reception will stop.",
+                primaryButtonTitle: "Take Back",
+                primaryAction: { [weak self, weak transmitter] in
+                    transmitter?.forceReturnSensorToPhone()
+                    self?.refresh()
+                },
+                secondaryButtonTitle: Texts_Common.Cancel
+            )
+            return
+        }
+
+        if transmitter.prepareCurrentSensorForWatch() != nil {
+            showInfo(
+                title: "Apple Watch",
+                message: "Open the Libre page in xDrip on Apple Watch and tap Watch takes Libre. Keep iPhone nearby during the hand-off."
+            )
+        } else {
+            showInfo(
+                title: "Apple Watch",
+                message: "Direct Watch reception needs a Libre 2 Plus C6/7F sensor with a completed NFC setup."
+            )
+        }
+        refresh()
     }
 
     func libre2SensorStartText(libre2: Libre2) -> String {

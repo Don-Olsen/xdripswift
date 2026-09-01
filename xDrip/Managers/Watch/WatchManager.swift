@@ -36,6 +36,13 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
     /// NightscoutSyncManager instance
     private var nightscoutSyncManager: NightscoutSyncManager
 
+    /// Releases/resumes the exact active Libre transmitter during a Watch hand-off.
+    private var bluetoothPeripheralManager: BluetoothPeripheralManager
+
+    private var libreWatchDirectSession: LibreWatchDirectSession?
+    private var libreWatchOwnership: LibreWatchOwnership = .iphone
+    private var libreWatchObservers: [NSObjectProtocol] = []
+
     /// Statistics manager used to build compact AGP backgrounds for the Watch chart
     private var statisticsManager: StatisticsManager
 
@@ -59,17 +66,61 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
 
     // MARK: - intializer
 
-    init(coreDataManager: CoreDataManager, nightscoutSyncManager: NightscoutSyncManager, session: WCSession = .default) {
+    init(
+        coreDataManager: CoreDataManager,
+        nightscoutSyncManager: NightscoutSyncManager,
+        bluetoothPeripheralManager: BluetoothPeripheralManager,
+        session: WCSession = .default
+    ) {
         // set coreDataManager and bgReadingsAccessor
         self.coreDataManager = coreDataManager
         self.bgReadingsAccessor = BgReadingsAccessor(coreDataManager: coreDataManager)
         self.sensorsAccessor = SensorsAccessor(coreDataManager: coreDataManager)
         self.nightscoutSyncManager = nightscoutSyncManager
+        self.bluetoothPeripheralManager = bluetoothPeripheralManager
         self.statisticsManager = StatisticsManager(coreDataManager: coreDataManager)
 
         self.session = session
 
         super.init()
+
+        libreWatchDirectSession = LibreWatchSessionStore.loadSession()
+        libreWatchOwnership = LibreWatchSessionStore.loadOwnership()
+
+        // An interrupted transition is recovered on the phone. A completed Watch owner remains
+        // authoritative across app restarts and immediately suppresses the phone reconnect loop.
+        if [.releasingToWatch, .releasingToPhone, .recovery].contains(libreWatchOwnership) {
+            libreWatchOwnership = .iphone
+            LibreWatchSessionStore.saveOwnership(.iphone)
+        }
+
+        libreWatchObservers.append(NotificationCenter.default.addObserver(
+            forName: .libreWatchDirectSessionPrepared,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let session = notification.object as? LibreWatchDirectSession else { return }
+            self?.storeAndSendLibreWatchSession(session)
+        })
+
+        libreWatchObservers.append(NotificationCenter.default.addObserver(
+            forName: .libreWatchDirectOwnershipForcedToPhone,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            self.setLibreWatchOwnership(.iphone)
+            self.sendLibreWatchSession()
+        })
+
+        if let transmitter = bluetoothPeripheralManager.getCGMTransmitter() as? CGMLibre2Transmitter {
+            if libreWatchOwnership == .watch, let libreWatchDirectSession {
+                transmitter.restoreWatchOwnership(libreWatchDirectSession)
+            }
+            if let currentSession = transmitter.prepareCurrentSensorForWatch() {
+                libreWatchDirectSession = currentSession
+            }
+        }
 
         if WCSession.isSupported() {
             session.delegate = self
@@ -358,6 +409,175 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
         }
     }
 
+    private func setLibreWatchOwnership(_ ownership: LibreWatchOwnership) {
+        libreWatchOwnership = ownership
+        LibreWatchSessionStore.saveOwnership(ownership)
+    }
+
+    private func storeAndSendLibreWatchSession(_ preparedSession: LibreWatchDirectSession) {
+        guard preparedSession.isValid else { return }
+
+        if let existing = libreWatchDirectSession,
+           !existing.representsSameSensor(as: preparedSession),
+           libreWatchOwnership == .watch {
+            (bluetoothPeripheralManager.getCGMTransmitter() as? CGMLibre2Transmitter)?
+                .forceReturnSensorToPhone()
+            setLibreWatchOwnership(.iphone)
+        }
+
+        libreWatchDirectSession = preparedSession
+        LibreWatchSessionStore.saveSession(preparedSession)
+        sendLibreWatchSession()
+    }
+
+    private func sendLibreWatchSession() {
+        guard let libreWatchDirectSession,
+              libreWatchDirectSession.isValid,
+              let encoded = try? JSONEncoder().encode(libreWatchDirectSession),
+              session.activationState == .activated
+        else { return }
+
+        let payload: [String: Any] = [
+            LibreWatchMessageKey.session: encoded,
+            LibreWatchMessageKey.ownership: libreWatchOwnership.rawValue
+        ]
+        try? session.updateApplicationContext(payload)
+        if session.isReachable {
+            session.sendMessage(payload, replyHandler: nil, errorHandler: { [weak self] error in
+                guard let self else { return }
+                trace("Could not send Libre Watch session: %{public}@", log: self.log, category: ConstantsLog.categoryWatchManager, type: .error, error.localizedDescription)
+            })
+        }
+    }
+
+    @discardableResult
+    private func handleLibreWatchMessage(
+        _ message: [String: Any],
+        reply: (([String: Any]) -> Void)?
+    ) -> Bool {
+        guard let rawCommand = message[LibreWatchMessageKey.command] as? String,
+              let command = LibreWatchCommand(rawValue: rawCommand)
+        else { return false }
+
+        let fail: (String) -> Void = { reason in
+            reply?([
+                LibreWatchMessageKey.success: false,
+                LibreWatchMessageKey.error: reason,
+                LibreWatchMessageKey.ownership: self.libreWatchOwnership.rawValue
+            ])
+        }
+
+        guard let idString = message[LibreWatchMessageKey.sessionID] as? String,
+              let sessionID = UUID(uuidString: idString),
+              var preparedSession = libreWatchDirectSession,
+              preparedSession.id == sessionID,
+              preparedSession.isValid
+        else {
+            fail("No matching Libre Watch session")
+            return true
+        }
+
+        switch command {
+        case .acknowledgeSession:
+            reply?([
+                LibreWatchMessageKey.success: true,
+                LibreWatchMessageKey.ownership: libreWatchOwnership.rawValue
+            ])
+
+        case .requestOwnership:
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                guard self.libreWatchOwnership == .iphone,
+                      let transmitter = self.bluetoothPeripheralManager.getCGMTransmitter() as? CGMLibre2Transmitter,
+                      transmitter.canReleaseSensorToWatch(preparedSession)
+                else {
+                    fail("iPhone could not release this Libre sensor")
+                    return
+                }
+
+                self.setLibreWatchOwnership(.releasingToWatch)
+                transmitter.releaseSensorToWatch(preparedSession) { [weak self] released in
+                    guard let self else { return }
+                    guard released else {
+                        self.setLibreWatchOwnership(.iphone)
+                        fail("iPhone could not release this Libre sensor")
+                        return
+                    }
+                    self.setLibreWatchOwnership(.watch)
+                    self.sendLibreWatchSession()
+                    reply?([
+                        LibreWatchMessageKey.success: true,
+                        LibreWatchMessageKey.ownership: self.libreWatchOwnership.rawValue
+                    ])
+                }
+            }
+
+        case .releaseOwnership:
+            updateLibreWatchUnlockCounter(from: message, session: &preparedSession)
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.setLibreWatchOwnership(.releasingToPhone)
+                (self.bluetoothPeripheralManager.getCGMTransmitter() as? CGMLibre2Transmitter)?
+                    .returnSensorToPhone(sessionID: sessionID)
+                self.setLibreWatchOwnership(.iphone)
+                self.sendLibreWatchSession()
+                reply?([
+                    LibreWatchMessageKey.success: true,
+                    LibreWatchMessageKey.ownership: self.libreWatchOwnership.rawValue
+                ])
+            }
+
+        case .updateUnlockCounter:
+            guard updateLibreWatchUnlockCounter(from: message, session: &preparedSession) else {
+                fail("Invalid or stale Libre unlock counter")
+                return true
+            }
+            reply?([
+                LibreWatchMessageKey.success: true,
+                LibreWatchMessageKey.ownership: libreWatchOwnership.rawValue
+            ])
+
+        case .submitReading:
+            guard libreWatchOwnership == .watch,
+                  let data = message[LibreWatchMessageKey.reading] as? Data,
+                  let reading = try? JSONDecoder().decode(LibreWatchDirectReadingPayload.self, from: data),
+                  reading.isValid,
+                  reading.sessionID == sessionID,
+                  let transmitter = bluetoothPeripheralManager.getCGMTransmitter() as? CGMLibre2Transmitter
+            else {
+                fail("Invalid Libre reading or Watch is not the owner")
+                return true
+            }
+            DispatchQueue.main.async {
+                transmitter.receiveReadingFromWatch(reading)
+            }
+            reply?([
+                LibreWatchMessageKey.success: true,
+                LibreWatchMessageKey.ownership: libreWatchOwnership.rawValue
+            ])
+        }
+
+        return true
+    }
+
+    @discardableResult
+    private func updateLibreWatchUnlockCounter(
+        from message: [String: Any],
+        session preparedSession: inout LibreWatchDirectSession
+    ) -> Bool {
+        guard let counter = message[LibreWatchMessageKey.unlockCounter] as? Int,
+              counter >= 0,
+              counter <= Int(UInt16.max),
+              UInt16(counter) >= preparedSession.unlockCount
+        else { return false }
+
+        preparedSession.unlockCount = UInt16(counter)
+        libreWatchDirectSession = preparedSession
+        UserDefaults.standard.libreActiveSensorUnlockCount = preparedSession.unlockCount
+        LibreWatchSessionStore.saveSession(preparedSession)
+        return true
+    }
+
     // MARK: - Public functions
 
     func updateWatchApp(forceComplicationUpdate: Bool) {
@@ -366,6 +586,7 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
 
     deinit {
         UserDefaults.standard.removeObserver(self, forKeyPath: UserDefaults.Key.nightscoutDeviceStatusWasUpdated.rawValue)
+        libreWatchObservers.forEach { NotificationCenter.default.removeObserver($0) }
     }
 }
 
@@ -393,11 +614,13 @@ extension WatchManager: WCSessionDelegate {
         // send the update that was deferred while the session was activating
         DispatchQueue.main.async { [weak self] in
             self?.processWatchUpdate(updateTypes: [.status, .bgReadings], forceComplicationUpdate: false)
+            self?.sendLibreWatchSession()
         }
     }
 
     // process any received messages from the watch app
     func session(_ session: WCSession, didReceiveMessage message: [String: Any]) {
+        if handleLibreWatchMessage(message, reply: nil) { return }
         // check which type of update the Watch is requesting and call the correct sending function as needed
         if let requestWatchUpdate = message["requestWatchUpdate"] as? String {
             switch requestWatchUpdate {
@@ -432,7 +655,18 @@ extension WatchManager: WCSessionDelegate {
         }
     }
 
-    func session(_: WCSession, didReceiveUserInfo userInfo: [String: Any] = [:]) {}
+    func session(
+        _: WCSession,
+        didReceiveMessage message: [String: Any],
+        replyHandler: @escaping ([String: Any]) -> Void
+    ) {
+        if handleLibreWatchMessage(message, reply: replyHandler) { return }
+        replyHandler([LibreWatchMessageKey.success: false])
+    }
+
+    func session(_: WCSession, didReceiveUserInfo userInfo: [String: Any] = [:]) {
+        _ = handleLibreWatchMessage(userInfo, reply: nil)
+    }
 
     func session(_: WCSession, didReceiveMessageData _: Data) {}
 
@@ -440,6 +674,7 @@ extension WatchManager: WCSessionDelegate {
         if session.isReachable {
             DispatchQueue.main.async {
                 self.processWatchUpdate(updateTypes: [.status, .bgReadings], forceComplicationUpdate: false)
+                self.sendLibreWatchSession()
             }
         }
     }

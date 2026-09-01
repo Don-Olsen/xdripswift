@@ -6,5 +6,7 @@
 	<string>$(APP_GROUP_IDENTIFIER)</string>
 	<key>MainAppBundleIdentifier</key>
 	<string>$(MAIN_APP_BUNDLE_IDENTIFIER)</string>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>Connects directly to your NFC-confirmed Libre sensor when you explicitly hand sensor control to Apple Watch.</string>
 </dict>
 </plist>

@@ -126,6 +126,10 @@ final class WatchStateModel: NSObject, ObservableObject {
     @Published var requestingDataIconColor: Color = ConstantsAppleWatch.requestingDataIconColorInactive
     @Published var lastComplicationUpdateTimeStamp: Date = .distantPast
 
+    /// NFC-authenticated direct Libre session and its persistent connection owner.
+    @Published private(set) var libreWatchDirectSession: LibreWatchDirectSession?
+    @Published private(set) var libreWatchOwnership: LibreWatchOwnership = .iphone
+
     @Published var aidStatus: AIDStatus?
 
     // we use the following to record when the user has manually requested a state update on each view so that we can trigger the animation on just this view
@@ -135,6 +139,8 @@ final class WatchStateModel: NSObject, ObservableObject {
 
     init(session: WCSession = .default) {
         self.session = session
+        libreWatchDirectSession = LibreWatchSessionStore.loadSession()
+        libreWatchOwnership = LibreWatchSessionStore.loadOwnership()
         super.init()
 
         session.delegate = self
@@ -492,6 +498,138 @@ final class WatchStateModel: NSObject, ObservableObject {
         }
     }
 
+    var phoneIsReachable: Bool {
+        session.activationState == .activated && session.isReachable
+    }
+
+    func requestLibreWatchOwnership(completion: @escaping (Bool, String?) -> Void) {
+        guard let preparedSession = libreWatchDirectSession, preparedSession.isValid else {
+            completion(false, LibreWatchDirectFailure.noSession.rawValue)
+            return
+        }
+        guard phoneIsReachable else {
+            completion(false, LibreWatchDirectFailure.phoneUnavailable.rawValue)
+            return
+        }
+
+        setLibreWatchOwnership(.releasingToWatch)
+        sendLibreWatchCommand(.requestOwnership, sessionID: preparedSession.id) { [weak self] success, error in
+            self?.setLibreWatchOwnership(success ? .watch : .iphone)
+            completion(success, error)
+        }
+    }
+
+    func releaseLibreWatchOwnership(
+        unlockCounter: UInt16?,
+        completion: @escaping (Bool, String?) -> Void
+    ) {
+        guard let preparedSession = libreWatchDirectSession else {
+            completion(false, LibreWatchDirectFailure.noSession.rawValue)
+            return
+        }
+        guard phoneIsReachable else {
+            completion(false, LibreWatchDirectFailure.phoneUnavailable.rawValue)
+            return
+        }
+
+        setLibreWatchOwnership(.releasingToPhone)
+        sendLibreWatchCommand(
+            .releaseOwnership,
+            sessionID: preparedSession.id,
+            unlockCounter: unlockCounter
+        ) { [weak self] success, error in
+            self?.setLibreWatchOwnership(success ? .iphone : .watch)
+            completion(success, error)
+        }
+    }
+
+    func updateLibreWatchUnlockCounter(_ counter: UInt16) {
+        guard var preparedSession = libreWatchDirectSession,
+              counter >= preparedSession.unlockCount
+        else { return }
+
+        preparedSession.unlockCount = counter
+        libreWatchDirectSession = preparedSession
+        LibreWatchSessionStore.saveSession(preparedSession)
+        sendLibreWatchCommand(
+            .updateUnlockCounter,
+            sessionID: preparedSession.id,
+            unlockCounter: counter,
+            queueIfUnreachable: true,
+            completion: nil
+        )
+    }
+
+    func submitLibreWatchReading(_ reading: LibreWatchDirectReadingPayload) {
+        guard reading.isValid,
+              reading.sessionID == libreWatchDirectSession?.id,
+              libreWatchOwnership == .watch,
+              let data = try? JSONEncoder().encode(reading)
+        else { return }
+
+        applyLibreWatchReadingLocally(reading)
+
+        let message: [String: Any] = [
+            LibreWatchMessageKey.command: LibreWatchCommand.submitReading.rawValue,
+            LibreWatchMessageKey.sessionID: reading.sessionID.uuidString,
+            LibreWatchMessageKey.reading: data
+        ]
+
+        guard session.activationState == .activated else {
+            session.activate()
+            session.transferUserInfo(message)
+            return
+        }
+
+        guard session.isReachable else {
+            session.transferUserInfo(message)
+            return
+        }
+
+        session.sendMessage(message, replyHandler: nil) { [weak self] _ in
+            guard let self else { return }
+            self.session.transferUserInfo(message)
+        }
+    }
+
+    private func applyLibreWatchReadingLocally(_ reading: LibreWatchDirectReadingPayload) {
+        guard bgReadingDates.first != reading.receivedAt else { return }
+
+        let previousValue = bgReadingValues.first
+        bgReadingValues.insert(reading.glucoseMGDL, at: 0)
+        bgReadingDates.insert(reading.receivedAt, at: 0)
+        bgReadingDatesAsDouble.insert(reading.receivedAt.timeIntervalSince1970, at: 0)
+
+        let oldestAllowed = Date().addingTimeInterval(-12 * 60 * 60)
+        while let lastDate = bgReadingDates.last, lastDate < oldestAllowed {
+            bgReadingDates.removeLast()
+            if !bgReadingValues.isEmpty { bgReadingValues.removeLast() }
+            if !bgReadingDatesAsDouble.isEmpty { bgReadingDatesAsDouble.removeLast() }
+        }
+
+        if let trend = reading.trendMGDLPerMinute {
+            if trend >= 3 { slopeOrdinal = 2 }
+            else if trend >= 1 { slopeOrdinal = 3 }
+            else if trend < -3 { slopeOrdinal = 6 }
+            else if trend < -1 { slopeOrdinal = 5 }
+            else { slopeOrdinal = 4 }
+        }
+
+        if let previousValue {
+            let deltaMGDL = reading.glucoseMGDL - previousValue
+            deltaValueInUserUnit = isMgDl ? deltaMGDL : deltaMGDL / 18.0182
+        }
+
+        updatedDate = reading.receivedAt
+        sensorAgeInMinutes = Double(reading.sensorTimeInMinutes)
+        lastUpdatedTextString = Texts_WatchApp.lastReading + " "
+        lastUpdatedTimeString = reading.receivedAt.formatted(date: .omitted, time: .shortened)
+        lastUpdatedTimeAgoString = reading.receivedAt.daysAndHoursAgo(appendAgo: true)
+        updateMainViewDate = .now
+        updateBigNumberViewDate = .now
+        updateComplicationData()
+    }
+
     /// request the compact AGP profile used by the Watch main chart background
     func requestAGPBackground(startDate: Date, endDate: Date) {
         // always save the latest requested range first
@@ -614,6 +752,85 @@ final class WatchStateModel: NSObject, ObservableObject {
         session.sendMessage(["requestWatchUpdate": updateType], replyHandler: nil) { [log] error in
             log.error("Error requesting \(updateType, privacy: .public): \(error.localizedDescription, privacy: .public)")
         }
+    }
+
+    private func setLibreWatchOwnership(_ ownership: LibreWatchOwnership) {
+        libreWatchOwnership = ownership
+        LibreWatchSessionStore.saveOwnership(ownership)
+    }
+
+    private func processLibreWatchPayload(_ payload: [String: Any]) {
+        guard let data = payload[LibreWatchMessageKey.session] as? Data,
+              let preparedSession = try? JSONDecoder().decode(LibreWatchDirectSession.self, from: data),
+              preparedSession.isValid
+        else { return }
+
+        libreWatchDirectSession = preparedSession
+        LibreWatchSessionStore.saveSession(preparedSession)
+
+        if let rawOwnership = payload[LibreWatchMessageKey.ownership] as? String,
+           let ownership = LibreWatchOwnership(rawValue: rawOwnership) {
+            setLibreWatchOwnership(ownership)
+        }
+
+        sendLibreWatchCommand(
+            .acknowledgeSession,
+            sessionID: preparedSession.id,
+            completion: nil
+        )
+    }
+
+    private func sendLibreWatchCommand(
+        _ command: LibreWatchCommand,
+        sessionID: UUID,
+        unlockCounter: UInt16? = nil,
+        queueIfUnreachable: Bool = false,
+        completion: ((Bool, String?) -> Void)?
+    ) {
+        var message: [String: Any] = [
+            LibreWatchMessageKey.command: command.rawValue,
+            LibreWatchMessageKey.sessionID: sessionID.uuidString
+        ]
+        if let unlockCounter {
+            message[LibreWatchMessageKey.unlockCounter] = Int(unlockCounter)
+        }
+
+        guard session.activationState == .activated else {
+            session.activate()
+            if queueIfUnreachable {
+                session.transferUserInfo(message)
+                completion?(true, nil)
+            } else {
+                completion?(false, "WatchConnectivity is not activated")
+            }
+            return
+        }
+
+        guard session.isReachable else {
+            if queueIfUnreachable {
+                session.transferUserInfo(message)
+                completion?(true, nil)
+            } else {
+                completion?(false, LibreWatchDirectFailure.phoneUnavailable.rawValue)
+            }
+            return
+        }
+
+        session.sendMessage(message, replyHandler: { reply in
+            DispatchQueue.main.async {
+                let success = reply[LibreWatchMessageKey.success] as? Bool ?? false
+                let error = reply[LibreWatchMessageKey.error] as? String
+                if let rawOwnership = reply[LibreWatchMessageKey.ownership] as? String,
+                   let ownership = LibreWatchOwnership(rawValue: rawOwnership) {
+                    self.setLibreWatchOwnership(ownership)
+                }
+                completion?(success, error)
+            }
+        }, errorHandler: { error in
+            DispatchQueue.main.async {
+                completion?(false, error.localizedDescription)
+            }
+        })
     }
 
     // MARK: - Private functions used to interact with the WCSession and prepare internal data
@@ -837,6 +1054,7 @@ extension WatchStateModel: WCSessionDelegate {
 
     func session(_: WCSession, didReceiveMessage message: [String: Any]) {
         DispatchQueue.main.async {
+            self.processLibreWatchPayload(message)
             self.processWatchPayloadFromDictionary(dictionary: message)
             self.requestingDataIconColor = ConstantsAppleWatch.requestingDataIconColorActive
 
@@ -850,7 +1068,17 @@ extension WatchStateModel: WCSessionDelegate {
 
     func session(_: WCSession, didReceiveUserInfo userInfo: [String: Any] = [:]) {
         DispatchQueue.main.async {
+            self.processLibreWatchPayload(userInfo)
             self.processWatchPayloadFromDictionary(dictionary: userInfo)
+        }
+    }
+
+    func session(
+        _: WCSession,
+        didReceiveApplicationContext applicationContext: [String: Any]
+    ) {
+        DispatchQueue.main.async {
+            self.processLibreWatchPayload(applicationContext)
         }
     }
 

@@ -10,6 +10,7 @@ import SwiftUI
 
 struct RootView: View {
     @EnvironmentObject var watchState: WatchStateModel
+    @StateObject private var libreDirectCollector = LibreWatchDirectCollector()
 
     // save the last selected tab on the Watch so re-opening the app returns to the same page
     @AppStorage("watchAppSelectedPage") private var selectedPage = WatchAppPage.main.rawValue
@@ -31,6 +32,10 @@ struct RootView: View {
             // large number page
             BigNumberView()
                 .tag(WatchAppPage.bigNumber.rawValue)
+
+            // Explicit persistent hand-off between iPhone and direct Watch reception.
+            LibreDirectView(collector: libreDirectCollector)
+                .tag(WatchAppPage.libreDirect.rawValue)
         }
         .modifier(RootViewTabViewStyleModifier())
         .environmentObject(watchState)
@@ -39,6 +44,13 @@ struct RootView: View {
             if WatchAppPage(rawValue: selectedPage) == nil {
                 selectedPage = WatchAppPage.main.rawValue
             }
+            libreDirectCollector.prepare(with: watchState)
+        }
+        .onChange(of: watchState.libreWatchDirectSession) { session in
+            libreDirectCollector.updateSession(session)
+        }
+        .onChange(of: watchState.libreWatchOwnership) { ownership in
+            libreDirectCollector.ownershipDidChange(ownership)
         }
     }
 }
@@ -47,6 +59,7 @@ private enum WatchAppPage: Int {
     case main = 0
     case agp = 1
     case bigNumber = 2
+    case libreDirect = 3
 }
 
 #if os(watchOS)

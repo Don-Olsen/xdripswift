@@ -117,6 +117,15 @@
 		476FE8FF2B2F1D1700537E0A /* ConstantsFollower.swift in Sources */ = {isa = PBXBuildFile; fileRef = 476FE8FE2B2F1D1700537E0A /* ConstantsFollower.swift */; };
 		477B2C7E2B432775002F64A4 /* LiveActivityType.swift in Sources */ = {isa = PBXBuildFile; fileRef = 477B2C7D2B432775002F64A4 /* LiveActivityType.swift */; };
 		4787058E2C4D76FE001C3170 /* RootView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4787058D2C4D76FE001C3170 /* RootView.swift */; };
+		D1B700012026090100000001 /* LibreWatchDirectSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1B710012026090100000001 /* LibreWatchDirectSession.swift */; };
+		D1B700012026090100000002 /* LibreWatchDirectSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1B710012026090100000001 /* LibreWatchDirectSession.swift */; };
+		D1B700012026090100000003 /* Libre2WatchDirectAlgorithms.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1B710012026090100000002 /* Libre2WatchDirectAlgorithms.swift */; };
+		D1B700012026090100000004 /* Libre2WatchDirectAlgorithms.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1B710012026090100000002 /* Libre2WatchDirectAlgorithms.swift */; };
+		D1B700012026090100000005 /* LibreWatchDirectState.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1B710012026090100000003 /* LibreWatchDirectState.swift */; };
+		D1B700012026090100000006 /* LibreWatchDirectCollector.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1B710012026090100000004 /* LibreWatchDirectCollector.swift */; };
+		D1B700012026090100000007 /* LibreDirectView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1B710012026090100000005 /* LibreDirectView.swift */; };
+		D1B700012026090100000008 /* PreLibre2.swift in Sources */ = {isa = PBXBuildFile; fileRef = F80D915B24F06A40006840B5 /* PreLibre2.swift */; };
+		D1B700012026090100000009 /* UInt16.swift in Sources */ = {isa = PBXBuildFile; fileRef = F898EDF3234A8A3200BFB79B /* UInt16.swift */; };
 		478705932C4D7B90001C3170 /* BigNumberView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 478705922C4D7B90001C3170 /* BigNumberView.swift */; };
 		478A923E2B8B64DE0084C394 /* ConstantsHomeView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F8A1586622EDB8BF007F5B5D /* ConstantsHomeView.swift */; };
 		478A92422B8CCF8F0084C394 /* ConstantsLiveActivity.swift in Sources */ = {isa = PBXBuildFile; fileRef = 47B7313F2B83DC0200B0A450 /* ConstantsLiveActivity.swift */; };
@@ -1011,6 +1020,11 @@
 		476FE8FE2B2F1D1700537E0A /* ConstantsFollower.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = ConstantsFollower.swift; sourceTree = "<group>"; };
 		477B2C7D2B432775002F64A4 /* LiveActivityType.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveActivityType.swift; sourceTree = "<group>"; };
 		4787058D2C4D76FE001C3170 /* RootView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RootView.swift; sourceTree = "<group>"; };
+		D1B710012026090100000001 /* LibreWatchDirectSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LibreWatchDirectSession.swift; sourceTree = "<group>"; };
+		D1B710012026090100000002 /* Libre2WatchDirectAlgorithms.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Libre2WatchDirectAlgorithms.swift; sourceTree = "<group>"; };
+		D1B710012026090100000003 /* LibreWatchDirectState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LibreWatchDirectState.swift; sourceTree = "<group>"; };
+		D1B710012026090100000004 /* LibreWatchDirectCollector.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LibreWatchDirectCollector.swift; sourceTree = "<group>"; };
+		D1B710012026090100000005 /* LibreDirectView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LibreDirectView.swift; sourceTree = "<group>"; };
 		478705922C4D7B90001C3170 /* BigNumberView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BigNumberView.swift; sourceTree = "<group>"; };
 		478A925E2B8FB5290084C394 /* XDripWatchComplication+Entry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "XDripWatchComplication+Entry.swift"; sourceTree = "<group>"; };
 		478A92602B8FB53B0084C394 /* XDripWatchComplication+EntryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "XDripWatchComplication+EntryView.swift"; sourceTree = "<group>"; };
@@ -2082,6 +2096,7 @@
 		472596032B76300800459D12 /* Watch */ = {
 			isa = PBXGroup;
 			children = (
+				D1B710012026090100000001 /* LibreWatchDirectSession.swift */,
 				472596042B76301F00459D12 /* WatchManager.swift */,
 				47DE41AC2B863D370041DA19 /* WatchState.swift */,
 			);
@@ -2187,6 +2202,8 @@
 		479359952B88BA4E007D3CEE /* DataModels */ = {
 			isa = PBXGroup;
 			children = (
+				D1B710012026090100000003 /* LibreWatchDirectState.swift */,
+				D1B710012026090100000004 /* LibreWatchDirectCollector.swift */,
 				47A6ABEE2B7949B80047A4BA /* WatchStateModel.swift */,
 				474822452C01097D0052D4FB /* NotificationController.swift */,
 			);
@@ -2274,6 +2291,7 @@
 		47DE41B72B87B2510041DA19 /* Views */ = {
 			isa = PBXGroup;
 			children = (
+				D1B710012026090100000005 /* LibreDirectView.swift */,
 				474822432C0108EA0052D4FB /* NotificationView.swift */,
 				4787058D2C4D76FE001C3170 /* RootView.swift */,
 				478705902C4D7B6F001C3170 /* BigNumberView */,
@@ -3643,6 +3661,7 @@
 				F8F971E823A5915900C3F17D /* CRC.swift */,
 				F8177024248ED4DE00AA3600 /* Libre1DerivedAlgorithmParameters.swift */,
 				F8A5EEAD25791F370085E660 /* Libre2BLEUtilities.swift */,
+				D1B710012026090100000002 /* Libre2WatchDirectAlgorithms.swift */,
 				F857A329253E2D9E00951BB2 /* LibreAlgorithmThresholds.swift */,
 				F857A333253F6A7500951BB2 /* LibreCalibrationInfo.swift */,
 				F8F971E923A5915900C3F17D /* LibreDataParser.swift */,
@@ -4214,6 +4233,13 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				D1B700012026090100000002 /* LibreWatchDirectSession.swift in Sources */,
+				D1B700012026090100000004 /* Libre2WatchDirectAlgorithms.swift in Sources */,
+				D1B700012026090100000005 /* LibreWatchDirectState.swift in Sources */,
+				D1B700012026090100000006 /* LibreWatchDirectCollector.swift in Sources */,
+				D1B700012026090100000007 /* LibreDirectView.swift in Sources */,
+				D1B700012026090100000008 /* PreLibre2.swift in Sources */,
+				D1B700012026090100000009 /* UInt16.swift in Sources */,
 				474822462C01097D0052D4FB /* NotificationController.swift in Sources */,
 				47A6AC2B2B7D3DE30047A4BA /* GlucoseChartView.swift in Sources */,
 				745981A52E1F1B0F85780B06 /* GlucoseChartState.swift in Sources */,
@@ -4307,6 +4333,8 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				D1B700012026090100000001 /* LibreWatchDirectSession.swift in Sources */,
+				D1B700012026090100000003 /* Libre2WatchDirectAlgorithms.swift in Sources */,
 				4D7A00023014000100000001 /* TroubleshootingLog.swift in Sources */,
 				4D7A00043014000100000001 /* TroubleshootingLogView.swift in Sources */,
 				A50000010000000000000001 /* OnlineHelp.swift in Sources */,

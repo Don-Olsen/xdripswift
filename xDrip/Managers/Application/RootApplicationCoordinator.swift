@@ -938,7 +938,11 @@ import AppIntents
         statisticsManager = StatisticsManager(coreDataManager: coreDataManager)
         
         // initialize watchManager
-        watchManager = WatchManager(coreDataManager: coreDataManager, nightscoutSyncManager: nightscoutSyncManager!)
+        watchManager = WatchManager(
+            coreDataManager: coreDataManager,
+            nightscoutSyncManager: nightscoutSyncManager!,
+            bluetoothPeripheralManager: bluetoothPeripheralManager!
+        )
         
     }
 

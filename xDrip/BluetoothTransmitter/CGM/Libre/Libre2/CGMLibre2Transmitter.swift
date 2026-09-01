@@ -10,16 +10,16 @@ class CGMLibre2Transmitter: BluetoothTransmitter, CGMTransmitter {
     // MARK: - properties
     
     /// service to be discovered
-    private let CBUUID_Service_Libre2: String = "FDE3"
+    private let CBUUID_Service_Libre2 = Libre2WatchDirectConstants.serviceUUIDString
     
     /// receive characteristic
-    private let CBUUID_ReceiveCharacteristic_Libre2: String = "F002"
+    private let CBUUID_ReceiveCharacteristic_Libre2 = Libre2WatchDirectConstants.receiveCharacteristicUUIDString
     
     /// write characteristic
-    private let CBUUID_WriteCharacteristic_Libre2: String = "F001"
+    private let CBUUID_WriteCharacteristic_Libre2 = Libre2WatchDirectConstants.writeCharacteristicUUIDString
     
     /// how many bytes should we receive from Libre 2
-    private let expectedBufferSize = 46
+    private let expectedBufferSize = Libre2WatchDirectConstants.encryptedFrameLength
     
     /// will be used to pass back bluetooth and cgm related events
     private(set) weak var cgmTransmitterDelegate: CGMTransmitterDelegate?
@@ -64,6 +64,12 @@ class CGMLibre2Transmitter: BluetoothTransmitter, CGMTransmitter {
     /// Bluetooth name selected from the NFC result. Newer 7F sensors advertise the returned
     /// MAC-derived name instead of the legacy "ABBOTT" + sensor serial number.
     private var expectedBluetoothNameFromNFC: String?
+
+    /// Non-nil only while this exact sensor is deliberately owned by Apple Watch.
+    private var watchOwnershipSessionID: UUID?
+
+    /// The latest session identity generated from this transmitter's NFC data.
+    private var preparedWatchSessionID: UUID?
     
     // MARK: - Initialization
 
@@ -111,6 +117,9 @@ class CGMLibre2Transmitter: BluetoothTransmitter, CGMTransmitter {
     // MARK: - overriden  BluetoothTransmitter functions
     
     override func startScanning() -> BluetoothTransmitter.startScanningResult {
+        guard watchOwnershipSessionID == nil else {
+            return .other(reason: "Libre is currently owned by Apple Watch")
+        }
         // For Libre 2, a user-requested scan starts with NFC because the NFC read enables
         // Bluetooth streaming and refreshes the unlock state before BLE reconnects.
         
@@ -159,6 +168,8 @@ class CGMLibre2Transmitter: BluetoothTransmitter, CGMTransmitter {
 
     override func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         super.centralManager(central, didConnect: peripheral)
+
+        guard watchOwnershipSessionID == nil else { return }
         
         if let sensorSerialNumber = tempSensorSerialNumber {
             // we need to send the sensorSerialNumber here. Possibly this is a new transmitter being scanned for, in which case the call to cGMLibre2TransmitterDelegate?.received(sensorSerialNumber: ..) in NFCTagReaderSessionDelegate functions wouldn't have stored the status in coredata, because it' doesn't find the transmitter, so let's store it again, at each connect, if not nil
@@ -189,6 +200,8 @@ class CGMLibre2Transmitter: BluetoothTransmitter, CGMTransmitter {
 
     override func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
         super.peripheral(peripheral, didUpdateValueFor: characteristic, error: error)
+
+        guard watchOwnershipSessionID == nil else { return }
         
         // there should be already stored a value for libreSensorUID in the userdefaults at this moment, otherwise processing is not possible
         guard let libreSensorUID = UserDefaults.standard.libreSensorUID else {
@@ -207,6 +220,8 @@ class CGMLibre2Transmitter: BluetoothTransmitter, CGMTransmitter {
     
     override func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
         super.peripheral(peripheral, didUpdateNotificationStateFor: characteristic, error: error)
+
+        guard watchOwnershipSessionID == nil else { return }
         
         // there should be already stored a value for libreSensorUID in the userdefaults at this moment, otherwise processing is not possible
         guard let libreSensorUID = UserDefaults.standard.libreSensorUID else {
@@ -270,6 +285,150 @@ class CGMLibre2Transmitter: BluetoothTransmitter, CGMTransmitter {
     }
 
     // MARK: - helpers
+
+    /// Builds a reusable Watch session from the already persisted NFC setup. This lets an
+    /// upgraded app prepare the current sensor without asking the user to scan it again.
+    @nonobjc func prepareCurrentSensorForWatch() -> LibreWatchDirectSession? {
+        guard let sensorUID = UserDefaults.standard.libreSensorUID,
+              let patchInfo = UserDefaults.standard.librePatchInfo,
+              let sensorType = LibreSensorType.type(patchInfo: patchInfo.hexEncodedString().uppercased()),
+              sensorType == .libre2C6 || sensorType == .libre27F,
+              let sensorSerialNumber,
+              let parameters = UserDefaults.standard.libre1DerivedAlgorithmParameters,
+              parameters.serialNumber.caseInsensitiveCompare(sensorSerialNumber) == .orderedSame
+        else { return nil }
+
+        let expectedPeripheralName: String
+        if sensorType.usesMacAddressAsBluetoothName {
+            guard let candidate = expectedBluetoothNameFromNFC ?? deviceName,
+                  candidate.count == 12
+            else { return nil }
+            expectedPeripheralName = candidate
+        } else {
+            expectedPeripheralName = "ABBOTT" + sensorSerialNumber
+        }
+
+        let watchParameters = LibreWatchAlgorithmParameters(
+            slopeSlope: parameters.slope_slope,
+            slopeOffset: parameters.slope_offset,
+            offsetSlope: parameters.offset_slope,
+            offsetOffset: parameters.offset_offset,
+            extraSlope: parameters.extraSlope,
+            extraOffset: parameters.extraOffset,
+            sensorSerialNumber: parameters.serialNumber
+        )
+
+        let candidate = LibreWatchDirectSession(
+            sensorUID: sensorUID,
+            patchInfo: patchInfo,
+            sensorSerialNumber: sensorSerialNumber,
+            sensorTypeRawValue: sensorType.rawValue,
+            expectedPeripheralName: expectedPeripheralName,
+            unlockCode: UserDefaults.standard.libreActiveSensorUnlockCode,
+            unlockCount: UserDefaults.standard.libreActiveSensorUnlockCount,
+            algorithmParameters: watchParameters
+        )
+        guard candidate.isValid else { return nil }
+
+        let session: LibreWatchDirectSession
+        if let stored = LibreWatchSessionStore.loadSession(), stored.representsSameSensor(as: candidate) {
+            session = LibreWatchDirectSession(
+                id: stored.id,
+                createdAt: stored.createdAt,
+                sensorUID: candidate.sensorUID,
+                patchInfo: candidate.patchInfo,
+                sensorSerialNumber: candidate.sensorSerialNumber,
+                sensorTypeRawValue: candidate.sensorTypeRawValue,
+                expectedPeripheralName: candidate.expectedPeripheralName,
+                unlockCode: candidate.unlockCode,
+                unlockCount: max(stored.unlockCount, candidate.unlockCount),
+                algorithmParameters: candidate.algorithmParameters
+            )
+        } else {
+            session = candidate
+            LibreWatchSessionStore.saveOwnership(.iphone)
+        }
+
+        preparedWatchSessionID = session.id
+        LibreWatchSessionStore.saveSession(session)
+        NotificationCenter.default.post(name: .libreWatchDirectSessionPrepared, object: session)
+        return session
+    }
+
+    @nonobjc func canReleaseSensorToWatch(_ session: LibreWatchDirectSession) -> Bool {
+        guard session.isValid,
+              watchOwnershipSessionID == nil,
+              preparedWatchSessionID == nil || preparedWatchSessionID == session.id,
+              UserDefaults.standard.libreSensorUID == session.sensorUID,
+              UserDefaults.standard.librePatchInfo == session.patchInfo,
+              sensorSerialNumber?.caseInsensitiveCompare(session.sensorSerialNumber) == .orderedSame
+        else { return false }
+        return true
+    }
+
+    @nonobjc func releaseSensorToWatch(
+        _ session: LibreWatchDirectSession,
+        completion: @escaping (Bool) -> Void
+    ) {
+        guard canReleaseSensorToWatch(session) else {
+            completion(false)
+            return
+        }
+        preparedWatchSessionID = session.id
+        watchOwnershipSessionID = session.id
+        pauseConnectionWithoutReconnect { completion(true) }
+    }
+
+    /// Restores a persisted Watch owner before the phone's normal reconnect loop can take over.
+    @nonobjc func restoreWatchOwnership(_ session: LibreWatchDirectSession) {
+        guard session.isValid,
+              UserDefaults.standard.libreSensorUID == session.sensorUID,
+              UserDefaults.standard.librePatchInfo == session.patchInfo
+        else { return }
+        preparedWatchSessionID = session.id
+        watchOwnershipSessionID = session.id
+        pauseConnectionWithoutReconnect {}
+    }
+
+    @nonobjc func returnSensorToPhone(sessionID: UUID) {
+        guard watchOwnershipSessionID == sessionID else { return }
+        watchOwnershipSessionID = nil
+        resumeConnectionAfterTemporaryPause()
+    }
+
+    @nonobjc func forceReturnSensorToPhone() {
+        guard let sessionID = watchOwnershipSessionID ?? LibreWatchSessionStore.loadSession()?.id else { return }
+        watchOwnershipSessionID = nil
+        LibreWatchSessionStore.saveOwnership(.iphone)
+        resumeConnectionAfterTemporaryPause()
+        NotificationCenter.default.post(
+            name: .libreWatchDirectOwnershipForcedToPhone,
+            object: sessionID
+        )
+    }
+
+    /// Re-enters Watch readings through the normal transmitter delegate, preserving the existing
+    /// calibration, alert, HealthKit, Nightscout and deduplication pipeline on iPhone.
+    @nonobjc func receiveReadingFromWatch(_ reading: LibreWatchDirectReadingPayload) {
+        guard reading.isValid,
+              watchOwnershipSessionID == reading.sessionID,
+              LibreWatchSessionStore.loadOwnership() == .watch
+        else { return }
+
+        var glucoseData = [GlucoseData(
+            timeStamp: reading.receivedAt,
+            glucoseLevelRaw: reading.glucoseMGDL
+        )]
+        cgmTransmitterDelegate?.cgmTransmitterInfoReceived(
+            glucoseData: &glucoseData,
+            transmitterBatteryInfo: nil,
+            sensorAge: TimeInterval(minutes: Double(reading.sensorTimeInMinutes))
+        )
+        cGMLibre2TransmitterDelegate?.received(
+            sensorTimeInMinutes: Int(reading.sensorTimeInMinutes),
+            from: self
+        )
+    }
     
     /// reset rxBuffer, reset startDate, stop packetRxMonitorTimer, set resendPacketCounter to 0
     private func resetRxBuffer() {
@@ -417,11 +576,22 @@ extension CGMLibre2Transmitter: LibreNFCDelegate {
             if libreSensorType.decryptIfPossibleAndNeeded(rxBuffer: &framCopy, headerLength: 0, log: log, patchInfo: patchInfo.hexEncodedString().uppercased(), uid: Array(sensorUID)) {
                 // we have all date to create libre1DerivedAlgorithmParameters
                 UserDefaults.standard.libre1DerivedAlgorithmParameters = Libre1DerivedAlgorithmParameters(bytes: framCopy, serialNumber: serialNumber, libreSensorType: libreSensorType)
+                _ = prepareCurrentSensorForWatch()
             }
         }
     }
     
     func received(sensorUID: Data, patchInfo: Data) {
+        if let previousUID = UserDefaults.standard.libreSensorUID, previousUID != sensorUID {
+            let wasOwnedByWatch = watchOwnershipSessionID != nil ||
+                LibreWatchSessionStore.loadOwnership() == .watch
+            watchOwnershipSessionID = nil
+            preparedWatchSessionID = nil
+            if wasOwnedByWatch {
+                resumeConnectionAfterTemporaryPause()
+            }
+            LibreWatchSessionStore.clear()
+        }
         // store sensorUID as data in UserDefaults
         UserDefaults.standard.libreSensorUID = sensorUID
         
@@ -522,5 +692,6 @@ extension CGMLibre2Transmitter: LibreNFCDelegate {
 
         expectedBluetoothNameFromNFC = expectedBluetoothName
         updateExpectedDeviceName(name: expectedBluetoothName)
+        _ = prepareCurrentSensorForWatch()
     }
 }
