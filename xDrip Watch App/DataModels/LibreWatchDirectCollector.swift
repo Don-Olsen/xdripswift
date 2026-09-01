@@ -27,7 +27,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
 
     /// System auto-reconnect is preferred because it can continue while the Watch UI is inactive.
     /// If CoreBluetooth cannot restore the link promptly, fall back to the proven service scan.
-    private static let reconnectFallbackDelay: TimeInterval = 45
+    private static let reconnectFallbackDelay: TimeInterval = 90
 
     private var connectionOptions: [String: Any] {
         [CBConnectPeripheralOptionEnableAutoReconnect: true]
@@ -366,10 +366,21 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
 
         systemAutoReconnectIsActive = false
         cancelReconnectFallback()
-        if state.failure == nil {
-            state.reconnecting(
-                error: bluetoothErrorDescription(error) ?? "Bluetooth link ended; scanning again"
-            )
+        if state.failure == nil,
+           watchState?.libreWatchOwnership == .watch,
+           let centralManager,
+           centralManager.state == .poweredOn {
+            // Keep the NFC-confirmed peripheral and reconnect it directly. Scanning is only the
+            // fallback if this known connection cannot be restored within the timeout.
+            writeCharacteristic = nil
+            receiveCharacteristic = nil
+            frameAssembler.reset()
+            dataExpectedSince = nil
+            systemAutoReconnectIsActive = true
+            state.reconnecting(error: bluetoothErrorDescription(error))
+            centralManager.connect(peripheral, options: connectionOptions)
+            scheduleReconnectFallback(for: peripheral)
+            return
         }
         scheduleRescan()
     }
@@ -385,10 +396,16 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
     }
 
     private func evaluateConnectionHealth(at date: Date) {
+        // After reconnecting, dataExpectedSince is newer than the previous packet. Always use
+        // the newest activity marker so an old reading cannot cancel a healthy new connection.
+        let lastActivity = [state.lastPacketAt, dataExpectedSince]
+            .compactMap { $0 }
+            .max()
+
         guard watchState?.libreWatchOwnership == .watch,
               state.stage == .receiving,
               sensorPeripheral?.state == .connected,
-              let lastActivity = state.lastPacketAt ?? dataExpectedSince,
+              let lastActivity,
               date.timeIntervalSince(lastActivity) >= LibreWatchDirectState.noDataTimeout
         else { return }
 
