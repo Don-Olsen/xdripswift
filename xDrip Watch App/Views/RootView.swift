@@ -10,6 +10,7 @@ import SwiftUI
 
 struct RootView: View {
     @EnvironmentObject var watchState: WatchStateModel
+    @Environment(\.scenePhase) private var scenePhase
     @ObservedObject var libreDirectCollector: LibreWatchDirectCollector
 
     // save the last selected tab on the Watch so re-opening the app returns to the same page
@@ -44,6 +45,10 @@ struct RootView: View {
             if WatchAppPage(rawValue: selectedPage) == nil {
                 selectedPage = WatchAppPage.main.rawValue
             }
+            libreDirectCollector.applicationActivityDidChange(isActive: scenePhase == .active)
+        }
+        .onChange(of: scenePhase) { newPhase in
+            libreDirectCollector.applicationActivityDidChange(isActive: newPhase == .active)
         }
     }
 }
