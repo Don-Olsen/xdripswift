@@ -531,6 +531,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
     private func handleDisconnect(
         peripheral: CBPeripheral,
         isReconnecting: Bool,
+        disconnectedAt: Date,
         error: Error?
     ) {
         guard peripheral === sensorPeripheral else { return }
@@ -569,7 +570,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         switch action {
         case .waitForSystemReconnect:
             systemAutoReconnectIsActive = true
-            reconnectStartedAt = Date()
+            reconnectStartedAt = disconnectedAt
             scheduleReconnectFallback(for: peripheral)
         case .reconnectManually:
             systemAutoReconnectIsActive = false
@@ -583,11 +584,14 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
             }
             // Keep the NFC-confirmed peripheral and reconnect it directly. Scanning is only the
             // fallback if this known connection cannot be restored within the timeout.
-            reconnectStartedAt = Date()
+            reconnectStartedAt = disconnectedAt
             centralManager.connect(peripheral, options: connectionOptions)
             scheduleReconnectFallback(for: peripheral)
         case .noAdditionalWork:
             systemAutoReconnectIsActive = isReconnecting && ownership == .watch
+            if systemAutoReconnectIsActive {
+                reconnectStartedAt = disconnectedAt
+            }
             cancelReconnectFallback()
         case .finishDeliberateDisconnect:
             break
@@ -597,6 +601,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
     private func handleDisconnectOnce(
         peripheral: CBPeripheral,
         isReconnecting: Bool,
+        disconnectedAt: Date,
         error: Error?
     ) {
         guard !disconnectHandledForCurrentConnection else { return }
@@ -604,6 +609,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         handleDisconnect(
             peripheral: peripheral,
             isReconnecting: isReconnecting,
+            disconnectedAt: disconnectedAt,
             error: error
         )
     }
@@ -832,12 +838,14 @@ extension LibreWatchDirectCollector: CBCentralManagerDelegate {
         // Older systems only call this delegate. Delay it by one run-loop turn so the modern
         // isReconnecting callback wins if an SDK/runtime happens to deliver both forms.
         pendingLegacyDisconnect?.cancel()
+        let disconnectedAt = Date()
         let workItem = DispatchWorkItem { [weak self] in
             guard let self else { return }
             self.pendingLegacyDisconnect = nil
             self.handleDisconnectOnce(
                 peripheral: peripheral,
                 isReconnecting: false,
+                disconnectedAt: disconnectedAt,
                 error: error
             )
         }
@@ -849,7 +857,7 @@ extension LibreWatchDirectCollector: CBCentralManagerDelegate {
     func centralManager(
         _: CBCentralManager,
         didDisconnectPeripheral peripheral: CBPeripheral,
-        timestamp _: CFAbsoluteTime,
+        timestamp: CFAbsoluteTime,
         isReconnecting: Bool,
         error: Error?
     ) {
@@ -858,6 +866,7 @@ extension LibreWatchDirectCollector: CBCentralManagerDelegate {
         handleDisconnectOnce(
             peripheral: peripheral,
             isReconnecting: isReconnecting,
+            disconnectedAt: Date(timeIntervalSinceReferenceDate: timestamp),
             error: error
         )
     }
