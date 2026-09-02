@@ -111,7 +111,57 @@ class CGMLibre2Transmitter: BluetoothTransmitter, CGMTransmitter {
         // initialize webOOPEnabled
         self.webOOPEnabled = webOOPEnabled ?? false
 
-        super.init(addressAndName: newAddressAndName, CBUUID_Advertisement: nil, servicesCBUUIDs: [CBUUID(string: CBUUID_Service_Libre2)], CBUUID_ReceiveCharacteristic: CBUUID_ReceiveCharacteristic_Libre2, CBUUID_WriteCharacteristic: CBUUID_WriteCharacteristic_Libre2, bluetoothTransmitterDelegate: bluetoothTransmitterDelegate)
+        let persistedOwnership = LibreWatchSessionStore.loadOwnership()
+        let startupDecision = LibreWatchPhoneStartupDecision.resolve(
+            persistedOwnership: persistedOwnership,
+            persistedSession: LibreWatchSessionStore.loadSession(),
+            activeSensorUID: UserDefaults.standard.libreSensorUID,
+            activePatchInfo: UserDefaults.standard.librePatchInfo
+        )
+        preparedWatchSessionID = startupDecision.session?.id
+        watchOwnershipSessionID = startupDecision.phoneConnectionIsBlocked
+            ? startupDecision.session?.id
+            : nil
+        if persistedOwnership != startupDecision.ownership {
+            LibreWatchSessionStore.saveOwnership(startupDecision.ownership)
+        }
+
+        super.init(
+            addressAndName: newAddressAndName,
+            CBUUID_Advertisement: nil,
+            servicesCBUUIDs: [CBUUID(string: CBUUID_Service_Libre2)],
+            CBUUID_ReceiveCharacteristic: CBUUID_ReceiveCharacteristic_Libre2,
+            CBUUID_WriteCharacteristic: CBUUID_WriteCharacteristic_Libre2,
+            bluetoothTransmitterDelegate: bluetoothTransmitterDelegate,
+            initiallyPaused: startupDecision.phoneConnectionIsBlocked
+        )
+
+        let redactedIdentity = startupDecision.session?.redactedIdentity() ?? "Libre-none"
+        trace(
+            "Libre Watch startup ownership loaded: owner=%{public}@ sensor=%{public}@",
+            log: log,
+            category: ConstantsLog.categoryCGMLibre2,
+            type: .info,
+            startupDecision.ownership.rawValue,
+            redactedIdentity
+        )
+        if startupDecision.phoneConnectionIsBlocked {
+            trace(
+                "iPhone Libre connection blocked before Core Bluetooth startup: sensor=%{public}@",
+                log: log,
+                category: ConstantsLog.categoryCGMLibre2,
+                type: .info,
+                redactedIdentity
+            )
+        } else {
+            trace(
+                "iPhone Libre connection enabled at Core Bluetooth startup: sensor=%{public}@",
+                log: log,
+                category: ConstantsLog.categoryCGMLibre2,
+                type: .info,
+                redactedIdentity
+            )
+        }
     }
     
     // MARK: - overriden  BluetoothTransmitter functions
@@ -376,7 +426,20 @@ class CGMLibre2Transmitter: BluetoothTransmitter, CGMTransmitter {
         }
         preparedWatchSessionID = session.id
         watchOwnershipSessionID = session.id
-        pauseConnectionWithoutReconnect { completion(true) }
+        pauseConnectionWithoutReconnect { [weak self] in
+            guard let self else {
+                completion(false)
+                return
+            }
+            trace(
+                "iPhone Libre connection released and blocked for Watch: sensor=%{public}@",
+                log: self.log,
+                category: ConstantsLog.categoryCGMLibre2,
+                type: .info,
+                session.redactedIdentity()
+            )
+            completion(true)
+        }
     }
 
     /// Restores a persisted Watch owner before the phone's normal reconnect loop can take over.
@@ -390,10 +453,18 @@ class CGMLibre2Transmitter: BluetoothTransmitter, CGMTransmitter {
         pauseConnectionWithoutReconnect {}
     }
 
-    @nonobjc func returnSensorToPhone(sessionID: UUID) {
-        guard watchOwnershipSessionID == sessionID else { return }
+    @nonobjc func returnSensorToPhone(sessionID: UUID) -> Bool {
+        guard watchOwnershipSessionID == sessionID else { return false }
         watchOwnershipSessionID = nil
         resumeConnectionAfterTemporaryPause()
+        trace(
+            "iPhone Libre connection enabled after explicit Watch return: sensor=%{public}@",
+            log: log,
+            category: ConstantsLog.categoryCGMLibre2,
+            type: .info,
+            LibreWatchSessionStore.loadSession()?.redactedIdentity() ?? "Libre-none"
+        )
+        return true
     }
 
     @nonobjc func forceReturnSensorToPhone() {
@@ -401,6 +472,13 @@ class CGMLibre2Transmitter: BluetoothTransmitter, CGMTransmitter {
         watchOwnershipSessionID = nil
         LibreWatchSessionStore.saveOwnership(.iphone)
         resumeConnectionAfterTemporaryPause()
+        trace(
+            "iPhone Libre connection enabled by explicit forced return: sensor=%{public}@",
+            log: log,
+            category: ConstantsLog.categoryCGMLibre2,
+            type: .info,
+            LibreWatchSessionStore.loadSession()?.redactedIdentity() ?? "Libre-none"
+        )
         NotificationCenter.default.post(
             name: .libreWatchDirectOwnershipForcedToPhone,
             object: sessionID
@@ -421,6 +499,7 @@ class CGMLibre2Transmitter: BluetoothTransmitter, CGMTransmitter {
             : calibrationSnapshot.calibrationType == (isNonFixedSlopeEnabled() ? .nonFixedSlope : .fixedSlope)
 
         guard reading.isValid(for: calibrationSnapshot),
+              calibrationSnapshot.displayedGlucose(for: reading) != nil,
               calibrationSnapshot.watchSessionID == reading.sessionID,
               calibrationSnapshot.requiredValueDomain == requiredValueDomain,
               calibrationTypeMatches,

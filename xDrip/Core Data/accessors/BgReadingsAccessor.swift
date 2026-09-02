@@ -119,6 +119,17 @@ class BgReadingsAccessor: ObservableObject {
                 subPredicates.append(NSPredicate(format: "isSuppressedByFiveMinuteCadence == NO"))
             }
 
+            if !ignoreCalculatedValue {
+                // 38 is the xDrip calibrator's error marker. Preserve a genuine native 38,
+                // which is identifiable as an unadjusted raw pass-through, and keep 39 because
+                // it is the normal completed-calculation lower clamp.
+                subPredicates.append(NSPredicate(
+                    format: "calculatedValue != 0.0 AND (calculatedValue != %f OR (rawData == %f AND ageAdjustedRawValue == 0.0))",
+                    ConstantsCalibrationAlgorithms.bgReadingErrorValue,
+                    ConstantsCalibrationAlgorithms.bgReadingErrorValue
+                ))
+            }
+
             if subPredicates.count > 0 {
                 fetchRequest.predicate = NSCompoundPredicate(andPredicateWithSubpredicates: subPredicates)
             }
@@ -137,7 +148,7 @@ class BgReadingsAccessor: ObservableObject {
                         guard let fetchedSensor = bgReading.sensor, fetchedSensor.id == sensorId else { continue }
                     }
 
-                    guard (ignoreCalculatedValue || bgReading.calculatedValue != 0.0) && (ignoreRawData || bgReading.rawData != 0.0) else { continue }
+                    guard (ignoreCalculatedValue || bgReading.isValidForDownstream) && (ignoreRawData || bgReading.rawData != 0.0) else { continue }
 
                     returnValue.append(bgReading)
 
@@ -187,6 +198,14 @@ class BgReadingsAccessor: ObservableObject {
                 subPredicates.append(NSPredicate(format: "isSuppressedByFiveMinuteCadence == NO"))
             }
 
+            if !ignoreCalculatedValue {
+                subPredicates.append(NSPredicate(
+                    format: "calculatedValue != 0.0 AND (calculatedValue != %f OR (rawData == %f AND ageAdjustedRawValue == 0.0))",
+                    ConstantsCalibrationAlgorithms.bgReadingErrorValue,
+                    ConstantsCalibrationAlgorithms.bgReadingErrorValue
+                ))
+            }
+
             if subPredicates.count > 0 {
                 fetchRequest.predicate = NSCompoundPredicate(andPredicateWithSubpredicates: subPredicates)
             }
@@ -205,7 +224,7 @@ class BgReadingsAccessor: ObservableObject {
                         guard let fetchedSensor = bgReading.sensor, fetchedSensor.id == sensorId else { continue }
                     }
 
-                    guard (ignoreCalculatedValue || bgReading.calculatedValue != 0.0) && (ignoreRawData || bgReading.rawData != 0.0) else { continue }
+                    guard (ignoreCalculatedValue || bgReading.isValidForDownstream) && (ignoreRawData || bgReading.rawData != 0.0) else { continue }
 
                     // this is the big difference here.
                     // Use snapshots instead of BgReading objects to avoid Core Data crashes.
@@ -217,7 +236,7 @@ class BgReadingsAccessor: ObservableObject {
                         calibrationSnapshot = nil
                     }
 
-                    returnValue.append(BgReadingSnapshot(timeStamp: bgReading.timeStamp, calculatedValue: bgReading.calculatedValue, rawData: bgReading.rawData, finalValue: bgReading.finalValue, adjustedValue: bgReading.adjustedValue?.doubleValue, smoothedValue: bgReading.smoothedValue?.doubleValue, backfilledAt: bgReading.backfilledAt, calculatedValueSlope: bgReading.calculatedValueSlope, hideSlope: bgReading.hideSlope, id: bgReading.id, deviceName: bgReading.deviceName, calibrationSnapshot: calibrationSnapshot, sensorID: bgReading.sensor?.id, objectID: bgReading.objectID))
+                    returnValue.append(BgReadingSnapshot(timeStamp: bgReading.timeStamp, calculatedValue: bgReading.calculatedValue, rawData: bgReading.rawData, ageAdjustedRawValue: bgReading.ageAdjustedRawValue, finalValue: bgReading.finalValue, adjustedValue: bgReading.adjustedValue?.doubleValue, smoothedValue: bgReading.smoothedValue?.doubleValue, backfilledAt: bgReading.backfilledAt, calculatedValueSlope: bgReading.calculatedValueSlope, hideSlope: bgReading.hideSlope, id: bgReading.id, deviceName: bgReading.deviceName, calibrationSnapshot: calibrationSnapshot, sensorID: bgReading.sensor?.id, objectID: bgReading.objectID))
 
                     if let limit = limit, returnValue.count == limit { break }
                 }

@@ -10,6 +10,7 @@ enum LibreWatchMessageKey {
     static let ownership = "libreWatchDirectOwnership"
     static let reading = "libreWatchDirectReading"
     static let calibration = "libreWatchCalibrationSnapshot"
+    static let diagnosticEvent = "libreWatchDiagnosticEvent"
 
     static let persistedSession = "libreWatchDirectPersistedSession.v2"
     static let persistedOwnership = "libreWatchDirectPersistedOwnership.v2"
@@ -24,6 +25,7 @@ enum LibreWatchCommand: String, Codable {
     case releaseOwnership
     case updateUnlockCounter
     case submitReading
+    case reportDiagnostic
 }
 
 /// Exactly one device may own the Libre Bluetooth connection at a time.
@@ -49,6 +51,79 @@ enum LibreWatchOwnership: String, Codable, Equatable {
         default:
             return self == next
         }
+    }
+}
+
+/// Resolves persisted ownership before the iPhone creates its Core Bluetooth central.
+/// Interrupted transfers stay conservatively with Watch; only an explicit, completed
+/// `.iphone` state or a proven sensor change permits the phone connection to start.
+struct LibreWatchPhoneStartupDecision: Equatable {
+    let session: LibreWatchDirectSession?
+    let ownership: LibreWatchOwnership
+    let phoneConnectionIsBlocked: Bool
+
+    static func resolve(
+        persistedOwnership: LibreWatchOwnership,
+        persistedSession: LibreWatchDirectSession?,
+        activeSensorUID: Data?,
+        activePatchInfo: Data?
+    ) -> LibreWatchPhoneStartupDecision {
+        guard let persistedSession, persistedSession.isValid else {
+            return LibreWatchPhoneStartupDecision(
+                session: nil,
+                ownership: .iphone,
+                phoneConnectionIsBlocked: false
+            )
+        }
+
+        let sensorIsKnownToDiffer = activeSensorUID.map { $0 != persistedSession.sensorUID } ?? false
+            || activePatchInfo.map { $0 != persistedSession.patchInfo } ?? false
+        guard !sensorIsKnownToDiffer else {
+            return LibreWatchPhoneStartupDecision(
+                session: persistedSession,
+                ownership: .iphone,
+                phoneConnectionIsBlocked: false
+            )
+        }
+
+        guard persistedOwnership != .iphone else {
+            return LibreWatchPhoneStartupDecision(
+                session: persistedSession,
+                ownership: .iphone,
+                phoneConnectionIsBlocked: false
+            )
+        }
+
+        return LibreWatchPhoneStartupDecision(
+            session: persistedSession,
+            ownership: .watch,
+            phoneConnectionIsBlocked: true
+        )
+    }
+}
+
+enum LibreWatchDiagnosticEventKind: String, Codable, Equatable {
+    case disconnected
+    case recoveryStarted
+    case recoverySucceeded
+    case recoveryFailed
+}
+
+/// A bounded, privacy-safe Watch diagnostic. Sensor identity is derived on iPhone from
+/// the validated session and never crosses as a raw peripheral identifier.
+struct LibreWatchDiagnosticEvent: Codable, Equatable {
+    let kind: LibreWatchDiagnosticEventKind
+    let isReconnecting: Bool?
+    let errorCode: Int?
+
+    init(
+        kind: LibreWatchDiagnosticEventKind,
+        isReconnecting: Bool? = nil,
+        errorCode: Int? = nil
+    ) {
+        self.kind = kind
+        self.isReconnecting = isReconnecting
+        self.errorCode = errorCode
     }
 }
 
@@ -567,8 +642,10 @@ struct LibreWatchCalibrationSnapshot: Codable, Equatable {
         let calibrated = slope * (reading.xDripCalibrationInput / rawValueDivider) + intercept
         guard calibrated.isFinite else { return nil }
 
-        // Mirrors Calibrator.updateCalculatedValue(for:).
-        if calibrated < 10 { return 38 }
+        // Calibrator uses 38 as an internal failure sentinel when the calculation never
+        // produced a usable value. It must not become a physiological LOW on Watch or be
+        // forwarded to iPhone. A completed low calculation is clamped to 39 below.
+        guard calibrated >= 10 else { return nil }
         return min(400, max(39, calibrated))
     }
 

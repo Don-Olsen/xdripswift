@@ -597,6 +597,7 @@ final class WatchStateModel: NSObject, ObservableObject {
             calibrationRevision: snapshot.revision
         )
         guard reading.isValid(for: snapshot),
+              snapshot.displayedGlucose(for: reading) != nil,
               let data = try? JSONEncoder().encode(reading)
         else { return false }
 
@@ -833,6 +834,20 @@ final class WatchStateModel: NSObject, ObservableObject {
             ) : nil,
             sourceDeltaOverride: stored.sourceDelta,
             displayedDeltaOverride: storedCalibrationIsCurrent ? stored.displayedDeltaMGDL : nil
+        )
+    }
+
+    func reportLibreWatchDiagnostic(_ event: LibreWatchDiagnosticEvent) {
+        guard let preparedSession = libreWatchDirectSession,
+              let encoded = try? JSONEncoder().encode(event)
+        else { return }
+
+        sendLibreWatchCommand(
+            .reportDiagnostic,
+            sessionID: preparedSession.id,
+            diagnosticEvent: encoded,
+            queueIfUnreachable: true,
+            completion: nil
         )
     }
 
@@ -1111,6 +1126,7 @@ final class WatchStateModel: NSObject, ObservableObject {
         _ command: LibreWatchCommand,
         sessionID: UUID,
         unlockCounter: UInt16? = nil,
+        diagnosticEvent: Data? = nil,
         queueIfUnreachable: Bool = false,
         completion: ((Bool, String?) -> Void)?
     ) {
@@ -1120,6 +1136,9 @@ final class WatchStateModel: NSObject, ObservableObject {
         ]
         if let unlockCounter {
             message[LibreWatchMessageKey.unlockCounter] = Int(unlockCounter)
+        }
+        if let diagnosticEvent {
+            message[LibreWatchMessageKey.diagnosticEvent] = diagnosticEvent
         }
 
         guard session.activationState == .activated else {

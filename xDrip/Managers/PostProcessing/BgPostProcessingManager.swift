@@ -237,7 +237,7 @@ class BgPostProcessingManager {
         } else {
             bgReadingsToReplaceDownstream = []
         }
-        let downstreamReadingsToReplace = bgReadingsToReplaceDownstream
+        let downstreamReadingsToReplace = bgReadingsToReplaceDownstream.filter(\.isValidForDownstream)
 
         if downstreamReadingsToReplace.count > 0 {
             if shouldRewriteFullDownstreamWindow, let earliestBgReading = bgReadings.first, let latestBgReading = bgReadings.last {

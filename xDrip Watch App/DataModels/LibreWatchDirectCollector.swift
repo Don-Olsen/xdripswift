@@ -33,6 +33,8 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
     private var pendingLegacyDisconnect: DispatchWorkItem?
     private var disconnectHandledForCurrentConnection = false
     private var scanAfterReconnectCancellation = false
+    private var recoveryDiagnosticIsPending = false
+    private var recoveryFailureWasReported = false
 
     private var connectionOptions: [String: Any] {
         [CBConnectPeripheralOptionEnableAutoReconnect: true]
@@ -252,6 +254,8 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
 
     private func finishStoppingForPhoneOwnership() {
         clearTransientBluetoothState()
+        recoveryDiagnosticIsPending = false
+        recoveryFailureWasReported = false
         state.returnedToPhone(session: preparedSession)
         deliberatelyDisconnecting = false
     }
@@ -448,6 +452,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
               !scanAfterReconnectCancellation
         else { return }
 
+        beginRecoveryDiagnosticIfNeeded()
         cancelReconnectFallback()
         systemAutoReconnectIsActive = false
         scanIsPending = false
@@ -509,6 +514,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
     }
 
     private func failAndRescan(_ failure: LibreWatchDirectFailure, error: String?) {
+        reportRecoveryFailureIfNeeded()
         state.fail(failure, error: error)
         centralManager?.stopScan()
         if let sensorPeripheral, sensorPeripheral.state != .disconnected {
@@ -535,6 +541,12 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         error: Error?
     ) {
         guard peripheral === sensorPeripheral else { return }
+
+        watchState?.reportLibreWatchDiagnostic(LibreWatchDiagnosticEvent(
+            kind: .disconnected,
+            isReconnecting: isReconnecting,
+            errorCode: error.map { ($0 as NSError).code }
+        ))
 
         if scanAfterReconnectCancellation {
             finishReconnectCancellationAndScan()
@@ -569,10 +581,12 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
 
         switch action {
         case .waitForSystemReconnect:
+            beginRecoveryDiagnosticIfNeeded()
             systemAutoReconnectIsActive = true
             reconnectStartedAt = disconnectedAt
             scheduleReconnectFallback(for: peripheral)
         case .reconnectManually:
+            beginRecoveryDiagnosticIfNeeded()
             systemAutoReconnectIsActive = false
             cancelReconnectFallback()
             guard !hadFailure,
@@ -596,6 +610,26 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         case .finishDeliberateDisconnect:
             break
         }
+    }
+
+    private func beginRecoveryDiagnosticIfNeeded() {
+        guard !recoveryDiagnosticIsPending else { return }
+        recoveryDiagnosticIsPending = true
+        recoveryFailureWasReported = false
+        watchState?.reportLibreWatchDiagnostic(LibreWatchDiagnosticEvent(kind: .recoveryStarted))
+    }
+
+    private func reportRecoveryFailureIfNeeded() {
+        guard recoveryDiagnosticIsPending, !recoveryFailureWasReported else { return }
+        recoveryFailureWasReported = true
+        watchState?.reportLibreWatchDiagnostic(LibreWatchDiagnosticEvent(kind: .recoveryFailed))
+    }
+
+    private func reportRecoverySuccessIfNeeded() {
+        guard recoveryDiagnosticIsPending else { return }
+        recoveryDiagnosticIsPending = false
+        recoveryFailureWasReported = false
+        watchState?.reportLibreWatchDiagnostic(LibreWatchDiagnosticEvent(kind: .recoverySucceeded))
     }
 
     private func handleDisconnectOnce(
@@ -1008,6 +1042,7 @@ extension LibreWatchDirectCollector: CBPeripheralDelegate {
             )
             if watchState?.submitLibreWatchReading(reading) == true {
                 state.recordDirectReading(reading)
+                reportRecoverySuccessIfNeeded()
             }
         } catch {
             state.fail(.invalidFrame, error: error.localizedDescription)

@@ -1073,8 +1073,9 @@ import AppIntents
             /// used if loopdelay > 0, to check if there was a recent calibration. If so then no readings are added in glucoseData array for a period of loopdelay + an amount of minutes
             let timeStampLastCalibrationForActiveSensor = lastCalibrationForActiveSensor != nil ? lastCalibrationForActiveSensor!.timeStamp : Date(timeIntervalSince1970: 0)
             
-            // was a new reading created or not ?
-            var newReadingCreated = false
+            // Only a completed reading may fan out to alerts and integrations. Raw/error rows are
+            // still retained in Core Data for calibration diagnostics and duplicate suppression.
+            var newDownstreamReadingCreated = false
             
             // assign value of timeStampLastBgReading
             var timeStampLastBgReading = Date(timeIntervalSince1970: 0)
@@ -1124,6 +1125,15 @@ import AppIntents
                         
                         let newReading = calibrator.createNewBgReading(rawData: glucose.glucoseLevelRaw, timeStamp: glucose.timeStamp, sensor: activeSensor, last3Readings: &last3ReadingsForNewReading, lastCalibrationsForActiveSensorInLastXDays: &lastCalibrationsForActiveSensorInLastXDays, firstCalibration: firstCalibrationForActiveSensor, lastCalibration: lastCalibrationForActiveSensor, deviceName: self.getCGMTransmitterDeviceName(for: cgmTransmitter), nsManagedObjectContext: coreDataManager.mainManagedObjectContext)
 
+                        let downstreamValidity = BgReadingDownstreamPolicy.validity(
+                            calculatedValue: newReading.calculatedValue,
+                            rawData: newReading.rawData,
+                            ageAdjustedRawValue: newReading.ageAdjustedRawValue,
+                            finalValue: newReading.finalValue,
+                            calibrationUsesErrorSentinel: !(calibrator is NoCalibrator)
+                        )
+                        let isValidForDownstream = downstreamValidity == .valid
+
                         if let backfilledAt = glucose.backfilledAt ?? (isHistoricalGapFill ? Date() : nil),
                            backfilledAt.timeIntervalSince(glucose.timeStamp) > ConstantsBloodGlucose.minimumSecondsToConsiderAsBackfillDelay {
                             newReading.backfilledAt = backfilledAt
@@ -1137,33 +1147,46 @@ import AppIntents
                         // because it describes when xDripswift accepted the value. The sensor's distinct
                         // measurement time remains in the typed payload and is shown in every reading.
                         // This preserves causality around connection and sensor lifecycle rows.
-                        trace(
-                            "in processNewGlucoseData, new reading created, timestamp = %{public}@, calculatedValue = %{public}@",
-                            log: self.log,
-                            category: ConstantsLog.categoryRootView,
-                            type: .debug,
-                            troubleshooting: .standard(
-                                // Persist the controlled CGM description with the reading. A generic
-                                // "direct sensor" label does not identify which acquisition path was
-                                // active, while the typed mapping still excludes transmitter IDs.
-                                .glucoseAccepted(
-                                    mgDl: newReading.calculatedValue,
-                                    source: TroubleshootingLogSource(
-                                        directTransmitterType: cgmTransmitter.cgmTransmitterType()
-                                    ),
-                                    measuredAt: newReading.timeStamp
-                                )
-                            ),
-                            newReading.timeStamp.description(with: .current),
-                            newReading.calculatedValue.description.replacingOccurrences(of: ".", with: ",")
-                        )
+                        if isValidForDownstream {
+                            trace(
+                                "in processNewGlucoseData, new reading created, timestamp = %{public}@, calculatedValue = %{public}@",
+                                log: self.log,
+                                category: ConstantsLog.categoryRootView,
+                                type: .debug,
+                                troubleshooting: .standard(
+                                    // Persist the controlled CGM description with the reading. A generic
+                                    // "direct sensor" label does not identify which acquisition path was
+                                    // active, while the typed mapping still excludes transmitter IDs.
+                                    .glucoseAccepted(
+                                        mgDl: newReading.calculatedValue,
+                                        source: TroubleshootingLogSource(
+                                            directTransmitterType: cgmTransmitter.cgmTransmitterType()
+                                        ),
+                                        measuredAt: newReading.timeStamp
+                                    )
+                                ),
+                                newReading.timeStamp.description(with: .current),
+                                newReading.calculatedValue.description.replacingOccurrences(of: ".", with: ",")
+                            )
+                        } else {
+                            trace(
+                                "in processNewGlucoseData, retained non-exportable reading, validity = %{public}@, timestamp = %{public}@",
+                                log: self.log,
+                                category: ConstantsLog.categoryRootView,
+                                type: .info,
+                                troubleshooting: .standard(.sensor(.unusableReading)),
+                                String(describing: downstreamValidity),
+                                newReading.timeStamp.description(with: .current)
+                            )
+                        }
                         
                         // save the newly created bgreading permenantly in coredata
                         coreDataManager.saveChanges()
                         statisticsManager?.invalidate()
                         
-                        // a new reading was created
-                        newReadingCreated = true
+                        if isValidForDownstream {
+                            newDownstreamReadingCreated = true
+                        }
                         
                         // set timeStampLastBgReading to new timestamp
                         if glucose.timeStamp > timeStampLastBgReading {
@@ -1176,7 +1199,7 @@ import AppIntents
                         // reset latest3BgReadings
                         latest3BgReadings = bgReadingsAccessor.getLatestBgReadings(limit: 3, howOld: nil, forSensor: activeSensor, ignoreRawData: false, ignoreCalculatedValue: false, includingSuppressed: true)
                         
-                        if let loopManager = loopManager, LoopManager.osAidSharingPermitted, LoopManager.loopDelay() > 0 && abs(Date().timeIntervalSince(timeStampLastCalibrationForActiveSensor)) > LoopManager.loopDelay() + TimeInterval(minutes: 5.5) {
+                        if isValidForDownstream, let loopManager = loopManager, LoopManager.osAidSharingPermitted, LoopManager.loopDelay() > 0 && abs(Date().timeIntervalSince(timeStampLastCalibrationForActiveSensor)) > LoopManager.loopDelay() + TimeInterval(minutes: 5.5) {
                             loopManager.glucoseData.insert(GlucoseData(timeStamp: newReading.timeStamp, glucoseLevelRaw: round(newReading.loopShareValue), slopeOrdinal: newReading.slopeOrdinal(), slopeName: newReading.slopeName), at: 0)
                         }
                     } else {
@@ -1187,8 +1210,17 @@ import AppIntents
                     // create a reading just to be able to fill up loopShareGoucoseData, to have them per minute
                     
                     let newReading = calibrator.createNewBgReading(rawData: glucose.glucoseLevelRaw, timeStamp: glucose.timeStamp, sensor: activeSensor, last3Readings: &latest3BgReadings, lastCalibrationsForActiveSensorInLastXDays: &lastCalibrationsForActiveSensorInLastXDays, firstCalibration: firstCalibrationForActiveSensor, lastCalibration: lastCalibrationForActiveSensor, deviceName: self.getCGMTransmitterDeviceName(for: cgmTransmitter), nsManagedObjectContext: coreDataManager.mainManagedObjectContext)
-                    
-                    loopManager.glucoseData.insert(GlucoseData(timeStamp: newReading.timeStamp, glucoseLevelRaw: round(newReading.loopShareValue), slopeOrdinal: newReading.slopeOrdinal(), slopeName: newReading.slopeName), at: 0)
+
+                    let isValidForDownstream = BgReadingDownstreamPolicy.validity(
+                        calculatedValue: newReading.calculatedValue,
+                        rawData: newReading.rawData,
+                        ageAdjustedRawValue: newReading.ageAdjustedRawValue,
+                        finalValue: newReading.finalValue,
+                        calibrationUsesErrorSentinel: !(calibrator is NoCalibrator)
+                    ) == .valid
+                    if isValidForDownstream {
+                        loopManager.glucoseData.insert(GlucoseData(timeStamp: newReading.timeStamp, glucoseLevelRaw: round(newReading.loopShareValue), slopeOrdinal: newReading.slopeOrdinal(), slopeName: newReading.slopeName), at: 0)
+                    }
                     
                     // delete the newReading, otherwise it stays in coredata and we would end up with per minute readings
                     coreDataManager.mainManagedObjectContext.delete(newReading)
@@ -1196,7 +1228,7 @@ import AppIntents
             }
             
             // if a new reading is created, create either initial calibration request or bgreading notification - upload to nightscout and check alerts
-            if newReadingCreated {
+            if newDownstreamReadingCreated {
                 _ = bgPostProcessingManager?.processLatestReadings()
                 sensorNoiseManager?.update(activeSensor: activeSensor)
 

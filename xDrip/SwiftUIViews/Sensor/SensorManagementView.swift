@@ -715,7 +715,15 @@ struct SensorManagementView: View {
             longTermNoise: activeSensor?.longTermNoise?.doubleValue,
             persistentNoise: activeSensor?.id == persistentNoiseSensorID ? persistentNoise : nil,
             noiseState: noiseState,
-            currentBgDisplay: activeSensor.flatMap { bgReadingsAccessor.last(forSensor: $0) }.map {
+            currentBgDisplay: activeSensor.flatMap {
+                bgReadingsAccessor.getLatestBgReadings(
+                    limit: 1,
+                    howOld: nil,
+                    forSensor: $0,
+                    ignoreRawData: true,
+                    ignoreCalculatedValue: false
+                ).first
+            }.map {
                 SensorManagementEnteredBgValue(rawValue: displayEditableBgValue($0.finalValue), valueInMgDl: $0.finalValue)
             },
             calibrationReadiness: calibrationReadiness,

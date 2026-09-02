@@ -91,15 +91,18 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
 
         super.init()
 
-        libreWatchDirectSession = LibreWatchSessionStore.loadSession()
-        libreWatchOwnership = LibreWatchSessionStore.loadOwnership()
+        let persistedOwnership = LibreWatchSessionStore.loadOwnership()
+        let startupDecision = LibreWatchPhoneStartupDecision.resolve(
+            persistedOwnership: persistedOwnership,
+            persistedSession: LibreWatchSessionStore.loadSession(),
+            activeSensorUID: UserDefaults.standard.libreSensorUID,
+            activePatchInfo: UserDefaults.standard.librePatchInfo
+        )
+        libreWatchDirectSession = startupDecision.session
+        libreWatchOwnership = startupDecision.ownership
         libreWatchCalibrationSnapshot = LibreWatchSessionStore.loadCalibration()
-
-        // An interrupted transition is recovered on the phone. A completed Watch owner remains
-        // authoritative across app restarts and immediately suppresses the phone reconnect loop.
-        if [.releasingToWatch, .releasingToPhone, .recovery].contains(libreWatchOwnership) {
-            libreWatchOwnership = .iphone
-            LibreWatchSessionStore.saveOwnership(.iphone)
+        if persistedOwnership != startupDecision.ownership {
+            LibreWatchSessionStore.saveOwnership(startupDecision.ownership)
         }
         libreWatchReadingAcceptance.reset(
             for: libreWatchOwnership == .watch ? libreWatchDirectSession?.id : nil
@@ -133,7 +136,7 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
         })
 
         if let transmitter = bluetoothPeripheralManager.getCGMTransmitter() as? CGMLibre2Transmitter {
-            if libreWatchOwnership == .watch, let libreWatchDirectSession {
+            if startupDecision.phoneConnectionIsBlocked, let libreWatchDirectSession {
                 transmitter.restoreWatchOwnership(libreWatchDirectSession)
             }
             if let currentSession = transmitter.prepareCurrentSensorForWatch() {
@@ -429,10 +432,20 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
     }
 
     private func setLibreWatchOwnership(_ ownership: LibreWatchOwnership) {
+        let previousOwnership = libreWatchOwnership
         let ownershipChanged = ownership != libreWatchOwnership
         libreWatchOwnership = ownership
         LibreWatchSessionStore.saveOwnership(ownership)
         if ownershipChanged {
+            trace(
+                "Libre Watch ownership changed: %{public}@ -> %{public}@ sensor=%{public}@",
+                log: log,
+                category: ConstantsLog.categoryWatchManager,
+                type: .info,
+                previousOwnership.rawValue,
+                ownership.rawValue,
+                libreWatchDirectSession?.redactedIdentity() ?? "Libre-none"
+            )
             libreWatchReadingAcceptance.reset(
                 for: ownership == .watch ? libreWatchDirectSession?.id : nil
             )
@@ -629,8 +642,14 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 self.setLibreWatchOwnership(.releasingToPhone)
-                (self.bluetoothPeripheralManager.getCGMTransmitter() as? CGMLibre2Transmitter)?
-                    .returnSensorToPhone(sessionID: sessionID)
+                guard let transmitter = self.bluetoothPeripheralManager.getCGMTransmitter() as? CGMLibre2Transmitter,
+                      transmitter.returnSensorToPhone(sessionID: sessionID)
+                else {
+                    self.setLibreWatchOwnership(.watch)
+                    self.sendLibreWatchSession()
+                    fail("iPhone could not restore this Libre sensor")
+                    return
+                }
                 self.setLibreWatchOwnership(.iphone)
                 self.sendLibreWatchSession()
                 reply?([
@@ -677,6 +696,7 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
                 guard let calibrationSnapshot = self.libreWatchCalibrationSnapshot,
                       calibrationSnapshot.matches(session: currentSession),
                       reading.isValid(for: calibrationSnapshot),
+                      calibrationSnapshot.displayedGlucose(for: reading) != nil,
                       let transmitter = self.bluetoothPeripheralManager.getCGMTransmitter() as? CGMLibre2Transmitter,
                       self.libreWatchReadingAcceptance.accept(
                           reading,
@@ -691,6 +711,45 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
                 transmitter.receiveReadingFromWatch(
                     reading,
                     calibrationSnapshot: calibrationSnapshot
+                )
+                reply?([
+                    LibreWatchMessageKey.success: true,
+                    LibreWatchMessageKey.ownership: self.libreWatchOwnership.rawValue
+                ])
+            }
+
+        case .reportDiagnostic:
+            guard let data = message[LibreWatchMessageKey.diagnosticEvent] as? Data,
+                  let event = try? JSONDecoder().decode(LibreWatchDiagnosticEvent.self, from: data)
+            else {
+                fail("Invalid Libre Watch diagnostic")
+                return true
+            }
+
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                let troubleshooting: TroubleshootingLogEntry?
+                switch event.kind {
+                case .disconnected:
+                    troubleshooting = .detailed(.bluetooth(.disconnected))
+                case .recoveryStarted:
+                    troubleshooting = .detailed(.integration(name: .watch, activity: .restarted))
+                case .recoverySucceeded:
+                    troubleshooting = .detailed(.integration(name: .watch, activity: .recovered))
+                case .recoveryFailed:
+                    troubleshooting = .standard(.integration(name: .watch, activity: .failed))
+                }
+
+                trace(
+                    "Watch Libre diagnostic: event=%{public}@ sensor=%{public}@ isReconnecting=%{public}@ errorCode=%{public}@",
+                    log: self.log,
+                    category: ConstantsLog.categoryWatchManager,
+                    type: event.kind == .recoveryFailed ? .error : .info,
+                    troubleshooting: troubleshooting,
+                    event.kind.rawValue,
+                    preparedSession.redactedIdentity(),
+                    event.isReconnecting.map { String($0) } ?? "n/a",
+                    event.errorCode.map { String($0) } ?? "none"
                 )
                 reply?([
                     LibreWatchMessageKey.success: true,

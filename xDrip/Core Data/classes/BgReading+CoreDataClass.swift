@@ -260,6 +260,19 @@ public class BgReading: NSManagedObject {
         
         return calculatedValue
     }
+
+    var downstreamValidity: BgReadingDownstreamValidity {
+        BgReadingDownstreamPolicy.validity(
+            calculatedValue: calculatedValue,
+            rawData: rawData,
+            ageAdjustedRawValue: ageAdjustedRawValue,
+            finalValue: finalValue
+        )
+    }
+
+    var isValidForDownstream: Bool {
+        downstreamValidity == .valid
+    }
     
     /// slopeName for upload to Nightscout
     public var slopeName:String {
@@ -295,6 +308,7 @@ public struct BgReadingSnapshot: Sendable, Hashable {
     public let timeStamp: Date
     public let calculatedValue: Double
     public let rawData: Double
+    public let ageAdjustedRawValue: Double
     public let finalValue: Double
     public let adjustedValue: Double?
     public let smoothedValue: Double?
@@ -306,6 +320,19 @@ public struct BgReadingSnapshot: Sendable, Hashable {
     public let calibrationSnapshot: CalibrationSnapshot?
     public let sensorID: String?
     public let objectID: NSManagedObjectID
+
+    var downstreamValidity: BgReadingDownstreamValidity {
+        BgReadingDownstreamPolicy.validity(
+            calculatedValue: calculatedValue,
+            rawData: rawData,
+            ageAdjustedRawValue: ageAdjustedRawValue,
+            finalValue: finalValue
+        )
+    }
+
+    var isValidForDownstream: Bool {
+        downstreamValidity == .valid
+    }
 
     public func slopeArrow() -> String {
         let slopeByMinute = calculatedValueSlope * 60000

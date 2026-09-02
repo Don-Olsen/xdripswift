@@ -160,7 +160,7 @@ class BluetoothTransmitter: NSObject, CBCentralManagerDelegate, CBPeripheralDele
     ///     - CBUUID_ReceiveCharacteristic: receive characteristic uuid
     ///     - CBUUID_WriteCharacteristic: write characteristic uuid
     ///     - bluetoothTransmitterDelegate : a BluetoothTransmitterDelegate
-    init(addressAndName:BluetoothTransmitter.DeviceAddressAndName, CBUUID_Advertisement:String?, servicesCBUUIDs:[CBUUID]?, CBUUID_ReceiveCharacteristic:String, CBUUID_WriteCharacteristic:String, bluetoothTransmitterDelegate: BluetoothTransmitterDelegate) {
+    init(addressAndName:BluetoothTransmitter.DeviceAddressAndName, CBUUID_Advertisement:String?, servicesCBUUIDs:[CBUUID]?, CBUUID_ReceiveCharacteristic:String, CBUUID_WriteCharacteristic:String, bluetoothTransmitterDelegate: BluetoothTransmitterDelegate, initiallyPaused: Bool = false) {
         
         switch addressAndName {
             
@@ -183,6 +183,10 @@ class BluetoothTransmitter: NSObject, CBCentralManagerDelegate, CBPeripheralDele
         
         // assign bluetoothTransmitterDelegate
         self.bluetoothTransmitterDelegate = bluetoothTransmitterDelegate
+
+        // This must be set before CBCentralManager is created. Its restoration/state callbacks
+        // may otherwise retrieve or connect a Libre peripheral before Watch ownership is restored.
+        isTemporarilyPaused = initiallyPaused
         
         super.init()
 
@@ -1009,7 +1013,14 @@ class BluetoothTransmitter: NSObject, CBCentralManagerDelegate, CBPeripheralDele
     
     func centralManager(_ central: CBCentralManager, willRestoreState dict: [String : Any]) {
         trace("in willRestoreState", log: log, category: ConstantsLog.categoryBlueToothTransmitter, type: .info)
-        
+
+        if isTemporarilyPaused {
+            let restoredPeripherals = dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral] ?? []
+            restoredPeripherals.forEach { central.cancelPeripheralConnection($0) }
+            trace("in willRestoreState, restored connection blocked by persisted Watch ownership", log: log, category: ConstantsLog.categoryBlueToothTransmitter, type: .info)
+            return
+        }
+
         // Attempt to reuse the restored peripheral (if any) without forcing a rescan.
         if let restoredPeripherals = dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral], let restoredPeripheral = restoredPeripherals.first {
             // Re-attach references and delegates

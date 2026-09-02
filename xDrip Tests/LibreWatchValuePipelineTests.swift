@@ -386,13 +386,13 @@ final class LibreWatchValuePipelineTests: XCTestCase {
     }
 
     func testReadingAcceptanceAllowsFreshLowThenNextNormalReading() throws {
-        let snapshot = calibration(type: .fixedSlope, slope: 1, intercept: 0)
+        let snapshot = calibration(type: .factoryCalibrated, slope: 1, intercept: 0)
         let low = payload(
             native: 38,
             previousNative: 45,
             raw: 1,
             previousRaw: 2,
-            domain: .xDripRawGlucose,
+            domain: .factoryNativeMGDL,
             sensorTime: 1_000,
             at: receivedAt
         )
@@ -401,7 +401,7 @@ final class LibreWatchValuePipelineTests: XCTestCase {
             previousNative: 85,
             raw: 900,
             previousRaw: 850,
-            domain: .xDripRawGlucose,
+            domain: .factoryNativeMGDL,
             sensorTime: 1_001,
             at: receivedAt.addingTimeInterval(60)
         )
@@ -415,6 +415,171 @@ final class LibreWatchValuePipelineTests: XCTestCase {
             now: receivedAt.addingTimeInterval(61)
         ))
         XCTAssertGreaterThan(try XCTUnwrap(snapshot.displayedGlucose(for: normal)), 38)
+    }
+
+    func testInternalCalibrationMarkerIsNotAClinicalLowButCompletedThirtyNineIsValid() {
+        XCTAssertEqual(
+            BgReadingDownstreamPolicy.validity(
+                calculatedValue: 92,
+                rawData: 92,
+                ageAdjustedRawValue: 0,
+                finalValue: 92,
+                calibrationUsesErrorSentinel: false
+            ),
+            .valid
+        )
+        XCTAssertEqual(
+            BgReadingDownstreamPolicy.validity(
+                calculatedValue: 38,
+                rawData: 0.12,
+                ageAdjustedRawValue: 0.12,
+                finalValue: 38,
+                calibrationUsesErrorSentinel: true
+            ),
+            .internalCalibrationError
+        )
+        XCTAssertEqual(
+            BgReadingDownstreamPolicy.validity(
+                calculatedValue: 39,
+                rawData: 11.7,
+                ageAdjustedRawValue: 11.7,
+                finalValue: 39,
+                calibrationUsesErrorSentinel: true
+            ),
+            .valid
+        )
+        XCTAssertEqual(
+            BgReadingDownstreamPolicy.validity(
+                calculatedValue: 95,
+                rawData: 95,
+                ageAdjustedRawValue: 0,
+                finalValue: 95,
+                calibrationUsesErrorSentinel: false
+            ),
+            .valid
+        )
+    }
+
+    func testFreshNativeThirtyEightRemainsAValidPhysiologicalLow() {
+        XCTAssertEqual(
+            BgReadingDownstreamPolicy.validity(
+                calculatedValue: 38,
+                rawData: 38,
+                ageAdjustedRawValue: 0,
+                finalValue: 38,
+                calibrationUsesErrorSentinel: false
+            ),
+            .valid
+        )
+    }
+
+    func testWatchRejectsFailedXDripCalculationInsteadOfDisplayingFalseLow() {
+        let failed = payload(
+            native: 84,
+            previousNative: 83,
+            raw: 1,
+            previousRaw: 1,
+            domain: .xDripRawGlucose
+        )
+        let completedLow = payload(
+            native: 84,
+            previousNative: 83,
+            raw: 100,
+            previousRaw: 100,
+            domain: .xDripRawGlucose
+        )
+        let snapshot = calibration(type: .fixedSlope, slope: 1, intercept: 0)
+
+        XCTAssertNil(snapshot.displayedGlucose(for: failed))
+        XCTAssertEqual(snapshot.displayedGlucose(for: completedLow), 39)
+    }
+
+    func testHealthKitUploadStateSerializesConcurrentStoreRequestsWithoutSkippingFailures() {
+        let first = receivedAt
+        let second = receivedAt.addingTimeInterval(60)
+        var state = HealthKitUploadState(latestStoredTimeStamp: receivedAt.addingTimeInterval(-60))
+
+        XCTAssertTrue(state.begin(timeStamp: first, now: receivedAt))
+        XCTAssertFalse(state.begin(timeStamp: second, now: receivedAt))
+        XCTAssertFalse(state.beginReplacement(timeStamp: first))
+        XCTAssertTrue(state.beginReplacement(timeStamp: second))
+        XCTAssertTrue(state.isInFlight(timeStamp: second))
+        state.finishReplacement(timeStamp: second)
+        XCTAssertEqual(
+            state.finish(timeStamp: second, succeeded: true, now: receivedAt),
+            .ignored
+        )
+
+        let retryAt = receivedAt.addingTimeInterval(30)
+        XCTAssertEqual(
+            state.finish(timeStamp: first, succeeded: false, now: receivedAt),
+            .retry(retryAt)
+        )
+        XCTAssertEqual(state.latestStoredTimeStamp, receivedAt.addingTimeInterval(-60))
+        XCTAssertFalse(state.begin(timeStamp: first, now: retryAt.addingTimeInterval(-1)))
+        XCTAssertTrue(state.begin(timeStamp: first, now: retryAt))
+        XCTAssertEqual(
+            state.finish(timeStamp: first, succeeded: true, now: retryAt),
+            .stored(first)
+        )
+        XCTAssertTrue(state.begin(timeStamp: second, now: retryAt))
+        XCTAssertEqual(
+            state.finish(timeStamp: second, succeeded: true, now: retryAt),
+            .stored(second)
+        )
+        state.synchronizeLatestStoredTimeStamp(first)
+        XCTAssertEqual(state.latestStoredTimeStamp, second)
+    }
+
+    func testColdLaunchWithMatchingWatchOwnerBlocksPhoneBeforeBluetoothStarts() {
+        let decision = LibreWatchPhoneStartupDecision.resolve(
+            persistedOwnership: .watch,
+            persistedSession: session,
+            activeSensorUID: session.sensorUID,
+            activePatchInfo: session.patchInfo
+        )
+
+        XCTAssertEqual(decision.ownership, .watch)
+        XCTAssertTrue(decision.phoneConnectionIsBlocked)
+        XCTAssertEqual(decision.session?.id, session.id)
+    }
+
+    func testCompletedReturnToIPhoneAllowsNormalPhoneConnection() {
+        let decision = LibreWatchPhoneStartupDecision.resolve(
+            persistedOwnership: .iphone,
+            persistedSession: session,
+            activeSensorUID: session.sensorUID,
+            activePatchInfo: session.patchInfo
+        )
+
+        XCTAssertEqual(decision.ownership, .iphone)
+        XCTAssertFalse(decision.phoneConnectionIsBlocked)
+    }
+
+    func testInterruptedHandoffsStayWithWatchAndSensorChangeCannotCreateDualOwnership() {
+        for interrupted in [
+            LibreWatchOwnership.releasingToWatch,
+            .releasingToPhone,
+            .recovery
+        ] {
+            let decision = LibreWatchPhoneStartupDecision.resolve(
+                persistedOwnership: interrupted,
+                persistedSession: session,
+                activeSensorUID: session.sensorUID,
+                activePatchInfo: session.patchInfo
+            )
+            XCTAssertEqual(decision.ownership, .watch)
+            XCTAssertTrue(decision.phoneConnectionIsBlocked)
+        }
+
+        let changedSensor = LibreWatchPhoneStartupDecision.resolve(
+            persistedOwnership: .watch,
+            persistedSession: session,
+            activeSensorUID: Data(repeating: 9, count: 8),
+            activePatchInfo: session.patchInfo
+        )
+        XCTAssertEqual(changedSensor.ownership, .iphone)
+        XCTAssertFalse(changedSensor.phoneConnectionIsBlocked)
     }
 
     func testReadingAcceptanceResetsForNewOwnershipSession() {
