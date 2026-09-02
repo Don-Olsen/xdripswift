@@ -222,12 +222,12 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         deliberatelyDisconnecting = false
     }
 
-    func directGlucoseText(isMgDl: Bool) -> String {
+    func nativeGlucoseText(isMgDl: Bool) -> String {
         guard let reading = state.directReading else { return "—" }
         if isMgDl {
-            return String(format: "%.0f", reading.glucoseMGDL)
+            return String(format: "%.0f", reading.nativeGlucoseMGDL)
         }
-        return String(format: "%.1f", reading.glucoseMGDL / 18.0182)
+        return String(format: "%.1f", reading.nativeGlucoseMGDL / ConstantsBloodGlucose.mmollToMgdl)
     }
 
     private func beginScanningIfPossible() {
@@ -436,6 +436,8 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
     }
 
     private func evaluateConnectionHealth(at date: Date) {
+        watchState?.refreshDirectLibreReadingFreshness(at: date)
+
         // After reconnecting, dataExpectedSince is newer than the previous packet. Always use
         // the newest activity marker so an old reading cannot cancel a healthy new connection.
         let lastActivity = [state.lastPacketAt, dataExpectedSince]
@@ -749,7 +751,7 @@ extension LibreWatchDirectCollector: CBPeripheralDelegate {
                 receivedAt: now
             )
             state.recordDirectReading(reading)
-            watchState?.submitLibreWatchReading(reading.payload(sessionID: preparedSession.id))
+            watchState?.submitLibreWatchReading(reading)
         } catch {
             state.fail(.invalidFrame, error: error.localizedDescription)
         }

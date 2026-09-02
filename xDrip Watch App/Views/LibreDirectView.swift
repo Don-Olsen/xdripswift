@@ -20,12 +20,14 @@ struct LibreDirectView: View {
                     .multilineTextAlignment(.center)
                     .foregroundStyle(statusColor)
 
-                if let reading = collector.state.directReading,
-                   watchState.libreWatchOwnership == .watch {
-                    let isCurrent = collector.state.directReadingIsCurrent(at: displayDate)
+                if watchState.libreWatchOwnership == .watch,
+                   watchState.isShowingDirectLibreReading || collector.state.directReading != nil {
+                    let isCurrent = watchState.directLibreReadingIsCurrent(at: displayDate)
                     let isRecovering = collector.state.connectionRecoveryIsInProgress
-                    let showsLiveReading = isCurrent && !isRecovering && collector.state.stage == .receiving
+                    let hasFinalReading = watchState.isShowingDirectLibreReading
+                    let showsLiveReading = hasFinalReading && isCurrent && !isRecovering && collector.state.stage == .receiving
                     let readingStatus: String = {
+                        if !hasFinalReading { return "WAITING FOR MATCHING CALIBRATION" }
                         if !isCurrent { return "STALE LAST DIRECT READING" }
                         if isRecovering { return "RECONNECTING — LAST DIRECT READING" }
                         if collector.state.stage != .receiving { return "LAST DIRECT READING" }
@@ -36,20 +38,30 @@ struct LibreDirectView: View {
                         .font(.caption.bold())
                         .foregroundStyle(showsLiveReading ? Color.green : Color.orange)
 
-                    HStack(alignment: .firstTextBaseline, spacing: 4) {
-                        Text(collector.directGlucoseText(isMgDl: watchState.isMgDl))
-                            .font(.system(size: 38, weight: .bold, design: .rounded))
-                            .minimumScaleFactor(0.7)
-                        Text(reading.trendSymbol)
-                            .font(.title2.bold())
+                    if hasFinalReading {
+                        HStack(alignment: .firstTextBaseline, spacing: 4) {
+                            Text(watchState.bgValueStringInUserChosenUnit())
+                                .font(.system(size: 38, weight: .bold, design: .rounded))
+                                .minimumScaleFactor(0.7)
+                            if isCurrent {
+                                Text(watchState.trendArrow())
+                                    .font(.title2.bold())
+                            }
+                        }
+                        .foregroundStyle(showsLiveReading ? Color.primary : Color.orange)
+                        Text(watchState.bgUnitString())
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
                     }
-                    .foregroundStyle(showsLiveReading ? Color.primary : Color.orange)
-                    Text(watchState.isMgDl ? "mg/dL" : "mmol/L")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
 
-                    if let ageText = collector.state.directReadingAgeText(at: displayDate) {
-                        Text("Last direct reading: \(ageText)")
+                    if collector.state.directReading != nil {
+                        Text("Native sensor: \(collector.nativeGlucoseText(isMgDl: watchState.isMgDl)) \(watchState.bgUnitString())")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    if hasFinalReading {
+                        Text("Last direct reading: \(watchState.lastUpdatedMinsAgoString(at: displayDate))")
                             .font(.caption2)
                             .foregroundStyle(showsLiveReading ? Color.secondary : Color.orange)
                     }
@@ -86,6 +98,7 @@ struct LibreDirectView: View {
         .navigationTitle("Libre")
         .onReceive(displayTimer) { date in
             displayDate = date
+            watchState.refreshDirectLibreReadingFreshness(at: date)
         }
     }
 

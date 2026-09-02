@@ -632,18 +632,24 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
             ])
 
         case .submitReading:
+            refreshLibreWatchCalibrationSnapshot(for: preparedSession)
             guard libreWatchOwnership == .watch,
                   let data = message[LibreWatchMessageKey.reading] as? Data,
                   let reading = try? JSONDecoder().decode(LibreWatchDirectReadingPayload.self, from: data),
-                  reading.isValid,
                   reading.sessionID == sessionID,
+                  let calibrationSnapshot = libreWatchCalibrationSnapshot,
+                  calibrationSnapshot.matches(session: preparedSession),
+                  reading.isValid(for: calibrationSnapshot),
                   let transmitter = bluetoothPeripheralManager.getCGMTransmitter() as? CGMLibre2Transmitter
             else {
                 fail("Invalid Libre reading or Watch is not the owner")
                 return true
             }
             DispatchQueue.main.async {
-                transmitter.receiveReadingFromWatch(reading)
+                transmitter.receiveReadingFromWatch(
+                    reading,
+                    calibrationSnapshot: calibrationSnapshot
+                )
             }
             reply?([
                 LibreWatchMessageKey.success: true,

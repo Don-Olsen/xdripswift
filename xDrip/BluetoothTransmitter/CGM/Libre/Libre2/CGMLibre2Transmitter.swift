@@ -409,15 +409,30 @@ class CGMLibre2Transmitter: BluetoothTransmitter, CGMTransmitter {
 
     /// Re-enters Watch readings through the normal transmitter delegate, preserving the existing
     /// calibration, alert, HealthKit, Nightscout and deduplication pipeline on iPhone.
-    @nonobjc func receiveReadingFromWatch(_ reading: LibreWatchDirectReadingPayload) {
-        guard reading.isValid,
+    @nonobjc func receiveReadingFromWatch(
+        _ reading: LibreWatchDirectReadingPayload,
+        calibrationSnapshot: LibreWatchCalibrationSnapshot
+    ) {
+        let requiredValueDomain: LibreWatchValueDomain = isWebOOPEnabled()
+            ? .factoryNativeMGDL
+            : .xDripRawGlucose
+        let calibrationTypeMatches = isWebOOPEnabled()
+            ? calibrationSnapshot.calibrationType == .factoryCalibrated
+            : calibrationSnapshot.calibrationType == (isNonFixedSlopeEnabled() ? .nonFixedSlope : .fixedSlope)
+
+        guard reading.isValid(for: calibrationSnapshot),
+              calibrationSnapshot.watchSessionID == reading.sessionID,
+              calibrationSnapshot.requiredValueDomain == requiredValueDomain,
+              calibrationTypeMatches,
               watchOwnershipSessionID == reading.sessionID,
               LibreWatchSessionStore.loadOwnership() == .watch
         else { return }
 
         var glucoseData = [GlucoseData(
             timeStamp: reading.receivedAt,
-            glucoseLevelRaw: reading.glucoseMGDL
+            // Match Libre2BLEUtilities: factory mode enters NoCalibrator as native mg/dL;
+            // xDrip modes enter Libre1Calibrator as rawGlucose * libreMultiplier.
+            glucoseLevelRaw: reading.sourceValue(for: requiredValueDomain)
         )]
         cgmTransmitterDelegate?.cgmTransmitterInfoReceived(
             glucoseData: &glucoseData,

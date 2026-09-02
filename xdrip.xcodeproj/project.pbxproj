@@ -126,6 +126,7 @@
 		D1B700012026090100000007 /* LibreDirectView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1B710012026090100000005 /* LibreDirectView.swift */; };
 		D1B700012026090100000008 /* PreLibre2.swift in Sources */ = {isa = PBXBuildFile; fileRef = F80D915B24F06A40006840B5 /* PreLibre2.swift */; };
 		D1B700012026090100000009 /* UInt16.swift in Sources */ = {isa = PBXBuildFile; fileRef = F898EDF3234A8A3200BFB79B /* UInt16.swift */; };
+		D1B720022026090200000001 /* LibreWatchValuePipelineTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1B720012026090200000001 /* LibreWatchValuePipelineTests.swift */; };
 		478705932C4D7B90001C3170 /* BigNumberView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 478705922C4D7B90001C3170 /* BigNumberView.swift */; };
 		478A923E2B8B64DE0084C394 /* ConstantsHomeView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F8A1586622EDB8BF007F5B5D /* ConstantsHomeView.swift */; };
 		478A92422B8CCF8F0084C394 /* ConstantsLiveActivity.swift in Sources */ = {isa = PBXBuildFile; fileRef = 47B7313F2B83DC0200B0A450 /* ConstantsLiveActivity.swift */; };
@@ -1025,6 +1026,7 @@
 		D1B710012026090100000003 /* LibreWatchDirectState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LibreWatchDirectState.swift; sourceTree = "<group>"; };
 		D1B710012026090100000004 /* LibreWatchDirectCollector.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LibreWatchDirectCollector.swift; sourceTree = "<group>"; };
 		D1B710012026090100000005 /* LibreDirectView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LibreDirectView.swift; sourceTree = "<group>"; };
+		D1B720012026090200000001 /* LibreWatchValuePipelineTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LibreWatchValuePipelineTests.swift; sourceTree = "<group>"; };
 		478705922C4D7B90001C3170 /* BigNumberView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BigNumberView.swift; sourceTree = "<group>"; };
 		478A925E2B8FB5290084C394 /* XDripWatchComplication+Entry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "XDripWatchComplication+Entry.swift"; sourceTree = "<group>"; };
 		478A92602B8FB53B0084C394 /* XDripWatchComplication+EntryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "XDripWatchComplication+EntryView.swift"; sourceTree = "<group>"; };
@@ -2545,6 +2547,7 @@
 		4F2600213002000200000001 /* xDrip Tests */ = {
 			isa = PBXGroup;
 			children = (
+				D1B720012026090200000001 /* LibreWatchValuePipelineTests.swift */,
 				4D7D00013016000200000001 /* BluetoothPeripheralDisplayStatusTests.swift */,
 				4D7C00013015000100000001 /* CalibrationReadinessTests.swift */,
 				4D7B00013014000200000001 /* CGMG5SensorSessionDetectionTests.swift */,
@@ -4311,6 +4314,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				D1B720022026090200000001 /* LibreWatchValuePipelineTests.swift in Sources */,
 				4D7D00023016000200000001 /* BluetoothPeripheralDisplayStatusTests.swift in Sources */,
 				4D7C00023015000100000001 /* CalibrationReadinessTests.swift in Sources */,
 				4D7B00023014000200000001 /* CGMG5SensorSessionDetectionTests.swift in Sources */,

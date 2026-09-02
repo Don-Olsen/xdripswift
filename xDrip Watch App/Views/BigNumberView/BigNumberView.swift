@@ -65,25 +65,28 @@ struct BigNumberView: View {
                     watchState.requestWatchStateUpdate()
                 }
             
-            HStack(alignment: .center, spacing: 10) {
-                HStack(alignment: .firstTextBaseline, spacing: 3) {
-                    Text(watchState.deltaChangeStringInUserChosenUnit())
-                        .font(.system(size: isSmallScreen ? 22 : 24)).fontWeight(.semibold)
-                        .lineLimit(1)
-                    
-                    Text(watchState.bgUnitString())
-                        .font(.system(size: isSmallScreen ? 22 : 24))
-                        .foregroundStyle(.gray)
-                        .lineLimit(1)
+            if watchState.libreWatchOwnership != .watch ||
+                watchState.directLibreReadingIsCurrent(at: displayDate) {
+                HStack(alignment: .center, spacing: 10) {
+                    HStack(alignment: .firstTextBaseline, spacing: 3) {
+                        Text(watchState.deltaChangeStringInUserChosenUnit())
+                            .font(.system(size: isSmallScreen ? 22 : 24)).fontWeight(.semibold)
+                            .lineLimit(1)
+
+                        Text(watchState.bgUnitString())
+                            .font(.system(size: isSmallScreen ? 22 : 24))
+                            .foregroundStyle(.gray)
+                            .lineLimit(1)
+                    }
+
+                    Text("\(watchState.trendArrow())")
+                        .font(.system(size: isSmallScreen ? 34 : 38)).fontWeight(.bold)
+                        .foregroundStyle(.colorPrimary)
+                        .minimumScaleFactor(0.5)
                 }
-                
-                Text("\(watchState.trendArrow())")
-                    .font(.system(size: isSmallScreen ? 34 : 38)).fontWeight(.bold)
-                    .foregroundStyle(.colorPrimary)
-                    .minimumScaleFactor(0.5)
+                .padding(.top, -20)
+                .padding(.bottom, 10)
             }
-            .padding(.top, -20)
-            .padding(.bottom, 10)
             
             VStack(alignment: .center, spacing: 1) {
                 Gauge(value: watchState.bgValueInMgDl() ?? watchState.gaugeModel().nilValue, in: watchState.gaugeModel().minValue...watchState.gaugeModel().maxValue) {
@@ -121,19 +124,33 @@ struct BigNumberView: View {
             .padding(.bottom, watchState.libreWatchOwnership == .watch ? 0 : -20)
 
             let connectionIsRecovering = libreDirectCollector.state.stage != .receiving
-            if let directStatus = watchState.directLibreStatus(connectionIsRecovering: connectionIsRecovering) {
+            let directReadingIsStale = watchState.libreWatchOwnership == .watch &&
+                !watchState.directLibreReadingIsCurrent(at: displayDate)
+            if let directStatus = watchState.directLibreStatus(
+                connectionIsRecovering: connectionIsRecovering,
+                at: displayDate
+            ) {
                 Text(directStatus)
                     .font(.caption2.bold())
-                    .foregroundStyle(connectionIsRecovering ? Color.orange : Color.green)
+                    .foregroundStyle(connectionIsRecovering || directReadingIsStale ? Color.orange : Color.green)
                     .padding(.top, 2)
                     .padding(.bottom, -18)
             }
         }
-        .onAppear { displayDate = Date() }
-        .onChange(of: scenePhase) { newPhase in
-            if newPhase == .active { displayDate = Date() }
+        .onAppear {
+            displayDate = Date()
+            watchState.refreshDirectLibreReadingFreshness(at: displayDate)
         }
-        .onReceive(displayTimer) { displayDate = $0 }
+        .onChange(of: scenePhase) { newPhase in
+            if newPhase == .active {
+                displayDate = Date()
+                watchState.refreshDirectLibreReadingFreshness(at: displayDate)
+            }
+        }
+        .onReceive(displayTimer) {
+            displayDate = $0
+            watchState.refreshDirectLibreReadingFreshness(at: $0)
+        }
     }
     
     func animateTextScale(){

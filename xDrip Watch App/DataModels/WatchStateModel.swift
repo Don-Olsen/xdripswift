@@ -131,11 +131,12 @@ final class WatchStateModel: NSObject, ObservableObject {
     @Published private(set) var libreWatchOwnership: LibreWatchOwnership = .iphone
     @Published private(set) var libreWatchCalibrationSnapshot: LibreWatchCalibrationSnapshot?
     @Published private(set) var isShowingDirectLibreReading = false
+    @Published private(set) var directLibreReadingIsStale = false
 
     /// Original direct values are retained in memory so a newer iPhone calibration can
     /// recompute the Watch-only presentation without altering values sent back to iPhone.
     private var directReadingHistory: [LibreWatchDirectReadingPayload] = []
-    private var latestDirectSourceDeltaMGDL: Double?
+    private var latestDirectSourceDelta: Double?
 
     @Published var aidStatus: AIDStatus?
 
@@ -275,6 +276,7 @@ final class WatchStateModel: NSObject, ObservableObject {
     /// - Returns: trend arrow string (i.e.  "↑")
     func trendArrow() -> String {
         if let bgReadingDate = bgReadingDate(),
+           (!isShowingDirectLibreReading || !directLibreReadingIsStale),
            isShowingDirectLibreReading || bgReadingDate > Date().addingTimeInterval(-60 * 20) {
             switch slopeOrdinal {
             case 7:
@@ -303,6 +305,7 @@ final class WatchStateModel: NSObject, ObservableObject {
     /// - Returns: a string holding the formatted delta change value (i.e. +0.4 or -6)
     func deltaChangeStringInUserChosenUnit() -> String {
         if let bgReadingDate = bgReadingDate(),
+           (!isShowingDirectLibreReading || !directLibreReadingIsStale),
            isShowingDirectLibreReading || bgReadingDate > Date().addingTimeInterval(-60 * 20) {
             let deltaValueAsString = isMgDl ? deltaValueInUserUnit.mgDlToMmolAndToString(mgDl: isMgDl) : deltaValueInUserUnit.mmolToString()
 
@@ -579,10 +582,19 @@ final class WatchStateModel: NSObject, ObservableObject {
         )
     }
 
-    func submitLibreWatchReading(_ reading: LibreWatchDirectReadingPayload) {
-        guard reading.isValid,
-              reading.sessionID == libreWatchDirectSession?.id,
-              libreWatchOwnership == .watch,
+    func submitLibreWatchReading(_ directReading: Libre2WatchDirectReading) {
+        guard let directSession = libreWatchDirectSession,
+              let snapshot = libreWatchCalibrationSnapshot,
+              snapshot.matches(session: directSession),
+              libreWatchOwnership == .watch
+        else { return }
+
+        let reading = directReading.payload(
+            sessionID: directSession.id,
+            valueDomain: snapshot.requiredValueDomain,
+            calibrationRevision: snapshot.revision
+        )
+        guard reading.isValid(for: snapshot),
               let data = try? JSONEncoder().encode(reading)
         else { return }
 
@@ -618,7 +630,11 @@ final class WatchStateModel: NSObject, ObservableObject {
         displayedDeltaOverride: Double? = nil
     ) {
         guard let directSession = libreWatchDirectSession,
-              reading.sessionID == directSession.id
+              let snapshot = libreWatchCalibrationSnapshot,
+              snapshot.matches(session: directSession),
+              reading.sessionID == directSession.id,
+              reading.isValid(for: snapshot),
+              let displayed = displayedOverride ?? displayedLibreValues(for: reading)
         else { return }
 
         if let existingIndex = directReadingHistory.firstIndex(where: { $0.id == reading.id }) {
@@ -628,13 +644,12 @@ final class WatchStateModel: NSObject, ObservableObject {
         directReadingHistory.sort { $0.receivedAt > $1.receivedAt }
         directReadingHistory.removeAll { $0.receivedAt < Date().addingTimeInterval(-12 * 60 * 60) }
 
-        let displayed = displayedOverride ?? displayedLibreValues(for: reading)
         upsertDirectReading(reading, displayedGlucose: displayed.glucose)
 
         guard directReadingHistory.first?.id == reading.id else { return }
         let sourceDelta = sourceDeltaOverride ?? directSourceDelta(for: reading)
         let displayedDelta = displayedDeltaOverride ?? displayedLibreDelta(sourceDelta)
-        latestDirectSourceDeltaMGDL = sourceDelta
+        latestDirectSourceDelta = sourceDelta
         updateDirectDerivedValues(
             for: reading,
             displayedGlucose: displayed.glucose,
@@ -647,7 +662,7 @@ final class WatchStateModel: NSObject, ObservableObject {
             sessionID: reading.sessionID,
             sensorIdentity: directSession.redactedIdentity(),
             sourceReading: reading,
-            sourceDeltaMGDL: sourceDelta,
+            sourceDelta: sourceDelta,
             displayedGlucoseMGDL: displayed.glucose,
             displayedTrendMGDLPerMinute: displayed.trend,
             displayedDeltaMGDL: displayedDelta,
@@ -659,31 +674,33 @@ final class WatchStateModel: NSObject, ObservableObject {
 
     private func displayedLibreValues(
         for reading: LibreWatchDirectReadingPayload
-    ) -> (glucose: Double, trend: Double?, revision: UInt64?) {
+    ) -> (glucose: Double, trend: Double?, revision: UInt64?)? {
         guard let directSession = libreWatchDirectSession,
               let snapshot = libreWatchCalibrationSnapshot,
               snapshot.matches(session: directSession),
               let glucose = snapshot.displayedGlucose(for: reading)
-        else {
-            return (reading.glucoseMGDL, reading.trendMGDLPerMinute, nil)
-        }
+        else { return nil }
 
         return (glucose, snapshot.displayedTrend(for: reading), snapshot.revision)
     }
 
     private func directSourceDelta(for reading: LibreWatchDirectReadingPayload) -> Double? {
         guard let index = directReadingHistory.firstIndex(where: { $0.id == reading.id }),
-              directReadingHistory.indices.contains(index + 1)
+              directReadingHistory.indices.contains(index + 1),
+              let snapshot = libreWatchCalibrationSnapshot,
+              reading.isValid(for: snapshot),
+              directReadingHistory[index + 1].isValid(for: snapshot)
         else { return nil }
-        return reading.glucoseMGDL - directReadingHistory[index + 1].glucoseMGDL
+        return reading.sourceValue(for: snapshot.requiredValueDomain) -
+            directReadingHistory[index + 1].sourceValue(for: snapshot.requiredValueDomain)
     }
 
     private func displayedLibreDelta(_ sourceDelta: Double?) -> Double? {
         guard let directSession = libreWatchDirectSession,
               let snapshot = libreWatchCalibrationSnapshot,
               snapshot.matches(session: directSession)
-        else { return sourceDelta }
-        return snapshot.displayedDelta(sourceDeltaMGDL: sourceDelta)
+        else { return nil }
+        return snapshot.displayedDelta(sourceDelta: sourceDelta)
     }
 
     private func upsertDirectReading(
@@ -713,11 +730,44 @@ final class WatchStateModel: NSObject, ObservableObject {
         }
     }
 
-    func directLibreStatus(connectionIsRecovering: Bool) -> String? {
+    func directLibreStatus(connectionIsRecovering: Bool, at date: Date = Date()) -> String? {
         guard libreWatchOwnership == .watch else { return nil }
-        return connectionIsRecovering || !isShowingDirectLibreReading
+        return connectionIsRecovering || !isShowingDirectLibreReading || !directLibreReadingIsCurrent(at: date)
             ? "Forbinder igen"
             : "Direkte fra Libre"
+    }
+
+    func directLibreReadingIsCurrent(at date: Date = Date()) -> Bool {
+        guard isShowingDirectLibreReading,
+              let latest = directReadingHistory.first
+        else { return false }
+        return latest.isCurrent(at: date)
+    }
+
+    func refreshDirectLibreReadingFreshness(at date: Date = Date()) {
+        guard libreWatchOwnership == .watch, isShowingDirectLibreReading else {
+            directLibreReadingIsStale = false
+            return
+        }
+
+        let isStale = !directLibreReadingIsCurrent(at: date)
+        guard isStale != directLibreReadingIsStale else { return }
+        directLibreReadingIsStale = isStale
+        if isStale {
+            slopeOrdinal = 0
+            deltaValueInUserUnit = 0
+        } else if let latest = directReadingHistory.first,
+                  let displayed = displayedLibreValues(for: latest) {
+            updateDirectDerivedValues(
+                for: latest,
+                displayedGlucose: displayed.glucose,
+                displayedTrend: displayed.trend,
+                displayedDelta: displayedLibreDelta(latestDirectSourceDelta)
+            )
+        }
+        updateMainViewDate = .now
+        updateBigNumberViewDate = .now
+        updateComplicationData()
     }
 
     private func updateDirectDerivedValues(
@@ -726,12 +776,15 @@ final class WatchStateModel: NSObject, ObservableObject {
         displayedTrend: Double?,
         displayedDelta: Double?
     ) {
+        directLibreReadingIsStale = !reading.isCurrent(at: Date())
         if let trend = displayedTrend {
             if trend >= 3 { slopeOrdinal = 2 }
             else if trend >= 1 { slopeOrdinal = 3 }
             else if trend < -3 { slopeOrdinal = 6 }
             else if trend < -1 { slopeOrdinal = 5 }
             else { slopeOrdinal = 4 }
+        } else {
+            slopeOrdinal = 0
         }
 
         if let deltaMGDL = displayedDelta {
@@ -752,8 +805,9 @@ final class WatchStateModel: NSObject, ObservableObject {
     private func restorePersistedLibreWatchReadingIfPossible() {
         guard libreWatchOwnership == .watch,
               let directSession = libreWatchDirectSession,
+              let snapshot = libreWatchCalibrationSnapshot,
               let stored = LibreWatchSessionStore.loadReading(),
-              stored.isValid(for: directSession)
+              stored.isValid(for: directSession, calibration: snapshot)
         else { return }
 
         let storedCalibrationIsCurrent = stored.calibrationRevision == libreWatchCalibrationSnapshot?.revision
@@ -764,7 +818,7 @@ final class WatchStateModel: NSObject, ObservableObject {
                 stored.displayedTrendMGDLPerMinute,
                 stored.calibrationRevision
             ) : nil,
-            sourceDeltaOverride: stored.sourceDeltaMGDL,
+            sourceDeltaOverride: stored.sourceDelta,
             displayedDeltaOverride: storedCalibrationIsCurrent ? stored.displayedDeltaMGDL : nil
         )
     }
@@ -780,20 +834,37 @@ final class WatchStateModel: NSObject, ObservableObject {
             return
         }
 
+        if let current = libreWatchCalibrationSnapshot,
+           current.matches(session: directSession),
+           current.requiredValueDomain != snapshot.requiredValueDomain {
+            clearDirectReadingPresentation()
+        }
+
         libreWatchCalibrationSnapshot = snapshot
         LibreWatchSessionStore.saveCalibration(snapshot)
         recalculateDirectPresentation()
     }
 
     private func recalculateDirectPresentation() {
+        guard let directSession = libreWatchDirectSession,
+              let snapshot = libreWatchCalibrationSnapshot,
+              snapshot.matches(session: directSession)
+        else { return }
+
+        directReadingHistory.removeAll { !$0.isValid(for: snapshot) }
         for reading in directReadingHistory {
-            let displayed = displayedLibreValues(for: reading)
+            guard let displayed = displayedLibreValues(for: reading) else { continue }
             upsertDirectReading(reading, displayedGlucose: displayed.glucose)
         }
 
-        guard let latest = directReadingHistory.first else { return }
-        let displayed = displayedLibreValues(for: latest)
-        let displayedDelta = displayedLibreDelta(latestDirectSourceDeltaMGDL)
+        guard let latest = directReadingHistory.first,
+              let displayed = displayedLibreValues(for: latest)
+        else {
+            isShowingDirectLibreReading = false
+            LibreWatchSessionStore.clearReading()
+            return
+        }
+        let displayedDelta = displayedLibreDelta(latestDirectSourceDelta)
         updateDirectDerivedValues(
             for: latest,
             displayedGlucose: displayed.glucose,
@@ -801,35 +872,38 @@ final class WatchStateModel: NSObject, ObservableObject {
             displayedDelta: displayedDelta
         )
 
-        if let directSession = libreWatchDirectSession {
-            LibreWatchSessionStore.saveReading(LibreWatchPersistedDirectReading(
-                sessionID: latest.sessionID,
-                sensorIdentity: directSession.redactedIdentity(),
-                sourceReading: latest,
-                sourceDeltaMGDL: latestDirectSourceDeltaMGDL,
-                displayedGlucoseMGDL: displayed.glucose,
-                displayedTrendMGDLPerMinute: displayed.trend,
-                displayedDeltaMGDL: displayedDelta,
-                calibrationRevision: displayed.revision
-            ))
-        }
+        LibreWatchSessionStore.saveReading(LibreWatchPersistedDirectReading(
+            sessionID: latest.sessionID,
+            sensorIdentity: directSession.redactedIdentity(),
+            sourceReading: latest,
+            sourceDelta: latestDirectSourceDelta,
+            displayedGlucoseMGDL: displayed.glucose,
+            displayedTrendMGDLPerMinute: displayed.trend,
+            displayedDeltaMGDL: displayedDelta,
+            calibrationRevision: displayed.revision
+        ))
         updateMainViewDate = .now
         updateBigNumberViewDate = .now
         updateComplicationData()
     }
 
-    private func clearStoredDirectStateForSessionChange() {
+    private func clearDirectReadingPresentation() {
         let directDates = Set(directReadingHistory.map(\.receivedAt))
         let retained = zip(bgReadingDates, bgReadingValues).filter { !directDates.contains($0.0) }
         bgReadingDates = retained.map { $0.0 }
         bgReadingValues = retained.map { $0.1 }
         bgReadingDatesAsDouble = bgReadingDates.map { $0.timeIntervalSince1970 }
         directReadingHistory.removeAll()
-        latestDirectSourceDeltaMGDL = nil
+        latestDirectSourceDelta = nil
         isShowingDirectLibreReading = false
+        directLibreReadingIsStale = false
+        LibreWatchSessionStore.clearReading()
+    }
+
+    private func clearStoredDirectStateForSessionChange() {
+        clearDirectReadingPresentation()
         libreWatchCalibrationSnapshot = nil
         LibreWatchSessionStore.clearCalibration()
-        LibreWatchSessionStore.clearReading()
     }
 
     /// request the compact AGP profile used by the Watch main chart background
@@ -964,9 +1038,11 @@ final class WatchStateModel: NSObject, ObservableObject {
                 restorePersistedLibreWatchReadingIfPossible()
             } else {
                 isShowingDirectLibreReading = true
+                refreshDirectLibreReadingFreshness()
             }
         } else if ownership == .iphone {
             isShowingDirectLibreReading = false
+            directLibreReadingIsStale = false
         }
     }
 
@@ -1239,8 +1315,13 @@ final class WatchStateModel: NSObject, ObservableObject {
         // visible long after watchOS stops receiving updates from the phone.
         let complicationBgReadingValues = keepAliveIsDisabled ? [] : bgReadingValues
         let complicationBgReadingDates = keepAliveIsDisabled ? [] : bgReadingDates
-        let complicationSlopeOrdinal = keepAliveIsDisabled ? 0 : slopeOrdinal
-        let complicationDeltaValueInUserUnit = keepAliveIsDisabled ? 0 : deltaValueInUserUnit
+        let hidesDirectDerivedValues = libreWatchOwnership == .watch &&
+            isShowingDirectLibreReading &&
+            !directLibreReadingIsCurrent()
+        let complicationSlopeOrdinal = keepAliveIsDisabled || hidesDirectDerivedValues ? 0 : slopeOrdinal
+        let complicationDeltaValueInUserUnit: Double? = keepAliveIsDisabled || hidesDirectDerivedValues
+            ? nil
+            : deltaValueInUserUnit
 
         let bgReadingDatesAsDouble = complicationBgReadingDates.map { date in
             date.timeIntervalSince1970

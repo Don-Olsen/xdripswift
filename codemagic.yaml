@@ -26,6 +26,21 @@ workflows:
           git submodule sync --recursive
           git submodule update --init --recursive
 
+      - name: Test Libre Watch value pipeline
+        script: |
+          set -euo pipefail
+          simulator_id="$(xcrun simctl list devices available -j | jq -r '[.devices[][] | select(.name | startswith("iPhone"))][0].udid // empty')"
+          test -n "$simulator_id"
+          mkdir -p "$CM_BUILD_DIR/build/test-results"
+          xcodebuild test \
+            -workspace "$CM_BUILD_DIR/xdrip.xcworkspace" \
+            -scheme "xdrip" \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,id=$simulator_id" \
+            -only-testing:xdripTests/LibreWatchValuePipelineTests \
+            -resultBundlePath "$CM_BUILD_DIR/build/test-results/LibreWatchValuePipelineTests.xcresult" \
+            CODE_SIGNING_ALLOWED=NO
+
       - name: Verify the xDrip4iOS release
         script: |
           set -euo pipefail
@@ -239,6 +254,7 @@ workflows:
 
     artifacts:
       - build/ios/ipa/*.ipa
+      - build/test-results/*.xcresult
       - /tmp/xcodebuild_logs/*.log
       - $HOME/Library/Developer/Xcode/DerivedData/**/Build/**/*.dSYM
 

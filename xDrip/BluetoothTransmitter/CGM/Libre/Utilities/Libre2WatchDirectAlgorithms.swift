@@ -36,27 +36,32 @@ enum Libre2WatchDirectAlgorithmError: LocalizedError, Equatable {
 }
 
 struct Libre2WatchDirectReading: Equatable {
-    let glucoseMGDL: Double
-    let trendMGDLPerMinute: Double?
+    let nativeGlucoseMGDL: Double
+    let previousNativeGlucoseMGDL: Double
+    let rawGlucose: UInt16
+    let previousRawGlucose: UInt16
     let sensorTimeInMinutes: UInt16
     let receivedAt: Date
 
-    var trendSymbol: String {
-        guard let trendMGDLPerMinute else { return "" }
-        if trendMGDLPerMinute >= 3 { return "↑" }
-        if trendMGDLPerMinute >= 1 { return "↗" }
-        if trendMGDLPerMinute < -3 { return "↓" }
-        if trendMGDLPerMinute < -1 { return "↘" }
-        return "→"
+    var nativeTrendMGDLPerMinute: Double {
+        (nativeGlucoseMGDL - previousNativeGlucoseMGDL) / 2
     }
 
-    func payload(sessionID: UUID) -> LibreWatchDirectReadingPayload {
+    func payload(
+        sessionID: UUID,
+        valueDomain: LibreWatchValueDomain,
+        calibrationRevision: UInt64
+    ) -> LibreWatchDirectReadingPayload {
         LibreWatchDirectReadingPayload(
             sessionID: sessionID,
-            glucoseMGDL: glucoseMGDL,
-            trendMGDLPerMinute: trendMGDLPerMinute,
+            valueDomain: valueDomain,
+            nativeGlucoseMGDL: nativeGlucoseMGDL,
+            previousNativeGlucoseMGDL: previousNativeGlucoseMGDL,
+            rawGlucose: rawGlucose,
+            previousRawGlucose: previousRawGlucose,
             sensorTimeInMinutes: sensorTimeInMinutes,
-            receivedAt: receivedAt
+            receivedAt: receivedAt,
+            calibrationRevision: calibrationRevision
         )
     }
 }
@@ -212,31 +217,42 @@ enum Libre2WatchDirectAlgorithms {
             throw Libre2WatchDirectAlgorithmError.badDecryptedFrameLength(decryptedData.count)
         }
 
-        let newest = glucoseMGDL(from: decryptedData, sampleIndex: 0, parameters: parameters)
-        let previous = glucoseMGDL(from: decryptedData, sampleIndex: 1, parameters: parameters)
-        guard newest.isFinite, newest > 0, newest <= 3_000 else {
+        let newest = sample(from: decryptedData, sampleIndex: 0, parameters: parameters)
+        let previous = sample(from: decryptedData, sampleIndex: 1, parameters: parameters)
+        guard newest.nativeGlucoseMGDL.isFinite,
+              newest.nativeGlucoseMGDL > 0,
+              newest.nativeGlucoseMGDL <= 3_000,
+              previous.nativeGlucoseMGDL.isFinite,
+              previous.nativeGlucoseMGDL > 0,
+              previous.nativeGlucoseMGDL <= 3_000,
+              newest.rawGlucose > 0,
+              previous.rawGlucose > 0
+        else {
             throw Libre2WatchDirectAlgorithmError.invalidGlucose
         }
 
         return Libre2WatchDirectReading(
-            glucoseMGDL: newest,
-            trendMGDLPerMinute: previous.isFinite && previous > 0 ? (newest - previous) / 2 : nil,
+            nativeGlucoseMGDL: newest.nativeGlucoseMGDL,
+            previousNativeGlucoseMGDL: previous.nativeGlucoseMGDL,
+            rawGlucose: newest.rawGlucose,
+            previousRawGlucose: previous.rawGlucose,
             sensorTimeInMinutes: word(decryptedData[41], decryptedData[40]),
             receivedAt: receivedAt
         )
     }
 
-    private static func glucoseMGDL(
+    private static func sample(
         from data: Data,
         sampleIndex: Int,
         parameters: LibreWatchAlgorithmParameters
-    ) -> Double {
+    ) -> (rawGlucose: UInt16, nativeGlucoseMGDL: Double) {
         let byteOffset = sampleIndex * 4
         let rawGlucose = readBits(data, byteOffset: byteOffset, bitOffset: 0, bitCount: 0xe)
         let rawTemperature = readBits(data, byteOffset: byteOffset, bitOffset: 0xe, bitCount: 0xc) << 2
         let slope = parameters.slopeSlope * Double(rawTemperature) + parameters.offsetSlope
         let offset = parameters.slopeOffset * Double(rawTemperature) + parameters.offsetOffset
-        return (slope * Double(rawGlucose) + offset) * parameters.extraSlope + parameters.extraOffset
+        let nativeGlucoseMGDL = (slope * Double(rawGlucose) + offset) * parameters.extraSlope + parameters.extraOffset
+        return (UInt16(rawGlucose), nativeGlucoseMGDL)
     }
 
     private static func readBits(

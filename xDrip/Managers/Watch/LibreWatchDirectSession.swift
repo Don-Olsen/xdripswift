@@ -14,7 +14,8 @@ enum LibreWatchMessageKey {
     static let persistedSession = "libreWatchDirectPersistedSession.v2"
     static let persistedOwnership = "libreWatchDirectPersistedOwnership.v2"
     static let persistedCalibration = "libreWatchCalibrationSnapshot.v1"
-    static let persistedReading = "libreWatchDirectPersistedReading.v1"
+    static let persistedReading = "libreWatchDirectPersistedReading.v2"
+    static let legacyPersistedReading = "libreWatchDirectPersistedReading.v1"
 }
 
 enum LibreWatchCommand: String, Codable {
@@ -179,36 +180,113 @@ struct LibreWatchDirectSession: Codable, Equatable, Identifiable {
     }
 }
 
+enum LibreWatchValueDomain: String, Codable, Equatable {
+    case factoryNativeMGDL
+    case xDripRawGlucose
+}
+
+/// A versioned Watch reading keeps both Libre value domains. `valueDomain` records which
+/// one was selected by the matching iPhone calibration snapshot when the frame arrived.
 struct LibreWatchDirectReadingPayload: Codable, Equatable, Identifiable {
+    static let currentVersion = 2
+
+    let version: Int
     let id: UUID
     let sessionID: UUID
-    let glucoseMGDL: Double
-    let trendMGDLPerMinute: Double?
+    let valueDomain: LibreWatchValueDomain
+    let nativeGlucoseMGDL: Double
+    let previousNativeGlucoseMGDL: Double
+    let rawGlucose: UInt16
+    let previousRawGlucose: UInt16
     let sensorTimeInMinutes: UInt16
     let receivedAt: Date
+    let calibrationRevision: UInt64
 
     init(
+        version: Int = Self.currentVersion,
         id: UUID = UUID(),
         sessionID: UUID,
-        glucoseMGDL: Double,
-        trendMGDLPerMinute: Double?,
+        valueDomain: LibreWatchValueDomain,
+        nativeGlucoseMGDL: Double,
+        previousNativeGlucoseMGDL: Double,
+        rawGlucose: UInt16,
+        previousRawGlucose: UInt16,
         sensorTimeInMinutes: UInt16,
-        receivedAt: Date
+        receivedAt: Date,
+        calibrationRevision: UInt64
     ) {
+        self.version = version
         self.id = id
         self.sessionID = sessionID
-        self.glucoseMGDL = glucoseMGDL
-        self.trendMGDLPerMinute = trendMGDLPerMinute
+        self.valueDomain = valueDomain
+        self.nativeGlucoseMGDL = nativeGlucoseMGDL
+        self.previousNativeGlucoseMGDL = previousNativeGlucoseMGDL
+        self.rawGlucose = rawGlucose
+        self.previousRawGlucose = previousRawGlucose
         self.sensorTimeInMinutes = sensorTimeInMinutes
         self.receivedAt = receivedAt
+        self.calibrationRevision = calibrationRevision
     }
 
     var isValid: Bool {
-        glucoseMGDL.isFinite &&
-            glucoseMGDL > 0 &&
-            glucoseMGDL <= 3_000 &&
-            (trendMGDLPerMinute?.isFinite ?? true) &&
+        version == Self.currentVersion &&
+            nativeGlucoseMGDL.isFinite &&
+            nativeGlucoseMGDL > 0 &&
+            nativeGlucoseMGDL <= 3_000 &&
+            previousNativeGlucoseMGDL.isFinite &&
+            previousNativeGlucoseMGDL > 0 &&
+            previousNativeGlucoseMGDL <= 3_000 &&
+            rawGlucose > 0 &&
+            rawGlucose <= 0x3FFF &&
+            previousRawGlucose > 0 &&
+            previousRawGlucose <= 0x3FFF &&
+            calibrationRevision > 0 &&
             receivedAt <= Date().addingTimeInterval(5 * 60)
+    }
+
+    var xDripCalibrationInput: Double {
+        Double(rawGlucose) * ConstantsBloodGlucose.libreMultiplier
+    }
+
+    var previousXDripCalibrationInput: Double {
+        Double(previousRawGlucose) * ConstantsBloodGlucose.libreMultiplier
+    }
+
+    func sourceValue(for domain: LibreWatchValueDomain) -> Double {
+        switch domain {
+        case .factoryNativeMGDL:
+            return nativeGlucoseMGDL
+        case .xDripRawGlucose:
+            return xDripCalibrationInput
+        }
+    }
+
+    func previousSourceValue(for domain: LibreWatchValueDomain) -> Double {
+        switch domain {
+        case .factoryNativeMGDL:
+            return previousNativeGlucoseMGDL
+        case .xDripRawGlucose:
+            return previousXDripCalibrationInput
+        }
+    }
+
+    func sourceTrendPerMinute(for domain: LibreWatchValueDomain) -> Double {
+        (sourceValue(for: domain) - previousSourceValue(for: domain)) / 2
+    }
+
+    func isValid(for snapshot: LibreWatchCalibrationSnapshot) -> Bool {
+        isValid &&
+            snapshot.isValid &&
+            sessionID == snapshot.watchSessionID &&
+            valueDomain == snapshot.requiredValueDomain &&
+            calibrationRevision <= snapshot.revision
+    }
+
+    func isCurrent(
+        at date: Date,
+        freshnessInterval: TimeInterval = 3 * 60
+    ) -> Bool {
+        isValid && date.timeIntervalSince(receivedAt) <= freshnessInterval
     }
 }
 
@@ -220,6 +298,17 @@ enum LibreWatchCalibrationType: String, Codable, Equatable {
     var usesXDripCalibration: Bool {
         self != .factoryCalibrated
     }
+
+    var requiredValueDomain: LibreWatchValueDomain {
+        usesXDripCalibration ? .xDripRawGlucose : .factoryNativeMGDL
+    }
+}
+
+struct LibreWatchDirectPresentation: Equatable {
+    let glucoseMGDL: Double
+    let trendMGDLPerMinute: Double?
+    let deltaMGDL: Double?
+    let isStale: Bool
 }
 
 /// Versioned snapshot of the iPhone calibration needed to render direct readings on Watch.
@@ -266,15 +355,23 @@ struct LibreWatchCalibrationSnapshot: Codable, Equatable {
     }
 
     var isValid: Bool {
-        version == Self.currentVersion &&
+        let dividerIsValid = calibrationType.usesXDripCalibration
+            ? rawValueDivider == 1_000
+            : rawValueDivider == 1
+
+        return version == Self.currentVersion &&
             !activeSensorID.isEmpty &&
             sensorUID.count == 8 &&
             !sensorSerialNumber.isEmpty &&
             slope.isFinite &&
             intercept.isFinite &&
             rawValueDivider.isFinite &&
-            rawValueDivider > 0 &&
+            dividerIsValid &&
             revision > 0
+    }
+
+    var requiredValueDomain: LibreWatchValueDomain {
+        calibrationType.requiredValueDomain
     }
 
     func matches(session: LibreWatchDirectSession) -> Bool {
@@ -297,16 +394,16 @@ struct LibreWatchCalibrationSnapshot: Codable, Equatable {
     }
 
     func displayedGlucose(for reading: LibreWatchDirectReadingPayload) -> Double? {
-        guard reading.isValid, reading.sessionID == watchSessionID else { return nil }
+        guard reading.isValid(for: self), reading.sessionID == watchSessionID else { return nil }
 
         if calibrationType == .factoryCalibrated {
             // Mirrors NoCalibrator: factory values are already mg/dL and are only capped.
-            return min(600, reading.glucoseMGDL)
+            return min(600, reading.nativeGlucoseMGDL)
         }
 
-        // Mirrors Calibrator.createNewBgReading: iPhone receives reading.glucoseMGDL,
-        // divides that exact input by rawValueDivider, then applies slope/intercept.
-        let calibrated = slope * (reading.glucoseMGDL / rawValueDivider) + intercept
+        // Mirrors Libre2BLEUtilities + Libre1Calibrator exactly: the 14-bit Libre value is
+        // multiplied first, then Calibrator divides that input by 1000 before applying slope.
+        let calibrated = slope * (reading.xDripCalibrationInput / rawValueDivider) + intercept
         guard calibrated.isFinite else { return nil }
 
         // Mirrors Calibrator.updateCalculatedValue(for:).
@@ -315,37 +412,50 @@ struct LibreWatchCalibrationSnapshot: Codable, Equatable {
     }
 
     func displayedTrend(for reading: LibreWatchDirectReadingPayload) -> Double? {
-        guard reading.isValid, reading.sessionID == watchSessionID else { return nil }
+        guard reading.isValid(for: self), reading.sessionID == watchSessionID else { return nil }
 
-        if calibrationType == .factoryCalibrated {
-            return reading.trendMGDLPerMinute
-        }
-
-        guard let directTrend = reading.trendMGDLPerMinute else { return nil }
-        let calibratedTrend = slope * directTrend / rawValueDivider
-        return calibratedTrend.isFinite ? calibratedTrend : nil
+        let sourceTrend = reading.sourceTrendPerMinute(for: requiredValueDomain)
+        let displayedTrend = calibrationType.usesXDripCalibration
+            ? slope * sourceTrend / rawValueDivider
+            : sourceTrend
+        return displayedTrend.isFinite ? displayedTrend : nil
     }
 
-    func displayedDelta(sourceDeltaMGDL: Double?) -> Double? {
-        guard let sourceDeltaMGDL, sourceDeltaMGDL.isFinite else { return nil }
+    func displayedDelta(sourceDelta: Double?) -> Double? {
+        guard let sourceDelta, sourceDelta.isFinite else { return nil }
         if calibrationType == .factoryCalibrated {
-            return sourceDeltaMGDL
+            return sourceDelta
         }
-        let calibratedDelta = slope * sourceDeltaMGDL / rawValueDivider
+        let calibratedDelta = slope * sourceDelta / rawValueDivider
         return calibratedDelta.isFinite ? calibratedDelta : nil
+    }
+
+    func presentation(
+        for reading: LibreWatchDirectReadingPayload,
+        sourceDelta: Double?,
+        at date: Date
+    ) -> LibreWatchDirectPresentation? {
+        guard let glucose = displayedGlucose(for: reading) else { return nil }
+        let isStale = !reading.isCurrent(at: date)
+        return LibreWatchDirectPresentation(
+            glucoseMGDL: glucose,
+            trendMGDLPerMinute: isStale ? nil : displayedTrend(for: reading),
+            deltaMGDL: isStale ? nil : displayedDelta(sourceDelta: sourceDelta),
+            isStale: isStale
+        )
     }
 }
 
 /// Last direct reading as rendered on Watch. Source values are retained so a newer
 /// calibration snapshot can immediately recompute the display without waiting for Libre.
 struct LibreWatchPersistedDirectReading: Codable, Equatable {
-    static let currentVersion = 1
+    static let currentVersion = 2
 
     let version: Int
     let sessionID: UUID
     let sensorIdentity: String
     let sourceReading: LibreWatchDirectReadingPayload
-    let sourceDeltaMGDL: Double?
+    let sourceDelta: Double?
     let displayedGlucoseMGDL: Double
     let displayedTrendMGDLPerMinute: Double?
     let displayedDeltaMGDL: Double?
@@ -356,7 +466,7 @@ struct LibreWatchPersistedDirectReading: Codable, Equatable {
         sessionID: UUID,
         sensorIdentity: String,
         sourceReading: LibreWatchDirectReadingPayload,
-        sourceDeltaMGDL: Double? = nil,
+        sourceDelta: Double? = nil,
         displayedGlucoseMGDL: Double,
         displayedTrendMGDLPerMinute: Double?,
         displayedDeltaMGDL: Double? = nil,
@@ -366,23 +476,27 @@ struct LibreWatchPersistedDirectReading: Codable, Equatable {
         self.sessionID = sessionID
         self.sensorIdentity = sensorIdentity
         self.sourceReading = sourceReading
-        self.sourceDeltaMGDL = sourceDeltaMGDL
+        self.sourceDelta = sourceDelta
         self.displayedGlucoseMGDL = displayedGlucoseMGDL
         self.displayedTrendMGDLPerMinute = displayedTrendMGDLPerMinute
         self.displayedDeltaMGDL = displayedDeltaMGDL
         self.calibrationRevision = calibrationRevision
     }
 
-    func isValid(for session: LibreWatchDirectSession) -> Bool {
+    func isValid(
+        for session: LibreWatchDirectSession,
+        calibration: LibreWatchCalibrationSnapshot
+    ) -> Bool {
         version == Self.currentVersion &&
             sessionID == session.id &&
             sourceReading.sessionID == session.id &&
             sensorIdentity == session.redactedIdentity() &&
-            sourceReading.isValid &&
+            calibration.matches(session: session) &&
+            sourceReading.isValid(for: calibration) &&
             displayedGlucoseMGDL.isFinite &&
             displayedGlucoseMGDL > 0 &&
             displayedGlucoseMGDL <= 600 &&
-            (sourceDeltaMGDL?.isFinite ?? true) &&
+            (sourceDelta?.isFinite ?? true) &&
             (displayedTrendMGDLPerMinute?.isFinite ?? true) &&
             (displayedDeltaMGDL?.isFinite ?? true)
     }
@@ -434,8 +548,15 @@ enum LibreWatchSessionStore {
     }
 
     static func loadReading(defaults: UserDefaults = .standard) -> LibreWatchPersistedDirectReading? {
-        guard let data = defaults.data(forKey: LibreWatchMessageKey.persistedReading) else { return nil }
-        return try? JSONDecoder().decode(LibreWatchPersistedDirectReading.self, from: data)
+        defaults.removeObject(forKey: LibreWatchMessageKey.legacyPersistedReading)
+        guard let data = defaults.data(forKey: LibreWatchMessageKey.persistedReading),
+              let reading = try? JSONDecoder().decode(LibreWatchPersistedDirectReading.self, from: data),
+              reading.version == LibreWatchPersistedDirectReading.currentVersion
+        else {
+            defaults.removeObject(forKey: LibreWatchMessageKey.persistedReading)
+            return nil
+        }
+        return reading
     }
 
     static func saveReading(
@@ -448,6 +569,7 @@ enum LibreWatchSessionStore {
 
     static func clearReading(defaults: UserDefaults = .standard) {
         defaults.removeObject(forKey: LibreWatchMessageKey.persistedReading)
+        defaults.removeObject(forKey: LibreWatchMessageKey.legacyPersistedReading)
     }
 
     static func clear(defaults: UserDefaults = .standard) {
@@ -455,6 +577,7 @@ enum LibreWatchSessionStore {
         defaults.removeObject(forKey: LibreWatchMessageKey.persistedOwnership)
         defaults.removeObject(forKey: LibreWatchMessageKey.persistedCalibration)
         defaults.removeObject(forKey: LibreWatchMessageKey.persistedReading)
+        defaults.removeObject(forKey: LibreWatchMessageKey.legacyPersistedReading)
     }
 }
 
