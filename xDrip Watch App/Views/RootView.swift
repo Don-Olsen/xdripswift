@@ -31,7 +31,7 @@ struct RootView: View {
                 .tag(WatchAppPage.agp.rawValue)
 
             // large number page
-            BigNumberView()
+            BigNumberView(libreDirectCollector: libreDirectCollector)
                 .tag(WatchAppPage.bigNumber.rawValue)
 
             // Explicit persistent hand-off between iPhone and direct Watch reception.
@@ -41,14 +41,24 @@ struct RootView: View {
         .modifier(RootViewTabViewStyleModifier())
         .environmentObject(watchState)
         .onAppear {
-            // if a saved tab value from an older build is invalid, fall back to the normal main page
-            if WatchAppPage(rawValue: selectedPage) == nil {
+            if watchState.libreWatchOwnership == .watch {
+                selectedPage = WatchAppPage.bigNumber.rawValue
+            } else if WatchAppPage(rawValue: selectedPage) == nil {
+                // if a saved tab value from an older build is invalid, fall back to the normal main page
                 selectedPage = WatchAppPage.main.rawValue
             }
             libreDirectCollector.applicationActivityDidChange(isActive: scenePhase == .active)
         }
         .onChange(of: scenePhase) { newPhase in
             libreDirectCollector.applicationActivityDidChange(isActive: newPhase == .active)
+            if newPhase == .active, watchState.libreWatchOwnership == .watch {
+                selectedPage = WatchAppPage.bigNumber.rawValue
+            }
+        }
+        .onChange(of: watchState.libreWatchOwnership) { ownership in
+            if ownership == .watch {
+                selectedPage = WatchAppPage.bigNumber.rawValue
+            }
         }
     }
 }

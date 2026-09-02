@@ -16,6 +16,11 @@ import UIKit
 
 struct BigNumberView: View {
     @EnvironmentObject var watchState: WatchStateModel
+    @Environment(\.scenePhase) private var scenePhase
+    @ObservedObject var libreDirectCollector: LibreWatchDirectCollector
+    @State private var displayDate = Date()
+
+    private let displayTimer = Timer.publish(every: 15, on: .main, in: .common).autoconnect()
     
     let isSmallScreen = {
         #if canImport(WatchKit)
@@ -104,7 +109,7 @@ struct BigNumberView: View {
                     .padding(.top, 4)
                     .padding(.trailing, 2)
                 
-                Text(watchState.lastUpdatedMinsAgoString())
+                Text(watchState.lastUpdatedMinsAgoString(at: displayDate))
                     .font(.system(size: isSmallScreen ? 20 : 22))
                     .foregroundStyle(minsAgoTextColor)
                     .animation(.easeOut(duration: 0.3), value: minsAgoTextColor)
@@ -113,8 +118,22 @@ struct BigNumberView: View {
                     }
             }
             .padding(.top, 15)
-            .padding(.bottom, -20)
+            .padding(.bottom, watchState.libreWatchOwnership == .watch ? 0 : -20)
+
+            let connectionIsRecovering = libreDirectCollector.state.stage != .receiving
+            if let directStatus = watchState.directLibreStatus(connectionIsRecovering: connectionIsRecovering) {
+                Text(directStatus)
+                    .font(.caption2.bold())
+                    .foregroundStyle(connectionIsRecovering ? Color.orange : Color.green)
+                    .padding(.top, 2)
+                    .padding(.bottom, -18)
+            }
         }
+        .onAppear { displayDate = Date() }
+        .onChange(of: scenePhase) { newPhase in
+            if newPhase == .active { displayDate = Date() }
+        }
+        .onReceive(displayTimer) { displayDate = $0 }
     }
     
     func animateTextScale(){
@@ -195,7 +214,7 @@ struct BigNumberView_Previews: PreviewProvider {
         watchState.sensorMaxAgeInMinutes = 14400
         
         return Group {
-            BigNumberView()
+            BigNumberView(libreDirectCollector: LibreWatchDirectCollector())
         }.environmentObject(watchState)
     }
 }

@@ -1720,6 +1720,7 @@ import AppIntents
         }
 
         coreDataManager.saveChanges()
+        watchManager?.publishLibreWatchCalibration()
         sensorNoiseManager?.update(activeSensor: activeSensor)
 
         // Record the exact immutable snapshot supplied by CalibrationView. Recomputing here after

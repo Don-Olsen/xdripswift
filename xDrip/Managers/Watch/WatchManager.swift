@@ -9,6 +9,7 @@
 import Combine
 import Foundation
 import OSLog
+import UIKit
 import WatchConnectivity
 import WidgetKit
 
@@ -30,6 +31,9 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
     /// a SensorsAccessor instance
     private var sensorsAccessor: SensorsAccessor
 
+    /// Supplies the exact active iPhone calibration used for direct Watch display.
+    private var calibrationsAccessor: CalibrationsAccessor
+
     /// a coreDataManager instance (must be passed from RVC in the initializer)
     private var coreDataManager: CoreDataManager
 
@@ -41,6 +45,7 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
 
     private var libreWatchDirectSession: LibreWatchDirectSession?
     private var libreWatchOwnership: LibreWatchOwnership = .iphone
+    private var libreWatchCalibrationSnapshot: LibreWatchCalibrationSnapshot?
     private var libreWatchObservers: [NSObjectProtocol] = []
 
     /// Statistics manager used to build compact AGP backgrounds for the Watch chart
@@ -76,6 +81,7 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
         self.coreDataManager = coreDataManager
         self.bgReadingsAccessor = BgReadingsAccessor(coreDataManager: coreDataManager)
         self.sensorsAccessor = SensorsAccessor(coreDataManager: coreDataManager)
+        self.calibrationsAccessor = CalibrationsAccessor(coreDataManager: coreDataManager)
         self.nightscoutSyncManager = nightscoutSyncManager
         self.bluetoothPeripheralManager = bluetoothPeripheralManager
         self.statisticsManager = StatisticsManager(coreDataManager: coreDataManager)
@@ -86,6 +92,7 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
 
         libreWatchDirectSession = LibreWatchSessionStore.loadSession()
         libreWatchOwnership = LibreWatchSessionStore.loadOwnership()
+        libreWatchCalibrationSnapshot = LibreWatchSessionStore.loadCalibration()
 
         // An interrupted transition is recovered on the phone. A completed Watch owner remains
         // authoritative across app restarts and immediately suppresses the phone reconnect loop.
@@ -111,6 +118,14 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
             guard let self else { return }
             self.setLibreWatchOwnership(.iphone)
             self.sendLibreWatchSession()
+        })
+
+        libreWatchObservers.append(NotificationCenter.default.addObserver(
+            forName: UIApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.sendLibreWatchSession()
         })
 
         if let transmitter = bluetoothPeripheralManager.getCGMTransmitter() as? CGMLibre2Transmitter {
@@ -437,10 +452,17 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
               session.activationState == .activated
         else { return }
 
-        let payload: [String: Any] = [
+        refreshLibreWatchCalibrationSnapshot(for: libreWatchDirectSession)
+
+        var payload: [String: Any] = [
             LibreWatchMessageKey.session: encoded,
             LibreWatchMessageKey.ownership: libreWatchOwnership.rawValue
         ]
+        if let snapshot = libreWatchCalibrationSnapshot,
+           snapshot.matches(session: libreWatchDirectSession),
+           let calibrationData = try? JSONEncoder().encode(snapshot) {
+            payload[LibreWatchMessageKey.calibration] = calibrationData
+        }
         try? session.updateApplicationContext(payload)
         if session.isReachable {
             session.sendMessage(payload, replyHandler: nil, errorHandler: { [weak self] error in
@@ -448,6 +470,78 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
                 trace("Could not send Libre Watch session: %{public}@", log: self.log, category: ConstantsLog.categoryWatchManager, type: .error, error.localizedDescription)
             })
         }
+    }
+
+    private func refreshLibreWatchCalibrationSnapshot(for directSession: LibreWatchDirectSession) {
+        guard let activeSensor = sensorsAccessor.fetchActiveSensor(),
+              let transmitter = bluetoothPeripheralManager.getCGMTransmitter() as? CGMLibre2Transmitter
+        else {
+            libreWatchCalibrationSnapshot = nil
+            LibreWatchSessionStore.clearCalibration()
+            return
+        }
+
+        let calibrationType: LibreWatchCalibrationType
+        let slope: Double
+        let intercept: Double
+        let rawValueDivider: Double
+        let calibratedAt: Date
+
+        if transmitter.isWebOOPEnabled() {
+            calibrationType = .factoryCalibrated
+            slope = 1
+            intercept = 0
+            rawValueDivider = 1
+            calibratedAt = directSession.createdAt
+        } else {
+            guard let calibration = calibrationsAccessor.lastCalibrationForActiveSensor(withActivesensor: activeSensor) else {
+                libreWatchCalibrationSnapshot = nil
+                LibreWatchSessionStore.clearCalibration()
+                return
+            }
+            calibrationType = transmitter.isNonFixedSlopeEnabled() ? .nonFixedSlope : .fixedSlope
+            slope = calibration.slope
+            intercept = calibration.intercept
+            rawValueDivider = 1_000
+            calibratedAt = calibration.timeStamp
+        }
+
+        let draft = LibreWatchCalibrationSnapshot(
+            activeSensorID: activeSensor.id,
+            sensorUID: directSession.sensorUID,
+            sensorSerialNumber: directSession.sensorSerialNumber,
+            watchSessionID: directSession.id,
+            calibrationType: calibrationType,
+            slope: slope,
+            intercept: intercept,
+            rawValueDivider: rawValueDivider,
+            calibratedAt: calibratedAt,
+            revision: 1
+        )
+
+        let previous = LibreWatchSessionStore.loadCalibration()
+        if let previous, previous.hasSameCalibration(as: draft) {
+            libreWatchCalibrationSnapshot = previous
+            return
+        }
+
+        let clockRevision = UInt64(max(1, Date().timeIntervalSince1970 * 1_000))
+        let previousRevision = previous?.revision ?? 0
+        let nextRevision = max(clockRevision, previousRevision == UInt64.max ? previousRevision : previousRevision + 1)
+        let snapshot = LibreWatchCalibrationSnapshot(
+            activeSensorID: draft.activeSensorID,
+            sensorUID: draft.sensorUID,
+            sensorSerialNumber: draft.sensorSerialNumber,
+            watchSessionID: draft.watchSessionID,
+            calibrationType: draft.calibrationType,
+            slope: draft.slope,
+            intercept: draft.intercept,
+            rawValueDivider: draft.rawValueDivider,
+            calibratedAt: draft.calibratedAt,
+            revision: nextRevision
+        )
+        libreWatchCalibrationSnapshot = snapshot
+        LibreWatchSessionStore.saveCalibration(snapshot)
     }
 
     @discardableResult
@@ -584,6 +678,15 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
         processWatchUpdate(updateTypes: [.status, .bgReadings], forceComplicationUpdate: forceComplicationUpdate)
     }
 
+    /// Sends a newly created or changed iPhone calibration to the active Watch session.
+    func publishLibreWatchCalibration() {
+        if Thread.isMainThread {
+            sendLibreWatchSession()
+        } else {
+            DispatchQueue.main.async { [weak self] in self?.sendLibreWatchSession() }
+        }
+    }
+
     deinit {
         UserDefaults.standard.removeObserver(self, forKeyPath: UserDefaults.Key.nightscoutDeviceStatusWasUpdated.rawValue)
         libreWatchObservers.forEach { NotificationCenter.default.removeObserver($0) }
@@ -627,6 +730,7 @@ extension WatchManager: WCSessionDelegate {
             case "status":
                 DispatchQueue.main.async {
                     self.processWatchUpdate(updateTypes: [.status], forceComplicationUpdate: false)
+                    self.sendLibreWatchSession()
                 }
             case "bgReadings":
                 DispatchQueue.main.async {
