@@ -41,6 +41,16 @@ workflows:
             -resultBundlePath "$CM_BUILD_DIR/build/test-results/LibreWatchValuePipelineTests.xcresult" \
             CODE_SIGNING_ALLOWED=NO
 
+      - name: Compile Watch app target
+        script: |
+          set -euo pipefail
+          xcodebuild build \
+            -workspace "$CM_BUILD_DIR/xdrip.xcworkspace" \
+            -scheme "xDrip Watch App" \
+            -configuration Debug \
+            -destination "generic/platform=watchOS Simulator" \
+            CODE_SIGNING_ALLOWED=NO
+
       - name: Verify the xDrip4iOS release
         script: |
           set -euo pipefail
@@ -244,6 +254,17 @@ workflows:
             CODE_SIGN_IDENTITY="Apple Distribution" \
             DEVELOPMENT_TEAM="$XDRIP_TEAM_ID" \
             archive
+
+          watch_app="$CM_BUILD_DIR/build/ios/xcarchive/xdrip.xcarchive/Products/Applications/xdrip.app/Watch/xDrip Watch App.app"
+          test -d "$watch_app"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :WKBackgroundModes:0' "$watch_app/Info.plist")" = "self-care"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :UIBackgroundModes:0' "$watch_app/Info.plist")" = "bluetooth-central"
+          codesign --verify --deep --strict "$watch_app"
+          watch_signing_info="$(codesign -dv --verbose=4 "$watch_app" 2>&1)"
+          case "$watch_signing_info" in
+            *"TeamIdentifier=${XDRIP_TEAM_ID}"*) ;;
+            *) echo "Archived Watch app has the wrong signing team"; exit 1 ;;
+          esac
 
           mkdir -p "$CM_BUILD_DIR/build/ios/ipa"
           xcodebuild \

@@ -212,6 +212,68 @@ final class LibreWatchValuePipelineTests: XCTestCase {
         XCTAssertNil(stale.deltaMGDL)
     }
 
+    func testActiveApplicationAllowsRecoveryWithoutExtendedRuntime() {
+        XCTAssertTrue(LibreWatchLifecyclePolicy.recoveryIsAllowed(
+            applicationIsActive: true,
+            extendedRuntimeIsRunning: false,
+            ownership: .watch
+        ))
+        XCTAssertTrue(LibreWatchLifecyclePolicy.shouldStartExtendedRuntime(
+            userInitiatedTakeover: true,
+            applicationIsActive: true,
+            ownership: .watch,
+            alreadyHasSession: false
+        ))
+    }
+
+    func testInactiveApplicationAllowsRecoveryWhileExtendedRuntimeIsRunning() {
+        XCTAssertTrue(LibreWatchLifecyclePolicy.recoveryIsAllowed(
+            applicationIsActive: false,
+            extendedRuntimeIsRunning: true,
+            ownership: .watch
+        ))
+    }
+
+    func testInactiveApplicationWithoutExtendedRuntimeDoesNotStartRecoveryWork() {
+        XCTAssertFalse(LibreWatchLifecyclePolicy.recoveryIsAllowed(
+            applicationIsActive: false,
+            extendedRuntimeIsRunning: false,
+            ownership: .watch
+        ))
+        XCTAssertFalse(LibreWatchLifecyclePolicy.shouldStartExtendedRuntime(
+            userInitiatedTakeover: false,
+            applicationIsActive: true,
+            ownership: .watch,
+            alreadyHasSession: false
+        ))
+    }
+
+    func testSystemAutoReconnectDoesNotStartParallelManualConnection() {
+        let action = LibreWatchLifecyclePolicy.disconnectRecoveryAction(
+            isDeliberate: false,
+            systemIsReconnecting: true,
+            recoveryIsAllowed: true,
+            ownership: .watch
+        )
+
+        XCTAssertEqual(action, .waitForSystemReconnect)
+        XCTAssertNotEqual(action, .reconnectManually)
+    }
+
+    func testReturningOwnershipToIPhoneStopsRuntimeAndRecovery() {
+        XCTAssertTrue(LibreWatchLifecyclePolicy.shouldStopExtendedRuntime(
+            ownership: .releasingToPhone
+        ))
+        XCTAssertTrue(LibreWatchLifecyclePolicy.shouldStopExtendedRuntime(
+            ownership: .iphone
+        ))
+        XCTAssertFalse(LibreWatchLifecyclePolicy.recoveryIsAllowed(
+            applicationIsActive: true,
+            extendedRuntimeIsRunning: true,
+            ownership: .iphone
+        ))
+    }
+
     private var watchAlgorithmParameters: LibreWatchAlgorithmParameters {
         LibreWatchAlgorithmParameters(
             slopeSlope: 0,

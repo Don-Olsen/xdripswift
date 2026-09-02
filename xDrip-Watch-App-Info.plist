@@ -12,5 +12,9 @@
 	<array>
 		<string>bluetooth-central</string>
 	</array>
+	<key>WKBackgroundModes</key>
+	<array>
+		<string>self-care</string>
+	</array>
 </dict>
 </plist>

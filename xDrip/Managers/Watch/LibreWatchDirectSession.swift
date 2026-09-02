@@ -52,6 +52,61 @@ enum LibreWatchOwnership: String, Codable, Equatable {
     }
 }
 
+enum LibreWatchDisconnectRecoveryAction: Equatable {
+    case finishDeliberateDisconnect
+    case waitForSystemReconnect
+    case reconnectManually
+    case noAdditionalWork
+}
+
+/// Pure lifecycle policy shared by the Watch collector and deterministic iPhone tests.
+/// Recovery work is allowed only while the app can actually execute, and Core Bluetooth's
+/// auto-reconnect always wins over a parallel manual connection attempt.
+struct LibreWatchLifecyclePolicy {
+    static func recoveryIsAllowed(
+        applicationIsActive: Bool,
+        extendedRuntimeIsRunning: Bool,
+        ownership: LibreWatchOwnership
+    ) -> Bool {
+        ownership == .watch && (applicationIsActive || extendedRuntimeIsRunning)
+    }
+
+    static func shouldStartExtendedRuntime(
+        userInitiatedTakeover: Bool,
+        applicationIsActive: Bool,
+        ownership: LibreWatchOwnership,
+        alreadyHasSession: Bool
+    ) -> Bool {
+        userInitiatedTakeover &&
+            applicationIsActive &&
+            ownership == .watch &&
+            !alreadyHasSession
+    }
+
+    static func shouldStopExtendedRuntime(
+        ownership: LibreWatchOwnership,
+        sensorChanged: Bool = false,
+        watchSessionEnded: Bool = false
+    ) -> Bool {
+        ownership != .watch || sensorChanged || watchSessionEnded
+    }
+
+    static func disconnectRecoveryAction(
+        isDeliberate: Bool,
+        systemIsReconnecting: Bool,
+        recoveryIsAllowed: Bool,
+        ownership: LibreWatchOwnership
+    ) -> LibreWatchDisconnectRecoveryAction {
+        if isDeliberate {
+            return .finishDeliberateDisconnect
+        }
+        guard ownership == .watch, recoveryIsAllowed else {
+            return .noAdditionalWork
+        }
+        return systemIsReconnecting ? .waitForSystemReconnect : .reconnectManually
+    }
+}
+
 struct LibreWatchAlgorithmParameters: Codable, Equatable {
     let slopeSlope: Double
     let slopeOffset: Double
