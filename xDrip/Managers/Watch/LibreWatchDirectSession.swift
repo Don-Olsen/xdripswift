@@ -59,10 +59,21 @@ enum LibreWatchDisconnectRecoveryAction: Equatable {
     case noAdditionalWork
 }
 
+enum LibreWatchReconnectFallbackAction: Equatable {
+    case wait(TimeInterval)
+    case restartConfirmedSensorScan
+    case noAdditionalWork
+}
+
 /// Pure lifecycle policy shared by the Watch collector and deterministic iPhone tests.
 /// Recovery work is allowed only while the app can actually execute, and Core Bluetooth's
 /// auto-reconnect always wins over a parallel manual connection attempt.
 struct LibreWatchLifecyclePolicy {
+    static let foregroundReconnectFallbackDelay: TimeInterval = 12
+    static let extendedRuntimeReconnectFallbackDelay: TimeInterval = 90
+    static let foregroundNoDataRecoveryDelay: TimeInterval = 2 * 60
+    static let extendedRuntimeNoDataRecoveryDelay: TimeInterval = 3 * 60
+
     static func recoveryIsAllowed(
         applicationIsActive: Bool,
         extendedRuntimeIsRunning: Bool,
@@ -104,6 +115,44 @@ struct LibreWatchLifecyclePolicy {
             return .noAdditionalWork
         }
         return systemIsReconnecting ? .waitForSystemReconnect : .reconnectManually
+    }
+
+    static func reconnectFallbackAction(
+        reconnectStartedAt: Date,
+        now: Date,
+        applicationIsActive: Bool,
+        extendedRuntimeIsRunning: Bool,
+        ownership: LibreWatchOwnership
+    ) -> LibreWatchReconnectFallbackAction {
+        guard recoveryIsAllowed(
+            applicationIsActive: applicationIsActive,
+            extendedRuntimeIsRunning: extendedRuntimeIsRunning,
+            ownership: ownership
+        ) else {
+            return .noAdditionalWork
+        }
+
+        let timeout = applicationIsActive
+            ? foregroundReconnectFallbackDelay
+            : extendedRuntimeReconnectFallbackDelay
+        let remaining = timeout - max(0, now.timeIntervalSince(reconnectStartedAt))
+        return remaining <= 0 ? .restartConfirmedSensorScan : .wait(remaining)
+    }
+
+    static func noDataRecoveryDelay(
+        applicationIsActive: Bool,
+        extendedRuntimeIsRunning: Bool,
+        ownership: LibreWatchOwnership
+    ) -> TimeInterval? {
+        guard recoveryIsAllowed(
+            applicationIsActive: applicationIsActive,
+            extendedRuntimeIsRunning: extendedRuntimeIsRunning,
+            ownership: ownership
+        ) else { return nil }
+
+        return applicationIsActive
+            ? foregroundNoDataRecoveryDelay
+            : extendedRuntimeNoDataRecoveryDelay
     }
 }
 
@@ -342,6 +391,63 @@ struct LibreWatchDirectReadingPayload: Codable, Equatable, Identifiable {
         freshnessInterval: TimeInterval = 3 * 60
     ) -> Bool {
         isValid && date.timeIntervalSince(receivedAt) <= freshnessInterval
+    }
+}
+
+/// Shared ordering and freshness gate for direct Watch readings. It deliberately does not
+/// inspect glucose values, so a fresh physiological LOW is treated exactly like any other value.
+struct LibreWatchReadingAcceptancePolicy {
+    static let maximumTransportAge: TimeInterval = 3 * 60
+
+    private(set) var sessionID: UUID?
+    private(set) var acceptedPayloadIDs = Set<UUID>()
+    private(set) var lastSensorTimeInMinutes: UInt16?
+    private(set) var lastReceivedAt: Date?
+
+    mutating func reset(
+        for sessionID: UUID? = nil,
+        seeding reading: LibreWatchDirectReadingPayload? = nil
+    ) {
+        self.sessionID = sessionID
+        acceptedPayloadIDs.removeAll(keepingCapacity: true)
+        lastSensorTimeInMinutes = nil
+        lastReceivedAt = nil
+
+        guard let sessionID,
+              let reading,
+              reading.isValid,
+              reading.sessionID == sessionID
+        else { return }
+
+        acceptedPayloadIDs.insert(reading.id)
+        lastSensorTimeInMinutes = reading.sensorTimeInMinutes
+        lastReceivedAt = reading.receivedAt
+    }
+
+    mutating func accept(
+        _ reading: LibreWatchDirectReadingPayload,
+        for expectedSessionID: UUID,
+        now: Date = Date(),
+        maximumAge: TimeInterval = LibreWatchReadingAcceptancePolicy.maximumTransportAge
+    ) -> Bool {
+        guard reading.isValid,
+              reading.sessionID == expectedSessionID,
+              now.timeIntervalSince(reading.receivedAt) <= maximumAge
+        else { return false }
+
+        if sessionID != expectedSessionID {
+            reset(for: expectedSessionID)
+        }
+
+        guard !acceptedPayloadIDs.contains(reading.id),
+              lastSensorTimeInMinutes.map({ reading.sensorTimeInMinutes > $0 }) ?? true,
+              lastReceivedAt.map({ reading.receivedAt > $0 }) ?? true
+        else { return false }
+
+        acceptedPayloadIDs.insert(reading.id)
+        lastSensorTimeInMinutes = reading.sensorTimeInMinutes
+        lastReceivedAt = reading.receivedAt
+        return true
     }
 }
 

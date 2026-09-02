@@ -46,6 +46,7 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
     private var libreWatchDirectSession: LibreWatchDirectSession?
     private var libreWatchOwnership: LibreWatchOwnership = .iphone
     private var libreWatchCalibrationSnapshot: LibreWatchCalibrationSnapshot?
+    private var libreWatchReadingAcceptance = LibreWatchReadingAcceptancePolicy()
     private var libreWatchObservers: [NSObjectProtocol] = []
 
     /// Statistics manager used to build compact AGP backgrounds for the Watch chart
@@ -100,6 +101,9 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
             libreWatchOwnership = .iphone
             LibreWatchSessionStore.saveOwnership(.iphone)
         }
+        libreWatchReadingAcceptance.reset(
+            for: libreWatchOwnership == .watch ? libreWatchDirectSession?.id : nil
+        )
 
         libreWatchObservers.append(NotificationCenter.default.addObserver(
             forName: .libreWatchDirectSessionPrepared,
@@ -425,12 +429,21 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
     }
 
     private func setLibreWatchOwnership(_ ownership: LibreWatchOwnership) {
+        let ownershipChanged = ownership != libreWatchOwnership
         libreWatchOwnership = ownership
         LibreWatchSessionStore.saveOwnership(ownership)
+        if ownershipChanged {
+            libreWatchReadingAcceptance.reset(
+                for: ownership == .watch ? libreWatchDirectSession?.id : nil
+            )
+        }
     }
 
     private func storeAndSendLibreWatchSession(_ preparedSession: LibreWatchDirectSession) {
         guard preparedSession.isValid else { return }
+
+        let sessionChanged = libreWatchDirectSession?.id != preparedSession.id ||
+            libreWatchDirectSession?.representsSameSensor(as: preparedSession) == false
 
         if let existing = libreWatchDirectSession,
            !existing.representsSameSensor(as: preparedSession),
@@ -442,6 +455,11 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
 
         libreWatchDirectSession = preparedSession
         LibreWatchSessionStore.saveSession(preparedSession)
+        if sessionChanged {
+            libreWatchReadingAcceptance.reset(
+                for: libreWatchOwnership == .watch ? preparedSession.id : nil
+            )
+        }
         sendLibreWatchSession()
     }
 
@@ -632,29 +650,53 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
             ])
 
         case .submitReading:
-            refreshLibreWatchCalibrationSnapshot(for: preparedSession)
-            guard libreWatchOwnership == .watch,
-                  let data = message[LibreWatchMessageKey.reading] as? Data,
+            guard let data = message[LibreWatchMessageKey.reading] as? Data,
                   let reading = try? JSONDecoder().decode(LibreWatchDirectReadingPayload.self, from: data),
-                  reading.sessionID == sessionID,
-                  let calibrationSnapshot = libreWatchCalibrationSnapshot,
-                  calibrationSnapshot.matches(session: preparedSession),
-                  reading.isValid(for: calibrationSnapshot),
-                  let transmitter = bluetoothPeripheralManager.getCGMTransmitter() as? CGMLibre2Transmitter
+                  reading.sessionID == sessionID
             else {
-                fail("Invalid Libre reading or Watch is not the owner")
+                fail("Invalid Libre reading")
                 return true
             }
-            DispatchQueue.main.async {
+
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+
+                // Re-read every mutable hand-off dependency immediately before the normal
+                // glucose pipeline. A delayed WatchConnectivity message must not cross an
+                // ownership, sensor-session, or calibration change.
+                guard self.libreWatchOwnership == .watch,
+                      let currentSession = self.libreWatchDirectSession,
+                      currentSession.id == sessionID,
+                      currentSession.isValid
+                else {
+                    fail("Watch is not the owner of this Libre session")
+                    return
+                }
+
+                self.refreshLibreWatchCalibrationSnapshot(for: currentSession)
+                guard let calibrationSnapshot = self.libreWatchCalibrationSnapshot,
+                      calibrationSnapshot.matches(session: currentSession),
+                      reading.isValid(for: calibrationSnapshot),
+                      let transmitter = self.bluetoothPeripheralManager.getCGMTransmitter() as? CGMLibre2Transmitter,
+                      self.libreWatchReadingAcceptance.accept(
+                          reading,
+                          for: currentSession.id,
+                          now: Date()
+                      )
+                else {
+                    fail("Duplicate, stale, or out-of-order Libre reading")
+                    return
+                }
+
                 transmitter.receiveReadingFromWatch(
                     reading,
                     calibrationSnapshot: calibrationSnapshot
                 )
+                reply?([
+                    LibreWatchMessageKey.success: true,
+                    LibreWatchMessageKey.ownership: self.libreWatchOwnership.rawValue
+                ])
             }
-            reply?([
-                LibreWatchMessageKey.success: true,
-                LibreWatchMessageKey.ownership: libreWatchOwnership.rawValue
-            ])
         }
 
         return true

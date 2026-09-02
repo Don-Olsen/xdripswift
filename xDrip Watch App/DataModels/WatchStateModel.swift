@@ -137,6 +137,7 @@ final class WatchStateModel: NSObject, ObservableObject {
     /// recompute the Watch-only presentation without altering values sent back to iPhone.
     private var directReadingHistory: [LibreWatchDirectReadingPayload] = []
     private var latestDirectSourceDelta: Double?
+    private var directReadingAcceptance = LibreWatchReadingAcceptancePolicy()
 
     @Published var aidStatus: AIDStatus?
 
@@ -582,12 +583,13 @@ final class WatchStateModel: NSObject, ObservableObject {
         )
     }
 
-    func submitLibreWatchReading(_ directReading: Libre2WatchDirectReading) {
+    @discardableResult
+    func submitLibreWatchReading(_ directReading: Libre2WatchDirectReading) -> Bool {
         guard let directSession = libreWatchDirectSession,
               let snapshot = libreWatchCalibrationSnapshot,
               snapshot.matches(session: directSession),
               libreWatchOwnership == .watch
-        else { return }
+        else { return false }
 
         let reading = directReading.payload(
             sessionID: directSession.id,
@@ -596,7 +598,13 @@ final class WatchStateModel: NSObject, ObservableObject {
         )
         guard reading.isValid(for: snapshot),
               let data = try? JSONEncoder().encode(reading)
-        else { return }
+        else { return false }
+
+        guard directReadingAcceptance.accept(
+            reading,
+            for: directSession.id,
+            now: Date()
+        ) else { return false }
 
         applyLibreWatchReadingLocally(reading)
 
@@ -609,18 +617,19 @@ final class WatchStateModel: NSObject, ObservableObject {
         guard session.activationState == .activated else {
             session.activate()
             session.transferUserInfo(message)
-            return
+            return true
         }
 
         guard session.isReachable else {
             session.transferUserInfo(message)
-            return
+            return true
         }
 
         session.sendMessage(message, replyHandler: nil) { [weak self] _ in
             guard let self else { return }
             self.session.transferUserInfo(message)
         }
+        return true
     }
 
     private func applyLibreWatchReadingLocally(
@@ -810,6 +819,10 @@ final class WatchStateModel: NSObject, ObservableObject {
               stored.isValid(for: directSession, calibration: snapshot)
         else { return }
 
+        directReadingAcceptance.reset(
+            for: directSession.id,
+            seeding: stored.sourceReading
+        )
         let storedCalibrationIsCurrent = stored.calibrationRevision == libreWatchCalibrationSnapshot?.revision
         applyLibreWatchReadingLocally(
             stored.sourceReading,
@@ -901,6 +914,7 @@ final class WatchStateModel: NSObject, ObservableObject {
     }
 
     private func clearStoredDirectStateForSessionChange() {
+        directReadingAcceptance.reset()
         clearDirectReadingPresentation()
         libreWatchCalibrationSnapshot = nil
         LibreWatchSessionStore.clearCalibration()
@@ -1031,8 +1045,14 @@ final class WatchStateModel: NSObject, ObservableObject {
     }
 
     private func setLibreWatchOwnership(_ ownership: LibreWatchOwnership) {
+        let ownershipChanged = ownership != libreWatchOwnership
         libreWatchOwnership = ownership
         LibreWatchSessionStore.saveOwnership(ownership)
+        if ownershipChanged {
+            directReadingAcceptance.reset(
+                for: ownership == .watch ? libreWatchDirectSession?.id : nil
+            )
+        }
         if ownership == .watch {
             if directReadingHistory.isEmpty {
                 restorePersistedLibreWatchReadingIfPossible()
@@ -1066,6 +1086,9 @@ final class WatchStateModel: NSObject, ObservableObject {
 
         libreWatchDirectSession = preparedSession
         LibreWatchSessionStore.saveSession(preparedSession)
+        if sessionChanged, libreWatchOwnership == .watch {
+            directReadingAcceptance.reset(for: preparedSession.id)
+        }
 
         if let calibrationData = payload[LibreWatchMessageKey.calibration] as? Data,
            let calibration = try? JSONDecoder().decode(LibreWatchCalibrationSnapshot.self, from: calibrationData) {

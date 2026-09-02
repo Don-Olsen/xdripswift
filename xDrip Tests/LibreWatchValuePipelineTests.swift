@@ -260,6 +260,183 @@ final class LibreWatchValuePipelineTests: XCTestCase {
         XCTAssertNotEqual(action, .reconnectManually)
     }
 
+    func testForegroundReconnectFallsBackAfterTwelveSeconds() {
+        let startedAt = receivedAt
+
+        XCTAssertEqual(
+            LibreWatchLifecyclePolicy.reconnectFallbackAction(
+                reconnectStartedAt: startedAt,
+                now: startedAt.addingTimeInterval(11),
+                applicationIsActive: true,
+                extendedRuntimeIsRunning: true,
+                ownership: .watch
+            ),
+            .wait(1)
+        )
+        XCTAssertEqual(
+            LibreWatchLifecyclePolicy.reconnectFallbackAction(
+                reconnectStartedAt: startedAt,
+                now: startedAt.addingTimeInterval(12),
+                applicationIsActive: true,
+                extendedRuntimeIsRunning: true,
+                ownership: .watch
+            ),
+            .restartConfirmedSensorScan
+        )
+    }
+
+    func testActiveTransitionRecalculatesRuntimeReconnectFromOriginalStart() {
+        let startedAt = receivedAt
+        let now = startedAt.addingTimeInterval(20)
+
+        XCTAssertEqual(
+            LibreWatchLifecyclePolicy.reconnectFallbackAction(
+                reconnectStartedAt: startedAt,
+                now: now,
+                applicationIsActive: false,
+                extendedRuntimeIsRunning: true,
+                ownership: .watch
+            ),
+            .wait(70)
+        )
+        XCTAssertEqual(
+            LibreWatchLifecyclePolicy.reconnectFallbackAction(
+                reconnectStartedAt: startedAt,
+                now: now,
+                applicationIsActive: true,
+                extendedRuntimeIsRunning: true,
+                ownership: .watch
+            ),
+            .restartConfirmedSensorScan
+        )
+    }
+
+    func testForegroundAndRuntimeNoDataRecoveryKeepTheirOwnLimits() {
+        XCTAssertEqual(
+            LibreWatchLifecyclePolicy.noDataRecoveryDelay(
+                applicationIsActive: true,
+                extendedRuntimeIsRunning: true,
+                ownership: .watch
+            ),
+            2 * 60
+        )
+        XCTAssertEqual(
+            LibreWatchLifecyclePolicy.noDataRecoveryDelay(
+                applicationIsActive: false,
+                extendedRuntimeIsRunning: true,
+                ownership: .watch
+            ),
+            3 * 60
+        )
+    }
+
+    func testReadingAcceptanceRejectsDuplicateStaleAndOutOfOrderPayloads() {
+        let firstID = UUID()
+        let first = payload(
+            id: firstID,
+            raw: 800,
+            previousRaw: 790,
+            domain: .xDripRawGlucose,
+            sensorTime: 1_000,
+            at: receivedAt
+        )
+        var acceptance = LibreWatchReadingAcceptancePolicy()
+
+        XCTAssertTrue(acceptance.accept(first, for: session.id, now: receivedAt.addingTimeInterval(1)))
+        XCTAssertFalse(acceptance.accept(first, for: session.id, now: receivedAt.addingTimeInterval(2)))
+
+        let lowerSensorTime = payload(
+            raw: 810,
+            previousRaw: 800,
+            domain: .xDripRawGlucose,
+            sensorTime: 999,
+            at: receivedAt.addingTimeInterval(60)
+        )
+        XCTAssertFalse(acceptance.accept(
+            lowerSensorTime,
+            for: session.id,
+            now: receivedAt.addingTimeInterval(61)
+        ))
+
+        let olderTimestamp = payload(
+            raw: 820,
+            previousRaw: 810,
+            domain: .xDripRawGlucose,
+            sensorTime: 1_001,
+            at: receivedAt
+        )
+        XCTAssertFalse(acceptance.accept(
+            olderTimestamp,
+            for: session.id,
+            now: receivedAt.addingTimeInterval(62)
+        ))
+
+        let staleTransport = payload(
+            raw: 830,
+            previousRaw: 820,
+            domain: .xDripRawGlucose,
+            sensorTime: 1_002,
+            at: receivedAt.addingTimeInterval(120)
+        )
+        XCTAssertFalse(acceptance.accept(
+            staleTransport,
+            for: session.id,
+            now: receivedAt.addingTimeInterval(301)
+        ))
+    }
+
+    func testReadingAcceptanceAllowsFreshLowThenNextNormalReading() throws {
+        let snapshot = calibration(type: .fixedSlope, slope: 1, intercept: 0)
+        let low = payload(
+            native: 38,
+            previousNative: 45,
+            raw: 1,
+            previousRaw: 2,
+            domain: .xDripRawGlucose,
+            sensorTime: 1_000,
+            at: receivedAt
+        )
+        let normal = payload(
+            native: 90,
+            previousNative: 85,
+            raw: 900,
+            previousRaw: 850,
+            domain: .xDripRawGlucose,
+            sensorTime: 1_001,
+            at: receivedAt.addingTimeInterval(60)
+        )
+        var acceptance = LibreWatchReadingAcceptancePolicy()
+
+        XCTAssertEqual(try XCTUnwrap(snapshot.displayedGlucose(for: low)), 38)
+        XCTAssertTrue(acceptance.accept(low, for: session.id, now: receivedAt.addingTimeInterval(1)))
+        XCTAssertTrue(acceptance.accept(
+            normal,
+            for: session.id,
+            now: receivedAt.addingTimeInterval(61)
+        ))
+        XCTAssertGreaterThan(try XCTUnwrap(snapshot.displayedGlucose(for: normal)), 38)
+    }
+
+    func testReadingAcceptanceResetsForNewOwnershipSession() {
+        let first = payload(
+            raw: 800,
+            previousRaw: 790,
+            domain: .xDripRawGlucose,
+            sensorTime: 1_000,
+            at: receivedAt
+        )
+        var acceptance = LibreWatchReadingAcceptancePolicy()
+        XCTAssertTrue(acceptance.accept(first, for: session.id, now: receivedAt.addingTimeInterval(1)))
+
+        acceptance.reset(for: session.id)
+        XCTAssertTrue(acceptance.accept(first, for: session.id, now: receivedAt.addingTimeInterval(2)))
+
+        acceptance.reset()
+        XCTAssertNil(acceptance.sessionID)
+        XCTAssertNil(acceptance.lastSensorTimeInMinutes)
+        XCTAssertNil(acceptance.lastReceivedAt)
+    }
+
     func testReturningOwnershipToIPhoneStopsRuntimeAndRecovery() {
         XCTAssertTrue(LibreWatchLifecyclePolicy.shouldStopExtendedRuntime(
             ownership: .releasingToPhone
@@ -336,22 +513,26 @@ final class LibreWatchValuePipelineTests: XCTestCase {
 
     private func payload(
         version: Int = LibreWatchDirectReadingPayload.currentVersion,
+        id: UUID = UUID(),
         native: Double = 84.7,
         previousNative: Double = 82.9,
         raw: UInt16,
         previousRaw: UInt16,
-        domain: LibreWatchValueDomain
+        domain: LibreWatchValueDomain,
+        sensorTime: UInt16 = 1_234,
+        at timestamp: Date? = nil
     ) -> LibreWatchDirectReadingPayload {
         LibreWatchDirectReadingPayload(
             version: version,
+            id: id,
             sessionID: session.id,
             valueDomain: domain,
             nativeGlucoseMGDL: native,
             previousNativeGlucoseMGDL: previousNative,
             rawGlucose: raw,
             previousRawGlucose: previousRaw,
-            sensorTimeInMinutes: 1_234,
-            receivedAt: receivedAt,
+            sensorTimeInMinutes: sensorTime,
+            receivedAt: timestamp ?? receivedAt,
             calibrationRevision: 10
         )
     }
