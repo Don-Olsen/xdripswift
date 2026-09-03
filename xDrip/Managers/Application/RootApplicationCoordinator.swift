@@ -1072,7 +1072,7 @@ struct InitialCalibrationRequestGate {
     ///     - sensorAge : should be present only if it's the first reading(s) being processed for a specific sensor and is needed if it's a transmitterType that returns true to the function canDetectNewSensor
     @discardableResult
     private func processNewGlucoseData(glucoseData: inout [GlucoseData], sensorAge: TimeInterval?, historicalWatchOnly: Bool = false) -> Int {
-        var insertedHistoricalIDs = Set<NSManagedObjectID>()
+        var insertedHistoricalIDs = Set<String>()
         // unwrap calibrationsAccessor and coreDataManager and cgmTransmitter
         guard let calibrationsAccessor = calibrationsAccessor, let coreDataManager = coreDataManager, let cgmTransmitter = bluetoothPeripheralManager?.getCGMTransmitter() else {
             trace("in processNewGlucoseData, calibrationsAccessor or coreDataManager or cgmTransmitter is nil", log: log, category: ConstantsLog.categoryRootView, type: .error)
@@ -1229,9 +1229,17 @@ struct InitialCalibrationRequestGate {
                         }
                         
                         // save the newly created bgreading permenantly in coredata
-                        coreDataManager.saveChanges()
+                        let readingWasSaved = coreDataManager.saveChanges()
+                        if historicalWatchOnly {
+                            guard readingWasSaved else {
+                                coreDataManager.mainManagedObjectContext.delete(newReading)
+                                continue
+                            }
+                            // Child-context object IDs can still be temporary until the
+                            // asynchronous parent save. The payload UUID is stable throughout.
+                            insertedHistoricalIDs.insert(newReading.id)
+                        }
                         statisticsManager?.invalidate()
-                        if historicalWatchOnly { insertedHistoricalIDs.insert(newReading.objectID) }
 
                         if newReading.rawData.isFinite, newReading.rawData > 0 {
                             newStoredRawReadingCreated = true

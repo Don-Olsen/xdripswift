@@ -824,7 +824,7 @@ final class LibreWatchValuePipelineTests: XCTestCase {
     }
 
     @MainActor
-    func testBackfillUsesPersistentPayloadIdentityAndPreservesPhoneCollision() throws {
+    func testBackfillUsesPersistentPayloadIdentityAndPreservesPhoneCollision() async throws {
         let stack = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
         let context = stack.mainManagedObjectContext
         let sensor = Sensor(startDate: session.createdAt, nsManagedObjectContext: context)
@@ -833,11 +833,16 @@ final class LibreWatchValuePipelineTests: XCTestCase {
                               deviceName: nil, nsManagedObjectContext: context)
         phone.calculatedValue = 120
         phone.id = reading.id.uuidString
-        stack.saveChanges()
-        let objectID = phone.objectID
+        XCTAssertTrue(stack.saveChanges())
         let sensorID = sensor.id
+        // Drain the existing asynchronous parent save, then reload by the actual payload
+        // identity rather than retaining a temporary child-context NSManagedObjectID.
+        await stack.privateManagedObjectContext.perform {}
         context.reset()
-        let stored = try XCTUnwrap(context.existingObject(with: objectID) as? BgReading)
+        let request: NSFetchRequest<BgReading> = BgReading.fetchRequest()
+        request.predicate = NSPredicate(format: "id == %@", reading.id.uuidString)
+        let stored = try XCTUnwrap(context.fetch(request).first)
+        XCTAssertFalse(stored.objectID.isTemporaryID)
         XCTAssertTrue(LibreWatchHistoryPolicy.collides(
             payloadID: reading.id.uuidString, measuredAt: receivedAt.addingTimeInterval(-600), sensorID: sensorID,
             existingID: stored.id, existingAt: stored.timeStamp, existingSensorID: stored.sensor?.id
