@@ -1136,6 +1136,8 @@ final class TroubleshootingLogStore {
                 case .added, .reconnectedToExisting:
                     // These are discrete outcomes of an explicit Add scan.
                     result.append(entry)
+                    // A retained recovery must also close the failure when history is replayed.
+                    if activity == .reconnectedToExisting { bluetoothHealth = .healthy }
                 case .connectionRequested:
                     // A saved non-CGM device was explicitly enabled by the user. Retain the action
                     // and let the next matching healthy connection provide its decisive outcome.
