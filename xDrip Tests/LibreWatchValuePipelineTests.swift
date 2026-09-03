@@ -234,10 +234,13 @@ final class LibreWatchValuePipelineTests: XCTestCase {
         ))
     }
 
-    func testInactiveApplicationWithoutExtendedRuntimeDoesNotStartRecoveryWork() {
+    func testInactiveWatchOwnerPreservesCoreBluetoothWithoutStartingTimedRecovery() {
         XCTAssertFalse(LibreWatchLifecyclePolicy.recoveryIsAllowed(
             applicationIsActive: false,
             extendedRuntimeIsRunning: false,
+            ownership: .watch
+        ))
+        XCTAssertTrue(LibreWatchLifecyclePolicy.eventDrivenRecoveryIsAllowed(
             ownership: .watch
         ))
         XCTAssertFalse(LibreWatchLifecyclePolicy.shouldStartExtendedRuntime(
@@ -252,12 +255,76 @@ final class LibreWatchValuePipelineTests: XCTestCase {
         let action = LibreWatchLifecyclePolicy.disconnectRecoveryAction(
             isDeliberate: false,
             systemIsReconnecting: true,
-            recoveryIsAllowed: true,
             ownership: .watch
         )
 
         XCTAssertEqual(action, .waitForSystemReconnect)
         XCTAssertNotEqual(action, .reconnectManually)
+    }
+
+    func testLongInactivePeriodPreservesEventDrivenRecoveryAfterForegroundRefresh() {
+        XCTAssertFalse(LibreWatchLifecyclePolicy.recoveryIsAllowed(
+            applicationIsActive: false,
+            extendedRuntimeIsRunning: false,
+            ownership: .watch
+        ))
+        XCTAssertTrue(LibreWatchLifecyclePolicy.recoveryIsAllowed(
+            applicationIsActive: true,
+            extendedRuntimeIsRunning: false,
+            ownership: .watch
+        ))
+        XCTAssertTrue(LibreWatchLifecyclePolicy.eventDrivenRecoveryIsAllowed(
+            ownership: .watch
+        ))
+        XCTAssertEqual(
+            LibreWatchLifecyclePolicy.disconnectRecoveryAction(
+                isDeliberate: false,
+                systemIsReconnecting: true,
+                ownership: .watch
+            ),
+            .waitForSystemReconnect
+        )
+    }
+
+    func testInactiveWatchOwnerAllowsOnlyOneManualConnectPerDisconnectDelivery() {
+        let action = LibreWatchLifecyclePolicy.disconnectRecoveryAction(
+            isDeliberate: false,
+            systemIsReconnecting: false,
+            ownership: .watch
+        )
+        var disconnectWasHandled = false
+        var manualConnectCount = 0
+
+        for _ in 0 ..< 2 {
+            guard LibreWatchLifecyclePolicy.shouldHandleDisconnect(
+                alreadyHandled: disconnectWasHandled
+            ) else { continue }
+            disconnectWasHandled = true
+            if action == .reconnectManually {
+                manualConnectCount += 1
+            }
+        }
+
+        XCTAssertEqual(action, .reconnectManually)
+        XCTAssertEqual(manualConnectCount, 1)
+    }
+
+    func testSuspendedWatchOwnerStartsNoFallbackTimerOrScanLoop() {
+        XCTAssertEqual(
+            LibreWatchLifecyclePolicy.reconnectFallbackAction(
+                reconnectStartedAt: receivedAt,
+                now: receivedAt.addingTimeInterval(300),
+                applicationIsActive: false,
+                extendedRuntimeIsRunning: false,
+                ownership: .watch
+            ),
+            .noAdditionalWork
+        )
+        XCTAssertNil(LibreWatchLifecyclePolicy.noDataRecoveryDelay(
+            applicationIsActive: false,
+            extendedRuntimeIsRunning: false,
+            ownership: .watch
+        ))
     }
 
     func testForegroundReconnectFallsBackAfterTwelveSeconds() {
@@ -693,6 +760,25 @@ final class LibreWatchValuePipelineTests: XCTestCase {
             extendedRuntimeIsRunning: true,
             ownership: .iphone
         ))
+        XCTAssertFalse(LibreWatchLifecyclePolicy.eventDrivenRecoveryIsAllowed(
+            ownership: .iphone
+        ))
+        XCTAssertEqual(
+            LibreWatchLifecyclePolicy.disconnectRecoveryAction(
+                isDeliberate: false,
+                systemIsReconnecting: false,
+                ownership: .iphone
+            ),
+            .noAdditionalWork
+        )
+        XCTAssertEqual(
+            LibreWatchLifecyclePolicy.disconnectRecoveryAction(
+                isDeliberate: true,
+                systemIsReconnecting: false,
+                ownership: .watch
+            ),
+            .finishDeliberateDisconnect
+        )
     }
 
     private var watchAlgorithmParameters: LibreWatchAlgorithmParameters {

@@ -141,8 +141,8 @@ enum LibreWatchReconnectFallbackAction: Equatable {
 }
 
 /// Pure lifecycle policy shared by the Watch collector and deterministic iPhone tests.
-/// Recovery work is allowed only while the app can actually execute, and Core Bluetooth's
-/// auto-reconnect always wins over a parallel manual connection attempt.
+/// Timed recovery requires foreground/runtime execution, while Core Bluetooth delegate events
+/// may finish one already-established operation whenever Watch still owns the sensor.
 struct LibreWatchLifecyclePolicy {
     static let foregroundReconnectFallbackDelay: TimeInterval = 12
     static let extendedRuntimeReconnectFallbackDelay: TimeInterval = 90
@@ -155,6 +155,14 @@ struct LibreWatchLifecyclePolicy {
         ownership: LibreWatchOwnership
     ) -> Bool {
         ownership == .watch && (applicationIsActive || extendedRuntimeIsRunning)
+    }
+
+    static func eventDrivenRecoveryIsAllowed(ownership: LibreWatchOwnership) -> Bool {
+        ownership == .watch
+    }
+
+    static func shouldHandleDisconnect(alreadyHandled: Bool) -> Bool {
+        !alreadyHandled
     }
 
     static func shouldStartExtendedRuntime(
@@ -180,13 +188,12 @@ struct LibreWatchLifecyclePolicy {
     static func disconnectRecoveryAction(
         isDeliberate: Bool,
         systemIsReconnecting: Bool,
-        recoveryIsAllowed: Bool,
         ownership: LibreWatchOwnership
     ) -> LibreWatchDisconnectRecoveryAction {
         if isDeliberate {
             return .finishDeliberateDisconnect
         }
-        guard ownership == .watch, recoveryIsAllowed else {
+        guard eventDrivenRecoveryIsAllowed(ownership: ownership) else {
             return .noAdditionalWork
         }
         return systemIsReconnecting ? .waitForSystemReconnect : .reconnectManually
