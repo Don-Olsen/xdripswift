@@ -856,13 +856,18 @@ final class WatchStateModel: NSObject, ObservableObject {
         guard let preparedSession = libreWatchDirectSession,
               let encoded = try? JSONEncoder().encode(event)
         else { return }
-
-        sendLibreWatchCommand(
-            .reportDiagnostic,
-            sessionID: preparedSession.id,
-            diagnosticEvent: encoded,
-            queueIfUnreachable: true,
-            completion: nil
+        let message: [String: Any] = [
+            LibreWatchMessageKey.command: LibreWatchCommand.reportDiagnostic.rawValue,
+            LibreWatchMessageKey.sessionID: preparedSession.id.uuidString,
+            LibreWatchMessageKey.diagnosticEvent: encoded
+        ]
+        if session.activationState != .activated { session.activate() }
+        LibreWatchDiagnosticDelivery.send(
+            message, interactively: phoneIsReachable,
+            send: { [session] message, failure in
+                session.sendMessage(message, replyHandler: nil, errorHandler: failure)
+            },
+            queue: { [session] message in session.transferUserInfo(message) }
         )
     }
 

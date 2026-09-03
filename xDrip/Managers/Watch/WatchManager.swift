@@ -812,24 +812,25 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
 
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
-                let troubleshooting: TroubleshootingLogEntry?
-                switch event.kind {
-                case .disconnected:
-                    troubleshooting = .detailed(.bluetooth(.disconnected))
-                case .recoveryStarted:
-                    troubleshooting = .detailed(.integration(name: .watch, activity: .restarted))
-                case .recoverySucceeded:
-                    troubleshooting = .detailed(.integration(name: .watch, activity: .recovered))
-                case .recoveryFailed:
-                    troubleshooting = .standard(.integration(name: .watch, activity: .failed))
+                guard self.libreWatchDirectSession?.id == sessionID else { return }
+                let defaults = UserDefaults.standard
+                var receipts = defaults.data(forKey: LibreWatchMessageKey.diagnosticReceipts)
+                    .flatMap { try? JSONDecoder().decode(LibreWatchDiagnosticReceipts.self, from: $0) }
+                    ?? LibreWatchDiagnosticReceipts()
+                let receivedAt = Date()
+                guard receipts.accept(event, now: receivedAt) else { return }
+                if let encoded = try? JSONEncoder().encode(receipts) {
+                    defaults.set(encoded, forKey: LibreWatchMessageKey.diagnosticReceipts)
                 }
-
+                let logKind = TroubleshootingLogKind.watchRecovery(event: event, transport: transport)
+                let diagnosticEntry: TroubleshootingLogEntry = event.kind == .recoveryFailed
+                    ? .standard(logKind, timestamp: receivedAt) : .detailed(logKind, timestamp: receivedAt)
                 trace(
-                    "Watch Libre diagnostic: event=%{public}@ sensor=%{public}@ isReconnecting=%{public}@ errorCode=%{public}@",
+                    "Watch-Libre diagnostic: event=%{public}@ sensor=%{public}@ isReconnecting=%{public}@ errorCode=%{public}@",
                     log: self.log,
                     category: ConstantsLog.categoryWatchManager,
                     type: event.kind == .recoveryFailed ? .error : .info,
-                    troubleshooting: troubleshooting,
+                    troubleshooting: diagnosticEntry,
                     event.kind.rawValue,
                     preparedSession.redactedIdentity(),
                     event.isReconnecting.map { String($0) } ?? "n/a",

@@ -772,6 +772,8 @@ enum TroubleshootingLogKind: Codable, Equatable {
     case integration(name: TroubleshootingIntegration, activity: TroubleshootingIntegrationActivity)
     /// Bounded Watch transport/receipt outcomes; no sensor keys or arbitrary trace strings.
     case watchDelivery(transport: LibreWatchReadingTransport?, outcome: LibreWatchDeliveryOutcome)
+    /// Watch-Libre event time is separate from the iPhone receipt timestamp of the log entry.
+    case watchRecovery(event: LibreWatchDiagnosticEvent, transport: LibreWatchReadingTransport)
     /// A real transmitter heartbeat received by the app; it contains no device identity or payload.
     case heartbeatReceived
     /// A typed user configuration change with no arbitrary or secret value.
@@ -1435,7 +1437,7 @@ final class TroubleshootingLogStore {
                 // Each calibration is a discrete user action and must remain independently visible.
                 result.append(entry)
 
-            case .heartbeatReceived, .configuration, .dataManagement, .glucoseManagement, .treatment, .watchDelivery:
+            case .heartbeatReceived, .configuration, .dataManagement, .glucoseManagement, .treatment, .watchDelivery, .watchRecovery:
                 // Each heartbeat is evidence that the transmitter/app link was alive at that moment.
                 // Configuration, reading-management and treatment rows are explicit user changes.
                 // None is timer-derived polling noise, so every occurrence is meaningful and retained
@@ -1749,6 +1751,30 @@ struct TroubleshootingLogReportBuilder {
     /// payload cannot become shareable until its privacy and wording have been considered explicitly.
     func message(for entry: TroubleshootingLogEntry) -> String {
         switch entry.kind {
+        case let .watchRecovery(event, transport):
+            let description: String
+            switch event.kind {
+            case .disconnected: description = "disconnected"
+            case .recoveryStarted: description = "recovery started"
+            case .recoverySucceeded: description = "recovery succeeded"
+            case .recoveryFailed: description = "recovery failed"
+            case .recoveryDecision: description = "recovery decision"
+            }
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.timeZone = timeZone
+            formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+            let watchTime = event.occurredAt.map { formatter.string(from: $0) } ?? "unavailable (legacy event)"
+            var text = "Watch–Libre \(description). Watch event: \(watchTime); WatchConnectivity: \(transport.rawValue)."
+            if let context = event.context {
+                text += " scene=\(context.scene.rawValue) runtime=\(context.runtime.rawValue) central=\(context.central.rawValue) peripheral=\(context.peripheral.rawValue) stage=\(context.stage.rawValue) trigger=\(context.trigger.rawValue) action=\(context.action.rawValue)."
+                if let startedAt = context.recoveryStartedAt {
+                    text += " Recovery since: \(formatter.string(from: startedAt))."
+                }
+            }
+            if let reconnecting = event.isReconnecting { text += " isReconnecting=\(reconnecting)." }
+            if let error = event.errorCode { text += " errorCode=\(error)." }
+            return text
         case let .watchDelivery(transport, outcome):
             let delivery = transport?.rawValue ?? "release receipt"
             if outcome == .historicalInserted { return "Watch \(delivery): inserted 1 historical point (no live alerts)." }
@@ -1937,7 +1963,8 @@ struct TroubleshootingLogReportBuilder {
                     return "Apple Health is enabled, but permission has not been granted."
                 }
                 return "\(name.name) does not have the required permission."
-            case .restarted: return "\(name.name) restarted."
+            case .restarted:
+                return name == .watch ? "Watch–Libre recovery started (legacy event time unavailable)." : "\(name.name) restarted."
             case .ended: return "\(name.name) ended."
             case .recovered: return "\(name.name) recovered and is updating again."
             }

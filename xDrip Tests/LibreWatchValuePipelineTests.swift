@@ -1,5 +1,6 @@
 import XCTest
 import CoreData
+import Combine
 @testable import xdrip
 
 final class LibreWatchValuePipelineTests: XCTestCase {
@@ -1023,6 +1024,177 @@ final class LibreWatchValuePipelineTests: XCTestCase {
         let genuineLow = payload(native: 38, previousNative: 40, raw: 380, previousRaw: 400, domain: .factoryNativeMGDL)
         XCTAssertNil(historyRejection(genuineLow, now: receivedAt.addingTimeInterval(600)))
         XCTAssertEqual(historyCalibration.displayedGlucose(for: genuineLow), 38)
+    }
+
+    @MainActor
+    func testRecoveryObserverReadsCommittedOwnershipInsteadOfPublishedWillSet() async {
+        let fixture = RecoveryOwnershipFixture()
+        let delivered = expectation(description: "Ownership committed before recovery reads it")
+        let observation = fixture.$ownership.dropFirst().receive(on: DispatchQueue.main).sink { owner in
+            XCTAssertEqual(owner, .watch)
+            XCTAssertEqual(fixture.ownership, .watch)
+            delivered.fulfill()
+        }
+        fixture.ownership = .watch
+        await fulfillment(of: [delivered], timeout: 1)
+        withExtendedLifetime(observation) {}
+    }
+
+    private final class RecoveryOwnershipFixture {
+        @Published var ownership: LibreWatchOwnership = .iphone
+    }
+
+    func testRecoveryDecisionForActiveAndInactiveDisconnects() {
+        for active in [true, false] {
+            XCTAssertEqual(recoveryAction(active: active, system: true), .waitForSystemReconnect)
+            XCTAssertEqual(recoveryAction(active: active), .connectConfirmedSensor)
+        }
+    }
+
+    func testFailedConnectionHasAnEventDrivenScanWithoutRuntime() {
+        XCTAssertEqual(recoveryAction(active: false, trigger: .connectionFailed), .scanConfirmedSensor)
+        XCTAssertEqual(recoveryAction(active: false, poweredOn: false, trigger: .connectionFailed), .waitForBluetooth)
+    }
+
+    func testRecoveryDeadlineSurvivesSuspensionAndChangesToForegroundLimit() throws {
+        var progress = LibreWatchRecoveryProgress(sessionID: session.id)
+        progress.begin(at: receivedAt)
+        progress.begin(at: receivedAt.addingTimeInterval(60))
+        let restored = try JSONDecoder().decode(LibreWatchRecoveryProgress.self, from: JSONEncoder().encode(progress))
+        XCTAssertEqual(restored.startedAt, receivedAt)
+        XCTAssertEqual(restored.attemptStartedAt, receivedAt)
+        XCTAssertEqual(recoveryAction(active: false, runtime: true, system: true, elapsed: 15), .waitForSystemReconnect)
+        XCTAssertEqual(recoveryAction(active: true, system: true, elapsed: 15, trigger: .scene), .restartConfirmedSensorScan)
+        XCTAssertEqual(recoveryAction(active: false, system: true, elapsed: 400, trigger: .restoration), .restartConfirmedSensorScan)
+        progress.beginAttempt(at: receivedAt.addingTimeInterval(400))
+        XCTAssertEqual(progress.startedAt, receivedAt) // whole outage is not hidden by a new attempt
+        XCTAssertEqual(progress.attemptStartedAt, receivedAt.addingTimeInterval(400))
+        progress.receivedPacket(at: receivedAt.addingTimeInterval(410))
+        XCTAssertNil(progress.startedAt)
+        XCTAssertNil(progress.attemptStartedAt)
+    }
+
+    func testRestorationSelectsExactlyOneNextOperationForEachPeripheralState() {
+        XCTAssertEqual(recoveryAction(peripheral: .absent, active: false, trigger: .restoration), .scanConfirmedSensor)
+        XCTAssertEqual(recoveryAction(peripheral: .disconnected, active: false, trigger: .restoration), .connectConfirmedSensor)
+        XCTAssertEqual(recoveryAction(peripheral: .connecting, active: false, system: true, trigger: .restoration), .waitForSystemReconnect)
+        XCTAssertEqual(recoveryAction(peripheral: .connected, active: false, trigger: .restoration), .discoverServices)
+        XCTAssertEqual(recoveryAction(peripheral: .disconnecting, active: false, trigger: .restoration), .waitForCancellation)
+    }
+
+    func testPoweredOnCallbackResumesRecoveryWithoutSceneActivation() {
+        XCTAssertEqual(recoveryAction(active: false, poweredOn: false, trigger: .bluetooth), .waitForBluetooth)
+        XCTAssertEqual(recoveryAction(active: false, poweredOn: true, trigger: .bluetooth), .connectConfirmedSensor)
+    }
+
+    func testManualConnectAndCancellationNeverStartParallelWork() {
+        XCTAssertEqual(recoveryAction(manual: true), .waitForConnection)
+        XCTAssertEqual(recoveryAction(system: true, scanning: true), .waitForSystemReconnect)
+        XCTAssertEqual(recoveryAction(peripheral: .disconnecting, active: false, cancelling: true), .waitForCancellation)
+        XCTAssertEqual(recoveryAction(active: false, cancelling: true), .scanConfirmedSensor)
+        XCTAssertEqual(recoveryAction(peripheral: .absent, active: false, scanning: true), .scanConfirmedSensor)
+    }
+
+    func testTimestampedDisconnectGateRejectsDuplicatesButAllowsNextRealDisconnect() {
+        var gate = LibreWatchDisconnectGate()
+        let first = receivedAt.addingTimeInterval(5)
+        XCTAssertTrue(gate.accept(disconnectedAt: first))
+        XCTAssertFalse(gate.accept(disconnectedAt: first))
+        XCTAssertFalse(gate.accept(disconnectedAt: first)) // delayed callback from previous connection
+        // didConnect may itself have arrived much later; its delivery time is not a cutoff.
+        XCTAssertTrue(gate.accept(disconnectedAt: receivedAt.addingTimeInterval(6)))
+        XCTAssertTrue(gate.accept(disconnectedAt: receivedAt.addingTimeInterval(15)))
+        XCTAssertFalse(LibreWatchDisconnectGate.useLegacyCallback(modernCallbackAvailable: true))
+        XCTAssertTrue(LibreWatchDisconnectGate.useLegacyCallback(modernCallbackAvailable: false))
+    }
+
+    func testNoDataIsCheckedAtNextCallbackIndependentlyOfDiagnosticStage() {
+        XCTAssertEqual(recoveryAction(peripheral: .connected, active: false, notifications: true,
+                                      lastActivity: receivedAt, elapsed: 181, trigger: .packet), .restartConfirmedSensorScan)
+        XCTAssertEqual(recoveryAction(peripheral: .connected, active: true, notifications: true,
+                                      lastActivity: receivedAt, elapsed: 121, trigger: .scene), .restartConfirmedSensorScan)
+        // A fresh accepted packet wins over an old reconnect deadline.
+        XCTAssertEqual(recoveryAction(peripheral: .connected, notifications: true,
+                                      lastActivity: receivedAt.addingTimeInterval(181), elapsed: 181, trigger: .packet), .waitForNotifications)
+    }
+
+    func testInactiveTimerDoesNotStartRecoveryOrRepeatedScanning() {
+        XCTAssertEqual(recoveryAction(active: false, elapsed: 600, trigger: .timer), .waitForExecution)
+        XCTAssertEqual(recoveryAction(peripheral: .absent, active: false, elapsed: 600, trigger: .timer), .waitForExecution)
+        XCTAssertEqual(recoveryAction(active: false, runtime: true, system: true, elapsed: 91, trigger: .timer), .restartConfirmedSensorScan)
+    }
+
+    func testFreshPartialFrameFinishesBeforeNoDataRecoveryCancelsConnection() {
+        XCTAssertEqual(recoveryAction(peripheral: .connected, notifications: true, receivingFrame: true,
+                                      lastActivity: receivedAt, elapsed: 181, trigger: .packet), .waitForNotifications)
+        XCTAssertEqual(recoveryAction(peripheral: .connected, notifications: true, receivingFrame: false,
+                                      lastActivity: receivedAt, elapsed: 185, trigger: .timer), .restartConfirmedSensorScan)
+    }
+
+    func testRecoveryStopsForEveryNonWatchOwnerAndInvalidSession() {
+        for owner in [LibreWatchOwnership.iphone, .releasingToPhone, .releasingToWatch, .recovery] {
+            XCTAssertEqual(recoveryAction(system: true, elapsed: 600, owner: owner), .stopped)
+        }
+        XCTAssertEqual(recoveryAction(validSession: false), .stopped)
+    }
+
+    func testSetupDeadlineCancelsBeforeStartingMoreDiscoveryWork() {
+        XCTAssertEqual(recoveryAction(peripheral: .connected, setup: true, elapsed: 13, trigger: .setup), .restartConfirmedSensorScan)
+        XCTAssertEqual(recoveryAction(peripheral: .connected, setup: true, elapsed: 1, trigger: .setup), .waitForConnection)
+        XCTAssertEqual(recoveryAction(active: false, trigger: .setupFailed), .scanConfirmedSensor)
+    }
+
+    func testDiagnosticFallbackQueuesIdenticalEventAndReceiverDeduplicatesAfterReload() throws {
+        let event = LibreWatchDiagnosticEvent(kind: .recoveryStarted, occurredAt: receivedAt)
+        let encoded = try JSONEncoder().encode(event)
+        let message: [String: Any] = [LibreWatchMessageKey.diagnosticEvent: encoded]
+        var queued = [Data]()
+        LibreWatchDiagnosticDelivery.send(message, interactively: true, send: { sent, failed in
+            XCTAssertEqual(sent[LibreWatchMessageKey.diagnosticEvent] as? Data, encoded)
+            failed(NSError(domain: "test", code: 1))
+        }, queue: { queued.append($0[LibreWatchMessageKey.diagnosticEvent] as! Data) })
+        XCTAssertEqual(queued, [encoded])
+        var receipts = LibreWatchDiagnosticReceipts()
+        XCTAssertTrue(receipts.accept(event, now: receivedAt))
+        var restored = try JSONDecoder().decode(LibreWatchDiagnosticReceipts.self, from: JSONEncoder().encode(receipts))
+        XCTAssertFalse(restored.accept(try JSONDecoder().decode(LibreWatchDiagnosticEvent.self, from: queued[0]), now: receivedAt))
+        XCTAssertTrue(restored.accept(LibreWatchDiagnosticEvent(kind: .recoveryStarted), now: receivedAt))
+    }
+
+    func testUnreachableDiagnosticIsQueuedWithoutInteractiveSend() {
+        var count = 0
+        LibreWatchDiagnosticDelivery.send([:], interactively: false, send: { _, _ in
+            XCTFail("No interactive attempt while unreachable")
+        }, queue: { _ in count += 1 })
+        XCTAssertEqual(count, 1)
+    }
+
+    func testLegacyDiagnosticDecodesWithoutInventingWatchTimeOrIdentity() throws {
+        let data = Data(#"{"kind":"disconnected","isReconnecting":true,"errorCode":7}"#.utf8)
+        let event = try JSONDecoder().decode(LibreWatchDiagnosticEvent.self, from: data)
+        XCTAssertEqual(event.kind, .disconnected)
+        XCTAssertNil(event.id)
+        XCTAssertNil(event.occurredAt)
+        XCTAssertNil(event.context)
+        XCTAssertEqual(event.errorCode, 7)
+    }
+
+    private func recoveryAction(peripheral: LibreWatchPeripheralState = .disconnected,
+                                active: Bool = true, runtime: Bool = false, poweredOn: Bool = true,
+                                system: Bool = false, manual: Bool = false, scanning: Bool = false,
+                                cancelling: Bool = false, setup: Bool = false, notifications: Bool = false,
+                                receivingFrame: Bool = false,
+                                lastActivity: Date? = nil, elapsed: TimeInterval = 1,
+                                trigger: LibreWatchRecoveryTrigger = .disconnected,
+                                owner: LibreWatchOwnership = .watch, validSession: Bool = true) -> LibreWatchRecoveryAction {
+        LibreWatchRecoveryPolicy.action(
+            ownership: owner, validSession: validSession, poweredOn: poweredOn, peripheral: peripheral,
+            scanning: scanning, systemReconnecting: system, manualConnecting: manual, cancelling: cancelling,
+            setupInProgress: setup, notificationsReady: notifications,
+            receivingFrame: receivingFrame,
+            attemptStartedAt: receivedAt, lastActivityAt: lastActivity, now: receivedAt.addingTimeInterval(elapsed),
+            applicationIsActive: active, extendedRuntimeIsRunning: runtime, trigger: trigger
+        )
     }
 
     private var historyCalibration: LibreWatchCalibrationSnapshot {

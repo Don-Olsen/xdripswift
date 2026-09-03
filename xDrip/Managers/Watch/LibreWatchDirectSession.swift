@@ -21,6 +21,8 @@ enum LibreWatchMessageKey {
     static let legacyPersistedReading = "libreWatchDirectPersistedReading.v1"
     static let persistedReleaseReceipt = "libreWatchReleaseReceipt.v1"
     static let persistedHistory = "libreWatchDirectHistory.v2"
+    static let recoveryProgress = "libreWatchRecoveryProgress.v1"
+    static let diagnosticReceipts = "libreWatchDiagnosticReceipts.v1"
 }
 
 enum LibreWatchCommand: String, Codable {
@@ -111,23 +113,176 @@ enum LibreWatchDiagnosticEventKind: String, Codable, Equatable {
     case recoveryStarted
     case recoverySucceeded
     case recoveryFailed
+    case recoveryDecision
+}
+
+enum LibreWatchScene: String, Codable { case active, inactive, background, unknown }
+enum LibreWatchRuntimeState: String, Codable { case none, starting, running }
+enum LibreWatchCentralState: String, Codable { case unknown, resetting, unsupported, unauthorized, poweredOff, poweredOn }
+enum LibreWatchPeripheralState: String, Codable { case absent, disconnected, connecting, connected, disconnecting }
+enum LibreWatchDiagnosticStage: String, Codable {
+    case unavailable, ready, handingOff, scanning, connecting, reconnecting, receiving, failed, returningToPhone
+}
+enum LibreWatchRecoveryTrigger: String, Codable {
+    case prepare, ownership, scene, runtime, bluetooth, restoration, disconnected, connectionFailed
+    case connected, setup, setupFailed, packet, timer
+}
+enum LibreWatchRecoveryAction: String, Codable {
+    case stopped, waitForExecution, waitForBluetooth, waitForCancellation, waitForSystemReconnect
+    case waitForConnection, waitForNotifications, scanConfirmedSensor, connectConfirmedSensor
+    case discoverServices, restartConfirmedSensorScan
+}
+
+struct LibreWatchDiagnosticContext: Codable, Equatable {
+    let scene: LibreWatchScene
+    let runtime: LibreWatchRuntimeState
+    let central: LibreWatchCentralState
+    let peripheral: LibreWatchPeripheralState
+    let stage: LibreWatchDiagnosticStage
+    let trigger: LibreWatchRecoveryTrigger
+    let action: LibreWatchRecoveryAction
+    let recoveryStartedAt: Date?
 }
 
 /// A bounded, privacy-safe Watch diagnostic. Sensor identity is derived on iPhone from
 /// the validated session and never crosses as a raw peripheral identifier.
 struct LibreWatchDiagnosticEvent: Codable, Equatable {
+    // Optional for already queued events from build 4245. Do not invent their event time/ID.
+    let id: UUID?
+    let occurredAt: Date?
     let kind: LibreWatchDiagnosticEventKind
     let isReconnecting: Bool?
     let errorCode: Int?
+    let context: LibreWatchDiagnosticContext?
 
     init(
         kind: LibreWatchDiagnosticEventKind,
         isReconnecting: Bool? = nil,
-        errorCode: Int? = nil
+        errorCode: Int? = nil,
+        id: UUID? = UUID(),
+        occurredAt: Date? = Date(),
+        context: LibreWatchDiagnosticContext? = nil
     ) {
+        self.id = id
+        self.occurredAt = occurredAt
         self.kind = kind
         self.isReconnecting = isReconnecting
         self.errorCode = errorCode
+        self.context = context
+    }
+}
+
+/// The same encoded event (and UUID) is queued if interactive delivery fails.
+enum LibreWatchDiagnosticDelivery {
+    static func send(_ message: [String: Any], interactively: Bool,
+                     send: ([String: Any], @escaping (Error) -> Void) -> Void,
+                     queue: @escaping ([String: Any]) -> Void) {
+        if interactively { send(message) { _ in queue(message) } }
+        else { queue(message) }
+    }
+}
+
+struct LibreWatchDiagnosticReceipts: Codable {
+    private var received: [UUID: Date] = [:]
+
+    mutating func accept(_ event: LibreWatchDiagnosticEvent, now: Date) -> Bool {
+        received = received.filter { now.timeIntervalSince($0.value) <= 24 * 60 * 60 }
+        guard let id = event.id else { return true } // legacy event, identity was not recorded
+        guard received[id] == nil else { return false }
+        if received.count >= 1_024, let oldest = received.min(by: { $0.value < $1.value })?.key {
+            received.removeValue(forKey: oldest)
+        }
+        received[id] = now
+        return true
+    }
+}
+
+/// Episode time survives suspension/restoration. Only a new actual connection attempt changes
+/// its deadline; lifecycle callbacks and repeated failures never postpone an existing deadline.
+struct LibreWatchRecoveryProgress: Codable, Equatable {
+    let sessionID: UUID
+    private(set) var startedAt: Date?
+    private(set) var attemptStartedAt: Date?
+    private(set) var lastPacketAt: Date?
+
+    init(sessionID: UUID) { self.sessionID = sessionID }
+    mutating func begin(at date: Date) {
+        startedAt = startedAt ?? date
+        attemptStartedAt = attemptStartedAt ?? date
+    }
+    mutating func beginAttempt(at date: Date) {
+        startedAt = startedAt ?? date
+        attemptStartedAt = date
+    }
+    mutating func receivedPacket(at date: Date) {
+        startedAt = nil
+        attemptStartedAt = nil
+        lastPacketAt = date
+    }
+}
+
+/// Modern callbacks carry the actual disconnect time. Old events cannot tear down a newer
+/// connection, and a callback for an unrelated peripheral never consumes this gate.
+struct LibreWatchDisconnectGate {
+    private var handledAt: Date?
+
+    mutating func accept(disconnectedAt date: Date) -> Bool {
+        // Compare event times, not the time a delayed didConnect callback reached our process.
+        // Do not reset on didConnect: a late duplicate still belongs to its old disconnect.
+        guard handledAt.map({ date > $0 }) ?? true else { return false }
+        handledAt = date
+        return true
+    }
+    static func useLegacyCallback(modernCallbackAvailable: Bool) -> Bool { !modernCallbackAvailable }
+}
+
+/// One decision per execution opportunity, not a background retry loop. The collector executes
+/// this action and then waits for Core Bluetooth (or an eligible foreground/runtime deadline).
+enum LibreWatchRecoveryPolicy {
+    static func action(ownership: LibreWatchOwnership, validSession: Bool,
+                       poweredOn: Bool, peripheral: LibreWatchPeripheralState,
+                       scanning: Bool, systemReconnecting: Bool, manualConnecting: Bool, cancelling: Bool,
+                       setupInProgress: Bool, notificationsReady: Bool, receivingFrame: Bool = false,
+                       attemptStartedAt: Date?, lastActivityAt: Date?, now: Date,
+                       applicationIsActive: Bool, extendedRuntimeIsRunning: Bool,
+                       trigger: LibreWatchRecoveryTrigger) -> LibreWatchRecoveryAction {
+        guard ownership == .watch, validSession else { return .stopped }
+        if trigger == .timer && !LibreWatchLifecyclePolicy.recoveryIsAllowed(
+            applicationIsActive: applicationIsActive, extendedRuntimeIsRunning: extendedRuntimeIsRunning,
+            ownership: ownership
+        ) { return .waitForExecution }
+        guard poweredOn else { return .waitForBluetooth }
+        if cancelling {
+            return peripheral == .disconnected || peripheral == .absent ? .scanConfirmedSensor : .waitForCancellation
+        }
+        let reconnectDelay = applicationIsActive
+            ? LibreWatchLifecyclePolicy.foregroundReconnectFallbackDelay
+            : LibreWatchLifecyclePolicy.extendedRuntimeReconnectFallbackDelay
+        let overdue = attemptStartedAt.map { now.timeIntervalSince($0) >= reconnectDelay } ?? false
+        if peripheral == .connected, notificationsReady {
+            // Let a newly arriving frame finish within the existing fragment-gap limit.
+            // Its first fragment is not a reason to cancel a now-working connection.
+            if receivingFrame { return .waitForNotifications }
+            let noDataDelay = applicationIsActive
+                ? LibreWatchLifecyclePolicy.foregroundNoDataRecoveryDelay
+                : LibreWatchLifecyclePolicy.extendedRuntimeNoDataRecoveryDelay
+            return lastActivityAt.map { now.timeIntervalSince($0) >= noDataDelay } == true
+                ? .restartConfirmedSensorScan : .waitForNotifications
+        }
+        if overdue && peripheral != .absent { return .restartConfirmedSensorScan }
+        if systemReconnecting { return .waitForSystemReconnect }
+        if manualConnecting { return .waitForConnection }
+        if scanning && (peripheral == .absent || peripheral == .disconnected) {
+            return .scanConfirmedSensor // keep the one existing filtered scan
+        }
+        switch peripheral {
+        case .absent: return .scanConfirmedSensor
+        case .disconnected: return trigger == .connectionFailed || trigger == .setupFailed
+            ? .scanConfirmedSensor : .connectConfirmedSensor
+        case .connecting: return .waitForConnection
+        case .disconnecting: return .waitForCancellation
+        case .connected: return setupInProgress ? .waitForConnection : .discoverServices
+        }
     }
 }
 

@@ -314,7 +314,7 @@ struct TroubleshootingLogView: View {
     private func symbol(for entry: TroubleshootingLogEntry) -> String {
         switch entry.kind {
         case .glucoseAccepted: return "drop.fill"
-        case .watchDelivery: return "applewatch"
+        case .watchDelivery, .watchRecovery: return "applewatch"
         case let .bluetooth(activity):
             switch activity {
             case .connectionFailed, .connectionTimedOut, .poweredOff, .unauthorized, .pairingFailed:

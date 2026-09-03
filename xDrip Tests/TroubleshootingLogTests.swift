@@ -12,6 +12,47 @@ import XCTest
 final class TroubleshootingLogTests: XCTestCase {
     private let referenceDate = Date(timeIntervalSince1970: 1_800_000_000)
 
+    func testWatchRecoveryShowsAcquisitionTimeSeparatelyFromPhoneReceiptTime() throws {
+        let event = LibreWatchDiagnosticEvent(
+            kind: .recoveryStarted, isReconnecting: true, errorCode: 7,
+            occurredAt: referenceDate.addingTimeInterval(-600),
+            context: LibreWatchDiagnosticContext(
+                scene: .inactive, runtime: .none, central: .poweredOn, peripheral: .connecting,
+                stage: .reconnecting, trigger: .disconnected, action: .waitForSystemReconnect,
+                recoveryStartedAt: referenceDate.addingTimeInterval(-600)
+            )
+        )
+        let entry = TroubleshootingLogEntry.detailed(
+            .watchRecovery(event: event, transport: .queuedUserInfo), timestamp: referenceDate
+        )
+        let restored = try JSONDecoder().decode(TroubleshootingLogEntry.self, from: JSONEncoder().encode(entry))
+        XCTAssertEqual(restored.timestamp, referenceDate)
+        let message = makeReport(entries: [restored]).message(for: restored)
+        XCTAssertTrue(message.contains("Watch–Libre recovery started"))
+        XCTAssertTrue(message.contains("Watch event:"))
+        XCTAssertTrue(message.contains("WatchConnectivity: queuedUserInfo"))
+        XCTAssertTrue(message.contains("scene=inactive runtime=none"))
+        XCTAssertTrue(message.contains("isReconnecting=true"))
+        XCTAssertTrue(message.contains("errorCode=7"))
+        XCTAssertFalse(message.contains("Apple Watch restarted"))
+    }
+
+    func testLegacyWatchRecoveryDoesNotMislabelPhoneReceiptAsWatchEventTime() throws {
+        let event = try JSONDecoder().decode(LibreWatchDiagnosticEvent.self, from: Data(#"{"kind":"recoveryStarted"}"#.utf8))
+        let entry = TroubleshootingLogEntry.detailed(
+            .watchRecovery(event: event, transport: .queuedUserInfo), timestamp: referenceDate
+        )
+        XCTAssertTrue(makeReport(entries: [entry]).message(for: entry).contains("unavailable (legacy event)"))
+    }
+
+    func testStoredLegacyWatchRestartEntryMeansLibreRecoveryNotDeviceRestart() {
+        let entry = TroubleshootingLogEntry.detailed(
+            .integration(name: .watch, activity: .restarted), timestamp: referenceDate
+        )
+        XCTAssertEqual(makeReport(entries: [entry]).message(for: entry),
+                       "Watch–Libre recovery started (legacy event time unavailable).")
+    }
+
     @MainActor
     func testIssueReportExistsOnlyInsideRevealedAdvancedRows() throws {
         let previousAdvancedVisibility = UserDefaults.standard.showDeveloperSettings
