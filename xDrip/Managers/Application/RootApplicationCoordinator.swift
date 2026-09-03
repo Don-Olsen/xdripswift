@@ -18,6 +18,26 @@ import SwiftUI
 import WidgetKit
 import AppIntents
 
+struct InitialCalibrationRequestGate {
+    private(set) var requestedSensorID: String?
+
+    mutating func shouldRequest(
+        for sensorID: String,
+        newRawReadingStored: Bool,
+        validRawReadingCount: Int,
+        initialCalibrationIsRequired: Bool
+    ) -> Bool {
+        guard newRawReadingStored,
+              initialCalibrationIsRequired,
+              requestedSensorID != sensorID,
+              validRawReadingCount >= 2
+        else { return false }
+
+        requestedSensorID = sensorID
+        return true
+    }
+}
+
 /// Owns the long-lived application services previously created by RootViewController.
 ///
 /// SwiftUI owns the complete root view hierarchy. This coordinator remains an NSObject because it
@@ -35,6 +55,9 @@ import AppIntents
     
     /// constant for key in ApplicationManager.shared.addClosureToRunWhenAppWillEnterForeground - initial calibration
     private let applicationManagerKeyInitialCalibration = "RootViewController-InitialCalibration"
+
+    /// Prevents repeated automatic prompts while subsequent raw readings await the first calibration.
+    private var initialCalibrationRequestGate = InitialCalibrationRequestGate()
     
     /// constant for key in ApplicationManager.shared.addClosureToRunWhenAppDidEnterBackground -  isIdleTimerDisabled
     private let applicationManagerKeyIsIdleTimerDisabled = "RootViewController-isIdleTimerDisabled"
@@ -1073,8 +1096,9 @@ import AppIntents
             /// used if loopdelay > 0, to check if there was a recent calibration. If so then no readings are added in glucoseData array for a period of loopdelay + an amount of minutes
             let timeStampLastCalibrationForActiveSensor = lastCalibrationForActiveSensor != nil ? lastCalibrationForActiveSensor!.timeStamp : Date(timeIntervalSince1970: 0)
             
-            // Only a completed reading may fan out to alerts and integrations. Raw/error rows are
-            // still retained in Core Data for calibration diagnostics and duplicate suppression.
+            // Raw rows must remain visible to initial calibration even before they have a calculated
+            // value. Only a completed reading may fan out to alerts and integrations.
+            var newStoredRawReadingCreated = false
             var newDownstreamReadingCreated = false
             
             // assign value of timeStampLastBgReading
@@ -1183,6 +1207,10 @@ import AppIntents
                         // save the newly created bgreading permenantly in coredata
                         coreDataManager.saveChanges()
                         statisticsManager?.invalidate()
+
+                        if newReading.rawData.isFinite, newReading.rawData > 0 {
+                            newStoredRawReadingCreated = true
+                        }
                         
                         if isValidForDownstream {
                             newDownstreamReadingCreated = true
@@ -1227,7 +1255,33 @@ import AppIntents
                 }
             }
             
-            // if a new reading is created, create either initial calibration request or bgreading notification - upload to nightscout and check alerts
+            let initialCalibrationIsRequired = firstCalibrationForActiveSensor == nil &&
+                lastCalibrationForActiveSensor == nil &&
+                !cgmTransmitter.isWebOOPEnabled() &&
+                !cgmTransmitter.overruleIsWebOOPEnabled()
+
+            if newStoredRawReadingCreated {
+                let validRawReadingCount = bgReadingsAccessor.getLatestBgReadings(
+                    limit: 36,
+                    howOld: nil,
+                    forSensor: activeSensor,
+                    ignoreRawData: false,
+                    ignoreCalculatedValue: true,
+                    includingSuppressed: true
+                ).lazy.filter { $0.rawData.isFinite && $0.rawData > 0 }.prefix(2).count
+
+                if initialCalibrationRequestGate.shouldRequest(
+                    for: activeSensor.id,
+                    newRawReadingStored: true,
+                    validRawReadingCount: validRawReadingCount,
+                    initialCalibrationIsRequired: initialCalibrationIsRequired
+                ) {
+                    trace("in processNewGlucoseData, calibration : two raw readings received, no calibrations exist yet and not web oopenabled, request calibration from user", log: self.log, category: ConstantsLog.categoryRootView, type: .info)
+                    createInitialCalibrationRequest()
+                }
+            }
+
+            // Only a downstream-valid reading may update UI, alerts, or integrations.
             if newDownstreamReadingCreated {
                 _ = bgPostProcessingManager?.processLatestReadings()
                 sensorNoiseManager?.update(activeSensor: activeSensor)
@@ -1235,17 +1289,7 @@ import AppIntents
                 // Publish the final stored value before optional downstream consumers perform their work.
                 updateLiveActivityAndWidgets(forceRestart: false)
                 
-                // only if no webOOPEnabled and overruleIsWebOOPEnabled false : if no two calibration exist yet then create calibration request notification, otherwise a bgreading notification and update labels
-                if firstCalibrationForActiveSensor == nil && lastCalibrationForActiveSensor == nil && (!cgmTransmitter.isWebOOPEnabled() && !cgmTransmitter.overruleIsWebOOPEnabled()) {
-                    // there must be at least 2 readings
-                    let latestReadings = bgReadingsAccessor.getLatestBgReadings(limit: 36, howOld: nil, forSensor: activeSensor, ignoreRawData: false, ignoreCalculatedValue: true, includingSuppressed: true)
-                    
-                    if latestReadings.count > 1 {
-                        trace("in processNewGlucoseData, calibration : two readings received, no calibrations exist yet and not web oopenabled, request calibation to user", log: self.log, category: ConstantsLog.categoryRootView, type: .info)
-                        
-                        createInitialCalibrationRequest()
-                    }
-                } else {
+                if !initialCalibrationIsRequired {
                     // check alerts, create notification, set app badge
                     checkAlertsCreateNotificationAndSetAppBadge()
                     rootHomeStateModel.invalidateCharts()

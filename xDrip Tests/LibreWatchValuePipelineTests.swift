@@ -473,6 +473,85 @@ final class LibreWatchValuePipelineTests: XCTestCase {
         )
     }
 
+    func testTwoUncalibratedRawReadingsRequestInitialCalibrationExactlyOnce() {
+        var gate = InitialCalibrationRequestGate()
+
+        XCTAssertFalse(gate.shouldRequest(
+            for: "sensor-a",
+            newRawReadingStored: false,
+            validRawReadingCount: 2,
+            initialCalibrationIsRequired: true
+        ))
+        XCTAssertFalse(gate.shouldRequest(
+            for: "sensor-a",
+            newRawReadingStored: true,
+            validRawReadingCount: 1,
+            initialCalibrationIsRequired: true
+        ))
+        XCTAssertTrue(gate.shouldRequest(
+            for: "sensor-a",
+            newRawReadingStored: true,
+            validRawReadingCount: 2,
+            initialCalibrationIsRequired: true
+        ))
+        XCTAssertFalse(gate.shouldRequest(
+            for: "sensor-a",
+            newRawReadingStored: true,
+            validRawReadingCount: 3,
+            initialCalibrationIsRequired: true
+        ))
+        XCTAssertEqual(gate.requestedSensorID, "sensor-a")
+    }
+
+    func testUncalibratedRawReadingsRemainUnavailableToDownstreamConsumers() {
+        let readings = [
+            (rawValue: 82.0, calculatedValue: 0.0),
+            (rawValue: 84.0, calculatedValue: 0.0)
+        ]
+        var gate = InitialCalibrationRequestGate()
+
+        XCTAssertTrue(gate.shouldRequest(
+            for: "sensor-a",
+            newRawReadingStored: true,
+            validRawReadingCount: readings.count,
+            initialCalibrationIsRequired: true
+        ))
+
+        let downstreamReadings = readings.filter {
+            BgReadingDownstreamPolicy.validity(
+                calculatedValue: $0.calculatedValue,
+                rawData: $0.rawValue,
+                ageAdjustedRawValue: $0.rawValue,
+                finalValue: $0.calculatedValue,
+                calibrationUsesErrorSentinel: true
+            ) == .valid
+        }
+
+        XCTAssertTrue(downstreamReadings.isEmpty)
+    }
+
+    func testCompletedReadingResumesDownstreamAfterInitialCalibration() {
+        var gate = InitialCalibrationRequestGate()
+        let completed = (rawValue: 84.0, calculatedValue: 91.0)
+
+        XCTAssertFalse(gate.shouldRequest(
+            for: "sensor-a",
+            newRawReadingStored: true,
+            validRawReadingCount: 2,
+            initialCalibrationIsRequired: false
+        ))
+        XCTAssertEqual(
+            BgReadingDownstreamPolicy.validity(
+                calculatedValue: completed.calculatedValue,
+                rawData: completed.rawValue,
+                ageAdjustedRawValue: completed.rawValue,
+                finalValue: completed.calculatedValue,
+                calibrationUsesErrorSentinel: true
+            ),
+            .valid
+        )
+    }
+
     func testWatchRejectsFailedXDripCalculationInsteadOfDisplayingFalseLow() {
         let failed = payload(
             native: 84,
