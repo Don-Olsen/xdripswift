@@ -770,6 +770,8 @@ enum TroubleshootingLogKind: Codable, Equatable {
     /// The persisted alert enum value is safe and compact; user-authored notification text is not.
     case alert(kindRawValue: Int, activity: TroubleshootingAlertActivity)
     case integration(name: TroubleshootingIntegration, activity: TroubleshootingIntegrationActivity)
+    /// Bounded Watch transport/receipt outcomes; no sensor keys or arbitrary trace strings.
+    case watchDelivery(transport: LibreWatchReadingTransport?, outcome: LibreWatchDeliveryOutcome)
     /// A real transmitter heartbeat received by the app; it contains no device identity or payload.
     case heartbeatReceived
     /// A typed user configuration change with no arbitrary or secret value.
@@ -1433,7 +1435,7 @@ final class TroubleshootingLogStore {
                 // Each calibration is a discrete user action and must remain independently visible.
                 result.append(entry)
 
-            case .heartbeatReceived, .configuration, .dataManagement, .glucoseManagement, .treatment:
+            case .heartbeatReceived, .configuration, .dataManagement, .glucoseManagement, .treatment, .watchDelivery:
                 // Each heartbeat is evidence that the transmitter/app link was alive at that moment.
                 // Configuration, reading-management and treatment rows are explicit user changes.
                 // None is timer-derived polling noise, so every occurrence is meaningful and retained
@@ -1747,6 +1749,10 @@ struct TroubleshootingLogReportBuilder {
     /// payload cannot become shareable until its privacy and wording have been considered explicitly.
     func message(for entry: TroubleshootingLogEntry) -> String {
         switch entry.kind {
+        case let .watchDelivery(transport, outcome):
+            let delivery = transport?.rawValue ?? "release receipt"
+            if outcome == .historicalInserted { return "Watch \(delivery): inserted 1 historical point (no live alerts)." }
+            return "Watch \(delivery): \(outcome.rawValue)."
         case let .app(activity):
             switch activity {
             case .started: return "App started."

@@ -1,4 +1,5 @@
 import XCTest
+import CoreData
 @testable import xdrip
 
 final class LibreWatchValuePipelineTests: XCTestCase {
@@ -781,6 +782,263 @@ final class LibreWatchValuePipelineTests: XCTestCase {
         )
     }
 
+    func testLiveTransportRemainsFreshOrderedAndIndependentOfHistory() {
+        var live = LibreWatchReadingAcceptancePolicy()
+        let reading = historyPayload(at: receivedAt)
+        XCTAssertTrue(live.accept(reading, for: session.id, now: receivedAt.addingTimeInterval(1)))
+        let older = historyPayload(at: receivedAt.addingTimeInterval(-60), sensorTime: 1_233)
+        XCTAssertNil(historyRejection(older, now: receivedAt.addingTimeInterval(300)))
+        XCTAssertEqual(live.lastReceivedAt, reading.receivedAt)
+        XCTAssertEqual(live.lastSensorTimeInMinutes, reading.sensorTimeInMinutes)
+        XCTAssertFalse(live.accept(older, for: session.id, now: receivedAt.addingTimeInterval(300)))
+    }
+
+    func testOldInteractiveReadingCannotEnterEitherLiveOrHistoricalPath() {
+        let reading = historyPayload(at: receivedAt)
+        var live = LibreWatchReadingAcceptancePolicy()
+        XCTAssertFalse(live.accept(reading, for: session.id, now: receivedAt.addingTimeInterval(181)))
+        XCTAssertEqual(LibreWatchHistoryPolicy.rejection(
+            for: reading, transport: .interactiveMessage, session: session, calibration: historyCalibration,
+            ownership: .watch, receipt: nil, now: receivedAt.addingTimeInterval(181)
+        ), .invalidPayload)
+    }
+
+    func testQueuedReadingOlderThanThreeMinutesAndUnderTwelveHoursIsAccepted() {
+        XCTAssertNil(historyRejection(historyPayload(at: receivedAt), now: receivedAt.addingTimeInterval(3_600)))
+    }
+
+    func testQueuedReadingOlderThanTwelveHoursIsRejected() {
+        XCTAssertEqual(historyRejection(historyPayload(at: receivedAt), now: receivedAt.addingTimeInterval(43_201)), .tooOld)
+    }
+
+    func testHistoricalReadingsCanArriveOutOfOrderWithoutChangingLiveWatermark() {
+        var live = LibreWatchReadingAcceptancePolicy()
+        let latest = historyPayload(at: receivedAt.addingTimeInterval(120), sensorTime: 1_236)
+        XCTAssertTrue(live.accept(latest, for: session.id, now: latest.receivedAt))
+        for minute in [1, -5, 0, -8] {
+            let older = historyPayload(at: receivedAt.addingTimeInterval(Double(minute * 60)), sensorTime: UInt16(1_234 + minute))
+            XCTAssertNil(historyRejection(older, now: latest.receivedAt))
+        }
+        XCTAssertEqual(live.lastReceivedAt, latest.receivedAt)
+        XCTAssertEqual(live.acceptedPayloadIDs, [latest.id])
+    }
+
+    @MainActor
+    func testBackfillUsesPersistentPayloadIdentityAndPreservesPhoneCollision() throws {
+        let stack = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let context = stack.mainManagedObjectContext
+        let sensor = Sensor(startDate: session.createdAt, nsManagedObjectContext: context)
+        let reading = historyPayload(at: receivedAt)
+        let phone = BgReading(timeStamp: receivedAt, sensor: sensor, calibration: nil, rawData: 120,
+                              deviceName: nil, nsManagedObjectContext: context)
+        phone.calculatedValue = 120
+        phone.id = reading.id.uuidString
+        stack.saveChanges()
+        let objectID = phone.objectID
+        let sensorID = sensor.id
+        context.reset()
+        let stored = try XCTUnwrap(context.existingObject(with: objectID) as? BgReading)
+        XCTAssertTrue(LibreWatchHistoryPolicy.collides(
+            payloadID: reading.id.uuidString, measuredAt: receivedAt.addingTimeInterval(-600), sensorID: sensorID,
+            existingID: stored.id, existingAt: stored.timeStamp, existingSensorID: stored.sensor?.id
+        ))
+        XCTAssertTrue(LibreWatchHistoryPolicy.collides(
+            payloadID: UUID().uuidString, measuredAt: receivedAt.addingTimeInterval(5), sensorID: stored.sensor!.id,
+            existingID: stored.id, existingAt: stored.timeStamp, existingSensorID: stored.sensor?.id
+        ))
+        XCTAssertEqual(stored.calculatedValue, 120) // the phone's point is not overwritten
+        XCTAssertEqual(try context.count(for: BgReading.fetchRequest()), 1)
+    }
+
+    func testHistoricalValidationRejectsWrongSessionSensorCalibrationDomainAndValue() {
+        let reading = historyPayload(at: receivedAt)
+        let wrongSession = payload(raw: 847, previousRaw: 830, domain: .factoryNativeMGDL, sessionID: UUID())
+        XCTAssertEqual(historyRejection(wrongSession), .wrongSession)
+        let wrongSensor = calibration(type: .factoryCalibrated, slope: 1, intercept: 0, sensorUID: Data(repeating: 9, count: 8))
+        XCTAssertEqual(LibreWatchHistoryPolicy.rejection(
+            for: reading, transport: .queuedUserInfo, session: session, calibration: wrongSensor,
+            ownership: .watch, receipt: nil, now: receivedAt
+        ), .wrongSensor)
+        XCTAssertEqual(historyRejection(payload(raw: 847, previousRaw: 830, domain: .factoryNativeMGDL, revision: 9)), .wrongCalibration)
+        XCTAssertEqual(historyRejection(payload(raw: 847, previousRaw: 830, domain: .xDripRawGlucose)), .wrongCalibration)
+        XCTAssertEqual(historyRejection(payload(native: 0, raw: 847, previousRaw: 830, domain: .factoryNativeMGDL)), .invalidValue)
+        XCTAssertEqual(historyRejection(payload(version: 1, raw: 847, previousRaw: 830, domain: .factoryNativeMGDL)), .invalidValue)
+        XCTAssertEqual(historyRejection(historyPayload(at: receivedAt.addingTimeInterval(60)), now: receivedAt), .invalidTime)
+    }
+
+    func testPreCutoffQueuedReadingAcceptedDuringRelease() throws {
+        let receipt = try XCTUnwrap(makeReleaseReceipt())
+        XCTAssertEqual(receipt.state, .pending)
+        XCTAssertNil(historyRejection(historyPayload(at: receivedAt), ownership: .releasingToPhone,
+                                      receipt: receipt, now: receivedAt.addingTimeInterval(600)))
+    }
+
+    func testPreCutoffQueuedReadingAcceptedAfterCompletedReturnToPhoneAndReload() throws {
+        let defaults = isolatedDefaults()
+        var receipt = try XCTUnwrap(makeReleaseReceipt())
+        receipt.complete()
+        LibreWatchSessionStore.saveReleaseReceipt(receipt, defaults: defaults)
+        LibreWatchSessionStore.saveOwnership(.iphone, defaults: defaults)
+        let restored = try XCTUnwrap(LibreWatchSessionStore.loadReleaseReceipt(defaults: defaults))
+        XCTAssertEqual(restored, receipt)
+        XCTAssertNil(historyRejection(historyPayload(at: receivedAt),
+                                      ownership: LibreWatchSessionStore.loadOwnership(defaults: defaults),
+                                      receipt: restored, now: receivedAt.addingTimeInterval(600)))
+    }
+
+    func testPostCutoffReadingRejectedInEveryHistoricalOwnershipState() throws {
+        var receipt = try XCTUnwrap(makeReleaseReceipt())
+        receipt.complete()
+        let after = historyPayload(at: receipt.cutoff.addingTimeInterval(1))
+        for owner in [LibreWatchOwnership.watch, .releasingToPhone, .iphone] {
+            XCTAssertEqual(historyRejection(after, ownership: owner, receipt: receipt,
+                                             now: receipt.cutoff.addingTimeInterval(2)), .afterCutoff)
+        }
+    }
+
+    func testFailedReleaseClearsReceiptAndRestoresConservativeWatchOwner() throws {
+        let defaults = isolatedDefaults()
+        LibreWatchSessionStore.saveSession(session, defaults: defaults)
+        LibreWatchSessionStore.saveReleaseReceipt(try XCTUnwrap(makeReleaseReceipt()), defaults: defaults)
+        LibreWatchSessionStore.saveOwnership(.releasingToPhone, defaults: defaults)
+        // Same rollback operations as the failed returnSensorToPhone branch; never enable iPhone.
+        LibreWatchSessionStore.clearReleaseReceipt(defaults: defaults)
+        LibreWatchSessionStore.saveOwnership(.watch, defaults: defaults)
+        XCTAssertNil(LibreWatchSessionStore.loadReleaseReceipt(defaults: defaults))
+        let decision = LibreWatchPhoneStartupDecision.resolve(
+            persistedOwnership: LibreWatchSessionStore.loadOwnership(defaults: defaults),
+            persistedSession: LibreWatchSessionStore.loadSession(defaults: defaults),
+            activeSensorUID: session.sensorUID, activePatchInfo: session.patchInfo
+        )
+        XCTAssertTrue(decision.phoneConnectionIsBlocked)
+        XCTAssertEqual(decision.ownership, .watch)
+    }
+
+    func testReceiptCannotAuthorizeAnotherCalibrationExpiredDataOrUncompletedPhoneReturn() throws {
+        let receipt = try XCTUnwrap(makeReleaseReceipt())
+        let reading = historyPayload(at: receivedAt)
+        XCTAssertEqual(historyRejection(reading, ownership: .iphone, receipt: receipt), .missingReceipt)
+        XCTAssertEqual(historyRejection(reading, ownership: .iphone, receipt: nil), .missingReceipt)
+        let otherCalibration = calibration(type: .factoryCalibrated, slope: 1, intercept: 1)
+        XCTAssertEqual(LibreWatchHistoryPolicy.rejection(
+            for: reading, transport: .queuedUserInfo, session: session, calibration: otherCalibration,
+            ownership: .releasingToPhone, receipt: receipt, now: receivedAt.addingTimeInterval(600)
+        ), .missingReceipt)
+        XCTAssertLessThanOrEqual(receipt.expiresAt.timeIntervalSince(receipt.cutoff), 43_200)
+        XCTAssertEqual(historyRejection(reading, ownership: .iphone, receipt: receipt,
+                                       now: receipt.expiresAt.addingTimeInterval(1)), .tooOld)
+    }
+
+    func testSessionChangeClearsReleaseReceiptAndWatchGraphCache() throws {
+        let defaults = isolatedDefaults()
+        LibreWatchSessionStore.saveSession(session, defaults: defaults)
+        LibreWatchSessionStore.saveReleaseReceipt(try XCTUnwrap(makeReleaseReceipt()), defaults: defaults)
+        LibreWatchSessionStore.saveHistory([historyPayload(at: receivedAt)], defaults: defaults)
+        let newSession = LibreWatchDirectSession(
+            sensorUID: session.sensorUID, patchInfo: session.patchInfo, sensorSerialNumber: session.sensorSerialNumber,
+            sensorTypeRawValue: session.sensorTypeRawValue, expectedPeripheralName: session.expectedPeripheralName,
+            unlockCode: session.unlockCode, unlockCount: session.unlockCount, algorithmParameters: session.algorithmParameters
+        )
+        LibreWatchSessionStore.saveSession(newSession, defaults: defaults)
+        XCTAssertNil(LibreWatchSessionStore.loadReleaseReceipt(defaults: defaults))
+        XCTAssertTrue(LibreWatchSessionStore.loadHistory(defaults: defaults).isEmpty)
+    }
+
+    func testGraphMergeRetainsWatchOnlyPointsAndPhoneWinsWithoutInterpolation() {
+        let phone = [LibreWatchHistoryMerge.Point(date: receivedAt, glucose: 120)]
+        let watch = [LibreWatchHistoryMerge.Point(date: receivedAt, glucose: 118),
+                     .init(date: receivedAt.addingTimeInterval(-60), glucose: 117),
+                     .init(date: receivedAt.addingTimeInterval(-43_201), glucose: 90)]
+        let merged = LibreWatchHistoryMerge.merge(phone: phone, watch: watch + watch, now: receivedAt)
+        XCTAssertEqual(merged, [phone[0], watch[1]])
+        XCTAssertEqual(LibreWatchHistoryMerge.merge(phone: merged, watch: watch, now: receivedAt), merged)
+    }
+
+    func testDocumentedOfflineTimelineKeepsEveryActualQueuedPointAndInventsNone() throws {
+        let parser = ISO8601DateFormatter()
+        let lastPhone = try XCTUnwrap(parser.date(from: "2026-09-02T10:43:59Z"))
+        let deliveredAt = try XCTUnwrap(parser.date(from: "2026-09-02T11:43:47Z"))
+        // The fixture intentionally has a minute with NO received frame. Never fill that minute.
+        let times = (1 ... 57).filter { $0 != 17 }.map { lastPhone.addingTimeInterval(Double($0 * 60)) } +
+            [try XCTUnwrap(parser.date(from: "2026-09-02T11:42:00Z")),
+             try XCTUnwrap(parser.date(from: "2026-09-02T11:43:01Z"))]
+        let queued = times.enumerated().map { historyPayload(at: $0.element, sensorTime: UInt16(1_235 + $0.offset)) }
+        var persisted = [UUID: LibreWatchDirectReadingPayload]()
+        for reading in Array(queued.reversed()) + queued {
+            XCTAssertNil(historyRejection(reading, now: deliveredAt))
+            persisted[reading.id] = reading
+        }
+        XCTAssertEqual(persisted.count, times.count)
+        XCTAssertEqual(Set(persisted.values.map(\.receivedAt)), Set(times))
+        let graph = LibreWatchHistoryMerge.merge(
+            phone: [.init(date: lastPhone, glucose: 100)],
+            watch: persisted.values.map { .init(date: $0.receivedAt, glucose: $0.nativeGlucoseMGDL) }, now: deliveredAt
+        )
+        XCTAssertEqual(graph.count, times.count + 1)
+        XCTAssertFalse(graph.contains { $0.date == lastPhone.addingTimeInterval(17 * 60) })
+    }
+
+    @MainActor
+    func testHistoricalCalibrationDoesNotRefineCalibrationOrChangeCurrentValueAndTrend() throws {
+        let stack = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let context = stack.mainManagedObjectContext
+        let sensor = Sensor(startDate: session.createdAt, nsManagedObjectContext: context)
+        let calibration = Calibration(
+            timeStamp: receivedAt.addingTimeInterval(-600), sensor: sensor, bg: 100, rawValue: 100,
+            adjustedRawValue: 100, sensorConfidence: 1, rawTimeStamp: receivedAt.addingTimeInterval(-600),
+            slope: 1.1, intercept: 4, distanceFromEstimate: 0, estimateRawAtTimeOfCalibration: 100,
+            slopeConfidence: 1, deviceName: nil, nsManagedObjectContext: context
+        )
+        let current = BgReading(timeStamp: receivedAt, sensor: sensor, calibration: calibration, rawData: 100,
+                                deviceName: nil, nsManagedObjectContext: context)
+        current.calculatedValue = 114
+        current.calculatedValueSlope = 0.02
+        current.calibrationFlag = true
+        let calibrators: [Calibrator] = [Libre1Calibrator(), Libre1NonFixedSlopeCalibrator()]
+        for calibrator in calibrators {
+            var previous = [current]
+            var calibrations = [calibration]
+            let reading = calibrator.createHistoricalBgReading(
+                rawData: 847 * ConstantsBloodGlucose.libreMultiplier, timeStamp: receivedAt.addingTimeInterval(-300),
+                sensor: sensor, last3Readings: &previous, lastCalibrationsForActiveSensorInLastXDays: &calibrations,
+                firstCalibration: calibration, lastCalibration: calibration, deviceName: nil, nsManagedObjectContext: context
+            )
+            XCTAssertEqual(reading.calculatedValue, iphoneCalibratedValue(
+                input: 847 * ConstantsBloodGlucose.libreMultiplier, slope: 1.1, intercept: 4, divider: 1_000
+            ), accuracy: 0.000_001)
+            XCTAssertEqual(calibration.slope, 1.1)
+            XCTAssertEqual(calibration.intercept, 4)
+            XCTAssertEqual(calibration.estimateRawAtTimeOfCalibration, 100)
+            XCTAssertEqual(current.calculatedValue, 114)
+            XCTAssertEqual(current.calculatedValueSlope, 0.02)
+        }
+    }
+
+    func testHistoricalNativeLowIsStillARealValidReading() {
+        let genuineLow = payload(native: 38, previousNative: 40, raw: 380, previousRaw: 400, domain: .factoryNativeMGDL)
+        XCTAssertNil(historyRejection(genuineLow, now: receivedAt.addingTimeInterval(600)))
+        XCTAssertEqual(historyCalibration.displayedGlucose(for: genuineLow), 38)
+    }
+
+    private var historyCalibration: LibreWatchCalibrationSnapshot {
+        calibration(type: .factoryCalibrated, slope: 1, intercept: 0)
+    }
+
+    private func historyPayload(at date: Date, sensorTime: UInt16 = 1_234) -> LibreWatchDirectReadingPayload {
+        payload(raw: 847, previousRaw: 830, domain: .factoryNativeMGDL, sensorTime: sensorTime, at: date)
+    }
+
+    private func historyRejection(_ reading: LibreWatchDirectReadingPayload, ownership: LibreWatchOwnership = .watch,
+                                  receipt: LibreWatchReleaseReceipt? = nil, now: Date? = nil) -> LibreWatchDeliveryOutcome? {
+        LibreWatchHistoryPolicy.rejection(for: reading, transport: .queuedUserInfo, session: session,
+                                          calibration: historyCalibration, ownership: ownership, receipt: receipt, now: now ?? receivedAt)
+    }
+
+    private func makeReleaseReceipt() -> LibreWatchReleaseReceipt? {
+        LibreWatchReleaseReceipt(session: session, calibration: historyCalibration,
+                                 cutoff: receivedAt.addingTimeInterval(60), now: receivedAt.addingTimeInterval(60))
+    }
+
     private var watchAlgorithmParameters: LibreWatchAlgorithmParameters {
         LibreWatchAlgorithmParameters(
             slopeSlope: 0,
@@ -825,11 +1083,12 @@ final class LibreWatchValuePipelineTests: XCTestCase {
         type: LibreWatchCalibrationType,
         slope: Double,
         intercept: Double,
-        revision: UInt64 = 10
+        revision: UInt64 = 10,
+        sensorUID: Data? = nil
     ) -> LibreWatchCalibrationSnapshot {
         LibreWatchCalibrationSnapshot(
             activeSensorID: "active-sensor",
-            sensorUID: session.sensorUID,
+            sensorUID: sensorUID ?? session.sensorUID,
             sensorSerialNumber: session.sensorSerialNumber,
             watchSessionID: session.id,
             calibrationType: type,
@@ -850,12 +1109,14 @@ final class LibreWatchValuePipelineTests: XCTestCase {
         previousRaw: UInt16,
         domain: LibreWatchValueDomain,
         sensorTime: UInt16 = 1_234,
-        at timestamp: Date? = nil
+        at timestamp: Date? = nil,
+        sessionID: UUID? = nil,
+        revision: UInt64 = 10
     ) -> LibreWatchDirectReadingPayload {
         LibreWatchDirectReadingPayload(
             version: version,
             id: id,
-            sessionID: session.id,
+            sessionID: sessionID ?? session.id,
             valueDomain: domain,
             nativeGlucoseMGDL: native,
             previousNativeGlucoseMGDL: previousNative,
@@ -863,7 +1124,7 @@ final class LibreWatchValuePipelineTests: XCTestCase {
             previousRawGlucose: previousRaw,
             sensorTimeInMinutes: sensorTime,
             receivedAt: timestamp ?? receivedAt,
-            calibrationRevision: 10
+            calibrationRevision: revision
         )
     }
 

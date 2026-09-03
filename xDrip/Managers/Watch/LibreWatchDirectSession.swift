@@ -11,12 +11,16 @@ enum LibreWatchMessageKey {
     static let reading = "libreWatchDirectReading"
     static let calibration = "libreWatchCalibrationSnapshot"
     static let diagnosticEvent = "libreWatchDiagnosticEvent"
+    static let releaseCutoff = "libreWatchReleaseCutoff"
+    static let historySensorID = "libreWatchHistorySensorID"
 
     static let persistedSession = "libreWatchDirectPersistedSession.v2"
     static let persistedOwnership = "libreWatchDirectPersistedOwnership.v2"
     static let persistedCalibration = "libreWatchCalibrationSnapshot.v1"
     static let persistedReading = "libreWatchDirectPersistedReading.v2"
     static let legacyPersistedReading = "libreWatchDirectPersistedReading.v1"
+    static let persistedReleaseReceipt = "libreWatchReleaseReceipt.v1"
+    static let persistedHistory = "libreWatchDirectHistory.v2"
 }
 
 enum LibreWatchCommand: String, Codable {
@@ -533,6 +537,132 @@ struct LibreWatchReadingAcceptancePolicy {
     }
 }
 
+/// Local delivery metadata, never a sender-controlled permission in the reading payload.
+enum LibreWatchReadingTransport: String, Codable {
+    case interactiveMessage
+    case queuedUserInfo
+}
+
+enum LibreWatchDeliveryOutcome: String, Codable {
+    case liveAccepted, historicalInserted, duplicate
+    case invalidPayload, wrongSession, wrongSensor, wrongCalibration, invalidValue
+    case invalidTime, tooOld, notOwner, missingReceipt, afterCutoff, collectorUnavailable
+    case liveOrderingRejected, historyNotInserted
+    case receiptCreated, receiptCompleted, receiptCancelled, receiptExpired
+}
+
+/// A receipt only authorizes late delivery of readings already acquired before Watch released
+/// the sensor. It never authorizes a BLE connection or relaxes the interactive/live policy.
+struct LibreWatchReleaseReceipt: Codable, Equatable {
+    enum State: String, Codable { case pending, completed }
+
+    let sessionID: UUID
+    let sensorUID: Data
+    let patchInfo: Data
+    let calibration: LibreWatchCalibrationSnapshot?
+    let cutoff: Date
+    let expiresAt: Date
+    private(set) var state: State = .pending
+
+    init?(session: LibreWatchDirectSession, calibration: LibreWatchCalibrationSnapshot?,
+          cutoff: Date, now: Date = Date()) {
+        guard session.isValid, calibration.map({ $0.matches(session: session) }) ?? true,
+              cutoff.timeIntervalSince1970.isFinite,
+              cutoff >= session.createdAt,
+              cutoff <= now.addingTimeInterval(5 * 60),
+              now.timeIntervalSince(cutoff) < LibreWatchHistoryPolicy.maximumAge
+        else { return nil }
+        sessionID = session.id
+        sensorUID = session.sensorUID
+        patchInfo = session.patchInfo
+        self.calibration = calibration
+        self.cutoff = cutoff
+        expiresAt = min(cutoff, now).addingTimeInterval(LibreWatchHistoryPolicy.maximumAge)
+    }
+
+    func matches(session: LibreWatchDirectSession, calibration: LibreWatchCalibrationSnapshot) -> Bool {
+        sessionID == session.id && sensorUID == session.sensorUID && patchInfo == session.patchInfo &&
+            self.calibration?.hasSameCalibration(as: calibration) == true &&
+            self.calibration?.revision == calibration.revision
+    }
+
+    mutating func complete() { state = .completed }
+}
+
+enum LibreWatchHistoryPolicy {
+    static let maximumAge: TimeInterval = 12 * 60 * 60
+    // Same tolerance as the normal newest-reading path, not its 2.5-minute backfill slot.
+    // This preserves actual one-minute Watch samples and the phone's existing collision winner.
+    static let collisionTolerance: TimeInterval = 10
+
+    static func rejection(
+        for reading: LibreWatchDirectReadingPayload,
+        transport: LibreWatchReadingTransport,
+        session: LibreWatchDirectSession,
+        calibration: LibreWatchCalibrationSnapshot,
+        ownership: LibreWatchOwnership,
+        receipt: LibreWatchReleaseReceipt?,
+        now: Date = Date()
+    ) -> LibreWatchDeliveryOutcome? {
+        guard transport == .queuedUserInfo else { return .invalidPayload }
+        guard session.isValid, reading.sessionID == session.id else { return .wrongSession }
+        guard calibration.matches(session: session) else { return .wrongSensor }
+        guard reading.calibrationRevision == calibration.revision,
+              reading.valueDomain == calibration.requiredValueDomain else { return .wrongCalibration }
+        guard reading.isValid(for: calibration),
+              reading.id != UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)),
+              calibration.displayedGlucose(for: reading) != nil else { return .invalidValue }
+        guard reading.receivedAt.timeIntervalSince1970.isFinite,
+              reading.receivedAt >= session.createdAt,
+              reading.receivedAt <= now,
+              reading.sensorTimeInMinutes > 0 else { return .invalidTime }
+        guard now.timeIntervalSince(reading.receivedAt) <= maximumAge else { return .tooOld }
+
+        if let receipt {
+            guard receipt.expiresAt > now,
+                  receipt.matches(session: session, calibration: calibration) else { return .missingReceipt }
+            guard reading.receivedAt <= receipt.cutoff else { return .afterCutoff }
+            switch ownership {
+            case .watch, .releasingToPhone: return nil
+            case .iphone: return receipt.state == .completed ? nil : .missingReceipt
+            default: return .notOwner
+            }
+        }
+        return ownership == .watch ? nil : .missingReceipt
+    }
+
+    static func collides(payloadID: String?, measuredAt: Date, sensorID: String,
+                         existingID: String, existingAt: Date, existingSensorID: String?) -> Bool {
+        existingSensorID == sensorID &&
+            (payloadID == existingID || abs(existingAt.timeIntervalSince(measuredAt)) <= collisionTolerance)
+    }
+}
+
+/// Chart-only union of real points. The caller supplies only the matching direct session.
+/// There is deliberately no interpolation or timestamp rounding.
+enum LibreWatchHistoryMerge {
+    struct Point: Equatable {
+        let date: Date
+        let glucose: Double
+    }
+
+    static func merge(phone: [Point], watch: [Point], now: Date = Date()) -> [Point] {
+        let oldest = now.addingTimeInterval(-LibreWatchHistoryPolicy.maximumAge)
+        let valid: (Point) -> Bool = {
+            $0.date >= oldest && $0.date <= now && $0.glucose.isFinite && $0.glucose > 0
+        }
+        let phone = phone.filter(valid)
+        var points = [Date: Point]()
+        for point in watch.filter(valid) where !phone.contains(where: {
+            abs($0.date.timeIntervalSince(point.date)) <= LibreWatchHistoryPolicy.collisionTolerance
+        }) {
+            points[point.date] = point
+        }
+        for point in phone { points[point.date] = point }
+        return points.values.sorted { $0.date > $1.date }
+    }
+}
+
 enum LibreWatchCalibrationType: String, Codable, Equatable {
     case factoryCalibrated
     case fixedSlope
@@ -758,6 +888,11 @@ enum LibreWatchSessionStore {
 
     static func saveSession(_ session: LibreWatchDirectSession, defaults: UserDefaults = .standard) {
         guard session.isValid, let data = try? JSONEncoder().encode(session) else { return }
+        if let previous = loadSession(defaults: defaults),
+           previous.id != session.id || !previous.representsSameSensor(as: session) {
+            clearReleaseReceipt(defaults: defaults)
+            defaults.removeObject(forKey: LibreWatchMessageKey.persistedHistory)
+        }
         defaults.set(data, forKey: LibreWatchMessageKey.persistedSession)
     }
 
@@ -817,7 +952,36 @@ enum LibreWatchSessionStore {
         defaults.removeObject(forKey: LibreWatchMessageKey.legacyPersistedReading)
     }
 
+    /// Chart cache only, never an outbox or resend source. WCSession owns delivery.
+    static func loadHistory(defaults: UserDefaults = .standard) -> [LibreWatchDirectReadingPayload] {
+        guard let data = defaults.data(forKey: LibreWatchMessageKey.persistedHistory),
+              let history = try? JSONDecoder().decode([LibreWatchDirectReadingPayload].self, from: data)
+        else { return [] }
+        return history
+    }
+
+    static func saveHistory(_ history: [LibreWatchDirectReadingPayload], defaults: UserDefaults = .standard) {
+        guard let data = try? JSONEncoder().encode(history) else { return }
+        defaults.set(data, forKey: LibreWatchMessageKey.persistedHistory)
+    }
+
+    static func loadReleaseReceipt(defaults: UserDefaults = .standard) -> LibreWatchReleaseReceipt? {
+        guard let data = defaults.data(forKey: LibreWatchMessageKey.persistedReleaseReceipt) else { return nil }
+        return try? JSONDecoder().decode(LibreWatchReleaseReceipt.self, from: data)
+    }
+
+    static func saveReleaseReceipt(_ receipt: LibreWatchReleaseReceipt, defaults: UserDefaults = .standard) {
+        guard let data = try? JSONEncoder().encode(receipt) else { return }
+        defaults.set(data, forKey: LibreWatchMessageKey.persistedReleaseReceipt)
+    }
+
+    static func clearReleaseReceipt(defaults: UserDefaults = .standard) {
+        defaults.removeObject(forKey: LibreWatchMessageKey.persistedReleaseReceipt)
+    }
+
     static func clear(defaults: UserDefaults = .standard) {
+        clearReleaseReceipt(defaults: defaults)
+        defaults.removeObject(forKey: LibreWatchMessageKey.persistedHistory)
         defaults.removeObject(forKey: LibreWatchMessageKey.persistedSession)
         defaults.removeObject(forKey: LibreWatchMessageKey.persistedOwnership)
         defaults.removeObject(forKey: LibreWatchMessageKey.persistedCalibration)

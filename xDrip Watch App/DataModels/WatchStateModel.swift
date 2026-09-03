@@ -136,6 +136,8 @@ final class WatchStateModel: NSObject, ObservableObject {
     /// Original direct values are retained in memory so a newer iPhone calibration can
     /// recompute the Watch-only presentation without altering values sent back to iPhone.
     private var directReadingHistory: [LibreWatchDirectReadingPayload] = []
+    private var phoneReadingHistory: [LibreWatchHistoryMerge.Point] = []
+    private var lastPhoneHistoryGeneratedAt: Double = 0
     private var latestDirectSourceDelta: Double?
     private var directReadingAcceptance = LibreWatchReadingAcceptancePolicy()
 
@@ -157,6 +159,14 @@ final class WatchStateModel: NSObject, ObservableObject {
            libreWatchCalibrationSnapshot?.matches(session: directSession) != true {
             libreWatchCalibrationSnapshot = nil
             LibreWatchSessionStore.clearCalibration()
+        }
+        if let directSession = libreWatchDirectSession,
+           let snapshot = libreWatchCalibrationSnapshot, snapshot.matches(session: directSession) {
+            directReadingHistory = LibreWatchSessionStore.loadHistory().filter {
+                $0.sessionID == directSession.id && $0.isValid(for: snapshot) &&
+                    Date().timeIntervalSince($0.receivedAt) <= LibreWatchHistoryPolicy.maximumAge
+            }.sorted { $0.receivedAt > $1.receivedAt }
+            mergeLibreGraphHistory()
         }
         restorePersistedLibreWatchReadingIfPossible()
 
@@ -559,7 +569,8 @@ final class WatchStateModel: NSObject, ObservableObject {
         sendLibreWatchCommand(
             .releaseOwnership,
             sessionID: preparedSession.id,
-            unlockCounter: unlockCounter
+            unlockCounter: unlockCounter,
+            releaseCutoff: Date()
         ) { [weak self] success, error in
             self?.setLibreWatchOwnership(success ? .iphone : .watch)
             completion(success, error)
@@ -653,6 +664,7 @@ final class WatchStateModel: NSObject, ObservableObject {
         directReadingHistory.append(reading)
         directReadingHistory.sort { $0.receivedAt > $1.receivedAt }
         directReadingHistory.removeAll { $0.receivedAt < Date().addingTimeInterval(-12 * 60 * 60) }
+        LibreWatchSessionStore.saveHistory(directReadingHistory)
 
         upsertDirectReading(reading, displayedGlucose: displayed.glucose)
 
@@ -717,6 +729,9 @@ final class WatchStateModel: NSObject, ObservableObject {
         _ reading: LibreWatchDirectReadingPayload,
         displayedGlucose: Double
     ) {
+        if phoneReadingHistory.contains(where: {
+            abs($0.date.timeIntervalSince(reading.receivedAt)) <= LibreWatchHistoryPolicy.collisionTolerance
+        }) { return }
         if let existingIndex = bgReadingDates.firstIndex(of: reading.receivedAt) {
             if existingIndex < bgReadingValues.count {
                 bgReadingValues[existingIndex] = displayedGlucose
@@ -922,6 +937,7 @@ final class WatchStateModel: NSObject, ObservableObject {
         bgReadingValues = retained.map { $0.1 }
         bgReadingDatesAsDouble = bgReadingDates.map { $0.timeIntervalSince1970 }
         directReadingHistory.removeAll()
+        LibreWatchSessionStore.saveHistory([])
         latestDirectSourceDelta = nil
         isShowingDirectLibreReading = false
         directLibreReadingIsStale = false
@@ -929,6 +945,8 @@ final class WatchStateModel: NSObject, ObservableObject {
     }
 
     private func clearStoredDirectStateForSessionChange() {
+        phoneReadingHistory.removeAll()
+        lastPhoneHistoryGeneratedAt = 0
         directReadingAcceptance.reset()
         clearDirectReadingPresentation()
         libreWatchCalibrationSnapshot = nil
@@ -1127,6 +1145,7 @@ final class WatchStateModel: NSObject, ObservableObject {
         sessionID: UUID,
         unlockCounter: UInt16? = nil,
         diagnosticEvent: Data? = nil,
+        releaseCutoff: Date? = nil,
         queueIfUnreachable: Bool = false,
         completion: ((Bool, String?) -> Void)?
     ) {
@@ -1139,6 +1158,9 @@ final class WatchStateModel: NSObject, ObservableObject {
         }
         if let diagnosticEvent {
             message[LibreWatchMessageKey.diagnosticEvent] = diagnosticEvent
+        }
+        if let releaseCutoff {
+            message[LibreWatchMessageKey.releaseCutoff] = releaseCutoff.timeIntervalSince1970
         }
 
         guard session.activationState == .activated else {
@@ -1204,25 +1226,36 @@ final class WatchStateModel: NSObject, ObservableObject {
     }
 
     private func processBgReadingsFromDictionary(dictionary: [String: Any]) -> Bool {
-        // While Watch owns Libre, its locally calibrated direct history remains authoritative.
-        // iPhone still receives the original direct value for its own normal processing.
-        guard libreWatchOwnership != .watch || !isShowingDirectLibreReading else { return false }
-
         let bgReadingDatesFromDictionary: [Double] = dictionary["bgReadingDatesAsDouble"] as? [Double] ?? [0]
+
+        let generatedAt = dictionary["generatedAt"] as? Double ?? 0
+        guard generatedAt >= lastPhoneHistoryGeneratedAt else { return false }
+        if !directReadingHistory.isEmpty, let directSession = libreWatchDirectSession,
+           let snapshot = libreWatchCalibrationSnapshot {
+            // Do not acknowledge/replace Watch points using another sensor's queued graph.
+            guard dictionary[LibreWatchMessageKey.sessionID] as? String == directSession.id.uuidString,
+                  dictionary[LibreWatchMessageKey.historySensorID] as? String == snapshot.activeSensorID
+            else { return false }
+        }
 
         // let's make a quick check to see if the data about to be processed is from within the last hour
         // this is to avoid long delays when re-opening a Watch app for the first time in days and waiting
         // whilst the whole queue of userInfo messages are processed
         if let lastBgReadingDateFromDictionaryReceived = bgReadingDatesFromDictionary.first, Date(timeIntervalSince1970: lastBgReadingDateFromDictionaryReceived) > Date(timeIntervalSinceNow: -60 * 60 * 1) {
-            bgReadingDates = bgReadingDatesFromDictionary.map { bgReadingDateAsDouble -> Date in
-                return Date(timeIntervalSince1970: bgReadingDateAsDouble)
+            phoneReadingHistory = zip(bgReadingDatesFromDictionary, dictionary["bgReadingValues"] as? [Double] ?? []).map {
+                LibreWatchHistoryMerge.Point(date: Date(timeIntervalSince1970: $0.0), glucose: $0.1)
             }
+            lastPhoneHistoryGeneratedAt = generatedAt
+            mergeLibreGraphHistory()
 
-            bgReadingValues = dictionary["bgReadingValues"] as? [Double] ?? [100]
-
-            slopeOrdinal = dictionary["slopeOrdinal"] as? Int ?? 0
-            deltaValueInUserUnit = dictionary["deltaValueInUserUnit"] as? Double ?? 0
-            updatedDate = Date(timeIntervalSince1970: dictionary["generatedAt"] as? Double ?? Date().timeIntervalSince1970)
+            // Merging a historical graph must not replace the current direct trend/delta.
+            if libreWatchOwnership != .watch || !isShowingDirectLibreReading {
+                if phoneReadingHistory.first?.date == bgReadingDates.first {
+                    slopeOrdinal = dictionary["slopeOrdinal"] as? Int ?? 0
+                    deltaValueInUserUnit = dictionary["deltaValueInUserUnit"] as? Double ?? 0
+                }
+                updatedDate = Date(timeIntervalSince1970: generatedAt)
+            }
 
             // check if there is any BG data available before updating the data source info strings accordingly
             if let bgReadingDate = bgReadingDate() {
@@ -1239,6 +1272,25 @@ final class WatchStateModel: NSObject, ObservableObject {
         }
 
         return false
+    }
+
+    private func mergeLibreGraphHistory() {
+        let now = Date()
+        directReadingHistory.removeAll { now.timeIntervalSince($0.receivedAt) > LibreWatchHistoryPolicy.maximumAge }
+        let watchPoints: [LibreWatchHistoryMerge.Point]
+        if let directSession = libreWatchDirectSession,
+           let snapshot = libreWatchCalibrationSnapshot, snapshot.matches(session: directSession) {
+            watchPoints = directReadingHistory.compactMap { reading in
+                guard reading.sessionID == directSession.id,
+                      let glucose = snapshot.displayedGlucose(for: reading) else { return nil }
+                return LibreWatchHistoryMerge.Point(date: reading.receivedAt, glucose: glucose)
+            }
+        } else { watchPoints = [] }
+        let merged = LibreWatchHistoryMerge.merge(phone: phoneReadingHistory, watch: watchPoints, now: now)
+        bgReadingDates = merged.map(\.date)
+        bgReadingDatesAsDouble = bgReadingDates.map(\.timeIntervalSince1970)
+        bgReadingValues = merged.map(\.glucose)
+        LibreWatchSessionStore.saveHistory(directReadingHistory)
     }
 
     private func processStatusFromDictionary(dictionary: [String: Any]) -> Bool {

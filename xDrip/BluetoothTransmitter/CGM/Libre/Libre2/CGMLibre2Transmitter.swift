@@ -513,6 +513,7 @@ class CGMLibre2Transmitter: BluetoothTransmitter, CGMTransmitter {
             // xDrip modes enter Libre1Calibrator as rawGlucose * libreMultiplier.
             glucoseLevelRaw: reading.sourceValue(for: requiredValueDomain)
         )]
+        glucoseData[0].sourceIdentifier = reading.id.uuidString
         cgmTransmitterDelegate?.cgmTransmitterInfoReceived(
             glucoseData: &glucoseData,
             transmitterBatteryInfo: nil,
@@ -522,6 +523,38 @@ class CGMLibre2Transmitter: BluetoothTransmitter, CGMTransmitter {
             sensorTimeInMinutes: Int(reading.sensorTimeInMinutes),
             from: self
         )
+    }
+
+    /// Separate queued-only entry. The live method above still requires actual Watch ownership.
+    @nonobjc func receiveHistoricalReadingFromWatch(
+        _ reading: LibreWatchDirectReadingPayload,
+        session: LibreWatchDirectSession,
+        calibrationSnapshot: LibreWatchCalibrationSnapshot,
+        receipt: LibreWatchReleaseReceipt?
+    ) -> LibreWatchDeliveryOutcome {
+        guard Thread.isMainThread,
+              UserDefaults.standard.libreSensorUID == session.sensorUID,
+              UserDefaults.standard.librePatchInfo == session.patchInfo else { return .wrongSensor }
+        let expectedType: LibreWatchCalibrationType = isWebOOPEnabled()
+            ? .factoryCalibrated : (isNonFixedSlopeEnabled() ? .nonFixedSlope : .fixedSlope)
+        guard calibrationSnapshot.calibrationType == expectedType else { return .wrongCalibration }
+        // Match the normal delegate's Libre warm-up check without reporting historical age
+        // as a new sensor/communication event.
+        guard Double(reading.sensorTimeInMinutes) >= Double(ConstantsMaster.minimumSensorWarmUpRequiredInMinutes)
+        else { return .invalidTime }
+        if let rejection = LibreWatchHistoryPolicy.rejection(
+            for: reading, transport: .queuedUserInfo, session: session,
+            calibration: calibrationSnapshot, ownership: LibreWatchSessionStore.loadOwnership(), receipt: receipt
+        ) { return rejection }
+        var glucoseData = [GlucoseData(
+            timeStamp: reading.receivedAt,
+            glucoseLevelRaw: reading.sourceValue(for: calibrationSnapshot.requiredValueDomain),
+            backfilledAt: Date()
+        )]
+        glucoseData[0].sourceIdentifier = reading.id.uuidString
+        return cgmTransmitterDelegate?.historicalWatchGlucoseReceived(
+            glucoseData: &glucoseData, sensorID: calibrationSnapshot.activeSensorID
+        ) ?? .collectorUnavailable
     }
     
     /// reset rxBuffer, reset startDate, stop packetRxMonitorTimer, set resendPacketCounter to 0

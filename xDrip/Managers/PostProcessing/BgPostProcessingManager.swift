@@ -113,7 +113,7 @@ class BgPostProcessingManager {
     /// when post processing is active. Manual historical apply explicitly opts
     /// into a full selected-window rewrite.
     @discardableResult
-    func processBgReadings(processingStartDateOverride: Date?, fiveMinuteReadingsStartTimeStampOverride: Date? = nil, forceFullDownstreamRewrite: Bool = false, allowHistoricalDownstreamRewrite: Bool = false) -> Bool {
+    func processBgReadings(processingStartDateOverride: Date?, fiveMinuteReadingsStartTimeStampOverride: Date? = nil, forceFullDownstreamRewrite: Bool = false, allowHistoricalDownstreamRewrite: Bool = false, onlyNewHistoricalReadingIDs: Set<NSManagedObjectID>? = nil) -> Bool {
         refreshSourceContext()
 
         guard let sourceContextIdentifier = currentSourceContextIdentifier() else {
@@ -177,8 +177,13 @@ class BgPostProcessingManager {
         // Automatic processing uses the wider fetched segment as calculation context only.
         // Restore older managed objects before saving so every historical value changed in
         // Core Data belongs to the same tail that is replaced in Nightscout and HealthKit.
-        if processingStartDateOverride == nil {
+        if processingStartDateOverride == nil || onlyNewHistoricalReadingIDs != nil {
             let contextOnlyBgReadings = bgReadings.filter { bgReading in
+                // Watch backfill may calculate with existing points as context, but must not
+                // rewrite the phone's authoritative history, current value or current trend.
+                if let onlyNewHistoricalReadingIDs {
+                    return !onlyNewHistoricalReadingIDs.contains(bgReading.objectID)
+                }
                 guard let automaticRewriteStartDate = automaticRewriteStartDate else { return true }
                 return bgReading.timeStamp < automaticRewriteStartDate
             }

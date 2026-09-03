@@ -21,6 +21,9 @@ protocol CGMTransmitterDelegate:AnyObject {
     ///     - transmitterBatteryInfo : needed for battery level alarm
     ///     - sensorAge : only if transmitter can give that info, eg MiaoMiao, otherwise nil
     func cgmTransmitterInfoReceived(glucoseData:inout [GlucoseData], transmitterBatteryInfo:TransmitterBatteryInfo?, sensorAge: TimeInterval?)
+
+    /// Stored Watch samples only: no live communication, sensor-age or alarm side effects.
+    func historicalWatchGlucoseReceived(glucoseData: inout [GlucoseData], sensorID: String) -> LibreWatchDeliveryOutcome
     
     /// to pass some text error message, delegate can decide to show to user, log, ...
     func errorOccurred(xDripError: XdripError)
@@ -35,6 +38,9 @@ protocol CGMTransmitterDelegate:AnyObject {
 }
 
 extension CGMTransmitterDelegate {
+    func historicalWatchGlucoseReceived(glucoseData: inout [GlucoseData], sensorID: String) -> LibreWatchDeliveryOutcome {
+        .collectorUnavailable
+    }
     func sensorHealthEventOccurred(_ event: CGMSensorHealthEvent) {}
     func sensorSessionStartResultReceived(_ result: CGMSensorSessionStartResult) {}
 }
