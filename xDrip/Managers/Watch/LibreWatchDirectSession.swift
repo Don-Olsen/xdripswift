@@ -115,15 +115,43 @@ struct LibreWatchDiagnosticEvent: Codable, Equatable {
     let kind: LibreWatchDiagnosticEventKind
     let isReconnecting: Bool?
     let errorCode: Int?
+    // Optional so already queued events from older Watch builds still decode.
+    let watchTimestamp: Date?
+    let trigger: String?
+    let applicationIsActive: Bool?
+    let extendedRuntimeIsRunning: Bool?
+    let peripheralState: String?
+    let connectionPhase: String?
+    let deadlinePhase: String?
+    let deadlineAt: Date?
+    let generation: UUID?
 
     init(
         kind: LibreWatchDiagnosticEventKind,
         isReconnecting: Bool? = nil,
-        errorCode: Int? = nil
+        errorCode: Int? = nil,
+        watchTimestamp: Date? = Date(),
+        trigger: String? = nil,
+        applicationIsActive: Bool? = nil,
+        extendedRuntimeIsRunning: Bool? = nil,
+        peripheralState: String? = nil,
+        connectionPhase: String? = nil,
+        deadlinePhase: String? = nil,
+        deadlineAt: Date? = nil,
+        generation: UUID? = nil
     ) {
         self.kind = kind
         self.isReconnecting = isReconnecting
         self.errorCode = errorCode
+        self.watchTimestamp = watchTimestamp
+        self.trigger = trigger
+        self.applicationIsActive = applicationIsActive
+        self.extendedRuntimeIsRunning = extendedRuntimeIsRunning
+        self.peripheralState = peripheralState
+        self.connectionPhase = connectionPhase
+        self.deadlinePhase = deadlinePhase
+        self.deadlineAt = deadlineAt
+        self.generation = generation
     }
 }
 
@@ -163,12 +191,26 @@ struct LibreWatchLegacyDisconnectGate {
         pendingToken = nil
         handled = false
     }
+
+    func legacyIsCurrent(_ token: UUID, scheduledGeneration: UUID, currentGeneration: UUID,
+                         peripheralIsDisconnectedOrDisconnecting: Bool) -> Bool {
+        !handled && pendingToken == token && scheduledGeneration == currentGeneration &&
+            peripheralIsDisconnectedOrDisconnecting
+    }
+
+    mutating func cancelLegacy() {
+        pendingToken = nil
+    }
 }
 
 /// Only connection/setup timing; Bluetooth operations remain in the existing collector.
 struct LibreWatchConnectionTiming {
-    enum Phase: Equatable {
-        case connection, services, characteristics, notifications, unlock, receiving
+    enum Phase: String, Equatable {
+        case connection, services, characteristics, notifications, unlock, receiving, cancelling
+    }
+
+    enum CancellationResult: Equatable {
+        case confirmedDisconnected, retireForScan, awaitConfirmedDisconnection
     }
 
     struct Deadline: Equatable {
@@ -180,6 +222,11 @@ struct LibreWatchConnectionTiming {
     private(set) var phase: Phase?
     private(set) var deadline: Deadline?
     private(set) var dataExpectedSince: Date?
+    private(set) var generation = UUID()
+    private(set) var cancellationWatchdogDidFire = false
+
+    // One bounded cancellation observation, using the collector's existing one-shot work item.
+    static let cancellationTimeout: TimeInterval = 5
 
     var setupInProgress: Bool {
         switch phase {
@@ -191,6 +238,8 @@ struct LibreWatchConnectionTiming {
     var canStartBluetoothOperation: Bool { phase == nil }
 
     mutating func beginConnection(at date: Date, applicationIsActive: Bool) {
+        // Retries belong to the same logical generation until it is explicitly retired.
+        guard phase == nil else { return }
         invalidate()
         phase = .connection
         deadline = Deadline(phase: .connection, token: UUID(), expiresAt: date.addingTimeInterval(
@@ -199,7 +248,9 @@ struct LibreWatchConnectionTiming {
     }
 
     mutating func beginSetup(at date: Date) {
-        invalidate()
+        guard phase != .cancelling else { return }
+        deadline = nil
+        dataExpectedSince = nil
         phase = .services
         refreshSetupDeadline(at: date)
     }
@@ -225,7 +276,8 @@ struct LibreWatchConnectionTiming {
     }
 
     mutating func receivedPacketOrEnabledNotifications(at date: Date) {
-        invalidate()
+        guard phase != .cancelling else { return }
+        deadline = nil
         phase = .receiving
         dataExpectedSince = date
     }
@@ -237,7 +289,7 @@ struct LibreWatchConnectionTiming {
         connected: Bool, connecting: Bool, hasReceptionState: Bool,
         at date: Date, applicationIsActive: Bool
     ) -> Bool {
-        guard !connected else { return false }
+        guard !connected, phase != .cancelling else { return false }
         let staleReception = hasReceptionState || setupInProgress || phase == .receiving
         let missingConnection = connecting && phase != .connection
         guard staleReception || missingConnection else { return false }
@@ -260,15 +312,66 @@ struct LibreWatchConnectionTiming {
         return date.timeIntervalSince(lastActivity) >= timeout
     }
 
+    func canConnect(at date: Date, peripheralIsDisconnected: Bool,
+                    retiredPeripheralIsReleased: Bool) -> Bool {
+        phase == .connection && deadline.map { date < $0.expiresAt } == true &&
+            peripheralIsDisconnected && retiredPeripheralIsReleased
+    }
+
+    mutating func beginCancellation(at date: Date) {
+        guard phase != .cancelling else { return }
+        dataExpectedSince = nil
+        phase = .cancelling
+        cancellationWatchdogDidFire = false
+        deadline = Deadline(phase: .cancelling, token: UUID(), expiresAt: date.addingTimeInterval(Self.cancellationTimeout))
+    }
+
+    /// Timeout may retire a cancelled attempt for scanning, never grant iPhone ownership.
+    mutating func finishCancellation(_ captured: Deadline, ownership: LibreWatchOwnership,
+                                     returningToPhone: Bool, peripheralIsDisconnected: Bool,
+                                     at date: Date) -> CancellationResult? {
+        guard phase == .cancelling, deadline == captured else { return nil }
+        if peripheralIsDisconnected {
+            invalidate()
+            return .confirmedDisconnected
+        }
+        guard date >= captured.expiresAt, !cancellationWatchdogDidFire else { return nil }
+        cancellationWatchdogDidFire = true
+        guard ownership == .watch, !returningToPhone else { return .awaitConfirmedDisconnection }
+        invalidate()
+        return .retireForScan
+    }
+
     mutating func invalidate() {
         phase = nil
         deadline = nil
         dataExpectedSince = nil
+        generation = UUID()
+        cancellationWatchdogDidFire = false
     }
 
     private mutating func refreshSetupDeadline(at date: Date) {
         guard let phase else { return }
         deadline = Deadline(phase: phase, token: UUID(), expiresAt: date.addingTimeInterval(60))
+    }
+}
+
+/// Per notification stream: tolerate a corrupt frame, recover once after three in a row.
+struct LibreWatchFrameLiveness {
+    static let invalidFrameLimit = 3
+    private(set) var consecutiveInvalidFrames = 0
+    private(set) var recoveryRequested = false
+
+    mutating func invalidFrame() -> Bool {
+        guard !recoveryRequested else { return false }
+        consecutiveInvalidFrames += 1
+        guard consecutiveInvalidFrames >= Self.invalidFrameLimit else { return false }
+        recoveryRequested = true
+        return true
+    }
+
+    mutating func validFrame() {
+        self = Self()
     }
 }
 

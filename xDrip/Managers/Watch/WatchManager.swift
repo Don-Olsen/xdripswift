@@ -740,8 +740,21 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
                     troubleshooting = .standard(.integration(name: .watch, activity: .failed))
                 }
 
+                // Receipt time remains the trace timestamp; queued Watch events carry their
+                // own origin time. Keep the context in one argument (trace supports ten).
+                let context = [
+                    "watchTime=\(event.watchTimestamp.map { ISO8601DateFormatter().string(from: $0) } ?? "n/a")",
+                    "trigger=\(event.trigger ?? "n/a")",
+                    "sceneActive=\(event.applicationIsActive.map { String($0) } ?? "n/a")",
+                    "runtime=\(event.extendedRuntimeIsRunning.map { String($0) } ?? "n/a")",
+                    "peripheral=\(event.peripheralState ?? "n/a")",
+                    "phase=\(event.connectionPhase ?? "n/a")",
+                    "deadlinePhase=\(event.deadlinePhase ?? "none")",
+                    "deadline=\(event.deadlineAt.map { ISO8601DateFormatter().string(from: $0) } ?? "none")",
+                    "generation=\(event.generation?.uuidString ?? "n/a")"
+                ].joined(separator: " ")
                 trace(
-                    "Watch Libre diagnostic: event=%{public}@ sensor=%{public}@ isReconnecting=%{public}@ errorCode=%{public}@",
+                    "Watch Libre diagnostic: event=%{public}@ sensor=%{public}@ isReconnecting=%{public}@ errorCode=%{public}@ %{public}@",
                     log: self.log,
                     category: ConstantsLog.categoryWatchManager,
                     type: event.kind == .recoveryFailed ? .error : .info,
@@ -749,7 +762,8 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
                     event.kind.rawValue,
                     preparedSession.redactedIdentity(),
                     event.isReconnecting.map { String($0) } ?? "n/a",
-                    event.errorCode.map { String($0) } ?? "none"
+                    event.errorCode.map { String($0) } ?? "none",
+                    context
                 )
                 reply?([
                     LibreWatchMessageKey.success: true,

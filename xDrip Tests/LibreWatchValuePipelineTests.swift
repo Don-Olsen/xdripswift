@@ -519,7 +519,7 @@ final class LibreWatchValuePipelineTests: XCTestCase {
         var timing = LibreWatchConnectionTiming()
         timing.beginConnection(at: receivedAt, applicationIsActive: true)
         let oldAttempt = try XCTUnwrap(timing.deadline)
-        timing.invalidate() // Explicit connection/setup errors retire the attempt immediately.
+        timing.invalidate() // An explicitly retired generation permits a new attempt.
         timing.beginConnection(at: receivedAt.addingTimeInterval(1), applicationIsActive: false)
         let currentAttempt = try XCTUnwrap(timing.deadline)
         XCTAssertNotEqual(oldAttempt.token, currentAttempt.token)
@@ -589,6 +589,268 @@ final class LibreWatchValuePipelineTests: XCTestCase {
             ),
             3 * 60
         )
+    }
+
+    func testRepeatedConnectionFailuresKeepOneAbsoluteDeadlineAndGeneration() throws {
+        for activeAtStart in [true, false] {
+            var timing = LibreWatchConnectionTiming()
+            timing.beginConnection(at: receivedAt, applicationIsActive: activeAtStart)
+            let original = try XCTUnwrap(timing.deadline)
+            let generation = timing.generation
+            // didFailToConnect retries use the same beginConnection entry point, without
+            // invalidating timing. No helper silently creates a replacement deadline.
+            for seconds in [1.0, 15.0, 30.0, 59.0] {
+                timing.beginConnection(at: receivedAt.addingTimeInterval(seconds),
+                                       applicationIsActive: !activeAtStart)
+                XCTAssertEqual(timing.deadline, original)
+                XCTAssertEqual(timing.generation, generation)
+                XCTAssertTrue(timing.canConnect(at: receivedAt.addingTimeInterval(seconds),
+                                                peripheralIsDisconnected: true,
+                                                retiredPeripheralIsReleased: true))
+            }
+        }
+    }
+
+    func testRetryAtOriginalDeadlineCannotStartOrRenewConnection() throws {
+        for activeAtStart in [true, false] {
+            var timing = LibreWatchConnectionTiming()
+            timing.beginConnection(at: receivedAt, applicationIsActive: activeAtStart)
+            let original = try XCTUnwrap(timing.deadline)
+            for delay in [0.0, 60.0, 600.0] {
+                let now = original.expiresAt.addingTimeInterval(delay)
+                timing.beginConnection(at: now, applicationIsActive: !activeAtStart)
+                XCTAssertEqual(timing.deadline, original)
+                XCTAssertFalse(timing.canConnect(at: now, peripheralIsDisconnected: true,
+                                                 retiredPeripheralIsReleased: true))
+                XCTAssertTrue(timing.timeoutIsCurrent(
+                    original, ownership: .watch, cancelling: false, at: now
+                ))
+            }
+        }
+    }
+
+    func testMissingCancelCallbackRetiresForOneFilteredScanAtWatchdogDeadline() throws {
+        var timing = LibreWatchConnectionTiming()
+        timing.beginConnection(at: receivedAt, applicationIsActive: true)
+        timing.beginCancellation(at: receivedAt.addingTimeInterval(60))
+        let cancellation = try XCTUnwrap(timing.deadline)
+        XCTAssertEqual(cancellation.expiresAt, receivedAt.addingTimeInterval(65))
+        XCTAssertNil(timing.finishCancellation(
+            cancellation, ownership: .watch, returningToPhone: false,
+            peripheralIsDisconnected: false, at: cancellation.expiresAt.addingTimeInterval(-1)
+        ))
+        XCTAssertFalse(timing.canStartBluetoothOperation)
+        XCTAssertEqual(timing.finishCancellation(
+            cancellation, ownership: .watch, returningToPhone: false,
+            peripheralIsDisconnected: false, at: cancellation.expiresAt
+        ), .retireForScan)
+        XCTAssertTrue(timing.canStartBluetoothOperation)
+        XCTAssertNil(timing.finishCancellation(
+            cancellation, ownership: .watch, returningToPhone: false,
+            peripheralIsDisconnected: false, at: cancellation.expiresAt.addingTimeInterval(30)
+        ))
+    }
+
+    func testOldCancellationWatchdogCannotAffectNewConnectionOrSetup() throws {
+        var timing = LibreWatchConnectionTiming()
+        timing.beginCancellation(at: receivedAt)
+        let old = try XCTUnwrap(timing.deadline)
+        let retiredGeneration = timing.generation
+        XCTAssertEqual(timing.finishCancellation(
+            old, ownership: .watch, returningToPhone: false,
+            peripheralIsDisconnected: true, at: receivedAt.addingTimeInterval(1)
+        ), .confirmedDisconnected)
+        timing.beginConnection(at: receivedAt.addingTimeInterval(2), applicationIsActive: true)
+        let connection = timing.deadline
+        XCTAssertNotEqual(timing.generation, retiredGeneration)
+        XCTAssertNil(timing.finishCancellation(
+            old, ownership: .watch, returningToPhone: false,
+            peripheralIsDisconnected: false, at: old.expiresAt
+        ))
+        XCTAssertEqual(timing.deadline, connection)
+        timing.beginSetup(at: receivedAt.addingTimeInterval(3))
+        let setup = timing.deadline
+        XCTAssertNil(timing.finishCancellation(
+            old, ownership: .watch, returningToPhone: false,
+            peripheralIsDisconnected: false, at: old.expiresAt
+        ))
+        XCTAssertEqual(timing.deadline, setup)
+    }
+
+    func testConfirmedCancellationWithoutDelegateCallbackCompletesOnlyOnce() throws {
+        var timing = LibreWatchConnectionTiming()
+        timing.beginCancellation(at: receivedAt)
+        let deadline = try XCTUnwrap(timing.deadline)
+        // A lifecycle/watchdog observation of native .disconnected is also confirmation.
+        XCTAssertEqual(timing.finishCancellation(
+            deadline, ownership: .watch, returningToPhone: false,
+            peripheralIsDisconnected: true, at: receivedAt.addingTimeInterval(1)
+        ), .confirmedDisconnected)
+        XCTAssertNil(timing.finishCancellation(
+            deadline, ownership: .watch, returningToPhone: false,
+            peripheralIsDisconnected: true, at: deadline.expiresAt
+        ))
+    }
+
+    func testReturnToPhoneTimeoutNeverSubstitutesForConfirmedDisconnection() throws {
+        for ownership in [LibreWatchOwnership.watch, .iphone] {
+            var timing = LibreWatchConnectionTiming()
+            timing.receivedPacketOrEnabledNotifications(at: receivedAt)
+            timing.beginCancellation(at: receivedAt)
+            let deadline = try XCTUnwrap(timing.deadline)
+            XCTAssertEqual(timing.finishCancellation(
+                deadline, ownership: ownership, returningToPhone: true,
+                peripheralIsDisconnected: false, at: deadline.expiresAt
+            ), .awaitConfirmedDisconnection)
+            XCTAssertTrue(timing.cancellationWatchdogDidFire)
+            XCTAssertFalse(timing.canStartBluetoothOperation)
+            XCTAssertNil(timing.finishCancellation(
+                deadline, ownership: ownership, returningToPhone: true,
+                peripheralIsDisconnected: false, at: deadline.expiresAt.addingTimeInterval(30)
+            ))
+            XCTAssertEqual(timing.finishCancellation(
+                deadline, ownership: ownership, returningToPhone: true,
+                peripheralIsDisconnected: true, at: deadline.expiresAt.addingTimeInterval(31)
+            ), .confirmedDisconnected)
+            XCTAssertFalse(LibreWatchLifecyclePolicy.eventDrivenRecoveryIsAllowed(ownership: .iphone))
+        }
+    }
+
+    func testCancellationAndRetiredPeripheralPreventParallelConnect() throws {
+        var timing = LibreWatchConnectionTiming()
+        timing.beginCancellation(at: receivedAt)
+        let cancellation = timing.deadline
+        timing.beginConnection(at: receivedAt, applicationIsActive: true)
+        timing.beginSetup(at: receivedAt)
+        timing.receivedPacketOrEnabledNotifications(at: receivedAt)
+        XCTAssertFalse(timing.observeLink(
+            connected: false, connecting: true, hasReceptionState: true,
+            at: receivedAt, applicationIsActive: true
+        ))
+        XCTAssertEqual(timing.phase, .cancelling)
+        XCTAssertEqual(timing.deadline, cancellation)
+        XCTAssertFalse(timing.canStartBluetoothOperation)
+        timing.invalidate()
+        timing.beginConnection(at: receivedAt, applicationIsActive: true)
+        XCTAssertFalse(timing.canConnect(at: receivedAt, peripheralIsDisconnected: true,
+                                         retiredPeripheralIsReleased: false))
+        XCTAssertFalse(timing.canConnect(at: receivedAt, peripheralIsDisconnected: false,
+                                         retiredPeripheralIsReleased: true))
+        XCTAssertTrue(timing.canConnect(at: receivedAt, peripheralIsDisconnected: true,
+                                        retiredPeripheralIsReleased: true))
+    }
+
+    func testInvalidFrameKeepsTechnicalNoDataMonitoringAndResetsAssembly() throws {
+        var timing = LibreWatchConnectionTiming()
+        timing.receivedPacketOrEnabledNotifications(at: receivedAt)
+        var liveness = LibreWatchFrameLiveness()
+        var assembler = Libre2WatchDirectFrameAssembler()
+        XCTAssertThrowsError(try assembler.append(
+            fragment: Data(repeating: 0, count: Libre2WatchDirectConstants.encryptedFrameLength + 1),
+            at: receivedAt.addingTimeInterval(60)
+        ))
+        assembler.reset() // Same catch path as the collector; UI failure does not alter timing.
+        XCTAssertFalse(liveness.invalidFrame())
+        XCTAssertEqual(assembler.assembledByteCount, 0)
+        XCTAssertEqual(timing.phase, .receiving)
+        XCTAssertEqual(timing.dataExpectedSince, receivedAt)
+        XCTAssertTrue(timing.noDataIsOverdue(
+            lastPacketAt: receivedAt, at: receivedAt.addingTimeInterval(120), timeout: 120
+        ))
+        XCTAssertNil(try assembler.append(
+            fragment: Data(repeating: 0, count: 20), at: receivedAt.addingTimeInterval(121)
+        ))
+        XCTAssertEqual(assembler.assembledByteCount, 20)
+    }
+
+    func testValidFrameResetsConsecutiveInvalidFrameCounter() {
+        var liveness = LibreWatchFrameLiveness()
+        XCTAssertFalse(liveness.invalidFrame())
+        XCTAssertFalse(liveness.invalidFrame())
+        XCTAssertEqual(liveness.consecutiveInvalidFrames, 2)
+        liveness.validFrame()
+        XCTAssertEqual(liveness.consecutiveInvalidFrames, 0)
+        XCTAssertFalse(liveness.recoveryRequested)
+        XCTAssertFalse(liveness.invalidFrame())
+        XCTAssertEqual(liveness.consecutiveInvalidFrames, 1)
+    }
+
+    func testThreeConsecutiveInvalidFramesRequestExactlyOneRecovery() {
+        var liveness = LibreWatchFrameLiveness()
+        let requests = (0 ..< 10).map { _ in liveness.invalidFrame() }
+        XCTAssertEqual(LibreWatchFrameLiveness.invalidFrameLimit, 3)
+        XCTAssertEqual(Array(requests.prefix(3)), [false, false, true])
+        XCTAssertEqual(requests.filter { $0 }.count, 1)
+        XCTAssertEqual(liveness.consecutiveInvalidFrames, 3)
+    }
+
+    func testDelayedLegacyDisconnectMustMatchGenerationAndDisconnectedState() throws {
+        var timing = LibreWatchConnectionTiming()
+        timing.receivedPacketOrEnabledNotifications(at: receivedAt)
+        let oldGeneration = timing.generation
+        var gate = LibreWatchLegacyDisconnectGate()
+        let token = try XCTUnwrap(gate.scheduleLegacy())
+        XCTAssertTrue(gate.legacyIsCurrent(
+            token, scheduledGeneration: oldGeneration, currentGeneration: timing.generation,
+            peripheralIsDisconnectedOrDisconnecting: true
+        ))
+        XCTAssertFalse(gate.legacyIsCurrent(
+            token, scheduledGeneration: oldGeneration, currentGeneration: timing.generation,
+            peripheralIsDisconnectedOrDisconnecting: false
+        ))
+        timing.invalidate()
+        timing.beginConnection(at: receivedAt.addingTimeInterval(1), applicationIsActive: true)
+        XCTAssertFalse(gate.legacyIsCurrent(
+            token, scheduledGeneration: oldGeneration, currentGeneration: timing.generation,
+            peripheralIsDisconnectedOrDisconnecting: true
+        ))
+        gate.cancelLegacy()
+        XCTAssertFalse(gate.accept(legacyToken: token))
+    }
+
+    func testModernCallbackAndDidConnectInvalidateDelayedLegacyWork() throws {
+        for didConnectFirst in [true, false] {
+            var gate = LibreWatchLegacyDisconnectGate()
+            let token = try XCTUnwrap(gate.scheduleLegacy())
+            let generation = UUID()
+            if didConnectFirst {
+                gate.reset()
+            } else {
+                XCTAssertTrue(gate.accept())
+            }
+            XCTAssertFalse(gate.legacyIsCurrent(
+                token, scheduledGeneration: generation, currentGeneration: generation,
+                peripheralIsDisconnectedOrDisconnecting: true
+            ))
+            XCTAssertFalse(gate.accept(legacyToken: token))
+        }
+    }
+
+    func testLegacyDiagnosticEventsStillDecodeWithoutNewContext() throws {
+        let data = Data(#"{"kind":"disconnected","isReconnecting":true,"errorCode":7}"#.utf8)
+        let event = try JSONDecoder().decode(LibreWatchDiagnosticEvent.self, from: data)
+        XCTAssertEqual(event.kind, .disconnected)
+        XCTAssertEqual(event.isReconnecting, true)
+        XCTAssertEqual(event.errorCode, 7)
+        XCTAssertNil(event.watchTimestamp)
+        XCTAssertNil(event.trigger)
+        XCTAssertNil(event.generation)
+        XCTAssertNil(event.deadlineAt)
+    }
+
+    func testQueuedDiagnosticPreservesWatchTimestampAndPhaseContext() throws {
+        let event = LibreWatchDiagnosticEvent(
+            kind: .recoveryStarted, watchTimestamp: receivedAt, trigger: "invalidFrames",
+            applicationIsActive: false, extendedRuntimeIsRunning: true,
+            peripheralState: "connected", connectionPhase: "cancelling",
+            deadlinePhase: "cancelling", deadlineAt: receivedAt.addingTimeInterval(5),
+            generation: UUID()
+        )
+        let decoded = try JSONDecoder().decode(
+            LibreWatchDiagnosticEvent.self, from: JSONEncoder().encode(event)
+        )
+        XCTAssertEqual(decoded, event)
+        XCTAssertEqual(decoded.watchTimestamp, receivedAt) // Not the later iPhone receipt time.
     }
 
     func testReadingAcceptanceRejectsDuplicateStaleAndOutOfOrderPayloads() {
