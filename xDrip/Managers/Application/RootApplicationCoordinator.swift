@@ -1070,18 +1070,29 @@ struct InitialCalibrationRequestGate {
     /// - parameters:
     ///     - glucoseData : array with new readings
     ///     - sensorAge : should be present only if it's the first reading(s) being processed for a specific sensor and is needed if it's a transmitterType that returns true to the function canDetectNewSensor
-    private func processNewGlucoseData(glucoseData: inout [GlucoseData], sensorAge: TimeInterval?) {
+    @discardableResult
+    private func processNewGlucoseData(
+        glucoseData: inout [GlucoseData],
+        sensorAge: TimeInterval?,
+        processingMode: LibreWatchGlucoseProcessingMode = .live
+    ) -> Int {
+        let historicalWatchOnly = !processingMode.permitsCurrentValueAndLiveSideEffects
+        // Child-context object IDs can still be temporary until the asynchronous
+        // parent save. The payload UUID is stable throughout that hand-off.
+        var insertedHistoricalIDs = Set<String>()
         // unwrap calibrationsAccessor and coreDataManager and cgmTransmitter
         guard let calibrationsAccessor = calibrationsAccessor, let coreDataManager = coreDataManager, let cgmTransmitter = bluetoothPeripheralManager?.getCGMTransmitter() else {
             trace("in processNewGlucoseData, calibrationsAccessor or coreDataManager or cgmTransmitter is nil", log: log, category: ConstantsLog.categoryRootView, type: .error)
-            return
+            return 0
         }
         
-        synchronizeDetectedSensorStartDate(sensorAge: sensorAge, glucoseData: glucoseData, cgmTransmitter: cgmTransmitter, coreDataManager: coreDataManager)
+        if !historicalWatchOnly {
+            synchronizeDetectedSensorStartDate(sensorAge: sensorAge, glucoseData: glucoseData, cgmTransmitter: cgmTransmitter, coreDataManager: coreDataManager)
+        }
         
         guard glucoseData.count > 0 else {
             trace("in processNewGlucoseData, glucoseData.count = 0", log: log, category: ConstantsLog.categoryRootView, type: .info)
-            return
+            return 0
         }
         
         // also for cases where calibration is not needed, we go through this code
@@ -1113,13 +1124,19 @@ struct InitialCalibrationRequestGate {
             var existingBgReadingsInIncomingRange = [BgReading]()
             
             if let oldestIncomingTimeStamp = oldestIncomingTimeStamp, let newestIncomingTimeStamp = newestIncomingTimeStamp {
-                existingBgReadingsInIncomingRange = bgReadingsAccessor.getBgReadings(from: oldestIncomingTimeStamp.addingTimeInterval(-duplicateReadingWindow), to: newestIncomingTimeStamp.addingTimeInterval(duplicateReadingWindow), on: coreDataManager.mainManagedObjectContext, includingSuppressed: true)
+                let from = historicalWatchOnly
+                    ? Date().addingTimeInterval(-LibreWatchHistoryPolicy.maximumAge)
+                    : oldestIncomingTimeStamp.addingTimeInterval(-duplicateReadingWindow)
+                let to = historicalWatchOnly
+                    ? Date()
+                    : newestIncomingTimeStamp.addingTimeInterval(duplicateReadingWindow)
+                existingBgReadingsInIncomingRange = bgReadingsAccessor.getBgReadings(from: from, to: to, on: coreDataManager.mainManagedObjectContext, includingSuppressed: true)
             }
             
             /// in case loopdelay > 0, this will be used to share with Loop
             /// - it will contain the full range off per minute readings (in stead of filtered by 5 minutes
             /// - reset to empty array
-            if let loopManager = loopManager {
+            if !historicalWatchOnly, let loopManager = loopManager {
                 loopManager.glucoseData = [GlucoseData]()
             }
             
@@ -1134,7 +1151,19 @@ struct InitialCalibrationRequestGate {
                 
                 // Backfill can arrive after a newer live reading has already been stored.
                 // Accept older samples only when they fill an empty 5-minute slot.
-                let isHistoricalGapFill = glucose.timeStamp <= checktimestamp && !existingReadingInSameSlot
+                let isHistoricalGapFill = historicalWatchOnly || (glucose.timeStamp <= checktimestamp && !existingReadingInSameSlot)
+                if historicalWatchOnly, existingBgReadingsInIncomingRange.contains(where: {
+                    LibreWatchHistoryPolicy.collides(
+                        payloadID: glucose.sourceIdentifier,
+                        measuredAt: glucose.timeStamp,
+                        sensorID: activeSensor.id,
+                        existingID: $0.id,
+                        existingAt: $0.timeStamp,
+                        existingSensorID: $0.sensor?.id
+                    )
+                }) {
+                    continue
+                }
                 
                 // timestamp of glucose being processed must be higher (ie more recent) than checktimestamp except if it's the last one (ie the first in the array), because there we don't care if it's less than 5 minutes different with the last but one
                 // adding 10 seconds to timeStampLastBgReading to handle case of G7, with backfills, because the array contains two times the same reading with a timestamp difference of a few seconds
@@ -1144,10 +1173,17 @@ struct InitialCalibrationRequestGate {
                         var last3ReadingsForNewReading = latest3BgReadings
                         
                         if isHistoricalGapFill {
-                            last3ReadingsForNewReading = Array(existingBgReadingsInIncomingRange.filter { $0.timeStamp < glucose.timeStamp }.reversed().prefix(3))
+                            last3ReadingsForNewReading = Array(existingBgReadingsInIncomingRange.filter {
+                                $0.timeStamp < glucose.timeStamp && (!historicalWatchOnly || $0.sensor?.id == activeSensor.id)
+                            }.reversed().prefix(3))
                         }
                         
-                        let newReading = calibrator.createNewBgReading(rawData: glucose.glucoseLevelRaw, timeStamp: glucose.timeStamp, sensor: activeSensor, last3Readings: &last3ReadingsForNewReading, lastCalibrationsForActiveSensorInLastXDays: &lastCalibrationsForActiveSensorInLastXDays, firstCalibration: firstCalibrationForActiveSensor, lastCalibration: lastCalibrationForActiveSensor, deviceName: self.getCGMTransmitterDeviceName(for: cgmTransmitter), nsManagedObjectContext: coreDataManager.mainManagedObjectContext)
+                        let newReading: BgReading
+                        if historicalWatchOnly {
+                            newReading = calibrator.createHistoricalBgReading(rawData: glucose.glucoseLevelRaw, timeStamp: glucose.timeStamp, sensor: activeSensor, last3Readings: &last3ReadingsForNewReading, lastCalibrationsForActiveSensorInLastXDays: &lastCalibrationsForActiveSensorInLastXDays, firstCalibration: firstCalibrationForActiveSensor, lastCalibration: lastCalibrationForActiveSensor, deviceName: self.getCGMTransmitterDeviceName(for: cgmTransmitter), nsManagedObjectContext: coreDataManager.mainManagedObjectContext)
+                        } else {
+                            newReading = calibrator.createNewBgReading(rawData: glucose.glucoseLevelRaw, timeStamp: glucose.timeStamp, sensor: activeSensor, last3Readings: &last3ReadingsForNewReading, lastCalibrationsForActiveSensorInLastXDays: &lastCalibrationsForActiveSensorInLastXDays, firstCalibration: firstCalibrationForActiveSensor, lastCalibration: lastCalibrationForActiveSensor, deviceName: self.getCGMTransmitterDeviceName(for: cgmTransmitter), nsManagedObjectContext: coreDataManager.mainManagedObjectContext)
+                        }
 
                         let downstreamValidity = BgReadingDownstreamPolicy.validity(
                             calculatedValue: newReading.calculatedValue,
@@ -1158,6 +1194,14 @@ struct InitialCalibrationRequestGate {
                         )
                         let isValidForDownstream = downstreamValidity == .valid
 
+                        if historicalWatchOnly && !isValidForDownstream {
+                            coreDataManager.mainManagedObjectContext.delete(newReading)
+                            continue
+                        }
+                        if let sourceIdentifier = glucose.sourceIdentifier {
+                            newReading.id = sourceIdentifier
+                        }
+
                         if let backfilledAt = glucose.backfilledAt ?? (isHistoricalGapFill ? Date() : nil),
                            backfilledAt.timeIntervalSince(glucose.timeStamp) > ConstantsBloodGlucose.minimumSecondsToConsiderAsBackfillDelay {
                             newReading.backfilledAt = backfilledAt
@@ -1167,10 +1211,8 @@ struct InitialCalibrationRequestGate {
                         }
                         
                         // Every accepted reading belongs in the consumer history, including one-minute
-                        // sources and backfills. The entry timestamp intentionally defaults to now,
-                        // because it describes when xDripswift accepted the value. The sensor's distinct
-                        // measurement time remains in the typed payload and is shown in every reading.
-                        // This preserves causality around connection and sensor lifecycle rows.
+                        // sources and backfills. Troubleshooting uses its own acceptance time while the
+                        // reading keeps the sensor's original measurement timestamp.
                         if isValidForDownstream {
                             trace(
                                 "in processNewGlucoseData, new reading created, timestamp = %{public}@, calculatedValue = %{public}@",
@@ -1205,7 +1247,14 @@ struct InitialCalibrationRequestGate {
                         }
                         
                         // save the newly created bgreading permenantly in coredata
-                        coreDataManager.saveChanges()
+                        let readingWasSaved = coreDataManager.saveChanges()
+                        if historicalWatchOnly {
+                            guard readingWasSaved else {
+                                coreDataManager.mainManagedObjectContext.delete(newReading)
+                                continue
+                            }
+                            insertedHistoricalIDs.insert(newReading.id)
+                        }
                         statisticsManager?.invalidate()
 
                         if newReading.rawData.isFinite, newReading.rawData > 0 {
@@ -1227,13 +1276,13 @@ struct InitialCalibrationRequestGate {
                         // reset latest3BgReadings
                         latest3BgReadings = bgReadingsAccessor.getLatestBgReadings(limit: 3, howOld: nil, forSensor: activeSensor, ignoreRawData: false, ignoreCalculatedValue: false, includingSuppressed: true)
                         
-                        if isValidForDownstream, let loopManager = loopManager, LoopManager.osAidSharingPermitted, LoopManager.loopDelay() > 0 && abs(Date().timeIntervalSince(timeStampLastCalibrationForActiveSensor)) > LoopManager.loopDelay() + TimeInterval(minutes: 5.5) {
+                        if !historicalWatchOnly, isValidForDownstream, let loopManager = loopManager, LoopManager.osAidSharingPermitted, LoopManager.loopDelay() > 0 && abs(Date().timeIntervalSince(timeStampLastCalibrationForActiveSensor)) > LoopManager.loopDelay() + TimeInterval(minutes: 5.5) {
                             loopManager.glucoseData.insert(GlucoseData(timeStamp: newReading.timeStamp, glucoseLevelRaw: round(newReading.loopShareValue), slopeOrdinal: newReading.slopeOrdinal(), slopeName: newReading.slopeName), at: 0)
                         }
                     } else {
                         trace("in processNewGlucoseData, reading skipped, rawValue <= 0, looks like a faulty sensor", log: self.log, category: ConstantsLog.categoryRootView, type: .info, troubleshooting: .standard(.sensor(.unusableReading)))
                     }
-                } else if let loopManager = loopManager, LoopManager.osAidSharingPermitted, LoopManager.loopDelay() > 0 && glucose.glucoseLevelRaw > 0 && abs(Date().timeIntervalSince(timeStampLastCalibrationForActiveSensor)) >  LoopManager.loopDelay() + TimeInterval(minutes: 5.5) {
+                } else if !historicalWatchOnly, let loopManager = loopManager, LoopManager.osAidSharingPermitted, LoopManager.loopDelay() > 0 && glucose.glucoseLevelRaw > 0 && abs(Date().timeIntervalSince(timeStampLastCalibrationForActiveSensor)) >  LoopManager.loopDelay() + TimeInterval(minutes: 5.5) {
                     // loopdelay > 0, LoopManager will use loopShareGoucoseData
                     // create a reading just to be able to fill up loopShareGoucoseData, to have them per minute
                     
@@ -1253,6 +1302,23 @@ struct InitialCalibrationRequestGate {
                     // delete the newReading, otherwise it stays in coredata and we would end up with per minute readings
                     coreDataManager.mainManagedObjectContext.delete(newReading)
                 }
+            }
+
+            // Historical Watch samples deliberately stop before the live fan-out below. Existing
+            // readings are calculation context only; post-processing may touch only newly inserted
+            // history and may not rewrite HealthKit, Nightscout or any current state.
+            if historicalWatchOnly {
+                if !insertedHistoricalIDs.isEmpty {
+                    _ = bgPostProcessingManager?.processBgReadings(
+                        processingStartDateOverride: oldestIncomingTimeStamp,
+                        allowHistoricalDownstreamRewrite: false,
+                        onlyNewHistoricalReadingIDs: insertedHistoricalIDs
+                    )
+                    rootHomeStateModel.invalidateCharts()
+                    updateMiniChart()
+                    watchManager?.updateWatchApp(forceComplicationUpdate: false)
+                }
+                return insertedHistoricalIDs.count
             }
             
             let initialCalibrationIsRequired = firstCalibrationForActiveSensor == nil &&
@@ -1334,6 +1400,7 @@ struct InitialCalibrationRequestGate {
                 watchManager?.updateWatchApp(forceComplicationUpdate: false)
             }
         }
+        return 0
     }
     
     /// closes the SwiftUI snooze screen if it is currently visible
@@ -2728,6 +2795,53 @@ extension RootApplicationCoordinator: @preconcurrency CGMTransmitterDelegate {
         loopManager?.shareMetadata(clearReadings: true, sensorState: "not_started")
 
         createNotification(title: Texts_Common.warning, body: Texts_HomeView.sensorNotDetected, identifier: ConstantsNotifications.NotificationIdentifierForSensorNotDetected.sensorNotDetected, sound: nil)
+    }
+
+    func historicalWatchGlucoseReceived(
+        glucoseData: inout [GlucoseData],
+        sensorID: String
+    ) -> LibreWatchDeliveryOutcome {
+        let now = Date()
+        guard Thread.isMainThread,
+              let activeSensor,
+              activeSensor.id == sensorID,
+              let coreDataManager,
+              let bgReadingsAccessor,
+              glucoseData.count == 1,
+              let glucose = glucoseData.first,
+              let sourceID = glucose.sourceIdentifier,
+              UUID(uuidString: sourceID) != nil,
+              glucose.glucoseLevelRaw.isFinite,
+              glucose.glucoseLevelRaw > 0,
+              glucose.timeStamp >= activeSensor.startDate,
+              glucose.timeStamp <= now,
+              now.timeIntervalSince(glucose.timeStamp) <= LibreWatchHistoryPolicy.maximumAge
+        else { return .invalidPayload }
+
+        let existing = bgReadingsAccessor.getBgReadings(
+            from: now.addingTimeInterval(-LibreWatchHistoryPolicy.maximumAge),
+            to: now,
+            on: coreDataManager.mainManagedObjectContext,
+            includingSuppressed: true
+        )
+        if existing.contains(where: {
+            LibreWatchHistoryPolicy.collides(
+                payloadID: sourceID,
+                measuredAt: glucose.timeStamp,
+                sensorID: sensorID,
+                existingID: $0.id,
+                existingAt: $0.timeStamp,
+                existingSensorID: $0.sensor?.id
+            )
+        }) {
+            return .duplicate
+        }
+
+        return processNewGlucoseData(
+            glucoseData: &glucoseData,
+            sensorAge: nil,
+            processingMode: .historicalBackfill
+        ) > 0 ? .historicalInserted : .historyNotInserted
     }
     
     func cgmTransmitterInfoReceived(glucoseData: inout [GlucoseData], transmitterBatteryInfo: TransmitterBatteryInfo?, sensorAge: TimeInterval?) {

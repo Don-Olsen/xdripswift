@@ -1920,7 +1920,11 @@ struct TroubleshootingLogReportBuilder {
             }
 
             switch activity {
-            case .started: return "\(name.name) started an update."
+            case .started:
+                if name == .watch {
+                    return "Apple Watch started Libre connection recovery"
+                }
+                return "\(name.name) started an update."
             case let .succeeded(itemCount):
                 if let itemCount {
                     return "\(name.name) updated \(itemCount) item\(itemCount == 1 ? "" : "s") successfully."

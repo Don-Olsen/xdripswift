@@ -513,6 +513,7 @@ class CGMLibre2Transmitter: BluetoothTransmitter, CGMTransmitter {
             // xDrip modes enter Libre1Calibrator as rawGlucose * libreMultiplier.
             glucoseLevelRaw: reading.sourceValue(for: requiredValueDomain)
         )]
+        glucoseData[0].sourceIdentifier = reading.id.uuidString
         cgmTransmitterDelegate?.cgmTransmitterInfoReceived(
             glucoseData: &glucoseData,
             transmitterBatteryInfo: nil,
@@ -522,6 +523,60 @@ class CGMLibre2Transmitter: BluetoothTransmitter, CGMTransmitter {
             sensorTimeInMinutes: Int(reading.sensorTimeInMinutes),
             from: self
         )
+    }
+
+    /// Separate queued-only entry point. Historical samples are calculated and persisted by the
+    /// normal iPhone data layer, but never enter its live alert or integration fan-out.
+    @nonobjc func receiveHistoricalReadingFromWatch(
+        _ reading: LibreWatchDirectReadingPayload,
+        session: LibreWatchDirectSession,
+        calibrationSnapshot: LibreWatchCalibrationSnapshot,
+        releaseReceipt: LibreWatchReleaseReceipt?,
+        now: Date = Date()
+    ) -> LibreWatchDeliveryOutcome {
+        guard Thread.isMainThread else { return .collectorUnavailable }
+        guard reading.sessionID == session.id else { return .wrongSession }
+        guard UserDefaults.standard.libreSensorUID == session.sensorUID,
+              UserDefaults.standard.librePatchInfo == session.patchInfo
+        else { return .wrongSensor }
+        guard reading.calibrationRevision == calibrationSnapshot.revision,
+              calibrationSnapshot.matches(session: session)
+        else { return .wrongCalibration }
+        guard reading.isValid(for: calibrationSnapshot, at: now),
+              calibrationSnapshot.displayedGlucose(for: reading) != nil
+        else { return .invalidPayload }
+        guard reading.receivedAt <= now else { return .invalidPayload }
+        let ownership = LibreWatchSessionStore.loadOwnership()
+        if let rejection = LibreWatchHistoryPolicy.rejection(
+            reading: reading,
+            transport: .queuedUserInfo,
+            session: session,
+            calibration: calibrationSnapshot,
+            ownership: ownership,
+            receipt: releaseReceipt,
+            now: now
+        ) { return rejection }
+
+        let expectedType: LibreWatchCalibrationType = isWebOOPEnabled()
+            ? .factoryCalibrated
+            : (isNonFixedSlopeEnabled() ? .nonFixedSlope : .fixedSlope)
+        guard calibrationSnapshot.calibrationType == expectedType else { return .wrongCalibration }
+
+        // Match the live delegate's Libre warm-up check without reporting an old sensor age as a
+        // current communication event.
+        guard Double(reading.sensorTimeInMinutes) >= Double(ConstantsMaster.minimumSensorWarmUpRequiredInMinutes)
+        else { return .invalidPayload }
+
+        var glucoseData = [GlucoseData(
+            timeStamp: reading.receivedAt,
+            glucoseLevelRaw: reading.sourceValue(for: calibrationSnapshot.requiredValueDomain),
+            backfilledAt: now
+        )]
+        glucoseData[0].sourceIdentifier = reading.id.uuidString
+        return cgmTransmitterDelegate?.historicalWatchGlucoseReceived(
+            glucoseData: &glucoseData,
+            sensorID: calibrationSnapshot.activeSensorID
+        ) ?? .collectorUnavailable
     }
     
     /// reset rxBuffer, reset startDate, stop packetRxMonitorTimer, set resendPacketCounter to 0

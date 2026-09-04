@@ -889,6 +889,26 @@ final class TroubleshootingLogTests: XCTestCase {
         ])
     }
 
+    func testAppleWatchRecoveryStartIsDistinctFromAnActualRestart() {
+        let entries: [TroubleshootingLogEntry] = [
+            .detailed(
+                .integration(name: .watch, activity: .started),
+                timestamp: referenceDate
+            ),
+            .detailed(
+                .integration(name: .watch, activity: .restarted),
+                timestamp: referenceDate.addingTimeInterval(1)
+            )
+        ]
+        let report = makeReport(entries: entries)
+
+        XCTAssertEqual(
+            report.message(for: entries[0]),
+            "Apple Watch started Libre connection recovery"
+        )
+        XCTAssertEqual(report.message(for: entries[1]), "Apple Watch restarted.")
+    }
+
     func testAppleHealthPermissionMessageExplainsEnabledState() throws {
         let fixture = makeStore()
         defer { removeFixture(fixture.directory) }

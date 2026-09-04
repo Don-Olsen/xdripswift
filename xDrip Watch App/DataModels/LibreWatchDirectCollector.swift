@@ -37,9 +37,9 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
     private var pendingLegacyDisconnect: DispatchWorkItem?
     private var disconnectGate = LibreWatchLegacyDisconnectGate()
     private var scanAfterReconnectCancellation = false
-    private var recoveryDiagnosticIsPending = false
-    private var recoveryFailureWasReported = false
-    private var recoveryTrigger = "disconnect"
+    private var recoveryAttemptState = LibreWatchSessionStore.loadRecoveryAttempt()
+    private var pendingRecoveryDiagnostic: (trigger: String, startedAt: Date)?
+    private var currentReconcileSource: LibreWatchRecoveryReconcileSource = .initialPreparation
 
     private var connectionOptions: [String: Any] {
         [CBConnectPeripheralOptionEnableAutoReconnect: true]
@@ -114,6 +114,16 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
             cancelReconnectFallback()
             connectionTiming.invalidate()
         }
+        if let context = recoveryAttemptState.context {
+            let contextMatches = resolvedSession.map {
+                watchState?.libreWatchOwnership == .watch &&
+                    context.sessionID == $0.id &&
+                    context.sensorIdentity == $0.redactedIdentity()
+            } ?? false
+            if !contextMatches {
+                invalidateRecoveryAttempt()
+            }
+        }
         let sensorChanged: Bool
         if let previousSensorUID, let nextSensorUID = resolvedSession?.sensorUID {
             sensorChanged = previousSensorUID != nextSensorUID
@@ -143,13 +153,14 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
     func ownershipDidChange(_ ownership: LibreWatchOwnership) {
         switch ownership {
         case .watch:
-            updateRecoveryActivity()
+            reconcileRecoveryState(at: Date(), source: .initialPreparation)
         case .iphone:
             stopExtendedRuntime()
             deliberatelyDisconnecting = true
             scanAfterReconnectCancellation = false
             systemAutoReconnectIsActive = false
             connectionTiming.invalidate()
+            invalidateRecoveryAttempt()
             returnAfterDisconnect = nil
             cancelReconnectFallback()
             scanIsPending = false
@@ -165,6 +176,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
             stopExtendedRuntime()
             cancelReconnectFallback()
             connectionTiming.invalidate()
+            invalidateRecoveryAttempt()
         }
     }
 
@@ -191,16 +203,16 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
             }
             self.userInitiatedRuntimeStart = true
             self.startExtendedRuntimeIfEligible()
-            self.updateRecoveryActivity()
+            self.reconcileRecoveryState(at: Date(), source: .initialPreparation)
         }
     }
 
-    func resumeDirectReceptionIfOwned() {
+    func resumeDirectReceptionIfOwned(allowsEventDrivenStart: Bool = false) {
         guard watchState?.libreWatchOwnership == .watch,
               preparedSession?.isValid == true,
               !systemAutoReconnectIsActive,
               !scanAfterReconnectCancellation,
-              timedRecoveryIsAllowed
+              (timedRecoveryIsAllowed || allowsEventDrivenStart)
         else { return }
 
         if centralManager?.isScanning == true { return }
@@ -210,7 +222,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
 
         deliberatelyDisconnecting = false
         scanIsPending = true
-        beginScanningIfPossible()
+        beginScanningIfPossible(allowsEventDrivenStart: allowsEventDrivenStart)
     }
 
     func returnLibreToPhone() {
@@ -266,8 +278,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
 
     private func finishStoppingForPhoneOwnership() {
         clearTransientBluetoothState()
-        recoveryDiagnosticIsPending = false
-        recoveryFailureWasReported = false
+        invalidateRecoveryAttempt()
         state.returnedToPhone(session: preparedSession)
         deliberatelyDisconnecting = false
     }
@@ -307,8 +318,15 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
 
     /// Timers and new fallback scans wait for foreground/runtime execution. Existing Core
     /// Bluetooth work remains intact while Watch owns the sensor and completes via delegates.
-    private func updateRecoveryActivity() {
+    private func reconcileRecoveryState(
+        at date: Date,
+        source: LibreWatchRecoveryReconcileSource
+    ) {
+        currentReconcileSource = source
         startExtendedRuntimeIfEligible()
+        let executionIsAvailable = timedRecoveryIsAllowed
+        let budgetChanged = connectionTiming.setExecutionAvailable(executionIsAvailable, at: date)
+        if budgetChanged { cancelReconnectFallback() }
 
         if connectionTiming.phase == .cancelling {
             evaluateCancellation()
@@ -316,13 +334,12 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         }
 
         if let sensorPeripheral {
-            normalizeObservedLink(sensorPeripheral, at: Date())
+            normalizeObservedLink(sensorPeripheral, at: date)
         }
 
-        guard timedRecoveryIsAllowed,
-              watchState?.libreWatchOwnership == .watch
+        guard watchState?.libreWatchOwnership == .watch
         else {
-            if !eventDrivenRecoveryIsAllowed, centralManager?.isScanning == true {
+            if centralManager?.isScanning == true {
                 centralManager?.stopScan()
                 scanIsPending = false
             }
@@ -330,10 +347,16 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
             return
         }
 
+        let allowsImmediateBluetoothAction = executionIsAvailable || source.grantsEventDrivenBluetoothAction
+        guard allowsImmediateBluetoothAction else {
+            cancelReconnectFallback()
+            return
+        }
+
         guard !scanAfterReconnectCancellation else { return }
 
         guard let sensorPeripheral else {
-            resumeDirectReceptionIfOwned()
+            resumeDirectReceptionIfOwned(allowsEventDrivenStart: source.grantsEventDrivenBluetoothAction)
             return
         }
 
@@ -352,7 +375,21 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
                 return
             }
             guard let centralManager, centralManager.state == .poweredOn else { return }
-            connect(sensorPeripheral, using: centralManager)
+            if connectionTiming.phase == .connection {
+                switch connectionTiming.failedConnectionAction(
+                    at: date,
+                    bluetoothIsPoweredOn: true
+                ) {
+                case .retryConfirmedPeripheral:
+                    connect(sensorPeripheral, using: centralManager)
+                case .scanConfirmedSensor:
+                    scheduleRescan(allowsEventDrivenStart: source.grantsEventDrivenBluetoothAction)
+                case .waitForBluetooth:
+                    break
+                }
+            } else {
+                connect(sensorPeripheral, using: centralManager)
+            }
         case .disconnecting:
             scheduleReconnectFallback(for: sensorPeripheral)
         @unknown default:
@@ -360,12 +397,12 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         }
     }
 
-    private func beginScanningIfPossible() {
+    private func beginScanningIfPossible(allowsEventDrivenStart: Bool = false) {
         guard scanIsPending,
               !scanAfterReconnectCancellation,
               connectionTiming.canStartBluetoothOperation,
               watchState?.libreWatchOwnership == .watch,
-              timedRecoveryIsAllowed,
+              (timedRecoveryIsAllowed || allowsEventDrivenStart),
               let centralManager
         else { return }
 
@@ -390,19 +427,36 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         }
     }
 
-    private func scheduleRescan() {
-        guard timedRecoveryIsAllowed, !deliberatelyDisconnecting else { return }
+    private func scheduleRescan(allowsEventDrivenStart: Bool = false) {
+        guard !deliberatelyDisconnecting else { return }
         systemAutoReconnectIsActive = false
         clearTransientBluetoothState()
         scanIsPending = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
-            self?.beginScanningIfPossible()
+        guard timedRecoveryIsAllowed || allowsEventDrivenStart else { return }
+        if allowsEventDrivenStart {
+            beginScanningIfPossible(allowsEventDrivenStart: true)
+            return
         }
+        let generation = connectionTiming.generation
+        let sessionID = preparedSession?.id
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self,
+                  self.connectionTiming.generation == generation,
+                  self.preparedSession?.id == sessionID,
+                  self.scanIsPending else { return }
+            self.reconnectFallbackWorkItem = nil
+            self.beginScanningIfPossible(allowsEventDrivenStart: allowsEventDrivenStart)
+        }
+        reconnectFallbackWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2, execute: workItem)
     }
 
     func applicationActivityDidChange(isActive: Bool) {
         applicationIsActive = isActive
-        updateRecoveryActivity()
+        reconcileRecoveryState(
+            at: Date(),
+            source: isActive ? .sceneActivation : .sceneDeactivation
+        )
         if isActive {
             evaluateConnectionHealth(at: Date())
         }
@@ -417,7 +471,14 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
               connectionTiming.phase == nil || connectionTiming.phase == .connection
         else { return }
         let now = Date()
-        connectionTiming.beginConnection(at: now, applicationIsActive: applicationIsActive)
+        connectionTiming.beginConnection(
+            at: now,
+            applicationIsActive: applicationIsActive,
+            executionIsAvailable: timedRecoveryIsAllowed
+        )
+        if pendingRecoveryDiagnostic != nil {
+            beginRecoveryDiagnosticIfNeeded()
+        }
         guard connectionTiming.canConnect(at: now, peripheralIsDisconnected: true,
                                           retiredPeripheralIsReleased: true) else {
             scheduleReconnectFallback(for: peripheral)
@@ -441,7 +502,9 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
                   connected: peripheral.state == .connected,
                   connecting: peripheral.state == .connecting,
                   hasReceptionState: state.stage == .receiving || receiveCharacteristic != nil || setupService != nil,
-                  at: date, applicationIsActive: applicationIsActive
+                  at: date,
+                  applicationIsActive: applicationIsActive,
+                  executionIsAvailable: timedRecoveryIsAllowed
               )
         else { return false }
         cancelReconnectFallback()
@@ -452,7 +515,14 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         state.reconnecting(error: nil)
         // An observed .connecting already represents one system/ongoing attempt.
         systemAutoReconnectIsActive = peripheral.state == .connecting
-        beginRecoveryDiagnosticIfNeeded(trigger: "observedLinkState")
+        // A .connecting observation already has a connection generation. A .disconnected or
+        // .disconnecting observation keeps its first trigger until an actual attempt/callback
+        // establishes the generation, so one immutable diagnostic cannot describe the wrong phase.
+        if peripheral.state == .connecting {
+            beginRecoveryDiagnosticIfNeeded(trigger: "observedLinkState")
+        } else if recoveryAttemptState.context == nil, pendingRecoveryDiagnostic == nil {
+            pendingRecoveryDiagnostic = (trigger: "observedLinkState", startedAt: date)
+        }
         return true
     }
 
@@ -461,7 +531,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
               !deliberatelyDisconnecting, !scanAfterReconnectCancellation else { return }
         prepareForExpectedDisconnectCallback()
         cancelReconnectFallback()
-        connectionTiming.beginSetup(at: Date())
+        connectionTiming.beginSetup(at: Date(), executionIsAvailable: timedRecoveryIsAllowed)
         systemAutoReconnectIsActive = false
         setupService = nil
         writeCharacteristic = nil
@@ -480,8 +550,13 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
     }
 
     private func recordSetupProgress(_ phase: LibreWatchConnectionTiming.Phase) {
+        currentReconcileSource = .gattCallback
         cancelReconnectFallback()
-        connectionTiming.setupProgress(phase, at: Date())
+        connectionTiming.setupProgress(
+            phase,
+            at: Date(),
+            executionIsAvailable: timedRecoveryIsAllowed
+        )
     }
 
     private func scheduleReconnectFallback(for peripheral: CBPeripheral) {
@@ -506,28 +581,32 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         }
         // Always enqueue: a current didConnect/GATT callback already on main wins first.
         let workItem = DispatchWorkItem { [weak self] in
-            guard let self,
-                  self.timedRecoveryIsAllowed,
-                  !self.deliberatelyDisconnecting,
-                  self.preparedSession?.id == preparedSession.id,
-                  self.preparedSession?.sensorUID == preparedSession.sensorUID,
-                  let currentPeripheral = self.sensorPeripheral,
-                  currentPeripheral === peripheral,
-                  self.connectionTiming.generation == generation,
-                  self.identityAndOwnershipAreConfirmed(for: currentPeripheral),
-                  self.connectionTiming.timeoutIsCurrent(
-                      deadline, ownership: self.watchState?.libreWatchOwnership ?? .iphone,
-                      cancelling: self.scanAfterReconnectCancellation, at: Date()
-                  )
-            else { return }
-            if deadline.phase == .connection, currentPeripheral.state == .connected {
-                self.beginSetup(for: currentPeripheral)
-                return
+            // Give a Core Bluetooth callback that was already queued on main one final turn.
+            DispatchQueue.main.async { [weak self] in
+                guard let self,
+                      self.timedRecoveryIsAllowed,
+                      !self.deliberatelyDisconnecting,
+                      self.preparedSession?.id == preparedSession.id,
+                      self.preparedSession?.sensorUID == preparedSession.sensorUID,
+                      let currentPeripheral = self.sensorPeripheral,
+                      currentPeripheral === peripheral,
+                      self.connectionTiming.generation == generation,
+                      self.identityAndOwnershipAreConfirmed(for: currentPeripheral),
+                      self.connectionTiming.timeoutIsCurrent(
+                          deadline, ownership: self.watchState?.libreWatchOwnership ?? .iphone,
+                          cancelling: self.scanAfterReconnectCancellation, at: Date()
+                      )
+                else { return }
+                if deadline.phase == .connection, currentPeripheral.state == .connected {
+                    self.beginSetup(for: currentPeripheral)
+                    return
+                }
+                self.currentReconcileSource = .executionBudgetExpired
+                self.beginControlledSensorRecovery(
+                    for: currentPeripheral,
+                    error: "Automatic reconnect timed out; returning to the NFC-confirmed sensor scan"
+                )
             }
-            self.beginControlledSensorRecovery(
-                for: currentPeripheral,
-                error: "Automatic reconnect timed out; returning to the NFC-confirmed sensor scan"
-            )
         }
         reconnectFallbackWorkItem = workItem
         DispatchQueue.main.asyncAfter(deadline: .now() + remaining, execute: workItem)
@@ -554,13 +633,13 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         beginCancellation(of: peripheral)
     }
 
-    private func finishReconnectCancellationAndScan() {
+    private func finishReconnectCancellationAndScan(allowsEventDrivenStart: Bool = false) {
         guard scanAfterReconnectCancellation, !deliberatelyDisconnecting,
               eventDrivenRecoveryIsAllowed else { return }
         scanAfterReconnectCancellation = false
         clearTransientBluetoothState()
         scanIsPending = true
-        beginScanningIfPossible()
+        beginScanningIfPossible(allowsEventDrivenStart: allowsEventDrivenStart)
     }
 
     private func releaseRetiredPeripheralIfDisconnected() -> Bool {
@@ -597,9 +676,10 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         evaluateCancellation()
     }
 
-    /// The same one-shot work item serves connection, GATT and bounded cancellation.
-    /// Lifecycle/Bluetooth callbacks also evaluate the absolute deadline after suspension.
-    private func evaluateCancellation() {
+    /// The same one-shot work item serves armed execution budgets and bounded cancellation.
+    /// Connection/GATT budgets pause outside foreground/runtime; cancellation proof remains wall-clock.
+    private func evaluateCancellation(allowsEventDrivenStart: Bool = false) {
+        if !allowsEventDrivenStart { currentReconcileSource = .cancellationWatchdog }
         guard connectionTiming.phase == .cancelling,
               let deadline = connectionTiming.deadline,
               let peripheral = sensorPeripheral else { return }
@@ -612,7 +692,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         case .confirmedDisconnected:
             cancelReconnectFallback()
             if scanAfterReconnectCancellation {
-                finishReconnectCancellationAndScan()
+                finishReconnectCancellationAndScan(allowsEventDrivenStart: allowsEventDrivenStart)
             } else if returnAfterDisconnect != nil {
                 finishPendingReturnAfterDisconnect()
             } else {
@@ -620,14 +700,18 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
             }
         case .retireForScan:
             cancelReconnectFallback()
-            reportDiagnostic(.recoveryFailed, trigger: "cancelCallbackTimeout")
+            reportRecoveryFailureIfNeeded()
             // One filtered scan may resume without the callback. A discovered sensor can
             // connect only once the retired object's native state confirms disconnection.
             retiredPeripheral = peripheral
-            finishReconnectCancellationAndScan()
+            finishReconnectCancellationAndScan(allowsEventDrivenStart: allowsEventDrivenStart)
         case .awaitConfirmedDisconnection:
             cancelReconnectFallback()
-            reportDiagnostic(.recoveryFailed, trigger: "returnAwaitingDisconnection")
+            if recoveryAttemptState.context != nil {
+                reportRecoveryFailureIfNeeded()
+            } else {
+                reportDiagnostic(.recoveryFailed, trigger: "returnAwaitingDisconnection")
+            }
             state.fail(.ownershipFailed, error: "Waiting for confirmed Watch disconnection; iPhone remains paused")
             // Do not acknowledge ownership release merely because a timer expired.
         case nil:
@@ -704,7 +788,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
             scanAfterReconnectCancellation = true
             beginCancellation(of: sensorPeripheral)
         } else {
-            scheduleRescan()
+            scheduleRescan(allowsEventDrivenStart: true)
         }
     }
 
@@ -725,6 +809,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         error: Error?
     ) {
         guard peripheral === sensorPeripheral else { return }
+        currentReconcileSource = .didDisconnect
 
         reportDiagnostic(
             .disconnected, trigger: "didDisconnect", at: disconnectedAt,
@@ -733,7 +818,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         )
 
         if scanAfterReconnectCancellation {
-            evaluateCancellation()
+            evaluateCancellation(allowsEventDrivenStart: true)
             return
         }
 
@@ -745,7 +830,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         )
 
         if action == .finishDeliberateDisconnect {
-            evaluateCancellation()
+            evaluateCancellation(allowsEventDrivenStart: true)
             return
         }
 
@@ -759,20 +844,26 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
 
         switch action {
         case .waitForSystemReconnect:
-            beginRecoveryDiagnosticIfNeeded()
             systemAutoReconnectIsActive = true
             if connectionTiming.phase != .connection {
-                connectionTiming.beginConnection(at: disconnectedAt, applicationIsActive: applicationIsActive)
+                connectionTiming.beginConnection(
+                    at: disconnectedAt,
+                    applicationIsActive: applicationIsActive,
+                    executionIsAvailable: timedRecoveryIsAllowed
+                )
             }
+            // Bind the immutable diagnostic context to the generation that owns this
+            // Core Bluetooth reconnect, not the idle generation it replaced.
+            beginRecoveryDiagnosticIfNeeded()
             scheduleReconnectFallback(for: peripheral)
         case .reconnectManually:
-            beginRecoveryDiagnosticIfNeeded()
             systemAutoReconnectIsActive = false
             cancelReconnectFallback()
             guard let centralManager,
                   centralManager.state == .poweredOn
             else {
-                scheduleRescan()
+                beginRecoveryDiagnosticIfNeeded()
+                scheduleRescan(allowsEventDrivenStart: true)
                 return
             }
             // Keep the NFC-confirmed peripheral and reconnect it directly. Scanning is only the
@@ -780,18 +871,28 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
             if peripheral.state == .connecting {
                 systemAutoReconnectIsActive = true
                 if connectionTiming.phase != .connection {
-                    connectionTiming.beginConnection(at: disconnectedAt, applicationIsActive: applicationIsActive)
+                    connectionTiming.beginConnection(
+                        at: disconnectedAt,
+                        applicationIsActive: applicationIsActive,
+                        executionIsAvailable: timedRecoveryIsAllowed
+                    )
                 }
+                beginRecoveryDiagnosticIfNeeded()
             } else {
-                // A retry keeps the same absolute deadline, including an observed missing callback.
+                // A retry keeps the same phase budget, including an observed missing callback.
                 connect(peripheral, using: centralManager, resetDisconnectGate: false)
+                beginRecoveryDiagnosticIfNeeded()
             }
             scheduleReconnectFallback(for: peripheral)
         case .noAdditionalWork:
             systemAutoReconnectIsActive = isReconnecting && ownership == .watch
             if systemAutoReconnectIsActive {
                 if connectionTiming.phase != .connection {
-                    connectionTiming.beginConnection(at: disconnectedAt, applicationIsActive: applicationIsActive)
+                    connectionTiming.beginConnection(
+                        at: disconnectedAt,
+                        applicationIsActive: applicationIsActive,
+                        executionIsAvailable: timedRecoveryIsAllowed
+                    )
                 }
             }
             cancelReconnectFallback()
@@ -800,41 +901,86 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         }
     }
 
-    private func reportDiagnostic(_ kind: LibreWatchDiagnosticEventKind, trigger: String,
-                                  at date: Date = Date(), isReconnecting: Bool? = nil,
-                                  errorCode: Int? = nil) {
+    private func reportDiagnostic(
+        _ kind: LibreWatchDiagnosticEventKind,
+        trigger: String,
+        at date: Date = Date(),
+        isReconnecting: Bool? = nil,
+        errorCode: Int? = nil,
+        runtimeInvalidationReason: Int? = nil,
+        runtimeError: String? = nil,
+        attempt: LibreWatchRecoveryAttemptContext? = nil
+    ) {
+        let attempt = attempt ?? recoveryAttemptState.context
+        let belongsToRecoveryAttempt: Bool
+        switch kind {
+        case .recoveryStarted, .recoverySucceeded, .recoveryFailed:
+            belongsToRecoveryAttempt = true
+        case .disconnected, .extendedRuntimeWillExpire, .extendedRuntimeInvalidated:
+            belongsToRecoveryAttempt = false
+        }
         watchState?.reportLibreWatchDiagnostic(LibreWatchDiagnosticEvent(
             kind: kind, isReconnecting: isReconnecting, errorCode: errorCode,
-            watchTimestamp: date, trigger: trigger,
+            watchTimestamp: date,
+            trigger: belongsToRecoveryAttempt ? (attempt?.originalTrigger ?? trigger) : trigger,
             applicationIsActive: applicationIsActive,
             extendedRuntimeIsRunning: extendedRuntimeIsRunning,
             peripheralState: sensorPeripheral.map { String(describing: $0.state) },
             connectionPhase: connectionTiming.phase?.rawValue ?? "idle",
             deadlinePhase: connectionTiming.deadline?.phase.rawValue,
             deadlineAt: connectionTiming.deadline?.expiresAt,
-            generation: connectionTiming.generation
+            generation: belongsToRecoveryAttempt
+                ? (attempt?.generation ?? connectionTiming.generation)
+                : connectionTiming.generation,
+            attemptID: attempt?.attemptID,
+            attemptStartedAt: attempt?.startedAt,
+            sessionID: attempt?.sessionID ?? preparedSession?.id,
+            sensorIdentity: attempt?.sensorIdentity ?? preparedSession?.redactedIdentity(),
+            reconcileSource: currentReconcileSource,
+            remainingExecutionBudget: connectionTiming.remainingExecutionTime(at: date),
+            runtimeInvalidationReason: runtimeInvalidationReason,
+            runtimeError: runtimeError
         ))
     }
 
     private func beginRecoveryDiagnosticIfNeeded(trigger: String = "disconnect") {
-        recoveryTrigger = trigger
-        guard !recoveryDiagnosticIsPending else { return }
-        recoveryDiagnosticIsPending = true
-        recoveryFailureWasReported = false
-        reportDiagnostic(.recoveryStarted, trigger: trigger)
+        guard let preparedSession else { return }
+        guard recoveryAttemptState.context == nil else {
+            pendingRecoveryDiagnostic = nil
+            return
+        }
+        let originalTrigger = pendingRecoveryDiagnostic?.trigger ?? trigger
+        let startedAt = pendingRecoveryDiagnostic?.startedAt ?? Date()
+        let candidate = LibreWatchRecoveryAttemptContext(
+            originalTrigger: originalTrigger,
+            startedAt: startedAt,
+            generation: connectionTiming.generation,
+            sessionID: preparedSession.id,
+            sensorIdentity: preparedSession.redactedIdentity()
+        )
+        guard let attempt = recoveryAttemptState.begin(candidate) else { return }
+        pendingRecoveryDiagnostic = nil
+        LibreWatchSessionStore.saveRecoveryAttempt(recoveryAttemptState)
+        reportDiagnostic(.recoveryStarted, trigger: originalTrigger, attempt: attempt)
     }
 
     private func reportRecoveryFailureIfNeeded() {
-        guard recoveryDiagnosticIsPending, !recoveryFailureWasReported else { return }
-        recoveryFailureWasReported = true
-        reportDiagnostic(.recoveryFailed, trigger: recoveryTrigger)
+        guard let attempt = recoveryAttemptState.reportFailure() else { return }
+        LibreWatchSessionStore.saveRecoveryAttempt(recoveryAttemptState)
+        reportDiagnostic(.recoveryFailed, trigger: attempt.originalTrigger, attempt: attempt)
     }
 
     private func reportRecoverySuccessIfNeeded() {
-        guard recoveryDiagnosticIsPending else { return }
-        recoveryDiagnosticIsPending = false
-        recoveryFailureWasReported = false
-        reportDiagnostic(.recoverySucceeded, trigger: recoveryTrigger)
+        pendingRecoveryDiagnostic = nil
+        guard let attempt = recoveryAttemptState.finishSuccess() else { return }
+        LibreWatchSessionStore.saveRecoveryAttempt(recoveryAttemptState)
+        reportDiagnostic(.recoverySucceeded, trigger: attempt.originalTrigger, attempt: attempt)
+    }
+
+    private func invalidateRecoveryAttempt() {
+        pendingRecoveryDiagnostic = nil
+        recoveryAttemptState.invalidate()
+        LibreWatchSessionStore.saveRecoveryAttempt(recoveryAttemptState)
     }
 
     private func handleDisconnectOnce(
@@ -864,6 +1010,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
     }
 
     private func evaluateConnectionHealth(at date: Date) {
+        currentReconcileSource = .healthTimer
         watchState?.refreshDirectLibreReadingFreshness(at: date)
         if connectionTiming.phase == .cancelling {
             evaluateCancellation()
@@ -872,7 +1019,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         if let sensorPeripheral {
             normalizeObservedLink(sensorPeripheral, at: date)
             if connectionTiming.phase != .receiving {
-                updateRecoveryActivity()
+                reconcileRecoveryState(at: date, source: .healthTimer)
             }
         }
 
@@ -885,7 +1032,9 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
               let sensorPeripheral,
               sensorPeripheral.state == .connected,
               connectionTiming.noDataIsOverdue(
-                  lastPacketAt: state.lastPacketAt, at: date, timeout: noDataRecoveryDelay
+                  lastPacketAt: frameLiveness.lastValidBLEFrameAt,
+                  at: date,
+                  timeout: noDataRecoveryDelay
               )
         else { return }
 
@@ -911,25 +1060,34 @@ extension LibreWatchDirectCollector: WKExtendedRuntimeSessionDelegate {
     func extendedRuntimeSessionDidStart(_ extendedRuntimeSession: WKExtendedRuntimeSession) {
         guard self.extendedRuntimeSession === extendedRuntimeSession else { return }
         extendedRuntimeIsRunning = true
-        updateRecoveryActivity()
+        reconcileRecoveryState(at: Date(), source: .extendedRuntimeStarted)
     }
 
     func extendedRuntimeSessionWillExpire(_ extendedRuntimeSession: WKExtendedRuntimeSession) {
         guard self.extendedRuntimeSession === extendedRuntimeSession else { return }
         // The system owns expiration. Do not create replacement sessions from the background.
         userInitiatedRuntimeStart = false
+        currentReconcileSource = .extendedRuntimeWillExpire
+        reportDiagnostic(.extendedRuntimeWillExpire, trigger: "extendedRuntimeWillExpire")
     }
 
     func extendedRuntimeSession(
         _ extendedRuntimeSession: WKExtendedRuntimeSession,
-        didInvalidateWith _: WKExtendedRuntimeSessionInvalidationReason,
-        error _: Error?
+        didInvalidateWith reason: WKExtendedRuntimeSessionInvalidationReason,
+        error: Error?
     ) {
         guard self.extendedRuntimeSession === extendedRuntimeSession else { return }
         self.extendedRuntimeSession = nil
         extendedRuntimeIsRunning = false
         userInitiatedRuntimeStart = false
-        updateRecoveryActivity()
+        currentReconcileSource = .extendedRuntimeInvalidated
+        reportDiagnostic(
+            .extendedRuntimeInvalidated,
+            trigger: "extendedRuntimeInvalidated",
+            runtimeInvalidationReason: reason.rawValue,
+            runtimeError: error?.localizedDescription
+        )
+        reconcileRecoveryState(at: Date(), source: .extendedRuntimeInvalidated)
     }
 }
 
@@ -946,11 +1104,12 @@ extension LibreWatchDirectCollector: CBCentralManagerDelegate {
         }
 
         if central.state == .poweredOn || connectionTiming.phase == .cancelling {
-            updateRecoveryActivity()
+            reconcileRecoveryState(at: Date(), source: .centralStateUpdate)
         }
     }
 
     func centralManager(_ central: CBCentralManager, willRestoreState dict: [String: Any]) {
+        currentReconcileSource = .stateRestoration
         guard watchState?.libreWatchOwnership == .watch,
               let peripherals = dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral],
               let preparedSession
@@ -990,7 +1149,7 @@ extension LibreWatchDirectCollector: CBCentralManagerDelegate {
         @unknown default:
             state.reconnecting(error: nil)
         }
-        updateRecoveryActivity()
+        reconcileRecoveryState(at: Date(), source: .stateRestoration)
     }
 
     func centralManager(
@@ -1016,13 +1175,14 @@ extension LibreWatchDirectCollector: CBCentralManagerDelegate {
         peripheral.delegate = self
         central.stopScan()
         guard identityAndOwnershipAreConfirmed(for: peripheral) else {
-            scheduleRescan()
+            scheduleRescan(allowsEventDrivenStart: true)
             return
         }
         connect(peripheral, using: central)
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+        currentReconcileSource = .didConnect
         guard peripheral === sensorPeripheral else {
             central.cancelPeripheralConnection(peripheral)
             return
@@ -1042,6 +1202,9 @@ extension LibreWatchDirectCollector: CBCentralManagerDelegate {
         guard eventDrivenRecoveryIsAllowed else { return }
         // Accept the connection before consulting any old deadline. GATT gets its own clock.
         beginSetup(for: peripheral)
+        if pendingRecoveryDiagnostic != nil {
+            beginRecoveryDiagnosticIfNeeded()
+        }
     }
 
     func centralManager(
@@ -1049,13 +1212,14 @@ extension LibreWatchDirectCollector: CBCentralManagerDelegate {
         didFailToConnect peripheral: CBPeripheral,
         error: Error?
     ) {
+        currentReconcileSource = .didFailToConnect
         if peripheral === retiredPeripheral {
             _ = releaseRetiredPeripheralIfDisconnected()
             return
         }
         guard peripheral === sensorPeripheral else { return }
         if scanAfterReconnectCancellation || deliberatelyDisconnecting {
-            evaluateCancellation()
+            evaluateCancellation(allowsEventDrivenStart: true)
             return
         }
         // Ignore callbacks belonging to retired setup/receiving phases or an ongoing newer attempt.
@@ -1065,16 +1229,27 @@ extension LibreWatchDirectCollector: CBCentralManagerDelegate {
         systemAutoReconnectIsActive = false
         cancelReconnectFallback()
 
-        if timedRecoveryIsAllowed,
-           watchState?.libreWatchOwnership == .watch,
-           peripheral === sensorPeripheral {
-            state.reconnecting(error: bluetoothErrorDescription(error))
-            connect(peripheral, using: central)
-            return
-        }
-
         state.reconnecting(error: bluetoothErrorDescription(error))
-        // Keep the deadline while suspended; the next lifecycle event evaluates its original end.
+        guard eventDrivenRecoveryIsAllowed,
+              watchState?.libreWatchOwnership == .watch,
+              peripheral === sensorPeripheral
+        else { return }
+
+        // A delegate callback is one bounded execution opportunity even without scene/runtime
+        // timer access. An exhausted generation cannot silently wait forever: because this
+        // callback confirms the old peripheral is disconnected, retire it and start one exact-
+        // sensor scan. A powered-off central has its explicit future poweredOn callback instead.
+        switch connectionTiming.failedConnectionAction(
+            at: Date(),
+            bluetoothIsPoweredOn: central.state == .poweredOn
+        ) {
+        case .retryConfirmedPeripheral:
+            connect(peripheral, using: central)
+        case .scanConfirmedSensor:
+            scheduleRescan(allowsEventDrivenStart: true)
+        case .waitForBluetooth:
+            break
+        }
     }
 
     func centralManager(
@@ -1141,6 +1316,7 @@ extension LibreWatchDirectCollector: CBCentralManagerDelegate {
 
 extension LibreWatchDirectCollector: CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
+        currentReconcileSource = .gattCallback
         guard setupCallbackIsCurrent(peripheral, phase: .services) else { return }
         if let error {
             failAndRescan(.serviceNotFound, error: error.localizedDescription)
@@ -1167,6 +1343,7 @@ extension LibreWatchDirectCollector: CBPeripheralDelegate {
         didDiscoverCharacteristicsFor service: CBService,
         error: Error?
     ) {
+        currentReconcileSource = .gattCallback
         guard setupCallbackIsCurrent(peripheral, phase: .characteristics),
               service === setupService else { return }
         if let error {
@@ -1199,6 +1376,7 @@ extension LibreWatchDirectCollector: CBPeripheralDelegate {
         didUpdateNotificationStateFor characteristic: CBCharacteristic,
         error: Error?
     ) {
+        currentReconcileSource = .gattCallback
         guard characteristic.uuid == CBUUID(string: Libre2WatchDirectConstants.receiveCharacteristicUUIDString),
               characteristic === receiveCharacteristic,
               setupCallbackIsCurrent(peripheral, phase: .notifications)
@@ -1241,6 +1419,7 @@ extension LibreWatchDirectCollector: CBPeripheralDelegate {
         didWriteValueFor characteristic: CBCharacteristic,
         error: Error?
     ) {
+        currentReconcileSource = .gattCallback
         guard characteristic.uuid == CBUUID(string: Libre2WatchDirectConstants.writeCharacteristicUUIDString),
               characteristic === writeCharacteristic,
               setupCallbackIsCurrent(peripheral, phase: .unlock)
@@ -1258,6 +1437,7 @@ extension LibreWatchDirectCollector: CBPeripheralDelegate {
         didUpdateValueFor characteristic: CBCharacteristic,
         error: Error?
     ) {
+        currentReconcileSource = .bleNotification
         guard characteristic.uuid == CBUUID(string: Libre2WatchDirectConstants.receiveCharacteristicUUIDString),
               characteristic === receiveCharacteristic,
               identityAndOwnershipAreConfirmed(for: peripheral),
@@ -1284,12 +1464,20 @@ extension LibreWatchDirectCollector: CBPeripheralDelegate {
                 parameters: preparedSession.algorithmParameters,
                 receivedAt: now
             )
-            frameLiveness.validFrame()
-            if watchState?.submitLibreWatchReading(reading) == true {
+            // BLE liveness is a property of the technically valid Libre frame, not of later
+            // clinical ordering/deduplication. Refresh it before the payload acceptance gate.
+            let wasAccepted = LibreWatchValidFramePolicy.record(
+                liveness: &frameLiveness,
+                at: now
+            ) { _ in
                 cancelReconnectFallback()
                 connectionTiming.receivedPacketOrEnabledNotifications(at: now)
-                state.recordDirectReading(reading)
+                state.notificationsActive()
                 reportRecoverySuccessIfNeeded()
+                return watchState?.submitLibreWatchReading(reading) == true
+            }
+            if wasAccepted {
+                state.recordDirectReading(reading)
             }
         } catch {
             frameAssembler.reset()

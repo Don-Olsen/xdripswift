@@ -9,6 +9,9 @@ public class GlucoseData {
 
     var backfilledAt: Date?
 
+    /// Stable source identity for idempotent Watch delivery.
+    var sourceIdentifier: String?
+
     /// used when needed
     var slopeOrdinal: Int?
     

@@ -138,6 +138,9 @@ final class WatchStateModel: NSObject, ObservableObject {
     private var directReadingHistory: [LibreWatchDirectReadingPayload] = []
     private var latestDirectSourceDelta: Double?
     private var directReadingAcceptance = LibreWatchReadingAcceptancePolicy()
+    private var connectivityOutbox = LibreWatchSessionStore.loadOutbox()
+    private var outboxInFlightID: UUID?
+    private var activationWasRequested = false
 
     @Published var aidStatus: AIDStatus?
 
@@ -161,7 +164,11 @@ final class WatchStateModel: NSObject, ObservableObject {
         restorePersistedLibreWatchReadingIfPossible()
 
         session.delegate = self
-        session.activate()
+        if session.activationState == .activated {
+            flushWatchConnectivityOutbox()
+        } else {
+            requestSessionActivationIfNeeded()
+        }
     }
 
     // MARK: - Functions to provide context data to populate the views
@@ -507,7 +514,7 @@ final class WatchStateModel: NSObject, ObservableObject {
     /// request a state update from the iOS companion app
     func requestWatchStateUpdate() {
         guard session.activationState == .activated else {
-            session.activate()
+            requestSessionActivationIfNeeded()
             return
         }
         // change the text, this must be done in the main thread but only do it if the watch app is reachable
@@ -555,11 +562,13 @@ final class WatchStateModel: NSObject, ObservableObject {
             return
         }
 
+        let releaseCutoff = Date()
         setLibreWatchOwnership(.releasingToPhone)
         sendLibreWatchCommand(
             .releaseOwnership,
             sessionID: preparedSession.id,
-            unlockCounter: unlockCounter
+            unlockCounter: unlockCounter,
+            releaseCutoff: releaseCutoff
         ) { [weak self] success, error in
             self?.setLibreWatchOwnership(success ? .iphone : .watch)
             completion(success, error)
@@ -574,6 +583,8 @@ final class WatchStateModel: NSObject, ObservableObject {
         preparedSession.unlockCount = counter
         libreWatchDirectSession = preparedSession
         LibreWatchSessionStore.saveSession(preparedSession)
+        connectivityOutbox.retain(sessionID: preparedSession.id)
+        LibreWatchSessionStore.saveOutbox(connectivityOutbox)
         sendLibreWatchCommand(
             .updateUnlockCounter,
             sessionID: preparedSession.id,
@@ -597,8 +608,7 @@ final class WatchStateModel: NSObject, ObservableObject {
             calibrationRevision: snapshot.revision
         )
         guard reading.isValid(for: snapshot),
-              snapshot.displayedGlucose(for: reading) != nil,
-              let data = try? JSONEncoder().encode(reading)
+              snapshot.displayedGlucose(for: reading) != nil
         else { return false }
 
         guard directReadingAcceptance.accept(
@@ -609,27 +619,7 @@ final class WatchStateModel: NSObject, ObservableObject {
 
         applyLibreWatchReadingLocally(reading)
 
-        let message: [String: Any] = [
-            LibreWatchMessageKey.command: LibreWatchCommand.submitReading.rawValue,
-            LibreWatchMessageKey.sessionID: reading.sessionID.uuidString,
-            LibreWatchMessageKey.reading: data
-        ]
-
-        guard session.activationState == .activated else {
-            session.activate()
-            session.transferUserInfo(message)
-            return true
-        }
-
-        guard session.isReachable else {
-            session.transferUserInfo(message)
-            return true
-        }
-
-        session.sendMessage(message, replyHandler: nil) { [weak self] _ in
-            guard let self else { return }
-            self.session.transferUserInfo(message)
-        }
+        enqueueForWatchConnectivity(.reading(reading))
         return true
     }
 
@@ -701,8 +691,11 @@ final class WatchStateModel: NSObject, ObservableObject {
               reading.isValid(for: snapshot),
               directReadingHistory[index + 1].isValid(for: snapshot)
         else { return nil }
-        return reading.sourceValue(for: snapshot.requiredValueDomain) -
-            directReadingHistory[index + 1].sourceValue(for: snapshot.requiredValueDomain)
+        return LibreWatchDirectDeltaPolicy.sourceDelta(
+            current: reading,
+            previous: directReadingHistory[index + 1],
+            calibration: snapshot
+        )
     }
 
     private func displayedLibreDelta(_ sourceDelta: Double?) -> Double? {
@@ -832,8 +825,8 @@ final class WatchStateModel: NSObject, ObservableObject {
                 stored.displayedTrendMGDLPerMinute,
                 stored.calibrationRevision
             ) : nil,
-            sourceDeltaOverride: stored.sourceDelta,
-            displayedDeltaOverride: storedCalibrationIsCurrent ? stored.displayedDeltaMGDL : nil
+            sourceDeltaOverride: nil,
+            displayedDeltaOverride: nil
         )
     }
 
@@ -950,7 +943,7 @@ final class WatchStateModel: NSObject, ObservableObject {
         // the Watch app can appear before WCSession has finished activating
         // keep the pending range and try again when activation completes
         guard session.activationState == .activated else {
-            session.activate()
+            requestSessionActivationIfNeeded()
             return
         }
 
@@ -1101,6 +1094,14 @@ final class WatchStateModel: NSObject, ObservableObject {
 
         libreWatchDirectSession = preparedSession
         LibreWatchSessionStore.saveSession(preparedSession)
+        if sessionChanged {
+            connectivityOutbox.retain(sessionID: preparedSession.id)
+            if let inFlightID = outboxInFlightID,
+               !connectivityOutbox.items.contains(where: { $0.id == inFlightID }) {
+                outboxInFlightID = nil
+            }
+            LibreWatchSessionStore.saveOutbox(connectivityOutbox)
+        }
         if sessionChanged, libreWatchOwnership == .watch {
             directReadingAcceptance.reset(for: preparedSession.id)
         }
@@ -1122,14 +1123,152 @@ final class WatchStateModel: NSObject, ObservableObject {
         )
     }
 
+    private func requestSessionActivationIfNeeded() {
+        guard session.activationState != .activated, !activationWasRequested else { return }
+        activationWasRequested = true
+        session.activate()
+    }
+
+    private func message(for item: LibreWatchOutboxItem) -> [String: Any]? {
+        guard let command = item.command else { return nil }
+        var message: [String: Any] = [
+            LibreWatchMessageKey.command: command.rawValue,
+            LibreWatchMessageKey.sessionID: item.sessionID.uuidString
+        ]
+        if let reading = item.reading,
+           let data = try? JSONEncoder().encode(reading) {
+            message[LibreWatchMessageKey.reading] = data
+        } else if item.kind == .reading {
+            return nil
+        }
+        if let unlockCounter = item.unlockCounter {
+            message[LibreWatchMessageKey.unlockCounter] = Int(unlockCounter)
+        }
+        if let diagnosticEvent = item.diagnosticEvent {
+            message[LibreWatchMessageKey.diagnosticEvent] = diagnosticEvent
+        }
+        return message
+    }
+
+    private func enqueueForWatchConnectivity(_ item: LibreWatchOutboxItem) {
+        connectivityOutbox.enqueue(item)
+        LibreWatchSessionStore.saveOutbox(connectivityOutbox)
+        flushWatchConnectivityOutbox()
+    }
+
+    private func finishOutboxItem(_ id: UUID) {
+        connectivityOutbox.remove(id: id)
+        LibreWatchSessionStore.saveOutbox(connectivityOutbox)
+        outboxInFlightID = nil
+        DispatchQueue.main.async { [weak self] in self?.flushWatchConnectivityOutbox() }
+    }
+
+    private func transferOutboxItemIfActivated(_ item: LibreWatchOutboxItem, message: [String: Any]) {
+        guard session.activationState == .activated else {
+            outboxInFlightID = nil
+            requestSessionActivationIfNeeded()
+            return
+        }
+        session.transferUserInfo(message)
+        finishOutboxItem(item.id)
+    }
+
+    private func flushWatchConnectivityOutbox() {
+        guard outboxInFlightID == nil else { return }
+        connectivityOutbox.prune()
+        LibreWatchSessionStore.saveOutbox(connectivityOutbox)
+        guard let item = connectivityOutbox.next else { return }
+        guard let message = message(for: item) else {
+            finishOutboxItem(item.id)
+            return
+        }
+
+        if session.activationState == .activated,
+           let reading = item.reading,
+           Date().timeIntervalSince(reading.receivedAt) > LibreWatchReadingAcceptancePolicy.maximumTransportAge {
+            outboxInFlightID = item.id
+            transferOutboxItemIfActivated(item, message: message)
+            return
+        }
+
+        switch LibreWatchConnectivityDeliveryPolicy.action(
+            sessionIsActivated: session.activationState == .activated,
+            phoneIsReachable: session.isReachable
+        ) {
+        case .activateAndQueue:
+            requestSessionActivationIfNeeded()
+        case .transferUserInfo:
+            outboxInFlightID = item.id
+            transferOutboxItemIfActivated(item, message: message)
+        case .sendMessage:
+            outboxInFlightID = item.id
+            session.sendMessage(message, replyHandler: { [weak self] reply in
+                DispatchQueue.main.async {
+                    guard let self, self.outboxInFlightID == item.id else { return }
+                    let success = reply[LibreWatchMessageKey.success] as? Bool ?? false
+                    let outcome = (reply[LibreWatchMessageKey.deliveryOutcome] as? String)
+                        .flatMap { LibreWatchDeliveryOutcome(rawValue: $0) }
+                    if success {
+                        self.finishOutboxItem(item.id)
+                    } else if item.kind == .reading,
+                              LibreWatchConnectivityDeliveryPolicy.shouldRetryReadingAsQueued(
+                                after: outcome
+                              ) {
+                        // The interactive delivery either crossed the live-age boundary or
+                        // raced an explicit phone return. The queued path independently checks
+                        // the persisted cutoff receipt before accepting historical data.
+                        self.transferOutboxItemIfActivated(item, message: message)
+                    } else {
+                        self.finishOutboxItem(item.id)
+                    }
+                }
+            }, errorHandler: { [weak self] _ in
+                DispatchQueue.main.async {
+                    guard let self, self.outboxInFlightID == item.id else { return }
+                    switch LibreWatchConnectivityDeliveryPolicy.actionAfterSendError(
+                        sessionIsActivated: self.session.activationState == .activated
+                    ) {
+                    case .transferUserInfo:
+                        self.transferOutboxItemIfActivated(item, message: message)
+                    case .activateAndQueue:
+                        self.outboxInFlightID = nil
+                        self.requestSessionActivationIfNeeded()
+                    case .sendMessage:
+                        break
+                    }
+                }
+            })
+        }
+    }
+
     private func sendLibreWatchCommand(
         _ command: LibreWatchCommand,
         sessionID: UUID,
         unlockCounter: UInt16? = nil,
+        releaseCutoff: Date? = nil,
         diagnosticEvent: Data? = nil,
         queueIfUnreachable: Bool = false,
         completion: ((Bool, String?) -> Void)?
     ) {
+        if queueIfUnreachable {
+            let eventID: UUID?
+            if let diagnosticEvent,
+               let event = try? JSONDecoder().decode(LibreWatchDiagnosticEvent.self, from: diagnosticEvent) {
+                eventID = event.eventID
+            } else {
+                eventID = nil
+            }
+            enqueueForWatchConnectivity(.command(
+                command,
+                sessionID: sessionID,
+                unlockCounter: unlockCounter,
+                diagnosticEvent: diagnosticEvent,
+                id: eventID ?? UUID()
+            ))
+            completion?(true, nil)
+            return
+        }
+
         var message: [String: Any] = [
             LibreWatchMessageKey.command: command.rawValue,
             LibreWatchMessageKey.sessionID: sessionID.uuidString
@@ -1137,28 +1276,21 @@ final class WatchStateModel: NSObject, ObservableObject {
         if let unlockCounter {
             message[LibreWatchMessageKey.unlockCounter] = Int(unlockCounter)
         }
+        if let releaseCutoff {
+            message[LibreWatchMessageKey.releaseCutoff] = releaseCutoff.timeIntervalSince1970
+        }
         if let diagnosticEvent {
             message[LibreWatchMessageKey.diagnosticEvent] = diagnosticEvent
         }
 
         guard session.activationState == .activated else {
-            session.activate()
-            if queueIfUnreachable {
-                session.transferUserInfo(message)
-                completion?(true, nil)
-            } else {
-                completion?(false, "WatchConnectivity is not activated")
-            }
+            requestSessionActivationIfNeeded()
+            completion?(false, "WatchConnectivity is not activated")
             return
         }
 
         guard session.isReachable else {
-            if queueIfUnreachable {
-                session.transferUserInfo(message)
-                completion?(true, nil)
-            } else {
-                completion?(false, LibreWatchDirectFailure.phoneUnavailable.rawValue)
-            }
+            completion?(false, LibreWatchDirectFailure.phoneUnavailable.rawValue)
             return
         }
 
@@ -1387,14 +1519,25 @@ final class WatchStateModel: NSObject, ObservableObject {
 // MARK: - WCSession delegate to handle communications
 
 extension WatchStateModel: WCSessionDelegate {
-    func session(_: WCSession, activationDidCompleteWith activationState: WCSessionActivationState, error _: Error?) {
+    func session(_: WCSession, activationDidCompleteWith activationState: WCSessionActivationState, error: Error?) {
         // keep Watch state changes on the main queue because WCSession delivers delegate callbacks on a non-main queue
         DispatchQueue.main.async { [weak self] in
-            guard let self = self, activationState == .activated else { return }
+            guard let self else { return }
+            self.activationWasRequested = false
+            // The payload remains persisted until a transport accepts it. Reclaim any send that
+            // was interrupted by session reactivation; stable payload IDs make retry idempotent.
+            self.outboxInFlightID = nil
+            guard activationState == .activated else {
+                if let error {
+                    self.log.error("WatchConnectivity activation failed; queued Libre data retained: \(error.localizedDescription, privacy: .public)")
+                }
+                return
+            }
 
             self.requestWatchStateUpdate()
             // if the AGP tab requested data while activation was pending, send it now
             self.sendPendingAGPRequestIfPossible()
+            self.flushWatchConnectivityOutbox()
         }
     }
 
@@ -1402,6 +1545,7 @@ extension WatchStateModel: WCSessionDelegate {
         DispatchQueue.main.async {
             // retry AGP requests that were made before the phone became reachable
             self.sendPendingAGPRequestIfPossible()
+            self.flushWatchConnectivityOutbox()
         }
     }
 

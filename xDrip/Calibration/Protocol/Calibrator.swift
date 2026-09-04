@@ -127,6 +127,20 @@ extension Calibrator {
     /// - returns:
     ///     - the created bgreading
     func createNewBgReading(rawData: Double, timeStamp: Date?, sensor: Sensor?, last3Readings: inout Array<BgReading>, lastCalibrationsForActiveSensorInLastXDays: inout Array<Calibration>, firstCalibration: Calibration?, lastCalibration: Calibration?, deviceName: String?, nsManagedObjectContext: NSManagedObjectContext ) -> BgReading {
+        makeBgReading(rawData: rawData, timeStamp: timeStamp, sensor: sensor, last3Readings: &last3Readings, lastCalibrationsForActiveSensorInLastXDays: &lastCalibrationsForActiveSensorInLastXDays, firstCalibration: firstCalibration, lastCalibration: lastCalibration, deviceName: deviceName, nsManagedObjectContext: nsManagedObjectContext, refineCalibration: true)
+    }
+
+    /// Reuses the normal value calculation for backfill without treating a delayed sample as new
+    /// calibration evidence. Factory mode retains NoCalibrator's unchanged implementation.
+    func createHistoricalBgReading(rawData: Double, timeStamp: Date, sensor: Sensor, last3Readings: inout [BgReading], lastCalibrationsForActiveSensorInLastXDays: inout [Calibration], firstCalibration: Calibration?, lastCalibration: Calibration?, deviceName: String?, nsManagedObjectContext: NSManagedObjectContext) -> BgReading {
+        if self is NoCalibrator {
+            return createNewBgReading(rawData: rawData, timeStamp: timeStamp, sensor: sensor, last3Readings: &last3Readings, lastCalibrationsForActiveSensorInLastXDays: &lastCalibrationsForActiveSensorInLastXDays, firstCalibration: firstCalibration, lastCalibration: lastCalibration, deviceName: deviceName, nsManagedObjectContext: nsManagedObjectContext)
+        }
+
+        return makeBgReading(rawData: rawData, timeStamp: timeStamp, sensor: sensor, last3Readings: &last3Readings, lastCalibrationsForActiveSensorInLastXDays: &lastCalibrationsForActiveSensorInLastXDays, firstCalibration: firstCalibration, lastCalibration: lastCalibration, deviceName: deviceName, nsManagedObjectContext: nsManagedObjectContext, refineCalibration: false)
+    }
+
+    private func makeBgReading(rawData: Double, timeStamp: Date?, sensor: Sensor?, last3Readings: inout [BgReading], lastCalibrationsForActiveSensorInLastXDays: inout [Calibration], firstCalibration: Calibration?, lastCalibration: Calibration?, deviceName: String?, nsManagedObjectContext: NSManagedObjectContext, refineCalibration: Bool) -> BgReading {
         
         var timeStampToUse: Date = Date()
         if let timeStamp = timeStamp {
@@ -147,13 +161,14 @@ extension Calibrator {
         if let lastCalibration = lastCalibration, let firstCalibration = firstCalibration {
             if last3Readings.count > 0 {
                 let latest:BgReading = last3Readings[0]
-                if var latestReadingCalibration = latest.calibration {
+                if refineCalibration, var latestReadingCalibration = latest.calibration {
                     if (latest.calibrationFlag && ((latest.timeStamp.toMillisecondsAsDouble() + (60000 * 20)) > timeStampToUse.toMillisecondsAsDouble()) && ((latestReadingCalibration.timeStamp.toMillisecondsAsDouble() + (60000 * 20)) > timeStampToUse.toMillisecondsAsDouble())) {
                         rawValueOverride(for: &latestReadingCalibration, rawValue: weightedAverageRaw(timeA: latest.timeStamp, timeB: timeStampToUse, calibrationTime: latestReadingCalibration.timeStamp, rawA: latest.ageAdjustedRawValue, rawB: bgReading.ageAdjustedRawValue), lastCalibrationsForActiveSensorInLastXDays: &lastCalibrationsForActiveSensorInLastXDays, firstCalibration: firstCalibration, lastCalibration: lastCalibration)
                     }
                 }
+            }
+            if !last3Readings.isEmpty || !refineCalibration {
                 bgReading.calculatedValue = ((lastCalibration.slope * bgReading.ageAdjustedRawValue) + lastCalibration.intercept)
-
             }
             updateCalculatedValue(for: bgReading)
         }
