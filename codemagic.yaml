@@ -38,6 +38,7 @@ workflows:
             -configuration Debug \
             -destination "platform=iOS Simulator,id=$simulator_id" \
             -only-testing:xdripTests/LibreWatchValuePipelineTests \
+            -only-testing:xdripTests/TroubleshootingLogTests \
             -resultBundlePath "$CM_BUILD_DIR/build/test-results/LibreWatchValuePipelineTests.xcresult" \
             CODE_SIGNING_ALLOWED=NO
 

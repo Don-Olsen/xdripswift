@@ -140,12 +140,142 @@ enum LibreWatchReconnectFallbackAction: Equatable {
     case noAdditionalWork
 }
 
+/// One disconnect per connection, with a cancellable legacy fallback on every OS version.
+struct LibreWatchLegacyDisconnectGate {
+    private(set) var pendingToken: UUID?
+    private(set) var handled = false
+
+    mutating func scheduleLegacy() -> UUID? {
+        guard !handled else { return nil }
+        if pendingToken == nil { pendingToken = UUID() }
+        return pendingToken
+    }
+
+    mutating func accept(legacyToken: UUID? = nil) -> Bool {
+        if let legacyToken, legacyToken != pendingToken { return false }
+        pendingToken = nil
+        guard !handled else { return false }
+        handled = true
+        return true
+    }
+
+    mutating func reset() {
+        pendingToken = nil
+        handled = false
+    }
+}
+
+/// Only connection/setup timing; Bluetooth operations remain in the existing collector.
+struct LibreWatchConnectionTiming {
+    enum Phase: Equatable {
+        case connection, services, characteristics, notifications, unlock, receiving
+    }
+
+    struct Deadline: Equatable {
+        let phase: Phase
+        let token: UUID
+        let expiresAt: Date
+    }
+
+    private(set) var phase: Phase?
+    private(set) var deadline: Deadline?
+    private(set) var dataExpectedSince: Date?
+
+    var setupInProgress: Bool {
+        switch phase {
+        case .services, .characteristics, .notifications, .unlock: return true
+        default: return false
+        }
+    }
+
+    var canStartBluetoothOperation: Bool { phase == nil }
+
+    mutating func beginConnection(at date: Date, applicationIsActive: Bool) {
+        invalidate()
+        phase = .connection
+        deadline = Deadline(phase: .connection, token: UUID(), expiresAt: date.addingTimeInterval(
+            applicationIsActive ? 60 : 90
+        ))
+    }
+
+    mutating func beginSetup(at date: Date) {
+        invalidate()
+        phase = .services
+        refreshSetupDeadline(at: date)
+    }
+
+    func acceptsSetup(_ expected: Phase) -> Bool {
+        setupInProgress && phase == expected
+    }
+
+    @discardableResult
+    mutating func setupProgress(_ completed: Phase, at date: Date) -> Bool {
+        guard acceptsSetup(completed) else { return false }
+        switch completed {
+        case .services: phase = .characteristics
+        case .characteristics: phase = .notifications
+        case .notifications: phase = .unlock
+        case .unlock:
+            receivedPacketOrEnabledNotifications(at: date)
+            return true
+        default: return false
+        }
+        refreshSetupDeadline(at: date)
+        return true
+    }
+
+    mutating func receivedPacketOrEnabledNotifications(at date: Date) {
+        invalidate()
+        phase = .receiving
+        dataExpectedSince = date
+    }
+
+    /// Observing .connecting must not fabricate a *new* attempt on every lifecycle event.
+    /// The true receiving-without-deadline case enters here with its timing still absent.
+    @discardableResult
+    mutating func observeLink(
+        connected: Bool, connecting: Bool, hasReceptionState: Bool,
+        at date: Date, applicationIsActive: Bool
+    ) -> Bool {
+        guard !connected else { return false }
+        let staleReception = hasReceptionState || setupInProgress || phase == .receiving
+        let missingConnection = connecting && phase != .connection
+        guard staleReception || missingConnection else { return false }
+        if phase != .connection {
+            invalidate()
+            if connecting { beginConnection(at: date, applicationIsActive: applicationIsActive) }
+        }
+        return true
+    }
+
+    func timeoutIsCurrent(_ captured: Deadline, ownership: LibreWatchOwnership,
+                          cancelling: Bool, at date: Date) -> Bool {
+        ownership == .watch && !cancelling && deadline == captured &&
+            phase == captured.phase && date >= captured.expiresAt
+    }
+
+    func noDataIsOverdue(lastPacketAt: Date?, at date: Date, timeout: TimeInterval) -> Bool {
+        guard phase == .receiving, let dataExpectedSince else { return false }
+        let lastActivity = max(dataExpectedSince, lastPacketAt ?? dataExpectedSince)
+        return date.timeIntervalSince(lastActivity) >= timeout
+    }
+
+    mutating func invalidate() {
+        phase = nil
+        deadline = nil
+        dataExpectedSince = nil
+    }
+
+    private mutating func refreshSetupDeadline(at date: Date) {
+        guard let phase else { return }
+        deadline = Deadline(phase: phase, token: UUID(), expiresAt: date.addingTimeInterval(60))
+    }
+}
+
 /// Pure lifecycle policy shared by the Watch collector and deterministic iPhone tests.
 /// Timed recovery requires foreground/runtime execution, while Core Bluetooth delegate events
 /// may finish one already-established operation whenever Watch still owns the sensor.
 struct LibreWatchLifecyclePolicy {
-    static let foregroundReconnectFallbackDelay: TimeInterval = 12
-    static let extendedRuntimeReconnectFallbackDelay: TimeInterval = 90
     static let foregroundNoDataRecoveryDelay: TimeInterval = 2 * 60
     static let extendedRuntimeNoDataRecoveryDelay: TimeInterval = 3 * 60
 
@@ -200,7 +330,7 @@ struct LibreWatchLifecyclePolicy {
     }
 
     static func reconnectFallbackAction(
-        reconnectStartedAt: Date,
+        deadline: Date,
         now: Date,
         applicationIsActive: Bool,
         extendedRuntimeIsRunning: Bool,
@@ -214,10 +344,7 @@ struct LibreWatchLifecyclePolicy {
             return .noAdditionalWork
         }
 
-        let timeout = applicationIsActive
-            ? foregroundReconnectFallbackDelay
-            : extendedRuntimeReconnectFallbackDelay
-        let remaining = timeout - max(0, now.timeIntervalSince(reconnectStartedAt))
+        let remaining = deadline.timeIntervalSince(now)
         return remaining <= 0 ? .restartConfirmedSensorScan : .wait(remaining)
     }
 

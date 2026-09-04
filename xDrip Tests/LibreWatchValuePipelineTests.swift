@@ -312,7 +312,7 @@ final class LibreWatchValuePipelineTests: XCTestCase {
     func testSuspendedWatchOwnerStartsNoFallbackTimerOrScanLoop() {
         XCTAssertEqual(
             LibreWatchLifecyclePolicy.reconnectFallbackAction(
-                reconnectStartedAt: receivedAt,
+                deadline: receivedAt.addingTimeInterval(90),
                 now: receivedAt.addingTimeInterval(300),
                 applicationIsActive: false,
                 extendedRuntimeIsRunning: false,
@@ -327,55 +327,249 @@ final class LibreWatchValuePipelineTests: XCTestCase {
         ))
     }
 
-    func testForegroundReconnectFallsBackAfterTwelveSeconds() {
-        let startedAt = receivedAt
+    func testConnectionAttemptsHaveFixedSixtyOrNinetySecondDeadlines() throws {
+        for (active, duration) in [(true, 60.0), (false, 90.0)] {
+            var timing = LibreWatchConnectionTiming()
+            timing.beginConnection(at: receivedAt, applicationIsActive: active)
+            let deadline = try XCTUnwrap(timing.deadline)
+            XCTAssertEqual(deadline.expiresAt, receivedAt.addingTimeInterval(duration))
+            XCTAssertFalse(timing.timeoutIsCurrent(
+                deadline, ownership: .watch, cancelling: false,
+                at: receivedAt.addingTimeInterval(duration - 1)
+            ))
+            XCTAssertTrue(timing.timeoutIsCurrent(
+                deadline, ownership: .watch, cancelling: false, at: deadline.expiresAt
+            ))
+        }
+    }
 
-        XCTAssertEqual(
-            LibreWatchLifecyclePolicy.reconnectFallbackAction(
-                reconnectStartedAt: startedAt,
-                now: startedAt.addingTimeInterval(11),
-                applicationIsActive: true,
-                extendedRuntimeIsRunning: true,
-                ownership: .watch
-            ),
-            .wait(1)
+    func testLifecycleChangesNeverShortenOrExtendAnExistingConnectionDeadline() throws {
+        for activeAtStart in [true, false] {
+            var timing = LibreWatchConnectionTiming()
+            timing.beginConnection(at: receivedAt, applicationIsActive: activeAtStart)
+            let original = try XCTUnwrap(timing.deadline)
+            for activeNow in [false, true, false, true] {
+                XCTAssertFalse(timing.observeLink(
+                    connected: false, connecting: true, hasReceptionState: false,
+                    at: receivedAt.addingTimeInterval(20), applicationIsActive: activeNow
+                ))
+                XCTAssertEqual(timing.deadline, original)
+                XCTAssertEqual(LibreWatchLifecyclePolicy.reconnectFallbackAction(
+                    deadline: original.expiresAt, now: receivedAt.addingTimeInterval(20),
+                    applicationIsActive: activeNow, extendedRuntimeIsRunning: true, ownership: .watch
+                ), .wait(activeAtStart ? 40 : 70))
+            }
+        }
+    }
+
+    func testLegacyDisconnectWithoutModernCallbackIsHandled() throws {
+        var gate = LibreWatchLegacyDisconnectGate()
+        let pending = try XCTUnwrap(gate.scheduleLegacy())
+        XCTAssertTrue(gate.accept(legacyToken: pending))
+        XCTAssertTrue(gate.handled)
+        XCTAssertNil(gate.pendingToken)
+    }
+
+    func testModernDisconnectCancelsPendingLegacyFallback() throws {
+        var gate = LibreWatchLegacyDisconnectGate()
+        let pending = try XCTUnwrap(gate.scheduleLegacy())
+        XCTAssertTrue(gate.accept())
+        XCTAssertNil(gate.pendingToken)
+        XCTAssertFalse(gate.accept(legacyToken: pending))
+    }
+
+    func testBothDisconnectCallbacksProduceOnlyOneRecoveryInEitherOrder() throws {
+        for modernFirst in [true, false] {
+            var gate = LibreWatchLegacyDisconnectGate()
+            let pending = try XCTUnwrap(gate.scheduleLegacy())
+            let deliveries: [UUID?] = modernFirst ? [nil, pending] : [pending, nil]
+            var handledCount = 0
+            for token in deliveries {
+                if gate.accept(legacyToken: token) { handledCount += 1 }
+            }
+            XCTAssertEqual(handledCount, 1)
+            XCTAssertNil(gate.scheduleLegacy())
+        }
+    }
+
+    func testDidConnectCancelsOldLegacyCallbackButAllowsTheNextRealDisconnect() throws {
+        var gate = LibreWatchLegacyDisconnectGate()
+        let old = try XCTUnwrap(gate.scheduleLegacy())
+        gate.reset() // Accepted didConnect.
+        let next = try XCTUnwrap(gate.scheduleLegacy())
+        XCTAssertFalse(gate.accept(legacyToken: old))
+        XCTAssertEqual(gate.pendingToken, next)
+        XCTAssertTrue(gate.accept(legacyToken: next))
+    }
+
+    func testReceivingThenObservedConnectingWithoutAnyDisconnectCreatesOneDeadline() throws {
+        var timing = LibreWatchConnectionTiming()
+        timing.receivedPacketOrEnabledNotifications(at: receivedAt)
+        // The real failure: receiving with no disconnect callback and NO pre-created deadline.
+        XCTAssertEqual(timing.phase, .receiving)
+        XCTAssertNil(timing.deadline)
+        let observedAt = receivedAt.addingTimeInterval(93)
+        XCTAssertTrue(timing.observeLink(
+            connected: false, connecting: true, hasReceptionState: true,
+            at: observedAt, applicationIsActive: true
+        ))
+        let deadline = try XCTUnwrap(timing.deadline)
+        XCTAssertEqual(deadline.expiresAt, observedAt.addingTimeInterval(60))
+        XCTAssertEqual(timing.phase, .connection)
+        XCTAssertNil(timing.dataExpectedSince)
+        XCTAssertFalse(timing.setupInProgress)
+        XCTAssertFalse(timing.canStartBluetoothOperation)
+        for seconds in [1.0, 20.0, 80.0] {
+            XCTAssertFalse(timing.observeLink(
+                connected: false, connecting: true, hasReceptionState: false,
+                at: observedAt.addingTimeInterval(seconds), applicationIsActive: false
+            ))
+            XCTAssertEqual(timing.deadline, deadline)
+        }
+    }
+
+    func testDisconnectedOrDisconnectingObservationClearsOldSetupOnlyOnce() {
+        var timing = LibreWatchConnectionTiming()
+        timing.beginSetup(at: receivedAt)
+        XCTAssertTrue(timing.observeLink(
+            connected: false, connecting: false, hasReceptionState: true,
+            at: receivedAt.addingTimeInterval(5), applicationIsActive: false
+        ))
+        XCTAssertNil(timing.deadline)
+        XCTAssertNil(timing.dataExpectedSince)
+        XCTAssertFalse(timing.setupInProgress)
+        XCTAssertFalse(timing.observeLink(
+            connected: false, connecting: false, hasReceptionState: false,
+            at: receivedAt.addingTimeInterval(6), applicationIsActive: true
+        ))
+    }
+
+    func testDidConnectEndsConnectionTimeoutAndStartsFreshGATTIndependentOfOldPacket() throws {
+        var timing = LibreWatchConnectionTiming()
+        timing.receivedPacketOrEnabledNotifications(at: receivedAt)
+        timing.observeLink(
+            connected: false, connecting: true, hasReceptionState: true,
+            at: receivedAt.addingTimeInterval(93), applicationIsActive: true
         )
+        let oldConnection = try XCTUnwrap(timing.deadline)
+        let connectedAt = receivedAt.addingTimeInterval(600)
+        timing.beginSetup(at: connectedAt) // didConnect wins before queued timeout cancellation.
+        let setup = try XCTUnwrap(timing.deadline)
+        XCTAssertEqual(setup.expiresAt, connectedAt.addingTimeInterval(60))
+        XCTAssertFalse(timing.timeoutIsCurrent(
+            oldConnection, ownership: .watch, cancelling: false, at: connectedAt
+        ))
+        XCTAssertFalse(timing.timeoutIsCurrent(
+            setup, ownership: .watch, cancelling: false, at: connectedAt.addingTimeInterval(13)
+        ))
+        XCTAssertFalse(timing.noDataIsOverdue(
+            lastPacketAt: receivedAt, at: connectedAt.addingTimeInterval(13), timeout: 120
+        ))
+    }
+
+    func testEveryGATTProgressRefreshesWatchdogAndUnlockStartsFreshNoDataGrace() throws {
+        var timing = LibreWatchConnectionTiming()
+        let connectedAt = receivedAt.addingTimeInterval(600)
+        timing.beginSetup(at: connectedAt)
+        let stages: [LibreWatchConnectionTiming.Phase] = [.services, .characteristics, .notifications, .unlock]
+        var progressAt = connectedAt
+        for stage in stages {
+            let old = try XCTUnwrap(timing.deadline)
+            progressAt = progressAt.addingTimeInterval(59)
+            XCTAssertTrue(timing.setupProgress(stage, at: progressAt))
+            XCTAssertFalse(timing.timeoutIsCurrent(
+                old, ownership: .watch, cancelling: false, at: old.expiresAt
+            ))
+            if stage != .unlock {
+                XCTAssertEqual(timing.deadline?.expiresAt, progressAt.addingTimeInterval(60))
+            }
+        }
+        XCTAssertNil(timing.deadline)
+        XCTAssertFalse(timing.setupInProgress)
+        XCTAssertEqual(timing.phase, .receiving)
+        XCTAssertEqual(timing.dataExpectedSince, progressAt)
+        for limit in [120.0, 180.0] {
+            XCTAssertFalse(timing.noDataIsOverdue(
+                lastPacketAt: receivedAt, at: progressAt.addingTimeInterval(limit - 1), timeout: limit
+            ))
+            XCTAssertTrue(timing.noDataIsOverdue(
+                lastPacketAt: receivedAt, at: progressAt.addingTimeInterval(limit), timeout: limit
+            ))
+        }
+    }
+
+    func testGATTProgressAtDeadlineWinsUnlessCancellationAlreadyStarted() throws {
+        var timing = LibreWatchConnectionTiming()
+        timing.beginSetup(at: receivedAt)
+        let old = try XCTUnwrap(timing.deadline)
+        XCTAssertTrue(timing.setupProgress(.services, at: old.expiresAt))
+        XCTAssertFalse(timing.timeoutIsCurrent(
+            old, ownership: .watch, cancelling: false, at: old.expiresAt
+        ))
+        let current = try XCTUnwrap(timing.deadline)
+        XCTAssertTrue(timing.timeoutIsCurrent(
+            current, ownership: .watch, cancelling: false, at: current.expiresAt
+        ))
+        timing.invalidate() // Controlled cancellation has begun on the serial main queue.
+        XCTAssertFalse(timing.setupProgress(.characteristics, at: current.expiresAt))
+        XCTAssertNil(timing.deadline)
+    }
+
+    func testStaleTimersCannotCancelNewAttemptSetupOrHealthyNotifications() throws {
+        var timing = LibreWatchConnectionTiming()
+        timing.beginConnection(at: receivedAt, applicationIsActive: true)
+        let oldAttempt = try XCTUnwrap(timing.deadline)
+        timing.invalidate() // Explicit connection/setup errors retire the attempt immediately.
+        timing.beginConnection(at: receivedAt.addingTimeInterval(1), applicationIsActive: false)
+        let currentAttempt = try XCTUnwrap(timing.deadline)
+        XCTAssertNotEqual(oldAttempt.token, currentAttempt.token)
+        XCTAssertFalse(timing.timeoutIsCurrent(
+            oldAttempt, ownership: .watch, cancelling: false, at: oldAttempt.expiresAt
+        ))
+        timing.beginSetup(at: receivedAt.addingTimeInterval(2))
+        let setup = try XCTUnwrap(timing.deadline)
+        timing.receivedPacketOrEnabledNotifications(at: receivedAt.addingTimeInterval(3))
+        for retired in [oldAttempt, currentAttempt, setup] {
+            XCTAssertFalse(timing.timeoutIsCurrent(
+                retired, ownership: .watch, cancelling: false, at: receivedAt.addingTimeInterval(300)
+            ))
+        }
+    }
+
+    func testReturnToPhoneInvalidatesAllWatchTimingAndPreventsFurtherRecovery() throws {
+        var timing = LibreWatchConnectionTiming()
+        timing.beginSetup(at: receivedAt)
+        let old = try XCTUnwrap(timing.deadline)
+        timing.invalidate()
+        XCTAssertNil(timing.phase)
+        XCTAssertNil(timing.dataExpectedSince)
+        XCTAssertFalse(timing.setupProgress(.services, at: old.expiresAt))
+        XCTAssertFalse(timing.timeoutIsCurrent(
+            old, ownership: .iphone, cancelling: false, at: old.expiresAt
+        ))
+        XCTAssertFalse(LibreWatchLifecyclePolicy.eventDrivenRecoveryIsAllowed(ownership: .iphone))
         XCTAssertEqual(
             LibreWatchLifecyclePolicy.reconnectFallbackAction(
-                reconnectStartedAt: startedAt,
-                now: startedAt.addingTimeInterval(12),
+                deadline: old.expiresAt, now: old.expiresAt,
                 applicationIsActive: true,
                 extendedRuntimeIsRunning: true,
-                ownership: .watch
+                ownership: .iphone
             ),
-            .restartConfirmedSensorScan
+            .noAdditionalWork
         )
     }
 
-    func testActiveTransitionRecalculatesRuntimeReconnectFromOriginalStart() {
-        let startedAt = receivedAt
-        let now = startedAt.addingTimeInterval(20)
-
-        XCTAssertEqual(
-            LibreWatchLifecyclePolicy.reconnectFallbackAction(
-                reconnectStartedAt: startedAt,
-                now: now,
-                applicationIsActive: false,
-                extendedRuntimeIsRunning: true,
-                ownership: .watch
-            ),
-            .wait(70)
-        )
-        XCTAssertEqual(
-            LibreWatchLifecyclePolicy.reconnectFallbackAction(
-                reconnectStartedAt: startedAt,
-                now: now,
-                applicationIsActive: true,
-                extendedRuntimeIsRunning: true,
-                ownership: .watch
-            ),
-            .restartConfirmedSensorScan
-        )
+    func testAnExistingConnectionOrSetupNeverStartsParallelScanOrConnect() {
+        var timing = LibreWatchConnectionTiming()
+        XCTAssertTrue(timing.canStartBluetoothOperation)
+        timing.beginConnection(at: receivedAt, applicationIsActive: true)
+        XCTAssertFalse(timing.canStartBluetoothOperation)
+        timing.beginSetup(at: receivedAt.addingTimeInterval(10))
+        XCTAssertFalse(timing.canStartBluetoothOperation)
+        timing.receivedPacketOrEnabledNotifications(at: receivedAt.addingTimeInterval(15))
+        XCTAssertFalse(timing.canStartBluetoothOperation)
+        timing.invalidate() // Only the retired attempt releases the gate for filtered scanning.
+        XCTAssertTrue(timing.canStartBluetoothOperation)
     }
 
     func testForegroundAndRuntimeNoDataRecoveryKeepTheirOwnLimits() {
