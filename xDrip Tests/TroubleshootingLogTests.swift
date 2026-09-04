@@ -213,6 +213,13 @@ final class TroubleshootingLogTests: XCTestCase {
             "Reconnected to existing Bluetooth device: L3-HeartBeat.",
             "Bluetooth could not connect and will try again."
         ])
+
+        let reloaded = TroubleshootingLogStore(fileURL: fixture.fileURL, now: { self.referenceDate })
+        reloaded.record(.standard(
+            .bluetoothDevice(name: heartbeatName, activity: .connected),
+            timestamp: referenceDate.addingTimeInterval(4)
+        ))
+        XCTAssertEqual(reloaded.snapshot(), entries)
     }
 
     func testNamedBluetoothUserLifecycleActionsAreRetainedWithOneConnectionOutcome() throws {

@@ -42,6 +42,16 @@ workflows:
             -resultBundlePath "$CM_BUILD_DIR/build/test-results/LibreWatchValuePipelineTests.xcresult" \
             CODE_SIGNING_ALLOWED=NO
 
+      - name: Compile iPhone app target
+        script: |
+          set -euo pipefail
+          xcodebuild build \
+            -workspace "$CM_BUILD_DIR/xdrip.xcworkspace" \
+            -scheme "xdrip" \
+            -configuration Debug \
+            -destination "generic/platform=iOS Simulator" \
+            CODE_SIGNING_ALLOWED=NO
+
       - name: Compile Watch app target
         script: |
           set -euo pipefail
