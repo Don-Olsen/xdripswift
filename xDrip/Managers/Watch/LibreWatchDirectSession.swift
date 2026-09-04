@@ -144,6 +144,23 @@ struct LibreWatchDiagnosticContext: Codable, Equatable {
     let recoveryStartedAt: Date?
 }
 
+/// Passive decisions describe a state, not every execution opportunity in that state.
+struct LibreWatchDiagnosticEmissionPolicy {
+    private var lastDecision: LibreWatchDiagnosticContext?
+
+    mutating func shouldEmit(_ kind: LibreWatchDiagnosticEventKind, context: LibreWatchDiagnosticContext) -> Bool {
+        guard kind == .recoveryDecision else { return true }
+        defer { lastDecision = context }
+        switch context.action {
+        case .waitForConnection, .waitForSystemReconnect, .waitForNotifications, .waitForExecution:
+            return lastDecision?.action != context.action || lastDecision?.central != context.central ||
+                lastDecision?.peripheral != context.peripheral || lastDecision?.stage != context.stage
+        default:
+            return true
+        }
+    }
+}
+
 /// A bounded, privacy-safe Watch diagnostic. Sensor identity is derived on iPhone from
 /// the validated session and never crosses as a raw peripheral identifier.
 struct LibreWatchDiagnosticEvent: Codable, Equatable {
@@ -197,26 +214,109 @@ struct LibreWatchDiagnosticReceipts: Codable {
     }
 }
 
-/// Episode time survives suspension/restoration. Only a new actual connection attempt changes
-/// its deadline; lifecycle callbacks and repeated failures never postpone an existing deadline.
+enum LibreWatchRecoveryPhase: String, Codable { case connection, setup }
+enum LibreWatchSetupStage: String, Codable, CaseIterable { case services, characteristics, notifications, unlock }
+
+struct LibreWatchRecoveryDeadline: Codable, Equatable {
+    let phase: LibreWatchRecoveryPhase
+    let token: UUID
+    let expiresAt: Date
+
+    init(phase: LibreWatchRecoveryPhase, expiresAt: Date) {
+        self.phase = phase
+        token = UUID()
+        self.expiresAt = expiresAt
+    }
+}
+
+/// The recovery episode outlives individual BLE/GATT phases. Optional new fields preserve
+/// decoding of libreWatchRecoveryProgress.v1, including its legacy attemptStartedAt.
 struct LibreWatchRecoveryProgress: Codable, Equatable {
     let sessionID: UUID
     private(set) var startedAt: Date?
     private(set) var attemptStartedAt: Date?
     private(set) var lastPacketAt: Date?
+    private(set) var deadline: LibreWatchRecoveryDeadline?
+    private(set) var setupGeneration: UUID?
+    private(set) var setupStage: LibreWatchSetupStage?
 
     init(sessionID: UUID) { self.sessionID = sessionID }
     mutating func begin(at date: Date) {
         startedAt = startedAt ?? date
-        attemptStartedAt = attemptStartedAt ?? date
     }
-    mutating func beginAttempt(at date: Date) {
-        startedAt = startedAt ?? date
+    mutating func beginConnection(at date: Date, applicationIsActive: Bool) {
+        begin(at: date)
+        invalidatePhase()
         attemptStartedAt = date
+        let duration = applicationIsActive ? LibreWatchLifecyclePolicy.foregroundReconnectFallbackDelay
+            : LibreWatchLifecyclePolicy.extendedRuntimeReconnectFallbackDelay
+        deadline = LibreWatchRecoveryDeadline(phase: .connection, expiresAt: date.addingTimeInterval(duration))
+    }
+
+    /// An expired but valid deadline is still authoritative; restoration must not renew it.
+    mutating func restoreConnecting(at date: Date) {
+        begin(at: date)
+        if let deadline, deadline.phase == .connection, deadline.expiresAt.timeIntervalSinceReferenceDate.isFinite {
+            return
+        }
+        let legacyStart = attemptStartedAt.flatMap {
+            $0.timeIntervalSinceReferenceDate.isFinite && $0 <= date ? $0 : nil
+        }
+        beginConnection(at: legacyStart ?? date, applicationIsActive: false)
+    }
+
+    mutating func beginSetup(at date: Date) {
+        begin(at: date)
+        invalidatePhase()
+        setupGeneration = UUID()
+        setupStage = .services
+        refreshSetupDeadline(at: date)
+    }
+
+    func acceptsSetupCallback(_ stage: LibreWatchSetupStage, generation: UUID?) -> Bool {
+        deadline?.phase == .setup && setupGeneration != nil && setupGeneration == generation && setupStage == stage
+    }
+
+    /// No elapsed-time check here: a current successful callback wins if cancellation has
+    /// not begun on the serial queue, even when the old watchdog has just become due.
+    @discardableResult
+    mutating func recordSetupProgress(after stage: LibreWatchSetupStage, generation: UUID?, at date: Date) -> Bool {
+        guard acceptsSetupCallback(stage, generation: generation) else { return false }
+        switch stage {
+        case .services: setupStage = .characteristics
+        case .characteristics: setupStage = .notifications
+        case .notifications: setupStage = .unlock
+        case .unlock:
+            invalidatePhase()
+            return true
+        }
+        refreshSetupDeadline(at: date)
+        return true
+    }
+
+    private mutating func refreshSetupDeadline(at date: Date) {
+        deadline = LibreWatchRecoveryDeadline(phase: .setup, expiresAt: date.addingTimeInterval(60))
+    }
+
+    func timeoutIsCurrent(_ captured: LibreWatchRecoveryDeadline, sessionID: UUID,
+                          ownership: LibreWatchOwnership, cancelling: Bool, notificationsReady: Bool, now: Date) -> Bool {
+        self.sessionID == sessionID && ownership == .watch && !cancelling && !notificationsReady &&
+            deadline == captured && now >= captured.expiresAt
+    }
+
+    mutating func invalidatePhase() {
+        deadline = nil
+        attemptStartedAt = nil
+        setupGeneration = nil
+        setupStage = nil
+    }
+
+    mutating func stop() {
+        invalidatePhase()
+        startedAt = nil
     }
     mutating func receivedPacket(at date: Date) {
-        startedAt = nil
-        attemptStartedAt = nil
+        stop()
         lastPacketAt = date
     }
 }
@@ -243,7 +343,7 @@ enum LibreWatchRecoveryPolicy {
                        poweredOn: Bool, peripheral: LibreWatchPeripheralState,
                        scanning: Bool, systemReconnecting: Bool, manualConnecting: Bool, cancelling: Bool,
                        setupInProgress: Bool, notificationsReady: Bool, receivingFrame: Bool = false,
-                       attemptStartedAt: Date?, lastActivityAt: Date?, now: Date,
+                       deadline: LibreWatchRecoveryDeadline?, lastActivityAt: Date?, now: Date,
                        applicationIsActive: Bool, extendedRuntimeIsRunning: Bool,
                        trigger: LibreWatchRecoveryTrigger) -> LibreWatchRecoveryAction {
         guard ownership == .watch, validSession else { return .stopped }
@@ -255,10 +355,9 @@ enum LibreWatchRecoveryPolicy {
         if cancelling {
             return peripheral == .disconnected || peripheral == .absent ? .scanConfirmedSensor : .waitForCancellation
         }
-        let reconnectDelay = applicationIsActive
-            ? LibreWatchLifecyclePolicy.foregroundReconnectFallbackDelay
-            : LibreWatchLifecyclePolicy.extendedRuntimeReconnectFallbackDelay
-        let overdue = attemptStartedAt.map { now.timeIntervalSince($0) >= reconnectDelay } ?? false
+        if trigger == .connectionFailed || trigger == .setupFailed {
+            return peripheral == .absent || peripheral == .disconnected ? .scanConfirmedSensor : .restartConfirmedSensorScan
+        }
         if peripheral == .connected, notificationsReady {
             // Let a newly arriving frame finish within the existing fragment-gap limit.
             // Its first fragment is not a reason to cancel a now-working connection.
@@ -269,7 +368,15 @@ enum LibreWatchRecoveryPolicy {
             return lastActivityAt.map { now.timeIntervalSince($0) >= noDataDelay } == true
                 ? .restartConfirmedSensorScan : .waitForNotifications
         }
-        if overdue && peripheral != .absent { return .restartConfirmedSensorScan }
+        if peripheral == .connected {
+            guard setupInProgress else { return .discoverServices }
+            return deadline?.phase == .setup && deadline.map({ now >= $0.expiresAt }) == true
+                ? .restartConfirmedSensorScan : .waitForConnection
+        }
+        if (systemReconnecting || manualConnecting || peripheral == .connecting),
+           deadline?.phase == .connection, deadline.map({ now >= $0.expiresAt }) == true {
+            return .restartConfirmedSensorScan
+        }
         if systemReconnecting { return .waitForSystemReconnect }
         if manualConnecting { return .waitForConnection }
         if scanning && (peripheral == .absent || peripheral == .disconnected) {
@@ -303,7 +410,7 @@ enum LibreWatchReconnectFallbackAction: Equatable {
 /// Timed recovery requires foreground/runtime execution, while Core Bluetooth delegate events
 /// may finish one already-established operation whenever Watch still owns the sensor.
 struct LibreWatchLifecyclePolicy {
-    static let foregroundReconnectFallbackDelay: TimeInterval = 12
+    static let foregroundReconnectFallbackDelay: TimeInterval = 60
     static let extendedRuntimeReconnectFallbackDelay: TimeInterval = 90
     static let foregroundNoDataRecoveryDelay: TimeInterval = 2 * 60
     static let extendedRuntimeNoDataRecoveryDelay: TimeInterval = 3 * 60
@@ -359,7 +466,7 @@ struct LibreWatchLifecyclePolicy {
     }
 
     static func reconnectFallbackAction(
-        reconnectStartedAt: Date,
+        deadline: Date,
         now: Date,
         applicationIsActive: Bool,
         extendedRuntimeIsRunning: Bool,
@@ -373,10 +480,7 @@ struct LibreWatchLifecyclePolicy {
             return .noAdditionalWork
         }
 
-        let timeout = applicationIsActive
-            ? foregroundReconnectFallbackDelay
-            : extendedRuntimeReconnectFallbackDelay
-        let remaining = timeout - max(0, now.timeIntervalSince(reconnectStartedAt))
+        let remaining = deadline.timeIntervalSince(now)
         return remaining <= 0 ? .restartConfirmedSensorScan : .wait(remaining)
     }
 

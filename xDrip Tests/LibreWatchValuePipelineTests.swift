@@ -314,7 +314,7 @@ final class LibreWatchValuePipelineTests: XCTestCase {
     func testSuspendedWatchOwnerStartsNoFallbackTimerOrScanLoop() {
         XCTAssertEqual(
             LibreWatchLifecyclePolicy.reconnectFallbackAction(
-                reconnectStartedAt: receivedAt,
+                deadline: receivedAt.addingTimeInterval(90),
                 now: receivedAt.addingTimeInterval(300),
                 applicationIsActive: false,
                 extendedRuntimeIsRunning: false,
@@ -329,13 +329,17 @@ final class LibreWatchValuePipelineTests: XCTestCase {
         ))
     }
 
-    func testForegroundReconnectFallsBackAfterTwelveSeconds() {
-        let startedAt = receivedAt
+    func testForegroundConnectionHasOneSixtySecondDeadline() throws {
+        var progress = LibreWatchRecoveryProgress(sessionID: session.id)
+        progress.beginConnection(at: receivedAt, applicationIsActive: true)
+        let deadline = try XCTUnwrap(progress.deadline)
+        XCTAssertEqual(deadline.phase, .connection)
+        XCTAssertEqual(deadline.expiresAt, receivedAt.addingTimeInterval(60))
 
         XCTAssertEqual(
             LibreWatchLifecyclePolicy.reconnectFallbackAction(
-                reconnectStartedAt: startedAt,
-                now: startedAt.addingTimeInterval(11),
+                deadline: deadline.expiresAt,
+                now: receivedAt.addingTimeInterval(59),
                 applicationIsActive: true,
                 extendedRuntimeIsRunning: true,
                 ownership: .watch
@@ -344,8 +348,8 @@ final class LibreWatchValuePipelineTests: XCTestCase {
         )
         XCTAssertEqual(
             LibreWatchLifecyclePolicy.reconnectFallbackAction(
-                reconnectStartedAt: startedAt,
-                now: startedAt.addingTimeInterval(12),
+                deadline: deadline.expiresAt,
+                now: receivedAt.addingTimeInterval(60),
                 applicationIsActive: true,
                 extendedRuntimeIsRunning: true,
                 ownership: .watch
@@ -354,30 +358,26 @@ final class LibreWatchValuePipelineTests: XCTestCase {
         )
     }
 
-    func testActiveTransitionRecalculatesRuntimeReconnectFromOriginalStart() {
-        let startedAt = receivedAt
-        let now = startedAt.addingTimeInterval(20)
-
-        XCTAssertEqual(
-            LibreWatchLifecyclePolicy.reconnectFallbackAction(
-                reconnectStartedAt: startedAt,
-                now: now,
-                applicationIsActive: false,
-                extendedRuntimeIsRunning: true,
-                ownership: .watch
-            ),
-            .wait(70)
-        )
-        XCTAssertEqual(
-            LibreWatchLifecyclePolicy.reconnectFallbackAction(
-                reconnectStartedAt: startedAt,
-                now: now,
-                applicationIsActive: true,
-                extendedRuntimeIsRunning: true,
-                ownership: .watch
-            ),
-            .restartConfirmedSensorScan
-        )
+    func testLifecycleChangesNeverShortenOrExtendCapturedConnectionDeadline() throws {
+        for beganActive in [false, true] {
+            var progress = LibreWatchRecoveryProgress(sessionID: session.id)
+            progress.beginConnection(at: receivedAt, applicationIsActive: beganActive)
+            let deadline = try XCTUnwrap(progress.deadline)
+            let duration: TimeInterval = beganActive ? 60 : 90
+            XCTAssertEqual(deadline.expiresAt, receivedAt.addingTimeInterval(duration))
+            for active in [true, false] {
+                for runtime in [true, false] {
+                    XCTAssertEqual(LibreWatchLifecyclePolicy.reconnectFallbackAction(
+                        deadline: deadline.expiresAt, now: receivedAt.addingTimeInterval(20),
+                        applicationIsActive: active, extendedRuntimeIsRunning: runtime, ownership: .watch
+                    ), active || runtime ? .wait(duration - 20) : .noAdditionalWork)
+                    XCTAssertEqual(recoveryAction(peripheral: .connecting, active: active, runtime: runtime,
+                                                  system: true, elapsed: 61, phaseDeadline: deadline, trigger: .scene),
+                                   beganActive ? .restartConfirmedSensorScan : .waitForSystemReconnect)
+                    XCTAssertEqual(progress.deadline, deadline)
+                }
+            }
+        }
     }
 
     func testForegroundAndRuntimeNoDataRecoveryKeepTheirOwnLimits() {
@@ -1056,22 +1056,29 @@ final class LibreWatchValuePipelineTests: XCTestCase {
         XCTAssertEqual(recoveryAction(active: false, poweredOn: false, trigger: .connectionFailed), .waitForBluetooth)
     }
 
-    func testRecoveryDeadlineSurvivesSuspensionAndChangesToForegroundLimit() throws {
+    func testRecoveryEpisodeAndFixedDeadlineSurviveSuspensionRestorationAndRetries() throws {
         var progress = LibreWatchRecoveryProgress(sessionID: session.id)
         progress.begin(at: receivedAt)
+        XCTAssertNil(progress.attemptStartedAt) // scanning/episode start creates no BLE deadline
+        progress.beginConnection(at: receivedAt, applicationIsActive: false)
+        let deadline = try XCTUnwrap(progress.deadline)
         progress.begin(at: receivedAt.addingTimeInterval(60))
-        let restored = try JSONDecoder().decode(LibreWatchRecoveryProgress.self, from: JSONEncoder().encode(progress))
+        var restored = try JSONDecoder().decode(LibreWatchRecoveryProgress.self, from: JSONEncoder().encode(progress))
+        restored.restoreConnecting(at: receivedAt.addingTimeInterval(400))
         XCTAssertEqual(restored.startedAt, receivedAt)
         XCTAssertEqual(restored.attemptStartedAt, receivedAt)
-        XCTAssertEqual(recoveryAction(active: false, runtime: true, system: true, elapsed: 15), .waitForSystemReconnect)
-        XCTAssertEqual(recoveryAction(active: true, system: true, elapsed: 15, trigger: .scene), .restartConfirmedSensorScan)
-        XCTAssertEqual(recoveryAction(active: false, system: true, elapsed: 400, trigger: .restoration), .restartConfirmedSensorScan)
-        progress.beginAttempt(at: receivedAt.addingTimeInterval(400))
+        XCTAssertEqual(restored.deadline, deadline) // expiration does not grant another 90 seconds
+        XCTAssertEqual(recoveryAction(active: true, system: true, elapsed: 15, phaseDeadline: deadline, trigger: .scene), .waitForSystemReconnect)
+        XCTAssertEqual(recoveryAction(active: false, system: true, elapsed: 400, phaseDeadline: deadline, trigger: .restoration), .restartConfirmedSensorScan)
+        progress.beginConnection(at: receivedAt.addingTimeInterval(400), applicationIsActive: true)
         XCTAssertEqual(progress.startedAt, receivedAt) // whole outage is not hidden by a new attempt
         XCTAssertEqual(progress.attemptStartedAt, receivedAt.addingTimeInterval(400))
+        progress.beginSetup(at: receivedAt.addingTimeInterval(405))
+        XCTAssertEqual(progress.startedAt, receivedAt)
         progress.receivedPacket(at: receivedAt.addingTimeInterval(410))
         XCTAssertNil(progress.startedAt)
         XCTAssertNil(progress.attemptStartedAt)
+        XCTAssertNil(progress.deadline)
     }
 
     func testRestorationSelectsExactlyOneNextOperationForEachPeripheralState() {
@@ -1138,10 +1145,228 @@ final class LibreWatchValuePipelineTests: XCTestCase {
         XCTAssertEqual(recoveryAction(validSession: false), .stopped)
     }
 
-    func testSetupDeadlineCancelsBeforeStartingMoreDiscoveryWork() {
-        XCTAssertEqual(recoveryAction(peripheral: .connected, setup: true, elapsed: 13, trigger: .setup), .restartConfirmedSensorScan)
+    func testConnectedSetupUsesSixtySecondsOfInactivityNotOldConnectionAge() {
+        XCTAssertEqual(recoveryAction(peripheral: .connected, setup: true, elapsed: 13, trigger: .setup), .waitForConnection)
         XCTAssertEqual(recoveryAction(peripheral: .connected, setup: true, elapsed: 1, trigger: .setup), .waitForConnection)
+        XCTAssertEqual(recoveryAction(peripheral: .connected, setup: true, elapsed: 60, trigger: .timer), .restartConfirmedSensorScan)
         XCTAssertEqual(recoveryAction(active: false, trigger: .setupFailed), .scanConfirmedSensor)
+    }
+
+    func testAcceptedDidConnectDiscardsExpiredConnectionDeadlineBeforeRecoveryEvaluation() throws {
+        var progress = LibreWatchRecoveryProgress(sessionID: session.id)
+        progress.beginConnection(at: receivedAt, applicationIsActive: true)
+        let old = try XCTUnwrap(progress.deadline)
+        let connectedAt = receivedAt.addingTimeInterval(91)
+        // The peripheral has connected, but its callback/timer were queued during suspension.
+        XCTAssertEqual(recoveryAction(peripheral: .connected, elapsed: 91, phaseDeadline: old, trigger: .connected), .discoverServices)
+        progress.beginSetup(at: connectedAt)
+        XCTAssertNil(progress.attemptStartedAt)
+        XCTAssertEqual(progress.deadline?.phase, .setup)
+        XCTAssertEqual(progress.deadline?.expiresAt, connectedAt.addingTimeInterval(60))
+        XCTAssertEqual(progress.startedAt, receivedAt)
+        XCTAssertFalse(timeoutIsCurrent(old, progress: progress, at: connectedAt))
+        XCTAssertEqual(recoveryAction(peripheral: .connected, setup: true, elapsed: 104,
+                                      phaseDeadline: progress.deadline, trigger: .scene), .waitForConnection)
+    }
+
+    func testEachCurrentGATTProgressRefreshesWatchdogAndUnlockEndsSetup() throws {
+        var progress = LibreWatchRecoveryProgress(sessionID: session.id)
+        progress.beginSetup(at: receivedAt)
+        let generation = try XCTUnwrap(progress.setupGeneration)
+        for (index, stage) in LibreWatchSetupStage.allCases.enumerated() {
+            let old = try XCTUnwrap(progress.deadline)
+            let now = receivedAt.addingTimeInterval(Double(index + 1) * 59)
+            XCTAssertTrue(progress.recordSetupProgress(after: stage, generation: generation, at: now))
+            XCTAssertFalse(timeoutIsCurrent(old, progress: progress, at: old.expiresAt))
+            XCTAssertEqual(progress.startedAt, receivedAt)
+            if stage == .unlock {
+                XCTAssertNil(progress.deadline)
+                XCTAssertNil(progress.setupGeneration)
+                XCTAssertNil(progress.setupStage)
+                XCTAssertEqual(recoveryAction(peripheral: .connected, notifications: true,
+                                              lastActivity: now, elapsed: 236, trigger: .setup), .waitForNotifications)
+            } else {
+                XCTAssertEqual(progress.deadline?.expiresAt, now.addingTimeInterval(60))
+                XCTAssertNotEqual(progress.deadline?.token, old.token)
+                XCTAssertEqual(progress.setupGeneration, generation)
+            }
+        }
+    }
+
+    func testSuccessfulBoundaryCallbackWinsBeforeTimeoutStartsCancellation() throws {
+        var progress = LibreWatchRecoveryProgress(sessionID: session.id)
+        progress.beginSetup(at: receivedAt)
+        let old = try XCTUnwrap(progress.deadline)
+        XCTAssertTrue(timeoutIsCurrent(old, progress: progress, at: old.expiresAt))
+        // Serial callback runs first, even at exactly the watchdog deadline.
+        XCTAssertTrue(progress.recordSetupProgress(after: .services, generation: progress.setupGeneration, at: old.expiresAt))
+        XCTAssertFalse(timeoutIsCurrent(old, progress: progress, at: old.expiresAt))
+        XCTAssertEqual(progress.deadline?.expiresAt, old.expiresAt.addingTimeInterval(60))
+        XCTAssertEqual(recoveryAction(peripheral: .connected, setup: true, elapsed: 60,
+                                      phaseDeadline: progress.deadline, trigger: .timer), .waitForConnection)
+    }
+
+    func testTimeoutWhichAlreadyStartedCancellationRejectsLaterSetupProgress() throws {
+        var progress = LibreWatchRecoveryProgress(sessionID: session.id)
+        progress.beginSetup(at: receivedAt)
+        let generation = progress.setupGeneration
+        let deadline = try XCTUnwrap(progress.deadline)
+        XCTAssertTrue(timeoutIsCurrent(deadline, progress: progress, at: deadline.expiresAt))
+        // beginControlledSensorRecovery invalidates the phase before cancelPeripheralConnection.
+        progress.invalidatePhase()
+        XCTAssertFalse(progress.recordSetupProgress(after: .services, generation: generation, at: deadline.expiresAt))
+        XCTAssertNil(progress.deadline)
+        XCTAssertEqual(progress.startedAt, receivedAt)
+    }
+
+    func testSetupCallbackRequiresCurrentStageAndGeneration() {
+        var progress = LibreWatchRecoveryProgress(sessionID: session.id)
+        progress.beginSetup(at: receivedAt)
+        let generation = progress.setupGeneration
+        XCTAssertFalse(progress.recordSetupProgress(after: .notifications, generation: generation, at: receivedAt))
+        XCTAssertFalse(progress.recordSetupProgress(after: .services, generation: UUID(), at: receivedAt))
+        XCTAssertTrue(progress.recordSetupProgress(after: .services, generation: generation, at: receivedAt))
+        XCTAssertFalse(progress.recordSetupProgress(after: .services, generation: generation, at: receivedAt))
+        progress.beginSetup(at: receivedAt.addingTimeInterval(1))
+        XCTAssertFalse(progress.recordSetupProgress(after: .services, generation: generation, at: receivedAt))
+    }
+
+    func testStaleTimersCannotCancelLaterAttemptsSetupOrAcceptedPackets() throws {
+        var progress = LibreWatchRecoveryProgress(sessionID: session.id)
+        progress.beginConnection(at: receivedAt, applicationIsActive: true)
+        let first = try XCTUnwrap(progress.deadline)
+        progress.beginConnection(at: receivedAt.addingTimeInterval(60), applicationIsActive: false)
+        XCTAssertFalse(timeoutIsCurrent(first, progress: progress, at: receivedAt.addingTimeInterval(200)))
+        let second = try XCTUnwrap(progress.deadline)
+        progress.beginSetup(at: receivedAt.addingTimeInterval(70))
+        XCTAssertFalse(timeoutIsCurrent(second, progress: progress, at: receivedAt.addingTimeInterval(200)))
+        let setup = try XCTUnwrap(progress.deadline)
+        progress.receivedPacket(at: receivedAt.addingTimeInterval(71))
+        XCTAssertFalse(timeoutIsCurrent(setup, progress: progress, at: receivedAt.addingTimeInterval(200)))
+        XCTAssertNil(progress.deadline)
+        XCTAssertNil(progress.startedAt)
+    }
+
+    func testTimeoutRequiresMatchingSessionOwnerPhaseAndUnhealthyNotifications() throws {
+        var progress = LibreWatchRecoveryProgress(sessionID: session.id)
+        progress.beginConnection(at: receivedAt, applicationIsActive: true)
+        let deadline = try XCTUnwrap(progress.deadline)
+        XCTAssertFalse(timeoutIsCurrent(deadline, progress: progress, at: receivedAt.addingTimeInterval(59)))
+        XCTAssertTrue(timeoutIsCurrent(deadline, progress: progress, at: deadline.expiresAt))
+        for owner in [LibreWatchOwnership.iphone, .releasingToWatch, .releasingToPhone, .recovery] {
+            XCTAssertFalse(progress.timeoutIsCurrent(deadline, sessionID: session.id, ownership: owner,
+                                                    cancelling: false, notificationsReady: false, now: deadline.expiresAt))
+        }
+        XCTAssertFalse(progress.timeoutIsCurrent(deadline, sessionID: UUID(), ownership: .watch,
+                                                cancelling: false, notificationsReady: false, now: deadline.expiresAt))
+        XCTAssertFalse(progress.timeoutIsCurrent(deadline, sessionID: session.id, ownership: .watch,
+                                                cancelling: true, notificationsReady: false, now: deadline.expiresAt))
+        XCTAssertFalse(progress.timeoutIsCurrent(deadline, sessionID: session.id, ownership: .watch,
+                                                cancelling: false, notificationsReady: true, now: deadline.expiresAt))
+        progress.stop()
+        XCTAssertNil(progress.startedAt)
+        XCTAssertFalse(timeoutIsCurrent(deadline, progress: progress, at: deadline.expiresAt))
+    }
+
+    func testLegacyConnectingMigrationPersistsOneNinetySecondDeadline() throws {
+        var progress = try legacyRecoveryProgress(attempt: receivedAt)
+        XCTAssertNil(progress.deadline)
+        progress.restoreConnecting(at: receivedAt.addingTimeInterval(20))
+        let deadline = try XCTUnwrap(progress.deadline)
+        XCTAssertEqual(deadline.expiresAt, receivedAt.addingTimeInterval(90))
+        var reloaded = try JSONDecoder().decode(LibreWatchRecoveryProgress.self, from: JSONEncoder().encode(progress))
+        reloaded.restoreConnecting(at: receivedAt.addingTimeInterval(200))
+        XCTAssertEqual(reloaded.deadline, deadline)
+        XCTAssertEqual(reloaded.startedAt, receivedAt)
+        XCTAssertEqual(recoveryAction(peripheral: .connecting, active: true, system: true, elapsed: 20,
+                                      phaseDeadline: reloaded.deadline, trigger: .scene), .waitForSystemReconnect)
+        XCTAssertEqual(recoveryAction(peripheral: .connecting, active: true, system: true, elapsed: 90,
+                                      phaseDeadline: reloaded.deadline, trigger: .restoration), .restartConfirmedSensorScan)
+    }
+
+    func testRestoredConnectingWithoutUsableLegacyTimeGetsOneNinetySecondDeadline() throws {
+        for attempt in [nil, receivedAt.addingTimeInterval(1_000)] as [Date?] {
+            var progress = try legacyRecoveryProgress(attempt: attempt)
+            let now = receivedAt.addingTimeInterval(100)
+            progress.restoreConnecting(at: now)
+            let deadline = try XCTUnwrap(progress.deadline)
+            XCTAssertEqual(deadline.expiresAt, now.addingTimeInterval(90))
+            progress.restoreConnecting(at: now.addingTimeInterval(10))
+            XCTAssertEqual(progress.deadline, deadline)
+        }
+    }
+
+    func testRestoredConnectedDiscardsLegacyConnectionAgeAndStartsFreshSetup() throws {
+        var progress = try legacyRecoveryProgress(attempt: receivedAt)
+        let now = receivedAt.addingTimeInterval(4_000)
+        progress.beginSetup(at: now)
+        XCTAssertNil(progress.attemptStartedAt)
+        XCTAssertEqual(progress.deadline?.phase, .setup)
+        XCTAssertEqual(progress.deadline?.expiresAt, now.addingTimeInterval(60))
+        XCTAssertEqual(progress.startedAt, receivedAt)
+        XCTAssertEqual(recoveryAction(peripheral: .connected, setup: true, elapsed: 4_013,
+                                      phaseDeadline: progress.deadline, trigger: .timer), .waitForConnection)
+    }
+
+    func testExplicitConnectionAndSetupErrorsDoNotWaitForAnyPhaseDeadline() {
+        for trigger in [LibreWatchRecoveryTrigger.connectionFailed, .setupFailed] {
+            for active in [false, true] {
+                XCTAssertEqual(recoveryAction(active: active, elapsed: 1, trigger: trigger), .scanConfirmedSensor)
+                XCTAssertEqual(recoveryAction(peripheral: .connecting, active: active, manual: true,
+                                              elapsed: 1, trigger: trigger), .restartConfirmedSensorScan)
+                XCTAssertEqual(recoveryAction(peripheral: .connected, active: active, setup: true,
+                                              elapsed: 1, trigger: trigger), .restartConfirmedSensorScan)
+            }
+        }
+    }
+
+    func testPassiveDiagnosticDecisionsIgnoreSceneRuntimeTriggerAndEpisodeChanges() {
+        for action in [LibreWatchRecoveryAction.waitForConnection, .waitForSystemReconnect, .waitForNotifications, .waitForExecution] {
+            var policy = LibreWatchDiagnosticEmissionPolicy()
+            XCTAssertTrue(policy.shouldEmit(.recoveryDecision, context: diagnosticContext(action: action)))
+            XCTAssertFalse(policy.shouldEmit(.recoveryDecision, context: diagnosticContext(action: action)))
+            let changedExecution = LibreWatchDiagnosticContext(
+                scene: .background, runtime: .running, central: .poweredOn, peripheral: .connecting,
+                stage: .reconnecting, trigger: .runtime, action: action, recoveryStartedAt: receivedAt.addingTimeInterval(600)
+            )
+            XCTAssertFalse(policy.shouldEmit(.recoveryDecision, context: changedExecution))
+            XCTAssertFalse(policy.shouldEmit(.recoveryDecision, context: diagnosticContext(action: action)))
+        }
+    }
+
+    func testDiagnosticPolicyEmitsMaterialChangesActiveActionsAndExplicitEvents() {
+        var policy = LibreWatchDiagnosticEmissionPolicy()
+        XCTAssertTrue(policy.shouldEmit(.recoveryDecision, context: diagnosticContext(action: .waitForConnection)))
+        XCTAssertTrue(policy.shouldEmit(.recoveryDecision, context: diagnosticContext(action: .waitForSystemReconnect)))
+        XCTAssertTrue(policy.shouldEmit(.recoveryDecision, context: diagnosticContext(action: .waitForSystemReconnect, central: .poweredOff)))
+        XCTAssertTrue(policy.shouldEmit(.recoveryDecision, context: diagnosticContext(action: .waitForSystemReconnect, central: .poweredOff, peripheral: .connected)))
+        XCTAssertTrue(policy.shouldEmit(.recoveryDecision, context: diagnosticContext(action: .waitForSystemReconnect, central: .poweredOff, peripheral: .connected, stage: .receiving)))
+        for action in [LibreWatchRecoveryAction.scanConfirmedSensor, .connectConfirmedSensor, .discoverServices, .restartConfirmedSensorScan] {
+            for _ in 0 ..< 2 { XCTAssertTrue(policy.shouldEmit(.recoveryDecision, context: diagnosticContext(action: action))) }
+        }
+        for kind in [LibreWatchDiagnosticEventKind.disconnected, .recoveryStarted, .recoveryFailed, .recoverySucceeded] {
+            for _ in 0 ..< 2 { XCTAssertTrue(policy.shouldEmit(kind, context: diagnosticContext(action: .waitForConnection))) }
+        }
+    }
+
+    private func timeoutIsCurrent(_ deadline: LibreWatchRecoveryDeadline, progress: LibreWatchRecoveryProgress, at date: Date) -> Bool {
+        progress.timeoutIsCurrent(deadline, sessionID: session.id, ownership: .watch,
+                                  cancelling: false, notificationsReady: false, now: date)
+    }
+
+    private func legacyRecoveryProgress(attempt: Date?) throws -> LibreWatchRecoveryProgress {
+        var json: [String: Any] = ["sessionID": session.id.uuidString,
+                                   "startedAt": receivedAt.timeIntervalSinceReferenceDate,
+                                   "lastPacketAt": receivedAt.addingTimeInterval(-60).timeIntervalSinceReferenceDate]
+        if let attempt { json["attemptStartedAt"] = attempt.timeIntervalSinceReferenceDate }
+        return try JSONDecoder().decode(LibreWatchRecoveryProgress.self, from: JSONSerialization.data(withJSONObject: json))
+    }
+
+    private func diagnosticContext(action: LibreWatchRecoveryAction, central: LibreWatchCentralState = .poweredOn,
+                                   peripheral: LibreWatchPeripheralState = .connecting,
+                                   stage: LibreWatchDiagnosticStage = .reconnecting) -> LibreWatchDiagnosticContext {
+        LibreWatchDiagnosticContext(scene: .active, runtime: .none, central: central, peripheral: peripheral,
+                                    stage: stage, trigger: .scene, action: action, recoveryStartedAt: receivedAt)
     }
 
     func testDiagnosticFallbackQueuesIdenticalEventAndReceiverDeduplicatesAfterReload() throws {
@@ -1185,14 +1410,20 @@ final class LibreWatchValuePipelineTests: XCTestCase {
                                 cancelling: Bool = false, setup: Bool = false, notifications: Bool = false,
                                 receivingFrame: Bool = false,
                                 lastActivity: Date? = nil, elapsed: TimeInterval = 1,
+                                phaseDeadline: LibreWatchRecoveryDeadline? = nil,
                                 trigger: LibreWatchRecoveryTrigger = .disconnected,
                                 owner: LibreWatchOwnership = .watch, validSession: Bool = true) -> LibreWatchRecoveryAction {
-        LibreWatchRecoveryPolicy.action(
+        var progress = LibreWatchRecoveryProgress(sessionID: session.id)
+        if setup { progress.beginSetup(at: receivedAt) }
+        else if system || manual || peripheral == .connecting {
+            progress.beginConnection(at: receivedAt, applicationIsActive: active)
+        }
+        return LibreWatchRecoveryPolicy.action(
             ownership: owner, validSession: validSession, poweredOn: poweredOn, peripheral: peripheral,
             scanning: scanning, systemReconnecting: system, manualConnecting: manual, cancelling: cancelling,
             setupInProgress: setup, notificationsReady: notifications,
             receivingFrame: receivingFrame,
-            attemptStartedAt: receivedAt, lastActivityAt: lastActivity, now: receivedAt.addingTimeInterval(elapsed),
+            deadline: phaseDeadline ?? progress.deadline, lastActivityAt: lastActivity, now: receivedAt.addingTimeInterval(elapsed),
             applicationIsActive: active, extendedRuntimeIsRunning: runtime, trigger: trigger
         )
     }
