@@ -36,6 +36,12 @@ extension XDripWatchComplication.EntryView {
                 }
                 .padding(0)
 
+                entry.widgetState.sourceAndAgeText
+                    .font(.system(size: 9))
+                    .foregroundStyle(entry.widgetState.hasRecentReading ? Color.colorSecondary : Color.orange)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
+
                 GlucoseChartCompactView(glucoseChartType: .watchAccessoryRectangular, bgReadingValues: entry.widgetState.bgReadingValues, bgReadingDates: entry.widgetState.bgReadingDates, isMgDl: entry.widgetState.isMgDl, urgentLowLimitInMgDl: entry.widgetState.urgentLowLimitInMgDl, lowLimitInMgDl: entry.widgetState.lowLimitInMgDl, highLimitInMgDl: entry.widgetState.highLimitInMgDl, urgentHighLimitInMgDl: entry.widgetState.urgentHighLimitInMgDl, liveActivityType: nil, hoursToShowScalingHours: nil, glucoseCircleDiameterScalingHours: nil, overrideChartHeight: entry.widgetState.overrideChartHeight(), overrideChartWidth: entry.widgetState.overrideChartWidth(), highContrast: nil)
             }
 

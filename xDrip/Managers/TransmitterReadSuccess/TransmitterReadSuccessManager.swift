@@ -17,6 +17,10 @@ public struct TransmitterReadSuccessDisplay {
     public let expected24h: Int
     public let actual24h: Int
     public let success24h: Double
+    public let calculationBasis: String
+    public let deliveryEvidence: String
+    public let timelyReceiptCount: Int
+    public let delayedReceiptCount: Int
 }
 
 public struct TransmitterReadSuccessHourlyBucket: Identifiable {
@@ -32,12 +36,14 @@ final class TransmitterReadSuccessManager {
     private let bgReadingsAccessor:BgReadingsAccessor
     
     private let nowProvider: () -> Date
+    private let defaults: UserDefaults
     
     // MARK: - initializer
     
-    init(bgReadingsAccessor: BgReadingsAccessor, nowProvider: @escaping () -> Date = { Date() }) {
+    init(bgReadingsAccessor: BgReadingsAccessor, nowProvider: @escaping () -> Date = { Date() }, defaults: UserDefaults = .standard) {
         self.bgReadingsAccessor = bgReadingsAccessor
         self.nowProvider = nowProvider
+        self.defaults = defaults
     }
     
     // MARK: - public functions
@@ -50,43 +56,60 @@ final class TransmitterReadSuccessManager {
     /// - Returns: A display model with expected/actual/success for 24h and hourly bucket data.
     func getReadSuccess(forSensor sensor: Sensor, now: Date? = nil, notBefore cutoff: Date? = nil) -> TransmitterReadSuccessDisplay {
         let now = now ?? nowProvider()
-        let analysisStartDate = max(
+        let analysisStartDate = max(cutoff ?? .distantPast, max(
             sensor.startDate,
             now.addingTimeInterval(-24 * 60 * 60)
-        )
+        ))
 
-        // Read success is about the current physical sensor session. Do not filter by the current
-        // Core Data Sensor relationship because that can change during one transmitter session.
+        // Do not borrow readings from another sensor to make this session look complete.
         let rawTimestamps = bgReadingsAccessor.getReadingTimestamps(
             fromDate: analysisStartDate,
             toDate: now,
-            forSensor: nil
+            forSensor: sensor,
+            onlyValidated: true
         )
         let allTimestamps = cutoff.map { cutoff in rawTimestamps.filter { $0 >= cutoff } } ?? rawTimestamps
 
-        let earliest24h = allTimestamps.first
-        let latest24h = allTimestamps.last
-
-        // Infer nominal gap from 24h
-        let nominalGapInSeconds = TransmitterReadSuccessManager.inferNominalGapSeconds(earliest: earliest24h, latest: latest24h, distinctCount: allTimestamps.count)
-
-        let expected24h = expectedSlots(forWindowHours: 24, now: now, earliest: earliest24h, periodSeconds: nominalGapInSeconds)
-        let actual24h = min(countPhaseAlignedDistinctSlots(timestamps: allTimestamps, now: now, periodSeconds: nominalGapInSeconds), expected24h)
+        let contexts = TransmitterReadSuccessEvidence.contexts(defaults: defaults)
+        let nominalGapInSeconds = TransmitterReadSuccessContext.acquisitionInterval(for: defaults.cgmTransmitterType) ?? 0
+        let counts = TransmitterReadSuccessPolicy.counts(timestamps: allTimestamps, start: analysisStartDate,
+            end: now, contexts: contexts, fallbackInterval: nominalGapInSeconds)
+        let expected24h = counts.expected
+        let actual24h = counts.actual
         let missing24 = max(0, expected24h - actual24h)
         let success24h = flooredPercent(actual: actual24h, expected: expected24h, hasMisses: missing24 > 0)
 
+        let recorded = TransmitterReadSuccessEvidence.receipts(at: now, defaults: defaults).filter {
+            $0.sensorID == sensor.id && $0.measuredAt >= analysisStartDate
+        }
+        let watchRecords = recorded.filter(\.fromWatch)
+        let timely = recorded.filter { !$0.historical && $0.storedAt.timeIntervalSince($0.measuredAt) <= 180 }.count
+        let delayed = recorded.count - timely
+        let evidence = recorded.isEmpty
+            ? "Delivery timing unavailable for legacy history. Coverage includes backfill; it does not prove continuous BLE reception."
+            : "Phone storage: \(timely) within 3 min, \(delayed) delayed/backfilled (\(watchRecords.count) Watch). Timing known for \(recorded.count) points only; BLE outages and transport delay are separate."
+        let basis = nominalGapInSeconds == 0 ? "Acquisition cadence unavailable for this source."
+            : "Stored sensor coverage including backfill. Source: \(defaults.cgmTransmitterType?.rawValue ?? "unknown"); acquisition \(nominalGapInSeconds / 60) min. Historical source intervals are retained. The visible 1/5-minute filter does not change expected Libre reception. Pre-upgrade interval history is unavailable."
+        let windowStart = now.addingTimeInterval(-24 * 3600)
+        let buckets = (0..<24).map { index -> TransmitterReadSuccessHourlyBucket in
+            let start = max(analysisStartDate, windowStart.addingTimeInterval(Double(index) * 3600))
+            let end = min(now, windowStart.addingTimeInterval(Double(index + 1) * 3600))
+            let counts = TransmitterReadSuccessPolicy.counts(timestamps: allTimestamps, start: start,
+                end: end, contexts: contexts, fallbackInterval: nominalGapInSeconds)
+            return TransmitterReadSuccessHourlyBucket(id: index, expected: counts.expected, actual: counts.actual,
+                success: flooredPercent(actual: counts.actual, expected: counts.expected, hasMisses: counts.actual < counts.expected))
+        }
         return TransmitterReadSuccessDisplay(
             nominalGapInSeconds: nominalGapInSeconds,
-            earliestTimestampInLast24h: earliest24h,
-            hourlyBuckets: makeHourlyBuckets(
-                timestamps: allTimestamps,
-                now: now,
-                earliest: earliest24h,
-                periodSeconds: nominalGapInSeconds
-            ),
+            earliestTimestampInLast24h: analysisStartDate,
+            hourlyBuckets: buckets,
             expected24h: expected24h,
             actual24h: actual24h,
-            success24h: success24h
+            success24h: success24h,
+            calculationBasis: basis,
+            deliveryEvidence: evidence,
+            timelyReceiptCount: timely,
+            delayedReceiptCount: delayed
         )
     }
     
@@ -107,131 +130,9 @@ final class TransmitterReadSuccessManager {
     
     // MARK: - private functions
 
-    /// Estimates the phase offset (in seconds) of reading arrivals within a typical nominal gap period.
-    /// - Parameters:
-    ///   - timestamps: Array of reading timestamps to analyze.
-    ///   - periodSeconds: Nominal expected gap between readings (e.g. 300 or 60 seconds).
-    /// - Returns: The approximate offset (in seconds) within the nominal period where readings most frequently arrive.
-    private func estimateArrivalPhaseOffset(timestamps: [Date], periodSeconds: Int) -> TimeInterval {
-        guard !timestamps.isEmpty else { return 0 }
-        let binSizeInSeconds: TimeInterval = 5
-        let numberOfBins = max(1, periodSeconds / Int(binSizeInSeconds))
-        var histogram = Array(repeating: 0, count: numberOfBins)
-        for timestamp in timestamps {
-            let remainder = timestamp.timeIntervalSince1970.truncatingRemainder(dividingBy: Double(periodSeconds))
-            let index = Int(floor(remainder / binSizeInSeconds)) % numberOfBins
-            histogram[index] &+= 1
-        }
-        let peakBinIndex = histogram.indices.max(by: { histogram[$0] < histogram[$1] }) ?? 0
-        return (Double(peakBinIndex) + 0.5) * binSizeInSeconds
-    }
-
-    /// Counts the number of distinct phase-aligned slots (bins) containing readings in the 24h window.
-    /// Each slot is centered based on the inferred phase offset to align with actual reading timing.
-    /// - Parameters:
-    ///   - timestamps: All reading timestamps in the last 24 hours.
-    ///   - now: Current reference time.
-    ///   - periodSeconds: Nominal expected gap between readings (e.g. 300 or 60 seconds).
-    /// - Returns: Distinct occupied slot count for the last 24 hours.
-    private func countPhaseAlignedDistinctSlots(timestamps: [Date], now: Date, periodSeconds: Int) -> Int {
-        guard periodSeconds > 0 else {
-            return 0
-        }
-
-        let window24Start = now.addingTimeInterval(-24 * 3600)
-        let filtered = timestamps.filter { $0 >= window24Start && $0 <= now }.sorted()
-        guard !filtered.isEmpty else {
-            return 0
-        }
-
-        let arrivalPhaseOffset = estimateArrivalPhaseOffset(timestamps: Array(filtered.suffix(120)), periodSeconds: periodSeconds)
-        let slotIndex = makeSlotIndexCalculator(arrivalPhaseOffset: arrivalPhaseOffset, periodSeconds: periodSeconds)
-
-        let indexSet24h = Set(filtered.map(slotIndex))
-
-        return indexSet24h.count
-    }
-
-    private func makeHourlyBuckets(timestamps: [Date], now: Date, earliest: Date?, periodSeconds: Int) -> [TransmitterReadSuccessHourlyBucket] {
-        guard periodSeconds > 0 else { return [] }
-
-        let window24Start = now.addingTimeInterval(-24 * 3600)
-        let filtered = timestamps.filter { $0 >= window24Start && $0 <= now }.sorted()
-        let arrivalPhaseOffset = estimateArrivalPhaseOffset(timestamps: Array(filtered.suffix(120)), periodSeconds: periodSeconds)
-        let slotIndex = makeSlotIndexCalculator(arrivalPhaseOffset: arrivalPhaseOffset, periodSeconds: periodSeconds)
-
-        return (0..<24).map { index in
-            let bucketStart = window24Start.addingTimeInterval(Double(index) * 3600.0)
-            let bucketEnd = min(bucketStart.addingTimeInterval(3600.0), now)
-            let bucketTimestamps = filtered.filter { $0 >= bucketStart && $0 < bucketEnd }
-            // Count distinct phase-aligned slots so duplicate readings within one transmitter interval only count once.
-            let actual = Set(bucketTimestamps.map(slotIndex)).count
-            let expected = expectedSlots(from: bucketStart, to: bucketEnd, earliest: earliest, periodSeconds: periodSeconds)
-            let success = flooredPercent(actual: min(actual, expected), expected: expected, hasMisses: expected > actual)
-
-            return TransmitterReadSuccessHourlyBucket(
-                id: index,
-                expected: expected,
-                actual: min(actual, expected),
-                success: success
-            )
-        }
-    }
-
-    private func makeSlotIndexCalculator(arrivalPhaseOffset: TimeInterval, periodSeconds: Int) -> (Date) -> Int {
-        { timestamp in
-            let phaseAdjustedTimestamp = timestamp.timeIntervalSince1970 - arrivalPhaseOffset + Double(periodSeconds) / 2.0
-            return Int(floor(phaseAdjustedTimestamp / Double(periodSeconds)))
-        }
-    }
-
-    private func expectedSlots(from startDate: Date, to endDate: Date, earliest: Date?, periodSeconds: Int) -> Int {
-        guard periodSeconds > 0, endDate > startDate, let earliest = earliest, earliest <= endDate else { return 0 }
-
-        let effectiveStartDate = max(startDate, earliest)
-        let span = max(0.0, endDate.timeIntervalSince(effectiveStartDate))
-
-        if effectiveStartDate > startDate {
-            return max(1, Int(floor(span / Double(periodSeconds))) + 1)
-        }
-
-        return Int(floor(span / Double(periodSeconds)))
-    }
-
-    private func expectedSlots(forWindowHours hours: Int, now: Date, earliest: Date?, periodSeconds: Int) -> Int {
-        guard periodSeconds > 0, let earliest = earliest else { return 0 }
-
-        let windowSeconds = Double(hours) * 3600.0
-        let fullExpected = Int(floor(windowSeconds / Double(periodSeconds)))
-        let startOfWindow = now.addingTimeInterval(-windowSeconds)
-
-        if earliest > startOfWindow {
-            let span = max(0.0, now.timeIntervalSince(earliest))
-            return max(1, Int(floor(span / Double(periodSeconds))) + 1)
-        }
-
-        return fullExpected
-    }
-
     private func flooredPercent(actual: Int, expected: Int, hasMisses: Bool) -> Double {
-        guard expected > 0 else { return 0.0 }
-        let raw = (Double(actual) * 100.0) / Double(expected)
-        let floored = floor(raw * 10.0) / 10.0
-        if hasMisses {
-            return min(floored, 99.9)
-        }
-        return floored
-    }
-    
-    // MARK: - Helper functions
-
-    /// Infer 1‑minute vs 5‑minute gap using average gap; conservative fallback to 5 minutes.
-    private static func inferNominalGapSeconds(earliest: Date?, latest: Date?, distinctCount: Int) -> Int {
-        guard let earliest = earliest, let latest = latest, distinctCount >= 2 else {
-            return 300 // fallback to Dexcom nominal gap
-        }
-        let avg = latest.timeIntervalSince(earliest) / Double(max(1, distinctCount - 1))
-        if avg <= 90.0 { return 60 }
-        return 300
+        guard expected > 0 else { return 0 }
+        let percentage = floor(Double(actual) * 1000 / Double(expected)) / 10
+        return hasMisses ? min(percentage, 99.9) : percentage
     }
 }

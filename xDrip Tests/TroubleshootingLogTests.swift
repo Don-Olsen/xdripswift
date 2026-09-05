@@ -9,6 +9,49 @@
 import XCTest
 @testable import xdrip
 
+extension TroubleshootingLogTests {
+    func testOriginalPhoneBuildSurvivesExportAndLegacyBuildStaysUnknown() throws {
+        let identity = TroubleshootingLogProvenance(version: "7.0.0", build: "4252",
+            commit: "a001908a9b752d909ff3cb8b1efe2e844de4c90f", installationID: UUID())
+        let entry = TroubleshootingLogEntry(timestamp: referenceDate, level: .standard,
+            kind: .app(.started), provenance: identity)
+        let restored = try JSONDecoder().decode(TroubleshootingLogEntry.self, from: JSONEncoder().encode(entry))
+        XCTAssertEqual(restored.provenance, identity)
+        XCTAssertEqual(restored.replacingKind(.app(.terminated)).provenance, identity)
+        let report = makeReport(entries: [restored]).reportText
+        XCTAssertTrue(report.contains("build=4252"))
+        XCTAssertTrue(report.contains(identity.commit!))
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(entry)) as? [String: Any])
+        object.removeValue(forKey: "provenance")
+        let legacy = try JSONDecoder().decode(TroubleshootingLogEntry.self,
+            from: JSONSerialization.data(withJSONObject: object))
+        XCTAssertNil(legacy.provenance)
+        XCTAssertNil(legacy.replacingKind(.app(.terminated)).provenance)
+    }
+
+    func testCoverageReportCannotImplyIsolatedBuildBluetoothStability() {
+        let entry = TroubleshootingLogEntry.standard(.sensorCoverage(percent: 92,
+            expected: 1432, actual: 1323, sourceInterval: 60, timely: 100, delayed: 30), timestamp: referenceDate)
+        let text = makeReport(entries: [entry]).message(for: entry)
+        XCTAssertTrue(text.contains("including backfill"))
+        XCTAssertTrue(text.contains("Rolling window may span builds"))
+        XCTAssertTrue(text.contains("Phone storage"))
+        XCTAssertTrue(text.contains("not isolated-build BLE stability"))
+    }
+}
+
+extension TroubleshootingLogTests {
+    func testNightscoutDeviceStatusSuccessDoesNotClearGlucoseUploadFailure() {
+        let fixture = makeStore()
+        defer { removeFixture(fixture.directory) }
+        fixture.store.record(.detailed(.integration(name: .nightscoutGlucose, activity: .failed), timestamp: referenceDate))
+        fixture.store.record(.detailed(.integration(name: .nightscoutDeviceStatus, activity: .succeeded(itemCount: 1)), timestamp: referenceDate.addingTimeInterval(1)))
+        XCTAssertFalse(fixture.store.snapshot().contains { $0.kind == .integration(name: .nightscoutGlucose, activity: .recovered) })
+        fixture.store.record(.detailed(.integration(name: .nightscoutGlucose, activity: .succeeded(itemCount: 2)), timestamp: referenceDate.addingTimeInterval(2)))
+        XCTAssertEqual(fixture.store.snapshot().filter { $0.kind == .integration(name: .nightscoutGlucose, activity: .recovered) }.count, 1)
+    }
+}
+
 final class TroubleshootingLogTests: XCTestCase {
     private let referenceDate = Date(timeIntervalSince1970: 1_800_000_000)
 
@@ -86,19 +129,22 @@ final class TroubleshootingLogTests: XCTestCase {
     func testProductionCapsFitOneDayOfHeartbeatsAndOneMinuteReadings() throws {
         XCTAssertEqual(TroubleshootingLogStore.retentionPeriod, 24 * 60 * 60)
         XCTAssertEqual(TroubleshootingLogStore.maximumEntryCount, 5_000)
-        XCTAssertEqual(TroubleshootingLogStore.maximumFileSize, 1_024 * 1_024)
+        XCTAssertEqual(TroubleshootingLogStore.maximumFileSize, 2 * 1_024 * 1_024)
+        let provenance = TroubleshootingLogProvenance(version: "7.0.0", build: "4253",
+            commit: String(repeating: "a", count: 40), installationID: UUID())
 
         let heartbeats = (0 ..< 2_880).map { offset in
-            TroubleshootingLogEntry.standard(
-                .heartbeatReceived,
-                timestamp: referenceDate.addingTimeInterval(TimeInterval(offset * 30))
+            TroubleshootingLogEntry(
+                timestamp: referenceDate.addingTimeInterval(TimeInterval(offset * 30)),
+                level: .standard, kind: .heartbeatReceived, provenance: provenance
             )
         }
         let readings = (0 ..< 1_440).map { offset in
             let timestamp = referenceDate.addingTimeInterval(TimeInterval(offset * 60))
-            return TroubleshootingLogEntry.standard(
-                .glucoseAccepted(mgDl: 100, source: .nightscout, measuredAt: timestamp),
-                timestamp: timestamp
+            return TroubleshootingLogEntry(
+                timestamp: timestamp, level: .standard,
+                kind: .glucoseAccepted(mgDl: 100, source: .nightscout, measuredAt: timestamp),
+                provenance: provenance
             )
         }
         let encodedByteCount = try (heartbeats + readings).reduce(into: 0) { byteCount, entry in
@@ -1706,4 +1752,160 @@ private extension JSONDecoder {
 
 private extension Data.SubSequence {
     var data: Data { Data(self) }
+}
+
+extension TroubleshootingLogTests {
+    func testWatchDiagnosticExportKeepsOriginalBuildAndSeparateEventReceiptClocks() throws {
+        let event = LibreWatchDiagnosticEvent(kind: .bluetoothAction,
+            watchTimestamp: referenceDate, trigger: "notificationSubscriptionReady",
+            peripheralState: "connected", connectionPhase: "unlock",
+            generation: UUID(), sessionID: UUID(),
+            applicationState: .inactive, appBuild: "4252",
+            bluetoothAction: "unlockRequested",
+            appCommit: "a001908a9b752d909ff3cb8b1efe2e844de4c90f", ownership: .watch,
+            unlockCounter: 42)
+        let projection = TroubleshootingWatchDiagnostic(event)
+        let entry = TroubleshootingLogEntry.detailed(.watchDiagnostic(projection),
+            timestamp: referenceDate.addingTimeInterval(600))
+        let encoded = try JSONEncoder().encode(entry)
+        let restored = try JSONDecoder().decode(TroubleshootingLogEntry.self, from: encoded)
+        XCTAssertEqual(restored, entry)
+        let report = makeReport(entries: [restored]).reportText
+        XCTAssertTrue(report.contains("build=4252"))
+        XCTAssertTrue(report.contains("watchTime="))
+        XCTAssertTrue(report.contains("receiptTime="))
+        XCTAssertTrue(report.contains("action=unlockRequested"))
+        XCTAssertTrue(report.contains("unlockCounter=42"))
+        XCTAssertEqual(projection.watchTime, referenceDate)
+        XCTAssertEqual(restored.timestamp, referenceDate.addingTimeInterval(600))
+    }
+
+    func testWatchDiagnosticExportExcludesArbitraryErrorsAndSecretText() {
+        let secret = "secret=https://user:password@example.invalid"
+        let event = LibreWatchDiagnosticEvent(kind: .recoveryFailed,
+            trigger: secret, peripheralState: secret, connectionPhase: secret,
+            sensorIdentity: secret, runtimeError: secret,
+            bluetoothAction: secret, actionReason: secret, errorDomain: secret, appCommit: secret)
+        let projection = TroubleshootingWatchDiagnostic(event)
+        let report = makeReport(entries: [.detailed(.watchDiagnostic(projection))]).reportText
+        XCTAssertFalse(report.contains("password"))
+        XCTAssertFalse(report.contains("example.invalid"))
+        XCTAssertNil(projection.trigger)
+        XCTAssertNil(projection.reason)
+        XCTAssertNil(projection.commit)
+    }
+
+    func testWatchDiagnosticStorageAcknowledgementDeduplicatesAcrossReload() throws {
+        let fixture = makeStore()
+        defer { removeFixture(fixture.directory) }
+        let event = TroubleshootingWatchDiagnostic(LibreWatchDiagnosticEvent(
+            kind: .recoveryStarted, watchTimestamp: referenceDate.addingTimeInterval(-600),
+            trigger: "observedLinkState", appBuild: "4252"))
+        let first = expectation(description: "diagnostic persisted")
+        fixture.store.recordWatchDiagnostic(event, receivedAt: referenceDate) { stored in
+            XCTAssertTrue(stored)
+            first.fulfill()
+        }
+        wait(for: [first], timeout: 5)
+        let reloaded = TroubleshootingLogStore(fileURL: fixture.fileURL, now: { self.referenceDate })
+        let second = expectation(description: "duplicate confirmed")
+        reloaded.recordWatchDiagnostic(event, receivedAt: referenceDate.addingTimeInterval(1)) { stored in
+            XCTAssertTrue(stored)
+            second.fulfill()
+        }
+        wait(for: [second], timeout: 5)
+        XCTAssertEqual(reloaded.snapshot().filter {
+            if case let .watchDiagnostic(value) = $0.kind { return value.eventID == event.eventID }
+            return false
+        }.count, 1)
+    }
+
+    func testWatchDiagnosticFailedPersistenceIsNotAcknowledgedAndCanRetry() throws {
+        let fixture = makeStore()
+        defer { removeFixture(fixture.directory) }
+        try FileManager.default.createDirectory(at: fixture.fileURL, withIntermediateDirectories: true)
+        let event = TroubleshootingWatchDiagnostic(LibreWatchDiagnosticEvent(kind: .recoveryFailed,
+            watchTimestamp: referenceDate, trigger: "didFailToConnect"))
+        let failed = expectation(description: "write failed")
+        fixture.store.recordWatchDiagnostic(event, receivedAt: referenceDate) { stored in
+            XCTAssertFalse(stored)
+            failed.fulfill()
+        }
+        wait(for: [failed], timeout: 5)
+        try FileManager.default.removeItem(at: fixture.fileURL)
+        let retried = expectation(description: "retry persisted")
+        fixture.store.recordWatchDiagnostic(event, receivedAt: referenceDate) { stored in
+            XCTAssertTrue(stored)
+            retried.fulfill()
+        }
+        wait(for: [retried], timeout: 5)
+        XCTAssertEqual(fixture.store.snapshot().count, 1)
+    }
+
+    func testWatchDiagnosticPreservesEffectiveAlarmStatusWithoutFreeText() throws {
+        var event = LibreWatchDiagnosticEvent(kind: .frameProgress, watchTimestamp: referenceDate)
+        event.alarmSettingsRevision = 23
+        event.alarmEnabledKinds = [0, 1, 4, 99, 4]
+        event.alarmSnoozeAllUntil = referenceDate.addingTimeInterval(600)
+        event.alarmSnoozes = [1: referenceDate.addingTimeInterval(60), 99: referenceDate]
+        event.alarmNotificationsAuthorized = false
+        event.alarmDelegatedToWatch = false
+        let projection = TroubleshootingWatchDiagnostic(event)
+        XCTAssertEqual(projection.alarmEnabledKinds, [0, 1, 4])
+        XCTAssertEqual(projection.alarmSnoozes?.count, 1)
+        let entry = TroubleshootingLogEntry.detailed(.watchDiagnostic(projection), timestamp: referenceDate)
+        let decoded = try JSONDecoder().decode(TroubleshootingLogEntry.self, from: JSONEncoder().encode(entry))
+        XCTAssertEqual(decoded, entry)
+        let report = makeReport(entries: [decoded]).reportText
+        XCTAssertTrue(report.contains("alarmRevision=23"))
+        XCTAssertTrue(report.contains("authorized=false watchAuthority=false"))
+    }
+
+    func testPhoneStatusTransportFailureIsNotWatchLibreRecoveryOrRestart() throws {
+        let fixture = makeStore()
+        defer { removeFixture(fixture.directory) }
+        fixture.store.record(.detailed(.integration(name: .watchStatus, activity: .failed), timestamp: referenceDate))
+        fixture.store.record(.detailed(.watchDiagnostic(TroubleshootingWatchDiagnostic(
+            LibreWatchDiagnosticEvent(kind: .recoverySucceeded, watchTimestamp: referenceDate.addingTimeInterval(-600),
+                                     trigger: "observedLinkState", appBuild: "4252"))), timestamp: referenceDate))
+        let entries = fixture.store.snapshot()
+        XCTAssertEqual(entries.count, 2)
+        let report = makeReport(entries: entries).reportText
+        XCTAssertTrue(report.contains("iPhone-to-Watch status/graph delivery"))
+        XCTAssertTrue(report.contains("Watch-Libre recoverySucceeded"))
+        XCTAssertFalse(report.contains("Apple Watch restarted"))
+        XCTAssertFalse(report.contains("iPhone-to-Watch status/graph delivery recovered"))
+        let restored = try JSONDecoder().decode([TroubleshootingLogEntry].self, from: JSONEncoder().encode(entries))
+        XCTAssertEqual(restored, entries)
+    }
+
+    func testLegacyReceiptStillPersistsFullWatchJournalEventOnUpgrade() throws {
+        let fixture = makeStore()
+        defer { removeFixture(fixture.directory) }
+        let sessionID = UUID()
+        let event = LibreWatchDiagnosticEvent(kind: .recoveryStarted,
+            watchTimestamp: referenceDate.addingTimeInterval(-600), trigger: "observedLinkState",
+            sessionID: sessionID, appBuild: "4252", appCommit: "a001908a9b752d909ff3cb8b1efe2e844de4c90f")
+        var legacyReceipts = LibreWatchDiagnosticReceiptLedger()
+        XCTAssertTrue(legacyReceipts.accept(event.eventID, at: referenceDate))
+        var restoredReceipts = try JSONDecoder().decode(LibreWatchDiagnosticReceiptLedger.self,
+            from: JSONEncoder().encode(legacyReceipts))
+        XCTAssertFalse(restoredReceipts.accept(event.eventID, at: referenceDate))
+        // A pre-upgrade receipt is deliberately not consulted by the storage path.
+        let persisted = expectation(description: "legacy receipt event actually exported")
+        fixture.store.recordWatchDiagnostic(TroubleshootingWatchDiagnostic(event), receivedAt: referenceDate) { stored in
+            XCTAssertTrue(stored)
+            persisted.fulfill()
+        }
+        wait(for: [persisted], timeout: 5)
+        let reloaded = TroubleshootingLogStore(fileURL: fixture.fileURL, now: { self.referenceDate })
+        let entry = try XCTUnwrap(reloaded.snapshot().first)
+        guard case let .watchDiagnostic(exported) = entry.kind else { return XCTFail("Missing Watch journal event") }
+        XCTAssertEqual(exported.eventID, event.eventID)
+        XCTAssertEqual(exported.watchTime, referenceDate.addingTimeInterval(-600))
+        XCTAssertEqual(exported.sessionID, sessionID)
+        XCTAssertEqual(exported.build, 4252)
+        XCTAssertEqual(exported.commit, event.appCommit)
+        XCTAssertEqual(entry.timestamp, referenceDate)
+    }
 }

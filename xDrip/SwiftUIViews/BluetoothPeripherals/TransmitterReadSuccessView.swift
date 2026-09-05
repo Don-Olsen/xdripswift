@@ -43,7 +43,7 @@ struct TransmitterReadSuccessView: View {
                 Text(Texts_BluetoothPeripheralView.status)
                     .foregroundStyle(ConstantsUI.tableViewHeaderTextColor)
             } footer: {
-                Text(Texts_BluetoothPeripheralView.readSuccessCadenceFooter(bluetoothPeripheralType: bluetoothPeripheralType.bluetoothPeripheralDisplayTitle))
+                Text(display.calculationBasis + "\n" + display.deliveryEvidence)
                     .foregroundStyle(ConstantsUI.listSectionFooterTextColor)
                     .padding(.bottom, ConstantsUI.listSectionFooterBottomPadding)
             }

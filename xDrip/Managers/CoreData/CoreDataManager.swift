@@ -204,6 +204,32 @@ public final class CoreDataManager {
         return mainContextSaveSucceeded
     }
     
+    /// Delivery acknowledgements require the parent store save, not merely a child-context save.
+    /// No main/private synchronous cross-wait is introduced; failed parent saves remain retryable.
+    public func saveChanges(completion: @escaping (Bool) -> Void) {
+        mainManagedObjectContext.perform {
+            do {
+                if self.mainManagedObjectContext.hasChanges { try self.mainManagedObjectContext.save() }
+            } catch {
+                completion(false)
+                return
+            }
+            self.privateManagedObjectContext.perform {
+                let saved: Bool
+                do {
+                    if self.privateManagedObjectContext.hasChanges { try self.privateManagedObjectContext.save() }
+                    saved = true
+                } catch {
+                    saved = false
+                    let error = error as NSError
+                    trace("Watch reading persistence failed domain=%{public}@ code=%{public}d", log: self.log,
+                          category: ConstantsLog.categoryCoreDataManager, type: .error, error.domain, error.code)
+                }
+                DispatchQueue.main.async { completion(saved) }
+            }
+        }
+    }
+
     /// creates an NSManagedObjectContext with concurrencyType = privateQueueConcurrencyType and parent = mainManagedObjectContext
     public func privateChildManagedObjectContext() -> NSManagedObjectContext {
         // Initialize Managed Object Context

@@ -15,7 +15,7 @@ extension XDripWatchComplication.EntryView {
         if entry.widgetState.keepAliveIsDisabled {
             Label(Texts_WatchComplication.keepAliveDisabled, systemImage: "exclamationmark.triangle.fill")
         } else {
-            Text("\(entry.widgetState.bgValueStringInUserChosenUnit()) \(entry.widgetState.trendArrow())  \(entry.widgetState.deltaChangeStringInUserChosenUnit())")
+            Text("\(entry.widgetState.bgValueStringInUserChosenUnit()) \(entry.widgetState.trendArrow()) \(entry.widgetState.deltaChangeStringInUserChosenUnit()) · ") + entry.widgetState.sourceAndAgeText
         }
     }
 }

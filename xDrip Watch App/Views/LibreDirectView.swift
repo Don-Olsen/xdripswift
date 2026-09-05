@@ -81,6 +81,15 @@ struct LibreDirectView: View {
 
                 controls
 
+                Text(watchState.localAlarmStatus)
+                    .font(.caption2)
+                    .multilineTextAlignment(.center)
+                    .foregroundStyle(.secondary)
+                Button("Tillad Watch-notifikationer") {
+                    watchState.requestLocalAlarmPermission()
+                }
+                .font(.caption2)
+
                 if let identity = collector.state.redactedSensorIdentity {
                     Text(identity)
                         .font(.caption2.monospaced())

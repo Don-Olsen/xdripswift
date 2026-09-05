@@ -51,6 +51,7 @@ struct RootView: View {
         }
         .onChange(of: scenePhase) { newPhase in
             libreDirectCollector.applicationActivityDidChange(newPhase.libreWatchApplicationState)
+            if newPhase == .active { watchState.refreshLocalAlarmPermission() }
             if newPhase == .active, watchState.libreWatchOwnership == .watch {
                 selectedPage = WatchAppPage.bigNumber.rawValue
             }

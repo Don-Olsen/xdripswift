@@ -7,6 +7,7 @@
 //
 
 import Combine
+import CoreData
 import Foundation
 import OSLog
 import UIKit
@@ -67,6 +68,7 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
 
     /// Sends CareLink connection and pump-status transitions without waiting for the next glucose reading.
     private var careLinkStatusObserver: AnyCancellable?
+    private var alarmSnapshotUpdatePending = false
 
     /// for logging
     private var log = OSLog(subsystem: ConstantsLog.subSystem, category: ConstantsLog.categoryWatchManager)
@@ -160,6 +162,17 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
 
         // add observer to sync to the watch once the device status was updated
         UserDefaults.standard.addObserver(self, forKeyPath: UserDefaults.Key.nightscoutDeviceStatusWasUpdated.rawValue, options: .new, context: nil)
+        UserDefaults.standard.addObserver(self, forKeyPath: UserDefaults.Key.snoozeAllAlertsUntilDate.rawValue, options: .new, context: nil)
+        libreWatchObservers.append(NotificationCenter.default.addObserver(
+            forName: .NSManagedObjectContextDidSave, object: coreDataManager.mainManagedObjectContext, queue: .main
+        ) { [weak self] notification in
+            let changed = [NSInsertedObjectsKey, NSUpdatedObjectsKey, NSDeletedObjectsKey].flatMap {
+                Array(notification.userInfo?[$0] as? Set<NSManagedObject> ?? [])
+            }
+            if changed.contains(where: { ["AlertEntry", "AlertType", "SnoozeParameters"].contains($0.entity.name ?? "") }) {
+                self?.scheduleAlarmSettingsUpdate()
+            }
+        })
 
         careLinkStatusObserver = CareLinkAccountState.shared.$snapshot
             .removeDuplicates()
@@ -180,6 +193,8 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
         if let keyPath = keyPath {
             if let keyPathEnum = UserDefaults.Key(rawValue: keyPath) {
                 switch keyPathEnum {
+                case .snoozeAllAlertsUntilDate:
+                    DispatchQueue.main.async { [weak self] in self?.scheduleAlarmSettingsUpdate() }
                 case UserDefaults.Key.nightscoutDeviceStatusWasUpdated:
                     // only ejecute if the key was set to true (to avoid a get-set loop)
                     // if so, process the watch state and set it back to false
@@ -276,6 +291,10 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
     private func currentStatus() -> WatchStatus {
         var status = WatchStatus()
 
+        if let session = libreWatchDirectSession {
+            status.libreAlarmSettings = AlertManager.makeLibreWatchAlarmSettings(session: session, coreDataManager: coreDataManager)
+        }
+
         status.generatedAt = Date().timeIntervalSince1970
         status.isMgDl = UserDefaults.standard.bloodGlucoseUnitIsMgDl
         status.urgentLowLimitInMgDl = UserDefaults.standard.urgentLowMarkValue
@@ -349,6 +368,16 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
         return status
     }
 
+    private func scheduleAlarmSettingsUpdate() {
+        guard !alarmSnapshotUpdatePending else { return }
+        alarmSnapshotUpdatePending = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.alarmSnapshotUpdatePending = false
+            self.sendLibreWatchSession()
+        }
+    }
+
     private func currentAGP(requestID: Double, visibleStartDate: Date, visibleEndDate: Date) async -> WatchAGP {
         guard visibleStartDate < visibleEndDate else {
             return WatchAGP(generatedAt: Date().timeIntervalSince1970, requestID: requestID, visibleStartDateAsDouble: visibleStartDate.timeIntervalSince1970, visibleEndDateAsDouble: visibleEndDate.timeIntervalSince1970)
@@ -412,16 +441,24 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
             return
         }
 
-        // if the WCSession is reachable it means that Watch app is in the foreground so send the watch update as a message
-        // if it's not reachable, then it means it's in the background so send the update as a userInfo
-        // if more than x minutes have passed since the last complication update, call transferCurrentComplicationUserInfo to force an update
-        // if not, then just send it as a normal priority transferUserInfo (but limit the sending to once every 5 minutes!) which will be queued and sent as soon as the watch app is reachable again (this will help get the app showing data quicker)
+        // Reachable peers get an interactive refresh; replacement context covers delayed delivery.
+        // Complication pushes retain their existing cadence and system delivery mechanism.
         if let userInfo = payload(updateTypes: updateTypes) {
+            // Status and graph snapshots replace older snapshots. Keep just the latest
+            // application context, alongside the sensor handoff fields, while unreachable.
+            var context = session.applicationContext
+            context.merge(userInfo) { _, updated in updated }
+            do {
+                try session.updateApplicationContext(context)
+            } catch {
+                trace("Could not replace Watch state context: %{public}@", log: log,
+                      category: ConstantsLog.categoryWatchManager, type: .error, error.localizedDescription)
+            }
             if session.isReachable {
                 trace("sending foreground watch update", log: log, category: ConstantsLog.categoryWatchManager, type: .debug)
                 session.sendMessage(userInfo, replyHandler: nil, errorHandler: { [weak self] error in
                     guard let self = self else { return }
-                    trace("error sending watch update, error = %{public}@", log: self.log, category: ConstantsLog.categoryWatchManager, type: .error, troubleshooting: .detailed(.integration(name: .watch, activity: .failed)), error.localizedDescription)
+                    trace("error sending watch update, error = %{public}@", log: self.log, category: ConstantsLog.categoryWatchManager, type: .error, troubleshooting: .detailed(.integration(name: .watchStatus, activity: .failed)), error.localizedDescription)
                 })
             } else {
                 if (lastForcedComplicationUpdateTimeStamp < .now.addingTimeInterval(-Double(UserDefaults.standard.forceComplicationUpdateInMinutes * 60)) && session.isComplicationEnabled) || forceComplicationUpdate {
@@ -432,9 +469,7 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
                     session.transferCurrentComplicationUserInfo(userInfo)
                     lastForcedComplicationUpdateTimeStamp = .now
                 } else {
-                    trace("sending background watch update", log: log, category: ConstantsLog.categoryWatchManager, type: .debug)
-
-                    session.transferUserInfo(userInfo)
+                    trace("replaced background Watch state context", log: log, category: ConstantsLog.categoryWatchManager, type: .debug)
                 }
             }
         }
@@ -445,6 +480,10 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
         let ownershipChanged = ownership != libreWatchOwnership
         libreWatchOwnership = ownership
         LibreWatchSessionStore.saveOwnership(ownership)
+        if ownership == .iphone, LibreWatchAlarmStore.delegation() != nil {
+            LibreWatchAlarmStore.save(nil as LibreWatchAlarmDelegation?)
+            NotificationCenter.default.post(name: .libreWatchAlarmDelegationChanged, object: nil)
+        }
         if ownershipChanged {
             trace(
                 "Libre Watch ownership changed: %{public}@ -> %{public}@ sensor=%{public}@",
@@ -525,12 +564,11 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
         sendLibreWatchSession()
     }
 
-    private func sendLibreWatchSession() {
+    private func libreWatchSessionPayload() -> [String: Any]? {
         guard let libreWatchDirectSession,
               libreWatchDirectSession.isValid,
-              let encoded = try? JSONEncoder().encode(libreWatchDirectSession),
-              session.activationState == .activated
-        else { return }
+              let encoded = try? JSONEncoder().encode(libreWatchDirectSession)
+        else { return nil }
 
         refreshLibreWatchCalibrationSnapshot(for: libreWatchDirectSession)
 
@@ -543,7 +581,30 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
            let calibrationData = try? JSONEncoder().encode(snapshot) {
             payload[LibreWatchMessageKey.calibration] = calibrationData
         }
-        try? session.updateApplicationContext(payload)
+        let alarmSettings = AlertManager.makeLibreWatchAlarmSettings(session: libreWatchDirectSession, coreDataManager: coreDataManager)
+        payload[LibreWatchMessageKey.alarmSettings] = try? JSONEncoder().encode(alarmSettings)
+        let snapshot = LibreWatchHandoffSnapshot(
+            session: libreWatchDirectSession,
+            calibration: libreWatchCalibrationSnapshot,
+            ownership: libreWatchOwnership,
+            revision: LibreWatchSessionStore.nextHandoffRevision(),
+            alarmSettings: alarmSettings,
+            alarmDelegation: LibreWatchAlarmStore.delegation()
+        )
+        guard snapshot.isValid,
+              let snapshotData = try? JSONEncoder().encode(snapshot)
+        else { return nil }
+        payload[LibreWatchMessageKey.handoffSnapshot] = snapshotData
+        return payload
+    }
+
+    private func sendLibreWatchSession(payload existingPayload: [String: Any]? = nil) {
+        guard session.activationState == .activated,
+              let payload = existingPayload ?? libreWatchSessionPayload()
+        else { return }
+        var context = session.applicationContext
+        context.merge(payload) { _, updated in updated }
+        try? session.updateApplicationContext(context)
         if session.isReachable {
             session.sendMessage(payload, replyHandler: nil, errorHandler: { [weak self] error in
                 guard let self else { return }
@@ -644,10 +705,18 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
             return true
         }
 
+        let interactiveReply = reply
+        let itemID = (message[LibreWatchMessageKey.deliveryItemID] as? String).flatMap(UUID.init(uuidString:))
         // WCSession delegates arrive on a private queue. Keep all mutable hand-off, calibration,
         // acceptance and UserDefaults state in the manager's existing main isolation domain.
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
+            let reply: (([String: Any]) -> Void)? = { response in
+                interactiveReply?(response)
+                if transport == .queuedUserInfo, let itemID {
+                    self.sendLibreWatchDeliveryReceipt(itemID: itemID, sessionID: sessionID, response: response)
+                }
+            }
             let fail: (String, LibreWatchDeliveryOutcome?) -> Void = { reason, outcome in
                 var response: [String: Any] = [
                     LibreWatchMessageKey.success: false,
@@ -660,6 +729,10 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
                 reply?(response)
             }
 
+            if command == .reportDiagnostic {
+                self.receiveLibreWatchDiagnostic(message, sessionID: sessionID, reply: reply)
+                return
+            }
             guard var preparedSession = self.libreWatchDirectSession,
                   preparedSession.id == sessionID,
                   preparedSession.isValid
@@ -670,14 +743,35 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
 
             switch command {
         case .acknowledgeSession:
-            reply?([
+            if [.watch, .releasingToPhone].contains(self.libreWatchOwnership),
+               let data = message[LibreWatchMessageKey.alarmState] as? Data,
+               let state = try? JSONDecoder().decode(LibreWatchAlarmState.self, from: data) {
+                AlertManager.applyLibreWatchAlarmState(state, session: preparedSession, coreDataManager: self.coreDataManager)
+            }
+            let alarmSettings = AlertManager.makeLibreWatchAlarmSettings(session: preparedSession, coreDataManager: self.coreDataManager)
+            if self.libreWatchOwnership == .watch,
+               let rawRevision = message[LibreWatchMessageKey.alarmSettingsRevision] as? String,
+               UInt64(rawRevision) == alarmSettings.revision {
+                AlertManager.setLibreWatchAlarmDelegation(
+                    readyRevision: message[LibreWatchMessageKey.alarmsReady] as? Bool == true ? alarmSettings.revision : nil,
+                    settings: alarmSettings)
+            }
+            var response: [String: Any] = [
                 LibreWatchMessageKey.success: true,
-                LibreWatchMessageKey.ownership: self.libreWatchOwnership.rawValue
-            ])
+                LibreWatchMessageKey.ownership: self.libreWatchOwnership.rawValue,
+                LibreWatchMessageKey.alarmsReady: LibreWatchAlarmStore.delegation()?.matches(alarmSettings) == true
+            ]
+            response[LibreWatchMessageKey.alarmSettings] = try? JSONEncoder().encode(alarmSettings)
+            if let delegation = LibreWatchAlarmStore.delegation() {
+                response[LibreWatchMessageKey.alarmDelegation] = try? JSONEncoder().encode(delegation)
+            }
+            reply?(response)
 
         case .requestOwnership:
+            self.refreshLibreWatchCalibrationSnapshot(for: preparedSession)
             guard transport == .interactiveMessage,
                   self.libreWatchOwnership == .iphone,
+                  self.libreWatchCalibrationSnapshot?.matches(session: preparedSession) == true,
                   let transmitter = self.bluetoothPeripheralManager.getCGMTransmitter() as? CGMLibre2Transmitter,
                   transmitter.canReleaseSensorToWatch(preparedSession)
             else {
@@ -691,19 +785,34 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
                 guard let self else { return }
                 guard released,
                       self.libreWatchDirectSession?.id == preparedSession.id,
-                      self.libreWatchDirectSession?.sensorUID == preparedSession.sensorUID
+                      self.libreWatchDirectSession?.sensorUID == preparedSession.sensorUID,
+                      let releasedSession = transmitter.prepareCurrentSensorForWatch(),
+                      releasedSession.id == preparedSession.id
                 else {
+                    _ = transmitter.returnSensorToPhone(sessionID: preparedSession.id)
                     self.setLibreWatchOwnership(.iphone)
                     self.sendLibreWatchSession()
                     fail("iPhone could not release this Libre sensor session", .wrongSession)
                     return
                 }
+                // Capture after the final phone BLE callback has released the peripheral.
+                // Its unlock counter can have advanced since the original NFC preparation.
+                self.libreWatchDirectSession = releasedSession
+                let alarmSettings = AlertManager.makeLibreWatchAlarmSettings(session: releasedSession, coreDataManager: self.coreDataManager)
+                let readyRevision = (message[LibreWatchMessageKey.alarmSettingsRevision] as? String).flatMap(UInt64.init)
+                AlertManager.setLibreWatchAlarmDelegation(
+                    readyRevision: message[LibreWatchMessageKey.alarmsReady] as? Bool == true ? readyRevision : nil,
+                    settings: alarmSettings)
                 self.setLibreWatchOwnership(.watch)
-                self.sendLibreWatchSession()
-                reply?([
-                    LibreWatchMessageKey.success: true,
-                    LibreWatchMessageKey.ownership: self.libreWatchOwnership.rawValue
-                ])
+                guard var response = self.libreWatchSessionPayload() else {
+                    _ = transmitter.returnSensorToPhone(sessionID: releasedSession.id)
+                    self.setLibreWatchOwnership(.iphone)
+                    fail("Current Libre calibration is unavailable after release", .wrongCalibration)
+                    return
+                }
+                self.sendLibreWatchSession(payload: response)
+                response[LibreWatchMessageKey.success] = true
+                reply?(response)
             }
 
         case .releaseOwnership:
@@ -714,10 +823,10 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
             if self.libreWatchOwnership == .iphone,
                let receipt = self.currentLibreWatchReleaseReceipt(),
                receipt.state == .completed {
-                reply?([
-                    LibreWatchMessageKey.success: true,
-                    LibreWatchMessageKey.ownership: LibreWatchOwnership.iphone.rawValue
-                ])
+                var response = self.libreWatchSessionPayload() ?? [:]
+                response[LibreWatchMessageKey.success] = true
+                response[LibreWatchMessageKey.ownership] = LibreWatchOwnership.iphone.rawValue
+                reply?(response)
                 return
             }
 
@@ -738,6 +847,10 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
             }
 
             _ = self.updateLibreWatchUnlockCounter(from: message, session: &preparedSession)
+            if let data = message[LibreWatchMessageKey.alarmState] as? Data,
+               let state = try? JSONDecoder().decode(LibreWatchAlarmState.self, from: data) {
+                AlertManager.applyLibreWatchAlarmState(state, session: preparedSession, coreDataManager: self.coreDataManager)
+            }
             LibreWatchSessionStore.saveReleaseReceipt(receipt)
             self.logLibreWatchDelivery(.receiptCreated)
             self.setLibreWatchOwnership(.releasingToPhone)
@@ -754,11 +867,11 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
             LibreWatchSessionStore.saveReleaseReceipt(receipt)
             self.logLibreWatchDelivery(.receiptCompleted)
             self.setLibreWatchOwnership(.iphone)
-            self.sendLibreWatchSession()
-            reply?([
-                LibreWatchMessageKey.success: true,
-                LibreWatchMessageKey.ownership: self.libreWatchOwnership.rawValue
-            ])
+            var response = self.libreWatchSessionPayload() ?? [:]
+            self.sendLibreWatchSession(payload: response)
+            response[LibreWatchMessageKey.success] = true
+            response[LibreWatchMessageKey.ownership] = self.libreWatchOwnership.rawValue
+            reply?(response)
 
         case .updateUnlockCounter:
             guard self.updateLibreWatchUnlockCounter(from: message, session: &preparedSession) else {
@@ -773,7 +886,8 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
         case .submitReading:
             guard let data = message[LibreWatchMessageKey.reading] as? Data,
                   let reading = try? JSONDecoder().decode(LibreWatchDirectReadingPayload.self, from: data),
-                  reading.sessionID == sessionID
+                  reading.sessionID == sessionID,
+                  itemID == nil || itemID == reading.id
             else {
                 fail("Invalid Libre reading", .invalidPayload)
                 return
@@ -803,6 +917,7 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
 
             let receivedAt = Date()
             let transportAge = receivedAt.timeIntervalSince(reading.receivedAt)
+            var candidateAcceptance = self.libreWatchReadingAcceptance
             if transport == .queuedUserInfo {
                 // A fresh queued fallback is still clinically live. This occurs when an
                 // interactive send fails or the activated phone is temporarily unreachable.
@@ -810,20 +925,16 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
                     transportAge: transportAge,
                     ownership: self.libreWatchOwnership
                 ) == .attemptLiveAcceptance,
-                   self.libreWatchReadingAcceptance.accept(
+                   candidateAcceptance.accept(
                     reading,
                     for: currentSession.id,
                     now: receivedAt
                    ) {
-                    transmitter.receiveReadingFromWatch(
+                    let outcome = transmitter.receiveReadingFromWatch(
                         reading,
                         calibrationSnapshot: calibrationSnapshot
                     )
-                    reply?([
-                        LibreWatchMessageKey.success: true,
-                        LibreWatchMessageKey.deliveryOutcome: LibreWatchDeliveryOutcome.liveAccepted.rawValue,
-                        LibreWatchMessageKey.ownership: self.libreWatchOwnership.rawValue
-                    ])
+                    self.confirmLibreWatchReading(outcome, reading: reading, transmitter: transmitter, reply: reply)
                     return
                 }
 
@@ -848,18 +959,7 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
                         now: receivedAt
                     )
                 }
-                trace(
-                    "Watch queued Libre reading: %{public}@",
-                    log: self.log,
-                    category: ConstantsLog.categoryWatchManager,
-                    type: outcome == .historicalInserted || outcome == .duplicate ? .info : .error,
-                    outcome.rawValue
-                )
-                reply?([
-                    LibreWatchMessageKey.success: outcome == .historicalInserted || outcome == .duplicate,
-                    LibreWatchMessageKey.deliveryOutcome: outcome.rawValue,
-                    LibreWatchMessageKey.ownership: self.libreWatchOwnership.rawValue
-                ])
+                self.confirmLibreWatchReading(outcome, reading: reading, transmitter: transmitter, reply: reply)
                 return
             }
 
@@ -871,120 +971,172 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
                 fail("Libre reading is too old for interactive delivery", .tooOld)
                 return
             }
-            guard self.libreWatchReadingAcceptance.accept(
+            guard candidateAcceptance.accept(
                 reading,
                 for: currentSession.id,
                 now: receivedAt
             ) else {
-                fail("Duplicate, invalid, or out-of-order Libre reading", .duplicate)
+                if transmitter.watchReadingIsStored(reading.id, sensorID: calibrationSnapshot.activeSensorID) {
+                    self.confirmLibreWatchReading(.duplicate, reading: reading, transmitter: transmitter, reply: reply)
+                } else {
+                    fail("Libre reading is out of live order; queued history may fill the gap", .outOfOrder)
+                }
                 return
             }
 
-            transmitter.receiveReadingFromWatch(
+            let outcome = transmitter.receiveReadingFromWatch(
                 reading,
                 calibrationSnapshot: calibrationSnapshot
             )
-            reply?([
-                LibreWatchMessageKey.success: true,
-                LibreWatchMessageKey.deliveryOutcome: LibreWatchDeliveryOutcome.liveAccepted.rawValue,
-                LibreWatchMessageKey.ownership: self.libreWatchOwnership.rawValue
-            ])
+            self.confirmLibreWatchReading(outcome, reading: reading, transmitter: transmitter, reply: reply)
 
         case .reportDiagnostic:
-            guard let data = message[LibreWatchMessageKey.diagnosticEvent] as? Data,
-                  let event = try? JSONDecoder().decode(LibreWatchDiagnosticEvent.self, from: data)
-            else {
-                fail("Invalid Libre Watch diagnostic", .invalidPayload)
-                return
-            }
-
-            guard let currentSession = self.libreWatchDirectSession,
-                  currentSession.id == sessionID,
-                  event.sessionID == nil || event.sessionID == currentSession.id,
-                  event.sensorIdentity == nil || event.sensorIdentity == currentSession.redactedIdentity()
-            else {
-                fail("Libre Watch diagnostic context mismatch", .wrongSession)
-                return
-            }
-            guard self.libreWatchDiagnosticReceipts.accept(event.eventID) else {
-                reply?([
-                    LibreWatchMessageKey.success: true,
-                    LibreWatchMessageKey.ownership: self.libreWatchOwnership.rawValue
-                ])
-                return
-            }
-            LibreWatchSessionStore.saveDiagnosticReceipts(self.libreWatchDiagnosticReceipts)
-            let receiptTime = Date()
-            let troubleshooting: TroubleshootingLogEntry?
-            switch event.kind {
-                case .disconnected:
-                    troubleshooting = .detailed(.bluetooth(.disconnected))
-                case .recoveryStarted:
-                    troubleshooting = .detailed(.integration(name: .watch, activity: .started))
-                case .recoverySucceeded:
-                    troubleshooting = .detailed(.integration(name: .watch, activity: .recovered))
-                case .recoveryFailed:
-                    troubleshooting = .standard(.integration(name: .watch, activity: .failed))
-                case .extendedRuntimeWillExpire, .extendedRuntimeInvalidated,
-                     .lifecycleChanged, .bluetoothAction, .coreBluetoothCallback,
-                     .frameProgress, .callbackRejected, .journalRotated:
-                    troubleshooting = nil
-            }
-
-                // Receipt time remains the trace timestamp; queued Watch events carry their
-                // own origin time. Keep the context in one argument (trace supports ten).
-            let context = [
-                    "watchTime=\(event.watchTimestamp.map { ISO8601DateFormatter().string(from: $0) } ?? "n/a")",
-                    "receiptTime=\(ISO8601DateFormatter().string(from: receiptTime))",
-                    "trigger=\(event.trigger ?? "n/a")",
-                    "attempt=\(event.attemptID?.uuidString ?? "n/a")",
-                    "attemptStarted=\(event.attemptStartedAt.map { ISO8601DateFormatter().string(from: $0) } ?? "n/a")",
-                    "source=\(event.reconcileSource?.rawValue ?? "n/a")",
-                    "scene=\(event.applicationState?.rawValue ?? "n/a")",
-                    "sceneActive=\(event.applicationIsActive.map { String($0) } ?? "n/a")",
-                    "runtime=\(event.extendedRuntimeIsRunning.map { String($0) } ?? "n/a")",
-                    "runtimeState=\(event.extendedRuntimeState ?? "none")",
-                    "runtimeStartRequested=\(event.extendedRuntimeStartRequested.map { String($0) } ?? "n/a")",
-                    "app=\(event.appVersion ?? "n/a") (\(event.appBuild ?? "n/a"))",
-                    "watchOS=\(event.watchOSVersion ?? "n/a")",
-                    "sequence=\(event.sequenceNumber.map { String($0) } ?? "n/a")",
-                    "peripheral=\(event.peripheralState ?? "n/a")",
-                    "phase=\(event.connectionPhase ?? "n/a")",
-                    "deadlinePhase=\(event.deadlinePhase ?? "none")",
-                    "deadline=\(event.deadlineAt.map { ISO8601DateFormatter().string(from: $0) } ?? "none")",
-                    "remainingBudget=\(event.remainingExecutionBudget.map { String(format: "%.1f", $0) } ?? "none")",
-                    "receivingDeadline=\(event.receivingBudgetDeadline.map { ISO8601DateFormatter().string(from: $0) } ?? "none")",
-                    "technicalFrame=\(event.technicalFrameAt.map { ISO8601DateFormatter().string(from: $0) } ?? "none")",
-                    "measurement=\(event.measurementAt.map { ISO8601DateFormatter().string(from: $0) } ?? "none")",
-                    "action=\(event.bluetoothAction ?? "none")",
-                    "reason=\(event.actionReason ?? "none")",
-                    "errorDomain=\(event.errorDomain ?? "none")",
-                    "errorClass=\(event.bluetoothErrorClassification ?? "none")",
-                    "journalDropped=\(event.journalDroppedCount.map { String($0) } ?? "0")",
-                    "generation=\(event.generation?.uuidString ?? "n/a")",
-                    "runtimeReason=\(event.runtimeInvalidationReason.map { String($0) } ?? "none")",
-                    "runtimeError=\(event.runtimeError ?? "none")"
-            ].joined(separator: " ")
-            trace(
-                    "Watch Libre diagnostic: event=%{public}@ sensor=%{public}@ isReconnecting=%{public}@ errorCode=%{public}@ %{public}@",
-                    log: self.log,
-                    category: ConstantsLog.categoryWatchManager,
-                    type: event.kind == .recoveryFailed ? .error : .info,
-                    troubleshooting: troubleshooting,
-                event.kind.rawValue,
-                currentSession.redactedIdentity(),
-                event.isReconnecting.map { String($0) } ?? "n/a",
-                event.errorCode.map { String($0) } ?? "none",
-                context
-            )
-            reply?([
-                LibreWatchMessageKey.success: true,
-                LibreWatchMessageKey.ownership: self.libreWatchOwnership.rawValue
-            ])
+            break // The diagnostics-only path is handled before active sensor validation.
             }
         }
 
         return true
+    }
+
+    private func receiveLibreWatchDiagnostic(
+        _ message: [String: Any], sessionID: UUID, reply: (([String: Any]) -> Void)?
+    ) {
+        let fail: (String, LibreWatchDeliveryOutcome?) -> Void = { reason, outcome in
+            reply?([
+                LibreWatchMessageKey.success: false,
+                LibreWatchMessageKey.error: reason,
+                LibreWatchMessageKey.deliveryOutcome: outcome?.rawValue ?? LibreWatchDeliveryOutcome.invalidPayload.rawValue
+            ])
+        }
+        guard let data = message[LibreWatchMessageKey.diagnosticEvent] as? Data,
+              let event = try? JSONDecoder().decode(LibreWatchDiagnosticEvent.self, from: data)
+        else {
+            fail("Invalid Libre Watch diagnostic", .invalidPayload)
+            return
+        }
+
+        let itemID = (message[LibreWatchMessageKey.deliveryItemID] as? String).flatMap(UUID.init(uuidString:))
+        guard (event.sessionID == nil || event.sessionID == sessionID),
+              itemID == nil || itemID == event.eventID
+        else {
+            fail("Libre Watch diagnostic context mismatch", .wrongSession)
+            return
+        }
+        // Older builds recorded receipt IDs before exporting the full event. That ledger
+        // is not proof of durable journal storage. Always use the export store's stable-ID
+        // deduplication, including upgrade/replayed events already present in that ledger.
+        let receiptTime = Date()
+        TroubleshootingLogStore.shared.recordWatchDiagnostic(
+            TroubleshootingWatchDiagnostic(event), receivedAt: receiptTime
+        ) { [weak self] stored in
+            guard let self else { return }
+            if stored {
+                _ = self.libreWatchDiagnosticReceipts.accept(event.eventID)
+                LibreWatchSessionStore.saveDiagnosticReceipts(self.libreWatchDiagnosticReceipts)
+            }
+            var response: [String: Any] = [
+                LibreWatchMessageKey.success: stored,
+                LibreWatchMessageKey.durableReceipt: stored
+            ]
+            if !stored { response[LibreWatchMessageKey.deliveryOutcome] = LibreWatchDeliveryOutcome.collectorUnavailable.rawValue }
+            reply?(response)
+        }
+        // The typed journal export above is the sole consumer-facing BLE fact. Do not also
+        // turn Watch-Libre recovery into generic phone Bluetooth or phone-to-Watch sharing.
+        // Receipt time remains the trace timestamp; queued Watch events carry their origin time.
+        let context = [
+                "watchTime=\(event.watchTimestamp.map { ISO8601DateFormatter().string(from: $0) } ?? "n/a")",
+                "receiptTime=\(ISO8601DateFormatter().string(from: receiptTime))",
+                "trigger=\(event.trigger ?? "n/a")",
+                "attempt=\(event.attemptID?.uuidString ?? "n/a")",
+                "attemptStarted=\(event.attemptStartedAt.map { ISO8601DateFormatter().string(from: $0) } ?? "n/a")",
+                "source=\(event.reconcileSource?.rawValue ?? "n/a")",
+                "scene=\(event.applicationState?.rawValue ?? "n/a")",
+                "sceneActive=\(event.applicationIsActive.map { String($0) } ?? "n/a")",
+                "runtime=\(event.extendedRuntimeIsRunning.map { String($0) } ?? "n/a")",
+                "runtimeState=\(event.extendedRuntimeState ?? "none")",
+                "runtimeStartRequested=\(event.extendedRuntimeStartRequested.map { String($0) } ?? "n/a")",
+                "app=\(event.appVersion ?? "n/a") (\(event.appBuild ?? "n/a"))",
+                "watchOS=\(event.watchOSVersion ?? "n/a")",
+                "sequence=\(event.sequenceNumber.map { String($0) } ?? "n/a")",
+                "peripheral=\(event.peripheralState ?? "n/a")",
+                "phase=\(event.connectionPhase ?? "n/a")",
+                "deadlinePhase=\(event.deadlinePhase ?? "none")",
+                "deadline=\(event.deadlineAt.map { ISO8601DateFormatter().string(from: $0) } ?? "none")",
+                "remainingBudget=\(event.remainingExecutionBudget.map { String(format: "%.1f", $0) } ?? "none")",
+                "receivingDeadline=\(event.receivingBudgetDeadline.map { ISO8601DateFormatter().string(from: $0) } ?? "none")",
+                "technicalFrame=\(event.technicalFrameAt.map { ISO8601DateFormatter().string(from: $0) } ?? "none")",
+                "measurement=\(event.measurementAt.map { ISO8601DateFormatter().string(from: $0) } ?? "none")",
+                "action=\(event.bluetoothAction ?? "none")",
+                "reason=\(event.actionReason ?? "none")",
+                "errorDomain=\(event.errorDomain ?? "none")",
+                "errorClass=\(event.bluetoothErrorClassification ?? "none")",
+                "journalDropped=\(event.journalDroppedCount.map { String($0) } ?? "0")",
+                "generation=\(event.generation?.uuidString ?? "n/a")",
+                "runtimeReason=\(event.runtimeInvalidationReason.map { String($0) } ?? "none")",
+                "runtimeError=\(event.runtimeError ?? "none")"
+        ].joined(separator: " ")
+        trace(
+                "Watch Libre diagnostic: event=%{public}@ sensor=%{public}@ isReconnecting=%{public}@ errorCode=%{public}@ %{public}@",
+                log: self.log,
+                category: ConstantsLog.categoryWatchManager,
+                type: event.kind == .recoveryFailed ? .error : .info,
+            event.kind.rawValue,
+            event.sessionID?.uuidString ?? "legacy-session",
+            event.isReconnecting.map { String($0) } ?? "n/a",
+            event.errorCode.map { String($0) } ?? "none",
+            context
+        )
+    }
+
+    private func confirmLibreWatchReading(
+        _ outcome: LibreWatchDeliveryOutcome,
+        reading: LibreWatchDirectReadingPayload,
+        transmitter: CGMLibre2Transmitter,
+        reply: (([String: Any]) -> Void)?
+    ) {
+        let persistedOutcome = outcome == .liveAccepted || outcome == .historicalInserted || outcome == .duplicate
+        let complete: (Bool) -> Void = { [weak self] stored in
+            guard let self else { return }
+            let finalOutcome = persistedOutcome && !stored ? LibreWatchDeliveryOutcome.historyNotInserted : outcome
+            if stored, outcome == .liveAccepted,
+               self.libreWatchOwnership == .watch,
+               self.libreWatchDirectSession?.id == reading.sessionID {
+                // A newer save may have completed first. accept() cannot roll its watermark back.
+                _ = self.libreWatchReadingAcceptance.accept(reading, for: reading.sessionID, now: Date())
+            }
+            trace("Watch Libre storage result: %{public}@ payload=%{public}@", log: self.log,
+                  category: ConstantsLog.categoryWatchManager,
+                  type: stored ? .info : .error, finalOutcome.rawValue, reading.id.uuidString)
+            reply?([
+                LibreWatchMessageKey.success: persistedOutcome && stored,
+                LibreWatchMessageKey.durableReceipt: persistedOutcome && stored,
+                LibreWatchMessageKey.deliveryOutcome: finalOutcome.rawValue,
+                LibreWatchMessageKey.ownership: self.libreWatchOwnership.rawValue
+            ])
+        }
+        if persistedOutcome {
+            transmitter.confirmReadingStorage(completion: complete)
+        } else {
+            complete(false)
+        }
+    }
+
+    private func sendLibreWatchDeliveryReceipt(itemID: UUID, sessionID: UUID, response: [String: Any]) {
+        guard session.activationState == .activated else { return }
+        var receipt = response
+        receipt[LibreWatchMessageKey.deliveryReceiptID] = itemID.uuidString
+        receipt[LibreWatchMessageKey.sessionID] = sessionID.uuidString
+        if session.isReachable {
+            session.sendMessage(receipt, replyHandler: nil) { [weak self] _ in
+                DispatchQueue.main.async {
+                    guard let self, self.session.activationState == .activated else { return }
+                    self.session.transferUserInfo(receipt)
+                }
+            }
+        } else {
+            session.transferUserInfo(receipt)
+        }
     }
 
     @discardableResult
@@ -995,10 +1147,18 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
         guard let counter = message[LibreWatchMessageKey.unlockCounter] as? Int,
               counter >= 0,
               counter <= Int(UInt16.max),
-              UInt16(counter) >= preparedSession.unlockCount
+              UserDefaults.standard.libreSensorUID == preparedSession.sensorUID,
+              UserDefaults.standard.librePatchInfo == preparedSession.patchInfo
         else { return false }
 
-        preparedSession.unlockCount = UInt16(counter)
+        preparedSession.unlockCount = LibreWatchUnlockCounterPolicy.highest(
+            incoming: UInt16(counter),
+            session: preparedSession,
+            storedSession: LibreWatchSessionStore.loadSession(),
+            activeSensorUID: UserDefaults.standard.libreSensorUID,
+            activePatchInfo: UserDefaults.standard.librePatchInfo,
+            activeCounter: UserDefaults.standard.libreActiveSensorUnlockCount
+        )
         libreWatchDirectSession = preparedSession
         UserDefaults.standard.libreActiveSensorUnlockCount = preparedSession.unlockCount
         LibreWatchSessionStore.saveSession(preparedSession)
@@ -1021,6 +1181,7 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
     }
 
     deinit {
+        UserDefaults.standard.removeObserver(self, forKeyPath: UserDefaults.Key.snoozeAllAlertsUntilDate.rawValue)
         UserDefaults.standard.removeObserver(self, forKeyPath: UserDefaults.Key.nightscoutDeviceStatusWasUpdated.rawValue)
         libreWatchObservers.forEach { NotificationCenter.default.removeObserver($0) }
     }
@@ -1041,7 +1202,7 @@ extension WatchManager: WCSessionDelegate {
         completeSessionActivationRequest()
 
         if let error {
-            trace("watch session activation failed, error = %{public}@", log: log, category: ConstantsLog.categoryWatchManager, type: .error, troubleshooting: .detailed(.integration(name: .watch, activity: .failed)), error.localizedDescription)
+            trace("watch session activation failed, error = %{public}@", log: log, category: ConstantsLog.categoryWatchManager, type: .error, troubleshooting: .detailed(.integration(name: .watchConnectivity, activity: .failed)), error.localizedDescription)
             return
         }
 

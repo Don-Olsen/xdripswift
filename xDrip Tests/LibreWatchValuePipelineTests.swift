@@ -1,6 +1,307 @@
 import XCTest
 import CoreData
+import HealthKit
 @testable import xdrip
+
+extension LibreWatchValuePipelineTests {
+    func testConfiguredReadSuccessCadenceDoesNotShrinkDuringOutageOrBackfill() {
+        let start = Date(timeIntervalSince1970: 1_800_000_000)
+        let end = start.addingTimeInterval(3600)
+        let contexts = [TransmitterReadSuccessContext(effectiveAt: start, source: "Libre2", interval: 60, visibleInterval: 60)]
+        let before = TransmitterReadSuccessPolicy.counts(timestamps: [start, start.addingTimeInterval(60)],
+            start: start, end: end, contexts: contexts, fallbackInterval: 60)
+        XCTAssertEqual(before.expected, 60)
+        XCTAssertEqual(before.actual, 2)
+        let after = TransmitterReadSuccessPolicy.counts(timestamps: (0..<60).map { start.addingTimeInterval(Double($0) * 60) },
+            start: start, end: end, contexts: contexts, fallbackInterval: 60)
+        XCTAssertEqual(after.expected, before.expected)
+        XCTAssertEqual(after.actual, 60)
+    }
+
+    func testConfiguredReadSuccessMixedIntervalsAndMinuteJitter() {
+        let start = Date(timeIntervalSince1970: 1_800_000_000)
+        let contexts = [
+            TransmitterReadSuccessContext(effectiveAt: start, source: "Libre2", interval: 60, visibleInterval: 60),
+            TransmitterReadSuccessContext(effectiveAt: start.addingTimeInterval(3600), source: "Dexcom", interval: 300, visibleInterval: 300)
+        ]
+        let counts = TransmitterReadSuccessPolicy.counts(timestamps: [], start: start,
+            end: start.addingTimeInterval(7200), contexts: contexts, fallbackInterval: 60)
+        XCTAssertEqual(counts.expected, 72)
+        let jitter = TransmitterReadSuccessPolicy.counts(timestamps: [59, 120.1, 179].map { start.addingTimeInterval($0) },
+            start: start, end: start.addingTimeInterval(180), contexts: contexts, fallbackInterval: 60)
+        XCTAssertEqual(jitter, .init(expected: 3, actual: 3))
+        let visibleOnly = Array(contexts.prefix(1)) + [TransmitterReadSuccessContext(effectiveAt: start.addingTimeInterval(30),
+            source: "Libre2", interval: 60, visibleInterval: 300)]
+        XCTAssertEqual(TransmitterReadSuccessPolicy.counts(timestamps: [], start: start,
+            end: start.addingTimeInterval(180), contexts: Array(visibleOnly), fallbackInterval: 60).expected, 3)
+        let unknown = [contexts[0],
+            TransmitterReadSuccessContext(effectiveAt: start.addingTimeInterval(3600), source: "Bubble", interval: 0, visibleInterval: 300),
+            TransmitterReadSuccessContext(effectiveAt: start.addingTimeInterval(7200), source: "Libre2", interval: 60, visibleInterval: 60)]
+        XCTAssertEqual(TransmitterReadSuccessPolicy.counts(timestamps: [], start: start,
+            end: start.addingTimeInterval(10800), contexts: unknown, fallbackInterval: 60).expected, 120)
+    }
+
+    @MainActor
+    func testReadSuccessUsesCurrentSensorAndSeparatesDelayedPhoneStorage() throws {
+        let suite = "ReadSuccessRegression-" + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.cgmTransmitterTypeAsString = CGMTransmitterType.Libre2.rawValue
+        let now = Date()
+        let start = now.addingTimeInterval(-600)
+        let stack = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let sensor = Sensor(startDate: start, nsManagedObjectContext: stack.mainManagedObjectContext)
+        let other = Sensor(startDate: start, nsManagedObjectContext: stack.mainManagedObjectContext)
+        let current = BgReading(timeStamp: start.addingTimeInterval(60), sensor: sensor, calibration: nil,
+            rawData: 85, deviceName: nil, nsManagedObjectContext: stack.mainManagedObjectContext)
+        current.calculatedValue = 85
+        current.ageAdjustedRawValue = 85
+        let unrelated = BgReading(timeStamp: start.addingTimeInterval(120), sensor: other, calibration: nil,
+            rawData: 86, deviceName: nil, nsManagedObjectContext: stack.mainManagedObjectContext)
+        unrelated.calculatedValue = 86
+        unrelated.ageAdjustedRawValue = 86
+        XCTAssertTrue(stack.saveChanges())
+        let receipt = TransmitterReadSuccessReceipt(id: current.id, sensorID: sensor.id,
+            measuredAt: current.timeStamp, storedAt: now, fromWatch: true, historical: true)
+        TransmitterReadSuccessEvidence.record(receipt, defaults: defaults)
+        TransmitterReadSuccessEvidence.record(receipt, defaults: defaults)
+        let display = TransmitterReadSuccessManager(bgReadingsAccessor: BgReadingsAccessor(coreDataManager: stack),
+            nowProvider: { now }, defaults: defaults).getReadSuccess(forSensor: sensor)
+        XCTAssertEqual(display.expected24h, 10)
+        XCTAssertEqual(display.actual24h, 1)
+        XCTAssertEqual(display.timelyReceiptCount, 0)
+        XCTAssertEqual(display.delayedReceiptCount, 1)
+        XCTAssertTrue(display.deliveryEvidence.contains("BLE outages and transport delay are separate"))
+    }
+
+    func testCorrectedLogDeliveryIntervalsRemainHistoricalNotCurrent() {
+        // Receipt-minus-measurement intervals from the supplied 18:58:25 report.
+        // These prove late phone registration, not the location of the delay or a BLE outage.
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        for age in [519.0, 2_415, 206, 184] {
+            XCTAssertGreaterThan(age, LibreWatchReadingAcceptancePolicy.maximumTransportAge)
+            XCTAssertLessThan(age, LibreWatchHistoryPolicy.maximumAge)
+            XCTAssertTrue(LibreWatchStoredReadingPolicy.requiresHistoricalPath(measuredAt: now.addingTimeInterval(-age),
+                latestStoredAt: now.addingTimeInterval(-60)))
+            let routing = LibreWatchGlucoseProcessingMode.historicalBackfill.routing
+            XCTAssertFalse(routing.triggersAlerts)
+            XCTAssertFalse(routing.resetsMissedReadingState)
+            XCTAssertFalse(routing.updatesCurrentValue)
+        }
+    }
+
+    func testStoredWatchReceiptDistinguishesPermanentErrorAndPendingCalibration() {
+        XCTAssertEqual(LibreWatchStoredReadingPolicy.outcome(isValid: false, calculatedValue: 0), .historyNotInserted)
+        XCTAssertEqual(LibreWatchStoredReadingPolicy.outcome(isValid: false, calculatedValue: 38), .invalidPayload)
+        XCTAssertEqual(LibreWatchStoredReadingPolicy.outcome(isValid: true, calculatedValue: 38), .duplicate)
+        XCTAssertEqual(LibreWatchStoredReadingPolicy.outcome(isValid: true, calculatedValue: 39), .duplicate)
+        XCTAssertTrue(LibreWatchConnectivityDeliveryPolicy.isTerminal(.invalidPayload))
+        XCTAssertFalse(LibreWatchConnectivityDeliveryPolicy.isTerminal(.historyNotInserted))
+    }
+
+    @MainActor
+    func testWatchStorageConfirmationWaitsForParentStoreAndCanRetryFailedChildSave() async throws {
+        let stack = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let sensor = Sensor(startDate: Date().addingTimeInterval(-3600), nsManagedObjectContext: stack.mainManagedObjectContext)
+        let reading = BgReading(timeStamp: Date(), sensor: sensor, calibration: nil, rawData: 85,
+            deviceName: nil, nsManagedObjectContext: stack.mainManagedObjectContext)
+        reading.calculatedValue = 85
+        reading.ageAdjustedRawValue = 85
+        let id = reading.id
+        reading.setValue(nil, forKey: "id")
+        let failed = expectation(description: "Invalid child save is not a receipt")
+        stack.saveChanges { saved in XCTAssertFalse(saved); failed.fulfill() }
+        await fulfillment(of: [failed], timeout: 5)
+        reading.id = id
+        let confirmed = expectation(description: "Valid retry is durable before receipt")
+        stack.saveChanges { saved in
+            XCTAssertTrue(saved)
+            let reader = NSManagedObjectContext(concurrencyType: .privateQueueConcurrencyType)
+            reader.persistentStoreCoordinator = stack.privateManagedObjectContext.persistentStoreCoordinator
+            reader.perform {
+                let request: NSFetchRequest<BgReading> = BgReading.fetchRequest()
+                request.predicate = NSPredicate(format: "id == %@", id)
+                XCTAssertEqual(try? reader.count(for: request), 1)
+                confirmed.fulfill()
+            }
+        }
+        await fulfillment(of: [confirmed], timeout: 5)
+    }
+}
+
+extension LibreWatchValuePipelineTests {
+    func testNightscoutDispatchGateHonorsDisabledEnabledAndDisabledDuringRead() async {
+        let reading: [String: Any] = ["_id": "enabled-gate", "type": "sgv", "date": 1_000, "sgv": 85]
+        var enabled = false
+        var actions = [String]()
+        let disabled = await NightscoutReadingConfirmation.reconcile([reading], isUploadAllowed: { enabled },
+            fetch: { _ in actions.append("read"); return [] }, upload: { _ in actions.append("write"); return true })
+        XCTAssertFalse(disabled)
+        XCTAssertTrue(actions.isEmpty)
+        enabled = true
+        var stored = false
+        let accepted = await NightscoutReadingConfirmation.reconcile([reading], isUploadAllowed: { enabled },
+            fetch: { _ in actions.append("read"); return stored ? [reading] : [] },
+            upload: { _ in actions.append("write"); stored = true; return true })
+        XCTAssertTrue(accepted)
+        XCTAssertEqual(actions, ["read", "write", "read"])
+        actions.removeAll()
+        let toggled = await NightscoutReadingConfirmation.reconcile([reading], isUploadAllowed: { enabled },
+            fetch: { _ in actions.append("read"); enabled = false; return [] },
+            upload: { _ in actions.append("write"); return true })
+        XCTAssertFalse(toggled)
+        XCTAssertEqual(actions, ["read"], "Turning upload off while a request is pending must prevent its retry POST")
+    }
+
+    func testHealthKitDispatchGateHonorsDisabledEnabledAndDisabledDuringQuery() {
+        var enabled = false
+        var actions = [String]()
+        HealthKitLegacyReplacement.perform(isEnabled: { enabled },
+            query: { complete in actions.append("query"); complete(.success([String]())) },
+            remove: { _, complete in actions.append("delete"); complete(true) },
+            save: { actions.append("save") }, failed: { actions.append("retained") })
+        XCTAssertEqual(actions, ["retained"])
+        actions.removeAll()
+        enabled = true
+        HealthKitLegacyReplacement.perform(isEnabled: { enabled },
+            query: { complete in actions.append("query"); complete(.success([String]())) },
+            remove: { _, complete in actions.append("delete"); complete(true) },
+            save: { actions.append("save") }, failed: { actions.append("retained") })
+        XCTAssertEqual(actions, ["query", "save"])
+        actions.removeAll()
+        HealthKitLegacyReplacement.perform(isEnabled: { enabled },
+            query: { complete in actions.append("query"); enabled = false; complete(.success(["legacy"])) },
+            remove: { _, complete in actions.append("delete"); complete(true) },
+            save: { actions.append("save") }, failed: { actions.append("retained") })
+        XCTAssertEqual(actions, ["query", "retained"])
+    }
+
+    func testCalendarDispatchGateHonorsDisabledAndEnabled() {
+        var actions = [String]()
+        XCTAssertFalse(CalendarShareReplacement.perform(enabled: false, save: { actions.append("save") },
+            removePrevious: { actions.append("removePrevious") }))
+        XCTAssertTrue(actions.isEmpty)
+        XCTAssertTrue(CalendarShareReplacement.perform(enabled: true, save: { actions.append("save") },
+            removePrevious: { actions.append("removePrevious") }))
+        XCTAssertEqual(actions, ["save", "removePrevious"])
+    }
+
+    func testNightscoutCode66RequiresPerReadingConfirmationOfMixedBatch() async {
+        let first: [String: Any] = ["_id": "first", "type": "sgv", "date": 1_000, "sgv": 85]
+        let second: [String: Any] = ["_id": "second", "type": "sgv", "date": 61_000, "sgv": 89]
+        var server = ["first": first]
+        var posts = [String]()
+        let confirmed = await NightscoutReadingConfirmation.reconcile([first, second], fetch: { id in
+            server[id].map { [$0] } ?? []
+        }, upload: { reading in
+            let id = reading["_id"] as! String
+            posts.append(id)
+            server[id] = reading
+            return true
+        })
+        XCTAssertTrue(confirmed)
+        XCTAssertEqual(posts, ["second"])
+        let replay = await NightscoutReadingConfirmation.reconcile([first, second], fetch: { id in
+            server[id].map { [$0] } ?? []
+        }, upload: { _ in XCTFail("Confirmed IDs must not be posted again"); return false })
+        XCTAssertTrue(replay)
+    }
+
+    func testNightscoutDoesNotConfirmConflictsFailedPostOrFailedRead() async {
+        let reading: [String: Any] = ["_id": "first", "type": "sgv", "date": 1_000, "sgv": 85]
+        var conflicting = reading
+        conflicting["sgv"] = 90
+        let conflict = await NightscoutReadingConfirmation.reconcile([reading], fetch: { _ in [conflicting] }, upload: { _ in
+            XCTFail("A real collision must not overwrite server data"); return false
+        })
+        XCTAssertFalse(conflict)
+        let failedPost = await NightscoutReadingConfirmation.reconcile([reading], fetch: { _ in [] }, upload: { _ in false })
+        XCTAssertFalse(failedPost)
+        for code in [NSURLErrorNotConnectedToInternet, NSURLErrorTimedOut, 401, 500] {
+            let failedRead = await NightscoutReadingConfirmation.reconcile([reading], fetch: { _ in
+                throw NSError(domain: "TestTransport", code: code)
+            }, upload: { _ in XCTFail("An unverified read must not lead to blind posting"); return false })
+            XCTAssertFalse(failedRead)
+        }
+    }
+
+    func testNightscoutCode66IsFailureNotBatchReceiptAndCheckpointIsMonotonic() {
+        let body = Data(#"{"description":{"code":66}}"#.utf8)
+        XCTAssertTrue(NightscoutReadingConfirmation.isDuplicateBatchFailure(status: 500, data: body))
+        XCTAssertFalse(NightscoutReadingConfirmation.isDuplicateBatchFailure(status: 401, data: body))
+        XCTAssertFalse(NightscoutReadingConfirmation.isDuplicateBatchFailure(status: 500, data: Data("bad response".utf8)))
+        let current = Date(timeIntervalSince1970: 1_000)
+        XCTAssertEqual(NightscoutReadingConfirmation.checkpoint(current: current, confirmed: current.addingTimeInterval(-60)), current)
+        XCTAssertEqual(NightscoutReadingConfirmation.checkpoint(current: current, confirmed: current.addingTimeInterval(60)), current.addingTimeInterval(60))
+    }
+
+    func testHistoricalNightscoutQueueRetainsUnconfirmedAndNewerRevisionsAcrossRestart() throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        var queue = NightscoutHistoricalQueue(siteFingerprint: "site-fingerprint")
+        let old = NightscoutHistoricalQueue.Entry(id: "reading", measuredAt: now.addingTimeInterval(-600), payload: Data("old".utf8))
+        queue.enqueue(old, now: now)
+        queue = try JSONDecoder().decode(NightscoutHistoricalQueue.self, from: JSONEncoder().encode(queue))
+        XCTAssertEqual(queue.entries, [old])
+        let corrected = NightscoutHistoricalQueue.Entry(id: old.id, measuredAt: old.measuredAt, payload: Data("corrected".utf8))
+        queue.enqueue(corrected, now: now)
+        queue.confirm([old])
+        XCTAssertEqual(queue.entries, [corrected], "An older in-flight response cannot clear a newer pending payload")
+        queue.confirm([corrected])
+        XCTAssertTrue(queue.entries.isEmpty)
+    }
+
+    func testHealthKitRetryKeepsSyncIdentityAndRevisionAndDoesNotClearNewerValue() throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        var queue = HealthKitReplacementQueue()
+        queue.enqueue(id: "reading", timeStamp: now.addingTimeInterval(-600), value: 85, now: now)
+        let original = try XCTUnwrap(queue.entries.first)
+        XCTAssertEqual(original.metadata[HKMetadataKeySyncIdentifier] as? String, "xdrip.bg.reading")
+        XCTAssertEqual((original.metadata[HKMetadataKeySyncVersion] as? NSNumber)?.int64Value, original.revision)
+        queue = try JSONDecoder().decode(HealthKitReplacementQueue.self, from: JSONEncoder().encode(queue))
+        queue.enqueue(id: original.id, timeStamp: original.timeStamp, value: original.value, now: now.addingTimeInterval(30))
+        XCTAssertEqual(queue.entries, [original], "A retry must retain the persisted sync version")
+        queue.enqueue(id: original.id, timeStamp: original.timeStamp, value: 90, now: now.addingTimeInterval(31))
+        let corrected = try XCTUnwrap(queue.entries.first)
+        XCTAssertGreaterThan(corrected.revision, original.revision)
+        queue.confirm(original)
+        XCTAssertEqual(queue.entries, [corrected])
+        queue.confirm(corrected)
+        XCTAssertTrue(queue.entries.isEmpty)
+    }
+
+    func testHealthKitLegacyReplacementDoesNotSaveAfterQueryOrDeleteFailure() {
+        enum Failure: Error { case query }
+        var actions = [String]()
+        HealthKitLegacyReplacement.perform(query: { complete in
+            complete(.failure(Failure.query))
+        }, remove: { (_: [String], complete: (Bool) -> Void) in actions.append("delete"); complete(true) },
+           save: { actions.append("save") }, failed: { actions.append("retry") })
+        XCTAssertEqual(actions, ["retry"])
+        actions.removeAll()
+        HealthKitLegacyReplacement.perform(query: { complete in complete(.success(["legacy"])) },
+            remove: { _, complete in actions.append("delete"); complete(false) },
+            save: { actions.append("save") }, failed: { actions.append("retry") })
+        XCTAssertEqual(actions, ["delete", "retry"])
+        actions.removeAll()
+        HealthKitLegacyReplacement.perform(query: { complete in complete(.success(["legacy"])) },
+            remove: { _, complete in actions.append("delete"); complete(true) },
+            save: { actions.append("save") }, failed: { actions.append("retry") })
+        XCTAssertEqual(actions, ["delete", "save"])
+    }
+
+    func testCalendarReplacementPreservesExistingEventWhenSaveFails() {
+        enum Failure: Error { case save }
+        var actions = [String]()
+        XCTAssertThrowsError(try CalendarShareReplacement.perform(save: {
+            actions.append("save")
+            throw Failure.save
+        }, removePrevious: { actions.append("removePrevious") }))
+        XCTAssertEqual(actions, ["save"])
+        actions.removeAll()
+        CalendarShareReplacement.perform(save: { actions.append("save") }, removePrevious: { actions.append("removePrevious") })
+        XCTAssertEqual(actions, ["save", "removePrevious"])
+    }
+}
 
 extension LibreWatchValuePipelineTests {
     @MainActor
@@ -1989,6 +2290,8 @@ final class LibreWatchValuePipelineTests: XCTestCase {
             eventID: firstID,
             at: receivedAt.addingTimeInterval(10)
         )
+        XCTAssertEqual(restored.pendingEvents(for: session.id).compactMap(\.eventID), [firstID, secondID])
+        restored.markAcknowledgedByPhone(eventID: firstID, at: receivedAt.addingTimeInterval(10.5))
         LibreWatchSessionStore.saveDiagnosticJournal(
             restored,
             defaults: defaults,
@@ -2699,6 +3002,64 @@ final class LibreWatchValuePipelineTests: XCTestCase {
         ))
         XCTAssertEqual(stored.calculatedValue, 120)
         XCTAssertEqual(try context.count(for: BgReading.fetchRequest()), 1)
+    }
+
+    @MainActor
+    func testHistoricalTimeCollisionIgnoresInvalidDifferentPayloadButPreservesExactIdentity() throws {
+        let stack = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let context = stack.mainManagedObjectContext
+        let sensor = Sensor(startDate: session.createdAt, nsManagedObjectContext: context)
+        let invalid = BgReading(
+            timeStamp: receivedAt,
+            sensor: sensor,
+            calibration: nil,
+            rawData: 100,
+            deviceName: nil,
+            nsManagedObjectContext: context
+        )
+        invalid.calculatedValue = 0
+        invalid.id = UUID().uuidString
+        let incomingID = UUID().uuidString
+
+        XCTAssertFalse(invalid.isValidForDownstream)
+        XCTAssertFalse(LibreWatchHistoryPolicy.collides(
+            payloadID: incomingID,
+            measuredAt: receivedAt,
+            sensorID: sensor.id,
+            existingID: invalid.id,
+            existingAt: invalid.timeStamp,
+            existingSensorID: invalid.sensor?.id,
+            existingIsValid: invalid.isValidForDownstream
+        ))
+        XCTAssertTrue(LibreWatchHistoryPolicy.collides(
+            payloadID: invalid.id,
+            measuredAt: receivedAt.addingTimeInterval(-600),
+            sensorID: sensor.id,
+            existingID: invalid.id,
+            existingAt: invalid.timeStamp,
+            existingSensorID: invalid.sensor?.id,
+            existingIsValid: invalid.isValidForDownstream
+        ))
+        XCTAssertEqual(
+            LibreWatchStoredReadingPolicy.outcome(
+                isValid: invalid.isValidForDownstream,
+                calculatedValue: invalid.calculatedValue
+            ),
+            .historyNotInserted
+        )
+
+        invalid.calculatedValue = 100
+        invalid.ageAdjustedRawValue = 100
+        XCTAssertTrue(invalid.isValidForDownstream)
+        XCTAssertTrue(LibreWatchHistoryPolicy.collides(
+            payloadID: incomingID,
+            measuredAt: receivedAt,
+            sensorID: sensor.id,
+            existingID: invalid.id,
+            existingAt: invalid.timeStamp,
+            existingSensorID: invalid.sensor?.id,
+            existingIsValid: invalid.isValidForDownstream
+        ))
     }
 
     @MainActor
@@ -3437,5 +3798,505 @@ final class LibreWatchValuePipelineTests: XCTestCase {
         let defaults = UserDefaults(suiteName: suiteName)!
         defaults.removePersistentDomain(forName: suiteName)
         return defaults
+    }
+}
+
+extension LibreWatchValuePipelineTests {
+    func testComplicationMissingOrCorruptStorageNeverProducesSampleReadings() throws {
+        XCTAssertNil(ComplicationSharedUserDefaultsModel.decodeStoredData(nil))
+        XCTAssertNil(ComplicationSharedUserDefaultsModel.decodeStoredData(Data("invalid".utf8)))
+        var model = complicationModel()
+        model.bgReadingDatesAsDouble = []
+        XCTAssertNil(ComplicationSharedUserDefaultsModel.decodeStoredData(try JSONEncoder().encode(model)))
+    }
+
+    func testDirectComplicationTimelineExpiresWithoutAnotherWatchUpdate() throws {
+        let model = complicationModel()
+        let readingDate = try XCTUnwrap(model.latestReadingDate)
+        let entries = model.timelineDates(startingAt: readingDate.addingTimeInterval(30))
+        XCTAssertEqual(entries.count, 2)
+        XCTAssertTrue(model.readingIsCurrent(at: entries[0]))
+        XCTAssertTrue(model.readingIsCurrent(at: readingDate.addingTimeInterval(180)))
+        XCTAssertFalse(model.readingIsCurrent(at: entries[1]))
+        XCTAssertEqual(entries[1].timeIntervalSince(readingDate), 180.001, accuracy: 0.0001)
+        XCTAssertEqual(model.bgReadingValues, [85])
+        XCTAssertEqual(model.slopeOrdinal, 4) // Storage is unchanged; the expired presentation hides it.
+    }
+
+    func testDirectComplicationExpirySurvivesProcessRestart() throws {
+        let model = complicationModel()
+        let restarted = try XCTUnwrap(ComplicationSharedUserDefaultsModel.decodeStoredData(JSONEncoder().encode(model)))
+        let now = try XCTUnwrap(model.latestReadingDate).addingTimeInterval(240)
+        XCTAssertEqual(restarted.readingSource, .directLibre)
+        XCTAssertEqual(restarted.latestReadingDate, model.latestReadingDate)
+        XCTAssertFalse(restarted.readingIsCurrent(at: now))
+        XCTAssertEqual(restarted.timelineDates(startingAt: now), [now])
+    }
+
+    func testLegacyPhoneComplicationStorageKeepsItsExistingFreshnessWindow() throws {
+        var model = complicationModel()
+        model.readingSource = nil
+        let encoded = try JSONEncoder().encode(model)
+        let legacy = try XCTUnwrap(ComplicationSharedUserDefaultsModel.decodeStoredData(encoded))
+        let readingDate = try XCTUnwrap(legacy.latestReadingDate)
+        XCTAssertNil(legacy.readingSource)
+        XCTAssertTrue(legacy.readingIsCurrent(at: readingDate.addingTimeInterval(181)))
+        XCTAssertFalse(legacy.readingIsCurrent(at: readingDate.addingTimeInterval(1_201)))
+    }
+
+    func testComplicationKeepsValidLowAndDoesNotInventDataWhenDisabled() throws {
+        var model = complicationModel()
+        model.bgReadingValues = [38]
+        let decoded = try XCTUnwrap(ComplicationSharedUserDefaultsModel.decodeStoredData(JSONEncoder().encode(model)))
+        XCTAssertEqual(decoded.bgReadingValues, [38])
+        model.keepAliveIsDisabled = true
+        let now = try XCTUnwrap(model.latestReadingDate)
+        XCTAssertFalse(model.readingIsCurrent(at: now))
+        XCTAssertEqual(model.timelineDates(startingAt: now), [now])
+    }
+
+    private func complicationModel() -> ComplicationSharedUserDefaultsModel {
+        ComplicationSharedUserDefaultsModel(
+            bgReadingValues: [85],
+            bgReadingDatesAsDouble: [Date(timeIntervalSince1970: 1_783_000_000).timeIntervalSince1970],
+            isMgDl: false,
+            slopeOrdinal: 4,
+            deltaValueInUserUnit: 0.1,
+            urgentLowLimitInMgDl: 60,
+            lowLimitInMgDl: 80,
+            highLimitInMgDl: 180,
+            urgentHighLimitInMgDl: 250,
+            keepAliveIsDisabled: false,
+            readingSource: .directLibre
+        )
+    }
+}
+
+extension LibreWatchValuePipelineTests {
+    func testWatchAlarmsUseActualThresholdsAndAcceptGenuineLow() {
+        let settings = alarmSettings()
+        var state = LibreWatchAlarmState()
+        state.use(settings)
+        let lease = alarmDelegation(settings)
+        let low = state.accept(id: UUID(), measuredAt: receivedAt, glucose: 38, settings: settings,
+            delegation: lease, watchOwnsSensor: true, now: receivedAt)
+        XCTAssertEqual(low?.kind, .veryLow)
+        let next = receivedAt.addingTimeInterval(60)
+        XCTAssertNil(state.accept(id: UUID(), measuredAt: next, glucose: 120, settings: settings,
+            delegation: lease, watchOwnsSensor: true, now: next))
+        let high = next.addingTimeInterval(60)
+        XCTAssertEqual(state.accept(id: UUID(), measuredAt: high, glucose: 260, settings: settings,
+            delegation: lease, watchOwnsSensor: true, now: high)?.kind, .veryHigh)
+    }
+
+    func testWatchAlarmsDoNotEnableDisabledRulesOrDelegateWithoutPermission() {
+        let enabled = alarmSettings()
+        XCTAssertNil(enabled.readinessRevision(notificationsAuthorized: false))
+        let disabled = alarmSettings(enabled: false)
+        XCTAssertEqual(disabled.readinessRevision(notificationsAuthorized: false), disabled.revision)
+        var state = LibreWatchAlarmState()
+        state.use(disabled)
+        XCTAssertNil(state.accept(id: UUID(), measuredAt: receivedAt, glucose: 38, settings: disabled,
+            delegation: alarmDelegation(disabled), watchOwnsSensor: true, now: receivedAt))
+        XCTAssertNil(state.nextMissedAlarm(settings: disabled, delegation: alarmDelegation(disabled),
+            watchOwnsSensor: true, now: receivedAt))
+    }
+
+    func testWatchAlarmsRequireMatchingDelegationAndCurrentOwnership() {
+        let settings = alarmSettings()
+        var state = LibreWatchAlarmState()
+        state.use(settings)
+        let wrong = LibreWatchAlarmDelegation(sessionID: UUID(), sensorIdentity: settings.sensorIdentity, settingsRevision: settings.revision)
+        XCTAssertNil(state.accept(id: UUID(), measuredAt: receivedAt, glucose: 38, settings: settings,
+            delegation: wrong, watchOwnsSensor: true, now: receivedAt))
+        XCTAssertNil(state.accept(id: UUID(), measuredAt: receivedAt, glucose: 38, settings: settings,
+            delegation: alarmDelegation(settings), watchOwnsSensor: false, now: receivedAt))
+        XCTAssertNil(state.lastReadingAt)
+        XCTAssertNil(state.nextMissedAlarm(settings: settings, delegation: alarmDelegation(settings),
+            watchOwnsSensor: false, now: receivedAt))
+    }
+
+    func testWatchAlarmsRejectHistoricalDuplicateAndOutOfOrderReadings() {
+        let settings = alarmSettings()
+        var state = LibreWatchAlarmState()
+        state.use(settings)
+        let lease = alarmDelegation(settings)
+        XCTAssertNil(state.accept(id: UUID(), measuredAt: receivedAt.addingTimeInterval(-181), glucose: 38,
+            settings: settings, delegation: lease, watchOwnsSensor: true, now: receivedAt))
+        XCTAssertNil(state.lastReadingAt)
+        let id = UUID()
+        XCTAssertNil(state.accept(id: id, measuredAt: receivedAt, glucose: 120,
+            settings: settings, delegation: lease, watchOwnsSensor: true, now: receivedAt))
+        XCTAssertNil(state.accept(id: id, measuredAt: receivedAt, glucose: 38,
+            settings: settings, delegation: lease, watchOwnsSensor: true, now: receivedAt))
+        XCTAssertNil(state.accept(id: UUID(), measuredAt: receivedAt.addingTimeInterval(-60), glucose: 38,
+            settings: settings, delegation: lease, watchOwnsSensor: true, now: receivedAt))
+        XCTAssertEqual(state.lastReadingAt, receivedAt)
+    }
+
+    func testWatchMissedAlarmUsesOriginalMeasurementAndSnoozeDeadlineAfterRestart() throws {
+        let defaults = isolatedDefaults()
+        let until = receivedAt.addingTimeInterval(20 * 60)
+        let settings = alarmSettings(snoozeAllUntil: until)
+        var state = LibreWatchAlarmState()
+        state.use(settings)
+        XCTAssertNil(state.accept(id: UUID(), measuredAt: receivedAt, glucose: 38,
+            settings: settings, delegation: alarmDelegation(settings), watchOwnsSensor: true, now: receivedAt))
+        state.snooze(.missed, until: receivedAt.addingTimeInterval(30 * 60))
+        LibreWatchAlarmStore.save(state, defaults: defaults)
+        LibreWatchAlarmStore.save(settings, defaults: defaults)
+        LibreWatchAlarmStore.save(alarmDelegation(settings), defaults: defaults)
+        let restored = LibreWatchAlarmStore.state(defaults: defaults)
+        let restoredSettings = try XCTUnwrap(LibreWatchAlarmStore.settings(defaults: defaults))
+        let due = restored.nextMissedAlarm(settings: restoredSettings,
+            delegation: LibreWatchAlarmStore.delegation(defaults: defaults), watchOwnsSensor: true,
+            now: receivedAt.addingTimeInterval(60))
+        XCTAssertEqual(due?.date, receivedAt.addingTimeInterval(30 * 60))
+        XCTAssertEqual(restored.lastReadingAt, receivedAt)
+        XCTAssertEqual(restoredSettings.snoozeAllUntil, until)
+    }
+
+    func testWatchLowSnoozeAlsoSuppressesUrgentLowAndSurvivesNewConfig() {
+        let settings = alarmSettings()
+        var state = LibreWatchAlarmState()
+        state.use(settings)
+        state.snooze(.low, until: receivedAt.addingTimeInterval(600))
+        var newer = settings
+        newer.revision += 1
+        state.use(newer)
+        XCTAssertNil(state.accept(id: UUID(), measuredAt: receivedAt, glucose: 38,
+            settings: newer, delegation: alarmDelegation(newer), watchOwnsSensor: true, now: receivedAt))
+        let later = receivedAt.addingTimeInterval(601)
+        XCTAssertEqual(state.accept(id: UUID(), measuredAt: later, glucose: 38,
+            settings: newer, delegation: alarmDelegation(newer), watchOwnsSensor: true, now: later)?.kind, .veryLow)
+    }
+
+    func testWatchAlarmSensorSessionChangeInvalidatesPreviousMeasurementAndSnooze() {
+        let settings = alarmSettings()
+        var state = LibreWatchAlarmState()
+        state.use(settings)
+        _ = state.accept(id: UUID(), measuredAt: receivedAt, glucose: 120,
+            settings: settings, delegation: alarmDelegation(settings), watchOwnsSensor: true, now: receivedAt)
+        state.snooze(.low, until: receivedAt.addingTimeInterval(600))
+        let changed = LibreWatchAlarmSettings(sessionID: UUID(), sensorIdentity: "Libre-other", revision: 3,
+            generatedAt: receivedAt, isMgDl: false, rules: settings.rules, snoozes: [], snoozeAllUntil: nil)
+        state.use(changed)
+        XCTAssertNil(state.lastReadingAt)
+        XCTAssertTrue(state.snoozes.isEmpty)
+        XCTAssertNil(state.nextMissedAlarm(settings: changed, delegation: alarmDelegation(settings),
+            watchOwnsSensor: true, now: receivedAt))
+    }
+
+    func testWatchSnoozeBecomesPhoneAuthoritativeOnlyAfterStoredExpiryIsReturned() {
+        let settings = alarmSettings()
+        var state = LibreWatchAlarmState()
+        state.use(settings)
+        let expiry = receivedAt.addingTimeInterval(600)
+        state.snooze(.low, until: expiry)
+        state.acknowledgePhoneSnoozes(settings)
+        XCTAssertFalse(state.snoozes.isEmpty)
+        let echoed = LibreWatchAlarmSettings(sessionID: settings.sessionID, sensorIdentity: settings.sensorIdentity,
+            revision: 2, generatedAt: receivedAt, isMgDl: settings.isMgDl, rules: settings.rules,
+            snoozes: state.snoozes, snoozeAllUntil: nil)
+        state.acknowledgePhoneSnoozes(echoed)
+        XCTAssertTrue(state.snoozes.isEmpty)
+        XCTAssertEqual(state.snoozedUntil(.low, settings: echoed), expiry)
+        XCTAssertEqual(state.snoozedUntil(.low, settings: settings), .distantPast)
+    }
+
+    func testWatchAlarmCompletionRevalidatesSettingsPermissionSnoozeAndLatestReading() throws {
+        let settings = alarmSettings()
+        var state = LibreWatchAlarmState()
+        state.use(settings)
+        let readingID = UUID()
+        let rule = try XCTUnwrap(state.accept(id: readingID, measuredAt: receivedAt, glucose: 38,
+            settings: settings, delegation: alarmDelegation(settings), watchOwnsSensor: true, now: receivedAt))
+        func permitted(_ state: LibreWatchAlarmState, _ current: LibreWatchAlarmSettings?, authorized: Bool = true) -> Bool {
+            state.glucoseNotificationIsCurrent(readingID: readingID, rule: rule, submittedSettings: settings,
+                currentSettings: current, delegation: alarmDelegation(settings), watchOwnsSensor: true,
+                notificationsAuthorized: authorized, now: receivedAt)
+        }
+        XCTAssertTrue(permitted(state, settings))
+        XCTAssertFalse(permitted(state, settings, authorized: false))
+        var newer = settings
+        newer.revision += 1
+        XCTAssertFalse(permitted(state, newer))
+        let snoozed = alarmSettings(snoozeAllUntil: receivedAt.addingTimeInterval(60))
+        XCTAssertFalse(permitted(state, snoozed))
+        var locallySnoozed = state
+        locallySnoozed.snooze(.low, until: receivedAt.addingTimeInterval(60))
+        XCTAssertFalse(permitted(locallySnoozed, settings))
+        _ = state.accept(id: UUID(), measuredAt: receivedAt.addingTimeInterval(1), glucose: 120,
+            settings: settings, delegation: alarmDelegation(settings), watchOwnsSensor: true,
+            now: receivedAt.addingTimeInterval(1))
+        XCTAssertFalse(permitted(state, settings))
+    }
+
+    func testWatchMissedAlarmRestoresUnconfirmedIntentButNotAlreadyDeliveredAlarm() throws {
+        var state = LibreWatchAlarmState()
+        state.scheduledMissedID = "scheduled-test"
+        state.scheduledMissedAt = receivedAt.addingTimeInterval(300)
+        state.scheduledMissedConfirmed = false
+        let restored = try JSONDecoder().decode(LibreWatchAlarmState.self, from: JSONEncoder().encode(state))
+        XCTAssertTrue(restored.shouldRestoreMissingMissedNotification(at: receivedAt.addingTimeInterval(600)))
+        state.scheduledMissedConfirmed = true
+        XCTAssertTrue(state.shouldRestoreMissingMissedNotification(at: receivedAt))
+        XCTAssertFalse(state.shouldRestoreMissingMissedNotification(at: receivedAt.addingTimeInterval(600)))
+        state.scheduledMissedID = nil
+        XCTAssertFalse(state.shouldRestoreMissingMissedNotification(at: receivedAt))
+    }
+
+    func testQueuedWatchAlarmPresentationRechecksAuthorityButAllowsMissingReading() {
+        let settings = alarmSettings()
+        var state = LibreWatchAlarmState()
+        state.use(settings)
+        let readingID = UUID()
+        state.lastReadingID = readingID
+        state.lastReadingAt = receivedAt.addingTimeInterval(-3600)
+        func permitted(_ kind: LibreWatchAlarmKind, owner: Bool = true, authorized: Bool = true,
+                       notificationSessionID: String? = nil, lease: LibreWatchAlarmDelegation? = nil) -> Bool {
+            state.notificationMayBePresented(kind: kind,
+                notificationSessionID: notificationSessionID ?? settings.sessionID.uuidString,
+                notificationReadingID: readingID,
+                settings: settings, delegation: lease ?? alarmDelegation(settings), watchOwnsSensor: owner,
+                notificationsAuthorized: authorized, at: receivedAt)
+        }
+        XCTAssertTrue(permitted(.missed))
+        XCTAssertFalse(permitted(.missed, owner: false))
+        XCTAssertFalse(permitted(.missed, authorized: false))
+        XCTAssertFalse(permitted(.low, notificationSessionID: UUID().uuidString))
+        XCTAssertFalse(permitted(.low, lease: LibreWatchAlarmDelegation(sessionID: settings.sessionID,
+            sensorIdentity: settings.sensorIdentity, settingsRevision: settings.revision + 1)))
+        state.lastReadingAt = receivedAt
+        state.recordAutomaticThrottle(.low, readingID: readingID, until: receivedAt.addingTimeInterval(300))
+        XCTAssertTrue(permitted(.low), "Automatic post-enqueue throttle must not suppress its own notification")
+        state.snooze(.low, until: receivedAt.addingTimeInterval(100))
+        XCTAssertFalse(permitted(.low), "A manual snooze must suppress even with an unchanged maximum expiry")
+    }
+
+    func testQueuedGlucoseAlarmDoesNotOutliveItsReadingOrManualSnoozeAfterRestart() throws {
+        let settings = alarmSettings()
+        var state = LibreWatchAlarmState()
+        state.use(settings)
+        let oldID = UUID()
+        _ = state.accept(id: oldID, measuredAt: receivedAt, glucose: 38, settings: settings,
+            delegation: alarmDelegation(settings), watchOwnsSensor: true, now: receivedAt)
+        state.recordAutomaticThrottle(.veryLow, readingID: oldID, until: receivedAt.addingTimeInterval(300))
+        func permitted(_ value: LibreWatchAlarmState) -> Bool {
+            value.notificationMayBePresented(kind: .veryLow, notificationSessionID: settings.sessionID.uuidString,
+                notificationReadingID: oldID, settings: settings, delegation: alarmDelegation(settings),
+                watchOwnsSensor: true, notificationsAuthorized: true, at: receivedAt.addingTimeInterval(60))
+        }
+        let restored = try JSONDecoder().decode(LibreWatchAlarmState.self, from: JSONEncoder().encode(state))
+        XCTAssertTrue(permitted(restored))
+        state.snooze(.low, until: receivedAt.addingTimeInterval(600))
+        let snoozed = try JSONDecoder().decode(LibreWatchAlarmState.self, from: JSONEncoder().encode(state))
+        XCTAssertFalse(permitted(snoozed))
+        state = restored
+        _ = state.accept(id: UUID(), measuredAt: receivedAt.addingTimeInterval(60), glucose: 120,
+            settings: settings, delegation: alarmDelegation(settings), watchOwnsSensor: true,
+            now: receivedAt.addingTimeInterval(60))
+        XCTAssertFalse(permitted(state), "A queued low from the previous reading is no longer current")
+    }
+
+    func testWatchMissedAlarmUsesPhoneMidnightBaseSchedule() {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        let now = Date(timeIntervalSince1970: 86_400 + 2 * 60)
+        let settings = alarmSettings()
+        XCTAssertEqual(settings.rules.filter { $0.kind == .missed }.first?.startMinute, 0)
+        var state = LibreWatchAlarmState()
+        state.use(settings)
+        state.lastReadingAt = now.addingTimeInterval(-4 * 60)
+        state.lastReadingID = UUID()
+        let next = state.nextMissedAlarm(settings: settings, delegation: alarmDelegation(settings),
+            watchOwnsSensor: true, now: now, calendar: calendar)
+        XCTAssertEqual(next?.date, now.addingTimeInterval(60))
+        XCTAssertEqual(next?.rule.startMinute, 0)
+    }
+
+    func testWatchDelegationDoesNotSuppressNewlyEnabledPhoneAlarmWhileOffline() throws {
+        let disabled = alarmSettings(enabled: false)
+        let lease = LibreWatchAlarmDelegation.confirmed(for: disabled)
+        XCTAssertFalse(lease.covers(.low))
+        var enabled = alarmSettings()
+        enabled.revision = disabled.revision + 1
+        XCTAssertFalse(lease.matches(enabled))
+        XCTAssertFalse(lease.covers(.low), "New phone settings do not enlarge an offline Watch delegation")
+        let confirmed = LibreWatchAlarmDelegation.confirmed(for: enabled)
+        XCTAssertTrue(confirmed.covers(.low))
+        XCTAssertTrue(confirmed.matches(enabled))
+        let restored = try JSONDecoder().decode(LibreWatchAlarmDelegation.self,
+            from: JSONEncoder().encode(confirmed))
+        XCTAssertTrue(restored.covers(.missed))
+        let legacy = LibreWatchAlarmDelegation(sessionID: enabled.sessionID,
+            sensorIdentity: enabled.sensorIdentity, settingsRevision: enabled.revision)
+        XCTAssertFalse(legacy.covers(.low), "Unspecified legacy delegation must never suppress phone alarms")
+        XCTAssertFalse(legacy.matches(enabled), "Unspecified legacy delegation must not enable local Watch alarms")
+    }
+
+    private func alarmSettings(enabled: Bool = true, snoozeAllUntil: Date? = nil) -> LibreWatchAlarmSettings {
+        let rules = zip(LibreWatchAlarmKind.allCases, [60.0, 80, 180, 250, 5]).map { kind, value in
+            LibreWatchAlarmRule(kind: kind, startMinute: 0, value: value, enabled: enabled,
+                snoozeMinutes: 15, allowsSnooze: true, soundEnabled: false, vibrate: false, title: "Test")
+        }
+        return LibreWatchAlarmSettings(sessionID: session.id, sensorIdentity: session.redactedIdentity(), revision: 1,
+            generatedAt: receivedAt, isMgDl: false, rules: rules, snoozes: [], snoozeAllUntil: snoozeAllUntil)
+    }
+
+    private func alarmDelegation(_ settings: LibreWatchAlarmSettings) -> LibreWatchAlarmDelegation {
+        LibreWatchAlarmDelegation.confirmed(for: settings)
+    }
+}
+
+extension LibreWatchValuePipelineTests {
+    func testTakeoverSnapshotRequiresMatchingCalibrationBeforeWatchOwnership() throws {
+        let snapshot = LibreWatchHandoffSnapshot(
+            session: session,
+            calibration: calibration(type: .fixedSlope, slope: 1, intercept: 0),
+            ownership: .watch,
+            revision: 31
+        )
+        XCTAssertTrue(snapshot.canApply(after: 30))
+        XCTAssertFalse(snapshot.canApply(after: 31))
+        XCTAssertFalse(snapshot.canApply(after: 32))
+        XCTAssertEqual(try JSONDecoder().decode(LibreWatchHandoffSnapshot.self,
+            from: JSONEncoder().encode(snapshot)), snapshot)
+        XCTAssertFalse(LibreWatchHandoffSnapshot(
+            session: session, calibration: nil, ownership: .watch, revision: 32
+        ).isValid)
+        var anotherSession = session
+        anotherSession.unlockCount += 1
+        let current = LibreWatchHandoffSnapshot(
+            session: anotherSession, calibration: snapshot.calibration, ownership: .watch, revision: 32
+        )
+        XCTAssertTrue(current.isValid)
+        XCTAssertEqual(current.session.unlockCount, session.unlockCount + 1)
+    }
+
+    func testPhoneReconnectsAndDelayedCounterMessageNeverRollBackUnlockCounter() {
+        var prepared = session
+        prepared.unlockCount = 4
+        var persisted = session
+        persisted.unlockCount = 7
+        XCTAssertEqual(LibreWatchUnlockCounterPolicy.highest(
+            incoming: 5, session: prepared, storedSession: persisted,
+            activeSensorUID: session.sensorUID, activePatchInfo: session.patchInfo,
+            activeCounter: 12
+        ), 12)
+        XCTAssertEqual(LibreWatchUnlockCounterPolicy.highest(
+            incoming: 14, session: prepared, storedSession: persisted,
+            activeSensorUID: session.sensorUID, activePatchInfo: session.patchInfo,
+            activeCounter: 12
+        ), 14)
+        XCTAssertEqual(LibreWatchUnlockCounterPolicy.highest(
+            incoming: 5, session: prepared, storedSession: nil,
+            activeSensorUID: Data(repeating: 0, count: 8), activePatchInfo: session.patchInfo,
+            activeCounter: 500
+        ), 5)
+    }
+
+    func testHandoffRevisionPersistsAndRejectsDelayedOwnershipContextAfterRestart() {
+        let defaults = isolatedDefaults()
+        let first = LibreWatchSessionStore.nextHandoffRevision(at: receivedAt, defaults: defaults)
+        let second = LibreWatchSessionStore.nextHandoffRevision(at: receivedAt.addingTimeInterval(-60), defaults: defaults)
+        XCTAssertGreaterThan(second, first)
+        XCTAssertEqual(LibreWatchSessionStore.loadHandoffRevision(defaults: defaults), second)
+        let delayed = LibreWatchHandoffSnapshot(
+            session: session, calibration: nil, ownership: .iphone, revision: first
+        )
+        XCTAssertFalse(delayed.canApply(after: LibreWatchSessionStore.loadHandoffRevision(defaults: defaults)))
+    }
+
+    func testWatchOutboxRetainsSubmittedPayloadUntilDurableReceiverReceipt() throws {
+        let item = LibreWatchOutboxItem.reading(payload(raw: 847, previousRaw: 829, domain: .factoryNativeMGDL))
+        var outbox = LibreWatchConnectivityOutbox()
+        outbox.enqueue(item, now: receivedAt)
+        outbox.markSubmitted(id: item.id, at: receivedAt)
+        XCTAssertEqual(outbox.items.map(\.id), [item.id])
+        XCTAssertNil(outbox.nextEligible(at: receivedAt.addingTimeInterval(59)))
+        let restored = try JSONDecoder().decode(LibreWatchConnectivityOutbox.self,
+            from: JSONEncoder().encode(outbox))
+        XCTAssertEqual(restored.nextEligible(at: receivedAt.addingTimeInterval(60))?.id, item.id)
+        XCTAssertFalse(LibreWatchConnectivityDeliveryPolicy.shouldFinish(item, success: true, outcome: nil))
+        XCTAssertFalse(LibreWatchConnectivityDeliveryPolicy.shouldFinish(item, success: false, outcome: .historyNotInserted))
+        XCTAssertFalse(LibreWatchConnectivityDeliveryPolicy.shouldFinish(item, success: false, outcome: .collectorUnavailable))
+        XCTAssertTrue(LibreWatchConnectivityDeliveryPolicy.shouldFinish(item, success: true, outcome: .liveAccepted, durableReceipt: true))
+        XCTAssertTrue(LibreWatchConnectivityDeliveryPolicy.shouldFinish(item, success: true, outcome: .historicalInserted, durableReceipt: true))
+        XCTAssertTrue(LibreWatchConnectivityDeliveryPolicy.shouldFinish(item, success: true, outcome: .duplicate, durableReceipt: true))
+        XCTAssertTrue(LibreWatchConnectivityDeliveryPolicy.shouldFinish(item, success: false, outcome: .wrongCalibration))
+        outbox.remove(id: item.id)
+        XCTAssertNil(outbox.nextEligible(at: receivedAt.addingTimeInterval(61)))
+    }
+
+    func testLegacyOutboxDecodesWithoutSubmissionMetadataAndKeepsStableIDs() throws {
+        let item = LibreWatchOutboxItem.reading(payload(raw: 847, previousRaw: 829, domain: .factoryNativeMGDL))
+        let legacy = try JSONSerialization.data(withJSONObject: [
+            "items": try JSONSerialization.jsonObject(with: JSONEncoder().encode([item]))
+        ])
+        let outbox = try JSONDecoder().decode(LibreWatchConnectivityOutbox.self, from: legacy)
+        XCTAssertEqual(outbox.nextEligible(at: receivedAt)?.id, item.id)
+        XCTAssertTrue(LibreWatchConnectivityDeliveryPolicy.shouldRetryReadingAsQueued(after: .outOfOrder))
+        XCTAssertFalse(LibreWatchConnectivityDeliveryPolicy.isTerminal(.outOfOrder))
+    }
+
+    func testDiagnosticJournalSeparatesConfirmedRotationFromUnacknowledgedLoss() throws {
+        var journal = LibreWatchDiagnosticJournal()
+        for index in 0 ..< 160 {
+            let date = receivedAt.addingTimeInterval(Double(index))
+            let event = LibreWatchDiagnosticEvent(kind: .coreBluetoothCallback,
+                watchTimestamp: date, trigger: "didConnect", sessionID: session.id, appBuild: "4252")
+            _ = journal.append(event, at: date)
+            journal.markHandedToWatchConnectivity(eventID: event.eventID, at: date)
+            journal.markAcknowledgedByPhone(eventID: event.eventID, at: date.addingTimeInterval(0.5))
+        }
+        XCTAssertGreaterThan(journal.droppedCount, 0)
+        XCTAssertEqual(journal.unacknowledgedDropCount ?? 0, 0)
+        for index in 160 ..< 320 {
+            _ = journal.append(LibreWatchDiagnosticEvent(kind: .disconnected,
+                sessionID: UUID(), appBuild: "4252"), at: receivedAt.addingTimeInterval(Double(index)))
+        }
+        XCTAssertGreaterThan(journal.unacknowledgedDropCount ?? 0, 0)
+        let restored = try JSONDecoder().decode(LibreWatchDiagnosticJournal.self,
+            from: JSONEncoder().encode(journal))
+        XCTAssertEqual(restored.unacknowledgedDropCount, journal.unacknowledgedDropCount)
+        XCTAssertFalse(restored.pendingEvents().isEmpty)
+        XCTAssertTrue(restored.entries.allSatisfy { $0.event.appBuild == "4252" })
+    }
+
+    func testSessionChangeKeepsPendingDiagnosticsButNeverOldSensorReadings() {
+        let diagnostic = LibreWatchOutboxItem.command(.reportDiagnostic, sessionID: session.id,
+            diagnosticEvent: Data("{}".utf8), createdAt: receivedAt)
+        let reading = LibreWatchOutboxItem.reading(payload(raw: 847, previousRaw: 829, domain: .factoryNativeMGDL))
+        var outbox = LibreWatchConnectivityOutbox()
+        outbox.enqueue(diagnostic, now: receivedAt)
+        outbox.enqueue(reading, now: receivedAt)
+        outbox.retain(sessionID: UUID())
+        XCTAssertEqual(outbox.items.map(\.id), [diagnostic.id])
+    }
+
+    func testOldPhoneSuccessDoesNotAcknowledgeReadingOrDiagnosticStorage() throws {
+        let reading = LibreWatchOutboxItem.reading(payload(raw: 847, previousRaw: 829, domain: .factoryNativeMGDL))
+        let event = LibreWatchDiagnosticEvent(kind: .recoveryStarted, watchTimestamp: receivedAt, sessionID: session.id)
+        let diagnostic = LibreWatchOutboxItem.command(.reportDiagnostic, sessionID: session.id,
+            diagnosticEvent: try JSONEncoder().encode(event), id: try XCTUnwrap(event.eventID), createdAt: receivedAt)
+        let counter = LibreWatchOutboxItem.command(.updateUnlockCounter, sessionID: session.id,
+            unlockCounter: 42, createdAt: receivedAt)
+        var outbox = LibreWatchConnectivityOutbox()
+        for item in [reading, diagnostic] {
+            outbox.enqueue(item, now: receivedAt)
+            let oldOutcome: LibreWatchDeliveryOutcome? = item.kind == .reading ? .liveAccepted : nil
+            XCTAssertFalse(LibreWatchConnectivityDeliveryPolicy.shouldFinish(item, success: true, outcome: oldOutcome))
+            XCTAssertFalse(LibreWatchConnectivityDeliveryPolicy.shouldFinish(item, success: true, outcome: oldOutcome, durableReceipt: false))
+            outbox.markSubmitted(id: item.id, at: receivedAt)
+        }
+        let restored = try JSONDecoder().decode(LibreWatchConnectivityOutbox.self, from: JSONEncoder().encode(outbox))
+        XCTAssertEqual(Set(restored.items.map(\.id)), Set([reading.id, diagnostic.id]))
+        XCTAssertNotNil(restored.nextEligible(at: receivedAt.addingTimeInterval(60)))
+        XCTAssertTrue(LibreWatchConnectivityDeliveryPolicy.shouldFinish(reading, success: true, outcome: .liveAccepted, durableReceipt: true))
+        XCTAssertTrue(LibreWatchConnectivityDeliveryPolicy.shouldFinish(diagnostic, success: true, outcome: nil, durableReceipt: true))
+        XCTAssertTrue(LibreWatchConnectivityDeliveryPolicy.shouldFinish(counter, success: true, outcome: nil))
+        XCTAssertFalse(LibreWatchConnectivityDeliveryPolicy.shouldFinish(diagnostic, success: false, outcome: nil))
+        XCTAssertTrue(LibreWatchConnectivityDeliveryPolicy.shouldFinish(diagnostic, success: false, outcome: .invalidPayload))
     }
 }

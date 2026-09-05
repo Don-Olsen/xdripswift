@@ -13,6 +13,12 @@ extension XDripWatchComplication {
     struct Entry: TimelineEntry {
         var date: Date = .now
         var widgetState: WidgetState
+
+        init(date: Date = .now, widgetState: WidgetState) {
+            self.date = date
+            self.widgetState = widgetState
+            self.widgetState.referenceDate = date
+        }
     }
 }
 
@@ -32,17 +38,19 @@ extension XDripWatchComplication.Entry {
         var highLimitInMgDl: Double
         var urgentHighLimitInMgDl: Double
         var keepAliveIsDisabled: Bool
+        var readingSource: ComplicationReadingSource?
+        var readingExpiresAt: Date?
+        var referenceDate: Date = .now
         
         var bgUnitString: String
         var bgValueInMgDl: Double?
         var bgReadingDate: Date?
         var hasRecentReading: Bool {
-            guard let bgReadingDate else { return false }
-
-            return bgReadingDate > Date().addingTimeInterval(-60 * 20)
+            guard !keepAliveIsDisabled, bgValueInMgDl != nil, let bgReadingDate else { return false }
+            return referenceDate <= (readingExpiresAt ?? bgReadingDate.addingTimeInterval(20 * 60))
         }
                 
-        init(bgReadingValues: [Double]? = nil, bgReadingDates: [Date]? = nil, isMgDl: Bool? = true, slopeOrdinal: Int? = 0, deltaValueInUserUnit: Double? = nil, urgentLowLimitInMgDl: Double? = 60, lowLimitInMgDl: Double? = 80, highLimitInMgDl: Double? = 180, urgentHighLimitInMgDl: Double? = 250, keepAliveIsDisabled: Bool? = false) {
+        init(bgReadingValues: [Double]? = nil, bgReadingDates: [Date]? = nil, isMgDl: Bool? = true, slopeOrdinal: Int? = 0, deltaValueInUserUnit: Double? = nil, urgentLowLimitInMgDl: Double? = 60, lowLimitInMgDl: Double? = 80, highLimitInMgDl: Double? = 180, urgentHighLimitInMgDl: Double? = 250, keepAliveIsDisabled: Bool? = false, readingSource: ComplicationReadingSource? = nil, readingExpiresAt: Date? = nil) {
             self.bgReadingValues = bgReadingValues
             self.bgReadingDates = bgReadingDates
             self.isMgDl = isMgDl ?? true
@@ -53,10 +61,33 @@ extension XDripWatchComplication.Entry {
             self.highLimitInMgDl = highLimitInMgDl ?? 180
             self.urgentHighLimitInMgDl = urgentHighLimitInMgDl ?? 250
             self.keepAliveIsDisabled = keepAliveIsDisabled ?? false
+            self.readingSource = readingSource
+            self.readingExpiresAt = readingExpiresAt
             
             self.bgValueInMgDl = (bgReadingValues?.count ?? 0) > 0 ? bgReadingValues?[0] : nil
             self.bgReadingDate = (bgReadingDates?.count ?? 0) > 0 ? bgReadingDates?[0] : nil
             self.bgUnitString = self.isMgDl ? Texts_Common.mgdl : Texts_Common.mmol
+        }
+
+        var sourceDescription: String {
+            guard bgReadingDate != nil else { return "Ingen data" }
+            switch readingSource {
+            case .directLibre: return "Direkte fra Libre"
+            case .phone: return "Fra iPhone"
+            case nil: return "Seneste måling"
+            }
+        }
+
+        var sourceAndAgeText: Text {
+            guard let bgReadingDate else { return Text("Ingen data") }
+            return Text("\(sourceDescription) · ") + Text(bgReadingDate, style: .relative) +
+                Text(hasRecentReading ? "" : " · gammel")
+        }
+
+        var gaugeValue: Double {
+            let model = gaugeModel()
+            guard hasRecentReading, let bgValueInMgDl else { return model.nilValue }
+            return min(model.maxValue, max(model.minValue, bgValueInMgDl))
         }
         
         /// returns blood glucose value as a string in the user-defined measurement unit. Will check and display also high, low and error texts as required.
@@ -218,6 +249,7 @@ extension XDripWatchComplication.Entry {
             var height = isSmallScreen() ? ConstantsGlucoseChartSwiftUI.viewHeightWatchAccessoryRectangularSmall : ConstantsGlucoseChartSwiftUI.viewHeightWatchAccessoryRectangular
             
             height += keepAliveIsDisabled ? -15 : 0
+            height -= 11 // Source and age row, including the scheduled stale state.
             
             return height
         }

@@ -10,6 +10,17 @@ import Foundation
 import os
 import EventKit
 
+/// Keep the last usable calendar payload until EventKit has accepted its replacement.
+enum CalendarShareReplacement {
+    @discardableResult
+    static func perform(enabled: Bool = true, save: () throws -> Void, removePrevious: () -> Void) rethrows -> Bool {
+        guard enabled else { return false }
+        try save()
+        removePrevious()
+        return true
+    }
+}
+
 /// One BG value stored inside the Calendar Share notes payload.
 ///
 /// Calendar Share always writes mg/dL internally. The follower converts to the
@@ -296,9 +307,6 @@ class CalendarManager: NSObject {
             return
         }
         
-        // time to delete any existing events
-        deleteAllEvents(in: calendar)
-        
         // create an event now
         let event = EKEvent(eventStore: eventStore)
         event.title = CalendarShareEventTitleFormatter.title(reading: latestReadingToShare, previousReading: readingsToShare.dropFirst().first)
@@ -317,7 +325,12 @@ class CalendarManager: NSObject {
         
         do{
             
-            try eventStore.save(event, span: .thisEvent)
+            guard try CalendarShareReplacement.perform(enabled: UserDefaults.standard.createCalendarEvent, save: {
+                try eventStore.save(event, span: .thisEvent)
+            }, removePrevious: {
+                deleteEvents(in: calendar, marker: ConstantsCalendar.calendarSharePayloadPrefix,
+                             endDate: Date(), excludingEventIdentifier: event.eventIdentifier)
+            }) else { return }
             
             timeStampLastProcessedReading = latestReadingToShare.timeStamp
             UserDefaults.standard.calendarShareLastUpload = Date()
@@ -424,18 +437,16 @@ class CalendarManager: NSObject {
 
     }
     
-    // deletes all Calendar Share events in the calendar, for the last 24 hours
-    private func deleteAllEvents(in calendar:EKCalendar) {
-        deleteEvents(in: calendar, marker: ConstantsCalendar.calendarSharePayloadPrefix, endDate: Date())
-    }
-
-    private func deleteEvents(in calendar: EKCalendar, marker: String, endDate: Date) {
+    private func deleteEvents(in calendar: EKCalendar, marker: String, endDate: Date, excludingEventIdentifier: String?) {
+        // A missing identifier is not permission to remove the newly saved event.
+        guard let excludingEventIdentifier else { return }
         
         let predicate = eventStore.predicateForEvents(withStart: Date(timeIntervalSinceNow: -24*3600), end: endDate, calendars: [calendar])
         
         let events = eventStore.events(matching: predicate)
         
         for event in events {
+            guard event.eventIdentifier != excludingEventIdentifier else { continue }
             if let notes = event.notes {
                 if notes.contains(find: marker) {
                     do{

@@ -1095,6 +1095,8 @@ struct InitialCalibrationRequestGate {
             trace("in processNewGlucoseData, glucoseData.count = 0", log: log, category: ConstantsLog.categoryRootView, type: .info)
             return 0
         }
+        TransmitterReadSuccessEvidence.recordConfiguration(source: cgmTransmitter.cgmTransmitterType(),
+            visibleFiveMinutes: UserDefaults.standard.useFiveMinuteReadings)
         
         // also for cases where calibration is not needed, we go through this code
         if let activeSensor = activeSensor, let calibrator = calibrator, let bgReadingsAccessor = bgReadingsAccessor {
@@ -1163,7 +1165,8 @@ struct InitialCalibrationRequestGate {
                         sensorID: activeSensor.id,
                         existingID: $0.id,
                         existingAt: $0.timeStamp,
-                        existingSensorID: $0.sensor?.id
+                        existingSensorID: $0.sensor?.id,
+                        existingIsValid: $0.isValidForDownstream
                     )
                 }) {
                     continue
@@ -1250,7 +1253,15 @@ struct InitialCalibrationRequestGate {
                             coreDataManager.mainManagedObjectContext.delete(newReading)
                             continue
                         }
-                        if isValidForDownstream { savedDownstreamReadingCount += 1 }
+                        if isValidForDownstream {
+                            savedDownstreamReadingCount += 1
+                            let receipt = TransmitterReadSuccessReceipt(id: newReading.id,
+                                sensorID: activeSensor.id, measuredAt: newReading.timeStamp, storedAt: Date(),
+                                fromWatch: glucose.sourceIdentifier != nil, historical: isHistoricalGapFill)
+                            coreDataManager.saveChanges { saved in
+                                if saved { TransmitterReadSuccessEvidence.record(receipt) }
+                            }
+                        }
                         if isHistoricalGapFill {
                             insertedHistoricalIDs.insert(newReading.id)
                         }
@@ -1305,18 +1316,29 @@ struct InitialCalibrationRequestGate {
 
             // Historical Watch samples deliberately stop before the live fan-out below. Existing
             // readings are calculation context only; post-processing may touch only newly inserted
-            // history and may not rewrite HealthKit, Nightscout or any current state.
-            if historicalWatchOnly || (!newDownstreamReadingCreated && !insertedHistoricalIDs.isEmpty) {
-                if !insertedHistoricalIDs.isEmpty {
-                    _ = bgPostProcessingManager?.processBgReadings(
-                        processingStartDateOverride: oldestIncomingTimeStamp,
-                        allowHistoricalDownstreamRewrite: false,
-                        onlyNewHistoricalReadingIDs: insertedHistoricalIDs
-                    )
-                    rootHomeStateModel.invalidateCharts()
-                    updateMiniChart()
-                    watchManager?.updateWatchApp(forceComplicationUpdate: false)
+            // history and may not rewrite any current value, alarm or calendar state.
+            if !insertedHistoricalIDs.isEmpty {
+                _ = bgPostProcessingManager?.processBgReadings(
+                    processingStartDateOverride: oldestIncomingTimeStamp,
+                    allowHistoricalDownstreamRewrite: false,
+                    onlyNewHistoricalReadingIDs: insertedHistoricalIDs
+                )
+                let historicalIDs = insertedHistoricalIDs
+                coreDataManager.saveChanges { [weak self] saved in
+                    guard saved, let self else { return }
+                    let historical = bgReadingsAccessor.getBgReadings(from: oldestIncomingTimeStamp,
+                        to: Date(), on: coreDataManager.mainManagedObjectContext, includingSuppressed: true)
+                        .filter { historicalIDs.contains($0.id) && $0.isValidForDownstream && !$0.isSuppressedByFiveMinuteCadence }
+                    // Destination managers enforce their own enabled setting and cadence against
+                    // stored neighbours. These queues never update live cursors or trigger alarms.
+                    self.nightscoutSyncManager?.storeHistoricalBgReadingsInNightscout(bgReadings: historical)
+                    self.healthKitManager?.storeHistoricalBgReadingsInHealthKit(bgReadings: historical)
                 }
+                rootHomeStateModel.invalidateCharts()
+                updateMiniChart()
+                watchManager?.updateWatchApp(forceComplicationUpdate: false)
+            }
+            if historicalWatchOnly || (!newDownstreamReadingCreated && !insertedHistoricalIDs.isEmpty) {
                 return insertedHistoricalIDs.count
             }
             
@@ -2796,6 +2818,59 @@ extension RootApplicationCoordinator: @preconcurrency CGMTransmitterDelegate {
         createNotification(title: Texts_Common.warning, body: Texts_HomeView.sensorNotDetected, identifier: ConstantsNotifications.NotificationIdentifierForSensorNotDetected.sensorNotDetected, sound: nil)
     }
 
+    func watchGlucoseIsStored(payloadID: UUID, sensorID: String) -> Bool {
+        guard Thread.isMainThread, let coreDataManager else { return false }
+        let request: NSFetchRequest<BgReading> = BgReading.fetchRequest()
+        request.predicate = NSPredicate(format: "id == %@ AND sensor.id == %@", payloadID.uuidString, sensorID)
+        request.fetchLimit = 1
+        return ((try? coreDataManager.mainManagedObjectContext.fetch(request)) ?? []).first?.isValidForDownstream == true
+    }
+
+    func confirmWatchGlucoseStorage(completion: @escaping (Bool) -> Void) {
+        guard let coreDataManager else { completion(false); return }
+        coreDataManager.saveChanges(completion: completion)
+    }
+
+    func liveWatchGlucoseReceived(glucoseData: inout [GlucoseData], sensorID: String,
+                                 sensorAge: TimeInterval) -> LibreWatchDeliveryOutcome {
+        let now = Date()
+        guard Thread.isMainThread, let activeSensor, activeSensor.id == sensorID,
+              let coreDataManager, calibrator != nil, let bgReadingsAccessor
+        else { return .collectorUnavailable }
+        guard glucoseData.count == 1, let glucose = glucoseData.first,
+              let sourceID = glucose.sourceIdentifier, let payloadID = UUID(uuidString: sourceID),
+              glucose.glucoseLevelRaw.isFinite, glucose.glucoseLevelRaw > 0,
+              glucose.timeStamp >= activeSensor.startDate, glucose.timeStamp <= now,
+              now.timeIntervalSince(glucose.timeStamp) <= LibreWatchReadingAcceptancePolicy.maximumTransportAge,
+              sensorAge >= ConstantsMaster.minimumSensorWarmUpRequiredInMinutes * 60
+        else { return .invalidPayload }
+        let existingRequest: NSFetchRequest<BgReading> = BgReading.fetchRequest()
+        existingRequest.predicate = NSPredicate(format: "id == %@ AND sensor.id == %@", payloadID.uuidString, sensorID)
+        existingRequest.fetchLimit = 1
+        if let row = (try? coreDataManager.mainManagedObjectContext.fetch(existingRequest))?.first {
+            return LibreWatchStoredReadingPolicy.outcome(isValid: row.isValidForDownstream, calculatedValue: row.calculatedValue)
+        }
+        let latest = bgReadingsAccessor.last(forSensor: activeSensor, includingSuppressed: true)?.timeStamp
+        if LibreWatchStoredReadingPolicy.requiresHistoricalPath(measuredAt: glucose.timeStamp, latestStoredAt: latest) {
+            // After process/ownership restart the in-memory live watermark is empty. The
+            // persisted sensor history still prevents queued data becoming current again.
+            return historicalWatchGlucoseReceived(glucoseData: &glucoseData, sensorID: sensorID)
+        }
+        let neighbours = bgReadingsAccessor.getBgReadings(from: glucose.timeStamp.addingTimeInterval(-10),
+            to: glucose.timeStamp.addingTimeInterval(10), on: coreDataManager.mainManagedObjectContext, includingSuppressed: true)
+        if neighbours.contains(where: { $0.sensor?.id == sensorID && $0.isValidForDownstream }) { return .duplicate }
+        let stored = processNewGlucoseData(glucoseData: &glucoseData, sensorAge: sensorAge)
+        guard stored > 0 else {
+            if let row = (try? coreDataManager.mainManagedObjectContext.fetch(existingRequest))?.first {
+                return LibreWatchStoredReadingPolicy.outcome(isValid: row.isValidForDownstream, calculatedValue: row.calculatedValue)
+            }
+            return .historyNotInserted
+        }
+        loopManager?.shareMetadata(lastCommunicationAt: now)
+        logTransmitterReadSuccessIfNeeded()
+        return watchGlucoseIsStored(payloadID: payloadID, sensorID: sensorID) ? .liveAccepted : .invalidPayload
+    }
+
     func historicalWatchGlucoseReceived(
         glucoseData: inout [GlucoseData],
         sensorID: String
@@ -2823,14 +2898,23 @@ extension RootApplicationCoordinator: @preconcurrency CGMTransmitterDelegate {
             on: coreDataManager.mainManagedObjectContext,
             includingSuppressed: true
         )
+        if let exactPayload = existing.first(where: {
+            $0.sensor?.id == sensorID && $0.id == sourceID
+        }) {
+            return LibreWatchStoredReadingPolicy.outcome(
+                isValid: exactPayload.isValidForDownstream,
+                calculatedValue: exactPayload.calculatedValue
+            )
+        }
         if existing.contains(where: {
             LibreWatchHistoryPolicy.collides(
-                payloadID: sourceID,
+                payloadID: nil,
                 measuredAt: glucose.timeStamp,
                 sensorID: sensorID,
                 existingID: $0.id,
                 existingAt: $0.timeStamp,
-                existingSensorID: $0.sensor?.id
+                existingSensorID: $0.sensor?.id,
+                existingIsValid: $0.isValidForDownstream
             )
         }) {
             return .duplicate
@@ -2883,51 +2967,51 @@ extension RootApplicationCoordinator: @preconcurrency CGMTransmitterDelegate {
         if !supressReadingIfSensorIsWarmingUp {
             processNewGlucoseData(glucoseData: &glucoseData, sensorAge: sensorAge)
             
-            // now try and log a transmitter read success line to the trace files.
-            // this will only happen once per hour after launching the app
-            if let activeSensor = activeSensor, let bgReadingsAccessor = bgReadingsAccessor, let transmitterReadSuccessDisplay = TransmitterReadSuccessManager(bgReadingsAccessor: bgReadingsAccessor).getReadSuccessForLogs(forSensor: activeSensor, notBefore: nil, timeStampOfLastLogCreated: transmitterReadSuccessTimeStampOfLastLogCreated), transmitterReadSuccessDisplay.expected24h > 0 {
-                let success24h: Double = transmitterReadSuccessDisplay.success24h
-                
-                // Compute how much history we actually have (after cutoff, capped to 24h)
-                let now = Date()
-                let hoursAvailable: Double = {
-                    guard let earliest = transmitterReadSuccessDisplay.earliestTimestampInLast24h else { return 0 }
-                    return min(24.0, max(0, now.timeIntervalSince(earliest) / 3600.0))
-                }()
-                
-                // Decide the window label to use
-                let gap = transmitterReadSuccessDisplay.nominalGapInSeconds
-                let fullExpected24h = Int(floor((24.0 * 3600.0) / Double(gap)))
-                let label: String = (transmitterReadSuccessDisplay.expected24h >= fullExpected24h) ? "24h" : String(format: "~%.0fh", hoursAvailable)
-                let windowHours = transmitterReadSuccessDisplay.expected24h >= fullExpected24h
-                    ? 24
-                    : Int(hoursAvailable.rounded())
-                let missedReadings = transmitterReadSuccessDisplay.expected24h - transmitterReadSuccessDisplay.actual24h
-                let roundedSuccess = Int(success24h.round(toDecimalPlaces: 2))
-                
-                trace(
-                    "in cgmTransmitterInfoReceived, transmitter Read Success: %{public}@ percent over the last %{public}@. %{public}@ missed readings from %{public}@",
-                    log: log,
-                    category: ConstantsLog.categoryRootView,
-                    type: .info,
-                    // Reuse the existing once-per-hour calculation. Only aggregate counts and the
-                    // bounded analysis window enter the shareable log; no transmitter identity does.
-                    troubleshooting: .standard(.transmitterReadSuccess(
-                        percent: roundedSuccess,
-                        missedReadings: missedReadings,
-                        expectedReadings: transmitterReadSuccessDisplay.expected24h,
-                        windowHours: windowHours
-                    )),
-                    roundedSuccess.description,
-                    label,
-                    missedReadings.description,
-                    transmitterReadSuccessDisplay.expected24h.description
-                )
-                
-                transmitterReadSuccessTimeStampOfLastLogCreated = .now
-            } else {
-                trace("in cgmTransmitterInfoReceived, cannot calculate hourly transmitter read success", log: log, category: ConstantsLog.categoryRootView, type: .debug)
-            }
+            logTransmitterReadSuccessIfNeeded()
+        }
+    }
+
+    private func logTransmitterReadSuccessIfNeeded() {
+        if let activeSensor = activeSensor, let bgReadingsAccessor = bgReadingsAccessor, let transmitterReadSuccessDisplay = TransmitterReadSuccessManager(bgReadingsAccessor: bgReadingsAccessor).getReadSuccessForLogs(forSensor: activeSensor, notBefore: nil, timeStampOfLastLogCreated: transmitterReadSuccessTimeStampOfLastLogCreated), transmitterReadSuccessDisplay.expected24h > 0 {
+            let success24h: Double = transmitterReadSuccessDisplay.success24h
+
+            // Compute how much history we actually have (after cutoff, capped to 24h)
+            let now = Date()
+            let hoursAvailable: Double = {
+                guard let earliest = transmitterReadSuccessDisplay.earliestTimestampInLast24h else { return 0 }
+                return min(24.0, max(0, now.timeIntervalSince(earliest) / 3600.0))
+            }()
+
+            // Decide the window label to use
+            let gap = transmitterReadSuccessDisplay.nominalGapInSeconds
+            let label: String = hoursAvailable >= 24 ? "24h" : String(format: "~%.0fh", hoursAvailable)
+            let missedReadings = transmitterReadSuccessDisplay.expected24h - transmitterReadSuccessDisplay.actual24h
+            let roundedSuccess = Int(success24h.round(toDecimalPlaces: 2))
+
+            trace(
+                "in cgmTransmitterInfoReceived, transmitter Read Success: %{public}@ percent over the last %{public}@. %{public}@ missed readings from %{public}@",
+                log: log,
+                category: ConstantsLog.categoryRootView,
+                type: .info,
+                // Reuse the existing once-per-hour calculation. Only aggregate counts and the
+                // bounded analysis window enter the shareable log; no transmitter identity does.
+                troubleshooting: .standard(.sensorCoverage(
+                    percent: roundedSuccess,
+                    expected: transmitterReadSuccessDisplay.expected24h,
+                    actual: transmitterReadSuccessDisplay.actual24h,
+                    sourceInterval: gap,
+                    timely: transmitterReadSuccessDisplay.timelyReceiptCount,
+                    delayed: transmitterReadSuccessDisplay.delayedReceiptCount
+                )),
+                roundedSuccess.description,
+                label,
+                missedReadings.description,
+                transmitterReadSuccessDisplay.expected24h.description
+            )
+
+            transmitterReadSuccessTimeStampOfLastLogCreated = .now
+        } else {
+            trace("in cgmTransmitterInfoReceived, cannot calculate hourly transmitter read success", log: log, category: ConstantsLog.categoryRootView, type: .debug)
         }
     }
     

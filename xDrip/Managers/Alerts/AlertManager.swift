@@ -57,6 +57,7 @@ public class AlertManager: NSObject {
     
     /// constant for key in ApplicationManager.shared.addClosureToRunWhenAppWillEnterForeground - for closure that will stop playing sound
     private let applicationManagerKeyStopPlayingSound = "AlertManager-stopplayingsound"
+    private var watchAlarmDelegationObserver: NSObjectProtocol?
     
     // MARK: - initializer
     
@@ -93,6 +94,15 @@ public class AlertManager: NSObject {
         
         // add observer for changes in UserDefaults
         addObservers()
+        watchAlarmDelegationObserver = NotificationCenter.default.addObserver(
+            forName: .libreWatchAlarmDelegationChanged, object: nil, queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            let delegatedKinds = LibreWatchAlarmStore.delegation()?.enabledKinds ?? []
+            let identifiers = delegatedKinds.compactMap { AlertKind(rawValue: $0.rawValue)?.notificationIdentifier() }
+            self.uNUserNotificationCenter.removePendingNotificationRequests(withIdentifiers: identifiers)
+            self.uNUserNotificationCenter.removeDeliveredNotifications(withIdentifiers: identifiers)
+        }
     }
     
     // MARK: - public functions
@@ -818,6 +828,8 @@ public class AlertManager: NSObject {
                 }
             }
 
+            if applicableAlertType.enabled && Self.watchOwnsAlarm(alertKind) { return false }
+
             // create the content for the alert notification, set body and text, category and also attachments and userInfo dict if available
             let content = UNMutableNotificationContent()
             
@@ -1116,6 +1128,7 @@ public class AlertManager: NSObject {
     }
 
     deinit {
+        if let watchAlarmDelegationObserver { NotificationCenter.default.removeObserver(watchAlarmDelegationObserver) }
         UserDefaults.standard.removeObserver(self, forKeyPath: UserDefaults.Key.missedReadingAlertChanged.rawValue)
         UserDefaults.standard.removeObserver(self, forKeyPath: UserDefaults.Key.notLoopingAlertChanged.rawValue)
         UserDefaults.standard.removeObserver(self, forKeyPath: UserDefaults.Key.nightscoutEnabled.rawValue)
@@ -1124,3 +1137,80 @@ public class AlertManager: NSObject {
 }
 
 extension AlertManager: SensorHealthOneOffAlarmRaising {}
+
+extension AlertManager {
+    static func makeLibreWatchAlarmSettings(session: LibreWatchDirectSession, coreDataManager: CoreDataManager) -> LibreWatchAlarmSettings {
+        dispatchPrecondition(condition: .onQueue(.main))
+        let types = AlertTypesAccessor(coreDataManager: coreDataManager)
+        let entries = AlertEntriesAccessor(coreDataManager: coreDataManager)
+        let rules = LibreWatchAlarmKind.allCases.flatMap { kind -> [LibreWatchAlarmRule] in
+            guard let alertKind = AlertKind(rawValue: kind.rawValue) else { return [] }
+            return entries.getAllEntries(forAlertKind: alertKind, alertTypesAccessor: types).map { entry in
+                LibreWatchAlarmRule(kind: kind, startMinute: Int(entry.start), value: Double(entry.value),
+                    enabled: !entry.isDisabled && entry.alertType.enabled,
+                    snoozeMinutes: Int(entry.alertType.snoozeperiod), allowsSnooze: entry.alertType.snooze,
+                    soundEnabled: entry.alertType.soundname != "", vibrate: entry.alertType.vibrate,
+                    title: alertKind.alertTitle())
+            }
+        }
+        let snoozes = SnoozeParametersAccessor(coreDataManager: coreDataManager).getSnoozeParameters().compactMap { item -> LibreWatchAlarmSnooze? in
+            guard let kind = LibreWatchAlarmKind(rawValue: Int(item.alertKind)),
+                  let stamp = item.snoozeTimeStamp, item.snoozePeriodInMinutes > 0
+            else { return nil }
+            return LibreWatchAlarmSnooze(kind: kind, until: stamp.addingTimeInterval(Double(item.snoozePeriodInMinutes) * 60))
+        }
+        let previous = LibreWatchAlarmStore.settings()
+        var settings = LibreWatchAlarmSettings(sessionID: session.id, sensorIdentity: session.redactedIdentity(),
+            revision: previous?.revision ?? 1, generatedAt: Date(), isMgDl: UserDefaults.standard.bloodGlucoseUnitIsMgDl,
+            rules: rules, snoozes: snoozes, snoozeAllUntil: UserDefaults.standard.snoozeAllAlertsUntilDate)
+        if let previous, settings.sameConfiguration(as: previous) { return previous }
+        settings.revision = (previous?.revision ?? 0) + 1
+        LibreWatchAlarmStore.save(settings)
+        return settings
+    }
+
+    @discardableResult
+    static func setLibreWatchAlarmDelegation(readyRevision: UInt64?, settings: LibreWatchAlarmSettings) -> LibreWatchAlarmDelegation? {
+        dispatchPrecondition(condition: .onQueue(.main))
+        let delegation = readyRevision == settings.revision
+            ? LibreWatchAlarmDelegation.confirmed(for: settings)
+            : nil
+        if LibreWatchAlarmStore.delegation() != delegation {
+            LibreWatchAlarmStore.save(delegation)
+            NotificationCenter.default.post(name: .libreWatchAlarmDelegationChanged, object: nil)
+        }
+        return delegation
+    }
+
+    static func applyLibreWatchAlarmState(_ state: LibreWatchAlarmState, session: LibreWatchDirectSession, coreDataManager: CoreDataManager) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard state.sessionID == session.id, state.sensorIdentity == session.redactedIdentity() else { return }
+        let now = Date()
+        let stored = SnoozeParametersAccessor(coreDataManager: coreDataManager).getSnoozeParameters()
+        for snooze in state.snoozes where snooze.until > now && snooze.until <= now.addingTimeInterval(7 * 24 * 60 * 60) {
+            guard let item = stored.first(where: { Int($0.alertKind) == snooze.kind.rawValue }) else { continue }
+            let previous = item.snoozeTimeStamp?.addingTimeInterval(Double(item.snoozePeriodInMinutes) * 60) ?? .distantPast
+            guard snooze.until > previous else { continue }
+            let minutes = Int16(ceil(snooze.until.timeIntervalSince(now) / 60))
+            item.snoozePeriodInMinutes = minutes
+            item.snoozeTimeStamp = snooze.until.addingTimeInterval(-Double(minutes) * 60)
+        }
+        coreDataManager.saveChanges()
+    }
+
+    private static func watchOwnsAlarm(_ kind: AlertKind) -> Bool {
+        guard let watchKind = LibreWatchAlarmKind(rawValue: kind.rawValue),
+              [.watch, .releasingToPhone].contains(LibreWatchSessionStore.loadOwnership()),
+              let session = LibreWatchSessionStore.loadSession(),
+              UserDefaults.standard.libreSensorUID == session.sensorUID,
+              UserDefaults.standard.librePatchInfo == session.patchInfo,
+              let delegation = LibreWatchAlarmStore.delegation(),
+              delegation.covers(watchKind),
+              delegation.sessionID == session.id,
+              delegation.sensorIdentity == session.redactedIdentity()
+        else { return false }
+        // A newer phone configuration cannot silently reclaim alarm authority while its
+        // previous, explicitly acknowledged Watch delegation is still in use offline.
+        return true
+    }
+}

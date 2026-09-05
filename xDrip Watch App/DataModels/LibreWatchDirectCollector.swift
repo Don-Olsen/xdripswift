@@ -859,6 +859,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
                 enableTime: preparedSession.unlockCode,
                 unlockCount: preparedSession.unlockCount
             )
+            reportBluetoothAction("unlockRequested", reason: "notificationSubscriptionReady")
             peripheral.writeValue(Data(unlock), for: characteristic, type: .withResponse)
             scheduleReconnectFallback(for: peripheral)
         } catch {
@@ -1352,7 +1353,8 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         runtimeInvalidationReason: Int? = nil,
         runtimeError: String? = nil,
         bluetoothErrorClassification: String? = nil,
-        attempt: LibreWatchRecoveryAttemptContext? = nil
+        attempt: LibreWatchRecoveryAttemptContext? = nil,
+        reconcileSource: LibreWatchRecoveryReconcileSource? = nil
     ) {
         let attempt = attempt ?? recoveryAttemptState.context
         let belongsToRecoveryAttempt: Bool
@@ -1381,7 +1383,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
             attemptStartedAt: attempt?.startedAt,
             sessionID: attempt?.sessionID ?? preparedSession?.id,
             sensorIdentity: attempt?.sensorIdentity ?? preparedSession?.redactedIdentity(),
-            reconcileSource: currentReconcileSource,
+            reconcileSource: reconcileSource ?? currentReconcileSource,
             remainingExecutionBudget: connectionTiming.remainingExecutionTime(
                 at: date,
                 monotonicTime: monotonicNow
@@ -1399,7 +1401,9 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
                 : nil,
             bluetoothErrorClassification: bluetoothErrorClassification,
             extendedRuntimeState: extendedRuntimeSession.map { String(describing: $0.state) },
-            extendedRuntimeStartRequested: userInitiatedRuntimeStart
+            extendedRuntimeStartRequested: userInitiatedRuntimeStart,
+            ownership: watchState?.libreWatchOwnership,
+            unlockCounter: preparedSession?.unlockCount
         ))
     }
 
@@ -1416,7 +1420,8 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         _ callback: String,
         error: Error? = nil,
         isReconnecting: Bool? = nil,
-        classification: String? = nil
+        classification: String? = nil,
+        source: LibreWatchRecoveryReconcileSource? = nil
     ) {
         let nsError = error.map { $0 as NSError }
         reportDiagnostic(
@@ -1425,7 +1430,8 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
             isReconnecting: isReconnecting,
             errorDomain: nsError?.domain,
             errorCode: nsError?.code,
-            bluetoothErrorClassification: classification
+            bluetoothErrorClassification: classification,
+            reconcileSource: source
         )
     }
 
@@ -1782,14 +1788,19 @@ extension LibreWatchDirectCollector: CBCentralManagerDelegate {
         didDisconnectPeripheral peripheral: CBPeripheral,
         error: Error?
     ) {
+        reportCoreBluetoothCallback("didDisconnectLegacy", error: error, source: .didDisconnect)
         // Keep the fallback on every OS version: availability does not guarantee delivery
         // of the modern callback. Its token is also invalidated by a later didConnect.
         if peripheral === retiredPeripheral {
+            reportRejectedCallback("didDisconnectLegacy", reason: "retiredPeripheral")
             _ = releaseRetiredPeripheralIfDisconnected()
             return
         }
         guard peripheral === sensorPeripheral, pendingLegacyDisconnect == nil,
-              let token = disconnectGate.scheduleLegacy() else { return }
+              let token = disconnectGate.scheduleLegacy() else {
+            reportRejectedCallback("didDisconnectLegacy", reason: "notCurrentPeripheralOrPendingLegacy")
+            return
+        }
         let disconnectedAt = Date()
         let generation = connectionTiming.generation
         let workItem = DispatchWorkItem { [weak self] in
@@ -1800,6 +1811,7 @@ extension LibreWatchDirectCollector: CBCentralManagerDelegate {
                 currentGeneration: self.connectionTiming.generation,
                 peripheralIsDisconnectedOrDisconnecting: peripheral.state == .disconnected || peripheral.state == .disconnecting
             ) else {
+                self.reportRejectedCallback("didDisconnectLegacy", reason: "staleGenerationOrLinkRecovered")
                 self.disconnectGate.cancelLegacy()
                 return
             }
@@ -1823,11 +1835,16 @@ extension LibreWatchDirectCollector: CBCentralManagerDelegate {
         isReconnecting: Bool,
         error: Error?
     ) {
+        reportCoreBluetoothCallback("didDisconnectModern", error: error, isReconnecting: isReconnecting, source: .didDisconnect)
         if peripheral === retiredPeripheral {
+            reportRejectedCallback("didDisconnectModern", reason: "retiredPeripheral")
             _ = releaseRetiredPeripheralIfDisconnected()
             return
         }
-        guard peripheral === sensorPeripheral else { return }
+        guard peripheral === sensorPeripheral else {
+            reportRejectedCallback("didDisconnectModern", reason: "notCurrentPeripheral")
+            return
+        }
         pendingLegacyDisconnect?.cancel()
         pendingLegacyDisconnect = nil
         handleDisconnectOnce(
@@ -1963,6 +1980,7 @@ extension LibreWatchDirectCollector: CBPeripheralDelegate {
             failAndRescan(.unlockWriteFailed, error: error.localizedDescription)
         } else {
             recordSetupProgress(.unlock)
+            reportBluetoothAction("unlockCompleted", reason: "writeAcknowledged")
             setupGeneration = nil
             connectionTiming.recordReceivingProgress(
                 at: Date(),

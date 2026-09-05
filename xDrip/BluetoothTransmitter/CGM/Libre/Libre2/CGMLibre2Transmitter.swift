@@ -490,7 +490,8 @@ class CGMLibre2Transmitter: BluetoothTransmitter, CGMTransmitter {
     @nonobjc func receiveReadingFromWatch(
         _ reading: LibreWatchDirectReadingPayload,
         calibrationSnapshot: LibreWatchCalibrationSnapshot
-    ) {
+    ) -> LibreWatchDeliveryOutcome {
+        guard Thread.isMainThread else { return .collectorUnavailable }
         let requiredValueDomain: LibreWatchValueDomain = isWebOOPEnabled()
             ? .factoryNativeMGDL
             : .xDripRawGlucose
@@ -505,7 +506,7 @@ class CGMLibre2Transmitter: BluetoothTransmitter, CGMTransmitter {
               calibrationTypeMatches,
               watchOwnershipSessionID == reading.sessionID,
               LibreWatchSessionStore.loadOwnership() == .watch
-        else { return }
+        else { return .invalidPayload }
 
         var glucoseData = [GlucoseData(
             timeStamp: reading.receivedAt,
@@ -514,15 +515,30 @@ class CGMLibre2Transmitter: BluetoothTransmitter, CGMTransmitter {
             glucoseLevelRaw: reading.sourceValue(for: requiredValueDomain)
         )]
         glucoseData[0].sourceIdentifier = reading.id.uuidString
-        cgmTransmitterDelegate?.cgmTransmitterInfoReceived(
+        let outcome = cgmTransmitterDelegate?.liveWatchGlucoseReceived(
             glucoseData: &glucoseData,
-            transmitterBatteryInfo: nil,
+            sensorID: calibrationSnapshot.activeSensorID,
             sensorAge: TimeInterval(minutes: Double(reading.sensorTimeInMinutes))
-        )
-        cGMLibre2TransmitterDelegate?.received(
-            sensorTimeInMinutes: Int(reading.sensorTimeInMinutes),
-            from: self
-        )
+        ) ?? .collectorUnavailable
+        if outcome == .liveAccepted {
+            cGMLibre2TransmitterDelegate?.received(
+                sensorTimeInMinutes: Int(reading.sensorTimeInMinutes),
+                from: self
+            )
+        }
+        return outcome
+    }
+
+    @nonobjc func confirmReadingStorage(completion: @escaping (Bool) -> Void) {
+        guard let cgmTransmitterDelegate else {
+            completion(false)
+            return
+        }
+        cgmTransmitterDelegate.confirmWatchGlucoseStorage(completion: completion)
+    }
+
+    @nonobjc func watchReadingIsStored(_ id: UUID, sensorID: String) -> Bool {
+        cgmTransmitterDelegate?.watchGlucoseIsStored(payloadID: id, sensorID: sensorID) ?? false
     }
 
     /// Separate queued-only entry point. Historical samples are calculated and persisted by the

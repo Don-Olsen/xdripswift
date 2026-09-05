@@ -314,6 +314,7 @@ struct TroubleshootingLogView: View {
     private func symbol(for entry: TroubleshootingLogEntry) -> String {
         switch entry.kind {
         case .glucoseAccepted: return "drop.fill"
+        case .watchDiagnostic: return "applewatch"
         case let .bluetooth(activity):
             switch activity {
             case .connectionFailed, .connectionTimedOut, .poweredOff, .unauthorized, .pairingFailed:
@@ -338,7 +339,7 @@ struct TroubleshootingLogView: View {
         case .sensorLabelScan: return "barcode.viewfinder"
         case .sensorNoise: return "waveform.path.ecg"
         case .sensorHealthAlert: return "exclamationmark.triangle.fill"
-        case .transmitterReadSuccess: return "antenna.radiowaves.left.and.right"
+        case .transmitterReadSuccess, .sensorCoverage: return "antenna.radiowaves.left.and.right"
         case .calibrationAccepted: return "scope"
         case let .alert(_, activity):
             return activity == .notificationsDenied || activity == .suppressedBySnooze || activity == .notificationDismissed || activity == .disabled ? "bell.slash.fill" : "bell.fill"
@@ -353,13 +354,15 @@ struct TroubleshootingLogView: View {
             }
         case let .integration(name, _):
             switch name {
-            case .nightscout, .nightscoutImport, .nightscoutBackfill: return "cloud.fill"
+            case .nightscout, .nightscoutImport, .nightscoutBackfill, .nightscoutGlucose,
+                 .nightscoutCalibration, .nightscoutTreatments, .nightscoutDeviceStatus,
+                 .nightscoutProfile, .nightscoutAuth: return "cloud.fill"
             case .healthKit: return "heart.text.square.fill"
             case .liveActivity: return "iphone"
             case .calendar: return "calendar"
             case .contactImage: return "person.crop.circle"
             case .osAid: return "arrow.left.arrow.right"
-            case .watch: return "applewatch"
+            case .watch, .watchStatus, .watchConnectivity: return "applewatch"
             }
         case .heartbeatReceived: return "heart.circle.fill"
         case let .configuration(activity):

@@ -13,6 +13,17 @@ enum LibreWatchMessageKey {
     static let diagnosticEvent = "libreWatchDiagnosticEvent"
     static let deliveryOutcome = "libreWatchDeliveryOutcome"
     static let releaseCutoff = "libreWatchReleaseCutoff"
+    static let handoffSnapshot = "libreWatchHandoffSnapshot"
+    static let persistedHandoffRevision = "libreWatchHandoffRevision.v1"
+    static let deliveryItemID = "libreWatchDeliveryItemID"
+    static let deliveryReceiptID = "libreWatchDeliveryReceiptID"
+    static let durableReceipt = "libreWatchDurableReceipt"
+    static let persistedInstallationID = "libreWatchInstallationID.v1"
+    static let alarmSettings = "libreWatchAlarmSettings"
+    static let alarmSettingsRevision = "libreWatchAlarmSettingsRevision"
+    static let alarmsReady = "libreWatchAlarmsReady"
+    static let alarmDelegation = "libreWatchAlarmDelegation"
+    static let alarmState = "libreWatchAlarmState"
 
     static let persistedSession = "libreWatchDirectPersistedSession.v2"
     static let persistedOwnership = "libreWatchDirectPersistedOwnership.v2"
@@ -259,6 +270,17 @@ struct LibreWatchDiagnosticEvent: Codable, Equatable {
     let bluetoothErrorClassification: String?
     let extendedRuntimeState: String?
     let extendedRuntimeStartRequested: Bool?
+    let appCommit: String?
+    let installationID: UUID?
+    let ownership: LibreWatchOwnership?
+    let unlockCounter: UInt16?
+    var journalUnacknowledgedDropCount: UInt64?
+    var alarmSettingsRevision: UInt64?
+    var alarmEnabledKinds: [Int]?
+    var alarmSnoozeAllUntil: Date?
+    var alarmSnoozes: [Int: Date]?
+    var alarmNotificationsAuthorized: Bool?
+    var alarmDelegatedToWatch: Bool?
 
     init(
         eventID: UUID? = UUID(),
@@ -296,7 +318,12 @@ struct LibreWatchDiagnosticEvent: Codable, Equatable {
         journalDroppedCount: UInt64? = nil,
         bluetoothErrorClassification: String? = nil,
         extendedRuntimeState: String? = nil,
-        extendedRuntimeStartRequested: Bool? = nil
+        extendedRuntimeStartRequested: Bool? = nil,
+        appCommit: String? = Bundle.main.infoDictionary?["XDripSourceCommit"] as? String,
+        installationID: UUID? = LibreWatchSessionStore.installationID(),
+        ownership: LibreWatchOwnership? = nil,
+        unlockCounter: UInt16? = nil,
+        journalUnacknowledgedDropCount: UInt64? = nil
     ) {
         self.eventID = eventID
         self.kind = kind
@@ -334,6 +361,11 @@ struct LibreWatchDiagnosticEvent: Codable, Equatable {
         self.bluetoothErrorClassification = Self.bounded(bluetoothErrorClassification)
         self.extendedRuntimeState = Self.bounded(extendedRuntimeState)
         self.extendedRuntimeStartRequested = extendedRuntimeStartRequested
+        self.appCommit = Self.bounded(appCommit)
+        self.installationID = installationID
+        self.ownership = ownership
+        self.unlockCounter = unlockCounter
+        self.journalUnacknowledgedDropCount = journalUnacknowledgedDropCount
     }
 
     private static func bounded(_ value: String?, maximumLength: Int = 512) -> String? {
@@ -351,6 +383,7 @@ enum LibreWatchDeliveryOutcome: String, Codable, Equatable {
     case liveAccepted
     case historicalInserted
     case duplicate
+    case outOfOrder
     case invalidPayload
     case tooOld
     case wrongSession
@@ -529,11 +562,12 @@ struct LibreWatchHistoryPolicy {
         existingID: String,
         existingAt: Date,
         existingSensorID: String?,
+        existingIsValid: Bool = true,
         tolerance: TimeInterval = 10
     ) -> Bool {
-        existingSensorID == sensorID &&
-            ((payloadID.map { existingID == $0 } ?? false) ||
-                abs(existingAt.timeIntervalSince(measuredAt)) <= tolerance)
+        guard existingSensorID == sensorID else { return false }
+        if payloadID.map({ existingID == $0 }) ?? false { return true }
+        return existingIsValid && abs(existingAt.timeIntervalSince(measuredAt)) <= tolerance
     }
 }
 
@@ -598,6 +632,10 @@ struct LibreWatchConnectivityOutbox: Codable, Equatable {
     static let maximumItems = 256
     static let maximumAge: TimeInterval = 60 * 60
     private(set) var items: [LibreWatchOutboxItem] = []
+    // Optional for decoding the persisted v1 queue after an upgrade. Submission is not
+    // storage acknowledgement; retain payloads until a receiver reports a terminal result.
+    private(set) var lastSubmittedAt: [UUID: Date]?
+    static let retryInterval: TimeInterval = 60
 
     mutating func enqueue(_ item: LibreWatchOutboxItem, now: Date = Date()) {
         prune(at: now)
@@ -615,6 +653,7 @@ struct LibreWatchConnectivityOutbox: Codable, Equatable {
 
     mutating func remove(id: UUID) {
         items.removeAll { $0.id == id }
+        lastSubmittedAt?.removeValue(forKey: id)
     }
 
     mutating func retain(sessionID: UUID?) {
@@ -622,16 +661,35 @@ struct LibreWatchConnectivityOutbox: Codable, Equatable {
             items.removeAll()
             return
         }
-        items.removeAll { $0.sessionID != sessionID }
+        items.removeAll { $0.sessionID != sessionID && $0.command != .reportDiagnostic }
     }
 
     mutating func prune(at date: Date = Date()) {
         items.removeAll {
             !$0.isStructurallyValid || date.timeIntervalSince($0.createdAt) > Self.maximumAge
         }
+        let retained = Set(items.map(\.id))
+        lastSubmittedAt = lastSubmittedAt?.filter { retained.contains($0.key) }
     }
 
     var next: LibreWatchOutboxItem? { items.first }
+
+    func nextEligible(at date: Date = Date()) -> LibreWatchOutboxItem? {
+        items.first { item in
+            guard let last = lastSubmittedAt?[item.id] else { return true }
+            return date.timeIntervalSince(last) >= Self.retryInterval
+        }
+    }
+
+    mutating func markSubmitted(id: UUID, at date: Date = Date()) {
+        guard items.contains(where: { $0.id == id }) else { return }
+        if lastSubmittedAt == nil { lastSubmittedAt = [:] }
+        lastSubmittedAt?[id] = date
+    }
+
+    mutating func retry(id: UUID) {
+        lastSubmittedAt?.removeValue(forKey: id)
+    }
 }
 
 enum LibreWatchConnectivityDeliveryAction: Equatable {
@@ -655,7 +713,33 @@ struct LibreWatchConnectivityDeliveryPolicy {
     static func shouldRetryReadingAsQueued(
         after outcome: LibreWatchDeliveryOutcome?
     ) -> Bool {
-        outcome == .tooOld || outcome == .wrongOwnership
+        outcome == .tooOld || outcome == .wrongOwnership || outcome == .outOfOrder
+    }
+
+    static func isTerminal(_ outcome: LibreWatchDeliveryOutcome?) -> Bool {
+        guard let outcome else { return false }
+        switch outcome {
+        case .liveAccepted, .historicalInserted, .duplicate, .invalidPayload, .tooOld,
+             .wrongSession, .wrongSensor, .wrongCalibration, .missingReceipt, .afterCutoff:
+            return true
+        case .outOfOrder, .wrongOwnership, .historyNotInserted, .collectorUnavailable,
+             .receiptCreated, .receiptCompleted, .receiptCancelled, .receiptExpired:
+            return false
+        }
+    }
+
+    static func shouldFinish(_ item: LibreWatchOutboxItem, success: Bool,
+                             outcome: LibreWatchDeliveryOutcome?, durableReceipt: Bool = false) -> Bool {
+        if success {
+            // Older phones acknowledged transport/void callbacks without confirming storage.
+            // Keep readings and diagnostics until a storage-aware receiver explicitly confirms.
+            if item.kind == .reading || item.command == .reportDiagnostic {
+                guard durableReceipt else { return false }
+            }
+            return item.kind == .command || outcome == .liveAccepted ||
+                outcome == .historicalInserted || outcome == .duplicate
+        }
+        return isTerminal(outcome)
     }
 }
 
@@ -692,6 +776,8 @@ struct LibreWatchDiagnosticJournal: Codable, Equatable {
         /// Local insertion time is independent of an absent or skewed event timestamp.
         let recordedAt: Date?
         var handedToWatchConnectivityAt: Date?
+        var acknowledgedByPhoneAt: Date?
+        var terminalDeliveryOutcome: String?
     }
 
     struct AppendResult: Equatable {
@@ -707,6 +793,7 @@ struct LibreWatchDiagnosticJournal: Codable, Equatable {
     private(set) var entries: [Entry] = []
     private(set) var nextSequenceNumber: UInt64 = 1
     private(set) var droppedCount: UInt64 = 0
+    private(set) var unacknowledgedDropCount: UInt64?
 
     mutating func append(
         _ sourceEvent: LibreWatchDiagnosticEvent,
@@ -727,10 +814,12 @@ struct LibreWatchDiagnosticJournal: Codable, Equatable {
 
         if entries.count >= Self.maximumEntries {
             let removalCount = entries.count - Self.maximumEntries + 1
+            recordDropped(entries.prefix(removalCount))
             entries.removeFirst(removalCount)
             droppedCount &+= UInt64(removalCount)
         }
         event.journalDroppedCount = droppedCount
+        event.journalUnacknowledgedDropCount = unacknowledgedDropCount ?? 0
         entries.append(Entry(
             event: event,
             recordedAt: date,
@@ -740,6 +829,7 @@ struct LibreWatchDiagnosticJournal: Codable, Equatable {
         let inserted = entries.last?.event.eventID == event.eventID
         if inserted, var appended = entries.last {
             appended.event.journalDroppedCount = droppedCount
+            appended.event.journalUnacknowledgedDropCount = unacknowledgedDropCount ?? 0
             entries[entries.count - 1] = appended
             event = appended.event
         }
@@ -758,11 +848,20 @@ struct LibreWatchDiagnosticJournal: Codable, Equatable {
         trimToEncodedSize()
     }
 
-    func pendingEvents(for sessionID: UUID) -> [LibreWatchDiagnosticEvent] {
+    mutating func markAcknowledgedByPhone(eventID: UUID?, outcome: String = "received", at date: Date = Date()) {
+        guard let eventID,
+              let index = entries.firstIndex(where: { $0.event.eventID == eventID })
+        else { return }
+        entries[index].acknowledgedByPhoneAt = date
+        entries[index].terminalDeliveryOutcome = String(outcome.prefix(64))
+        trimToEncodedSize()
+    }
+
+    func pendingEvents(for sessionID: UUID? = nil) -> [LibreWatchDiagnosticEvent] {
         entries
             .filter {
-                $0.handedToWatchConnectivityAt == nil &&
-                    $0.event.sessionID == sessionID
+                $0.acknowledgedByPhoneAt == nil &&
+                    (sessionID == nil || $0.event.sessionID == sessionID)
             }
             .map(\.event)
     }
@@ -773,6 +872,8 @@ struct LibreWatchDiagnosticJournal: Codable, Equatable {
             return date.timeIntervalSince(timestamp) <= Self.maximumAge
         }
         let removed = entries.count - retained.count
+        let retainedIDs = Set(retained.compactMap { $0.event.eventID })
+        recordDropped(entries.filter { !($0.event.eventID.map(retainedIDs.contains) ?? false) })
         entries = retained
         if removed > 0 { droppedCount &+= UInt64(removed) }
         if let highest = entries.compactMap({ $0.event.sequenceNumber }).max() {
@@ -784,9 +885,15 @@ struct LibreWatchDiagnosticJournal: Codable, Equatable {
     private mutating func trimToEncodedSize() {
         while !entries.isEmpty,
               (try? JSONEncoder().encode(self).count).map({ $0 > Self.maximumEncodedBytes }) == true {
+            recordDropped(entries.prefix(1))
             entries.removeFirst()
             droppedCount &+= 1
         }
+    }
+
+    private mutating func recordDropped<S: Sequence>(_ removed: S) where S.Element == Entry {
+        let unconfirmed = removed.filter { $0.acknowledgedByPhoneAt == nil }.count
+        unacknowledgedDropCount = (unacknowledgedDropCount ?? 0) &+ UInt64(unconfirmed)
     }
 }
 
@@ -2319,4 +2426,73 @@ enum LibreWatchSessionStore {
 extension Notification.Name {
     static let libreWatchDirectSessionPrepared = Notification.Name("libreWatchDirectSessionPrepared")
     static let libreWatchDirectOwnershipForcedToPhone = Notification.Name("libreWatchDirectOwnershipForcedToPhone")
+}
+
+/// One phone-authored transaction: connection ownership is applied only after its exact
+/// sensor session, highest used unlock counter and calibration have been installed on Watch.
+struct LibreWatchHandoffSnapshot: Codable, Equatable {
+    let session: LibreWatchDirectSession
+    let calibration: LibreWatchCalibrationSnapshot?
+    let ownership: LibreWatchOwnership
+    let revision: UInt64
+    var alarmSettings: LibreWatchAlarmSettings? = nil
+    var alarmDelegation: LibreWatchAlarmDelegation? = nil
+
+    var isValid: Bool {
+        session.isValid && revision > 0 &&
+            (alarmSettings == nil || alarmSettings?.matches(session) == true) &&
+            (calibration == nil || calibration?.matches(session: session) == true) &&
+            (ownership != .watch || calibration?.matches(session: session) == true)
+    }
+
+    func canApply(after acceptedRevision: UInt64) -> Bool {
+        isValid && revision > acceptedRevision
+    }
+}
+
+enum LibreWatchUnlockCounterPolicy {
+    static func highest(
+        incoming: UInt16,
+        session: LibreWatchDirectSession,
+        storedSession: LibreWatchDirectSession?,
+        activeSensorUID: Data?,
+        activePatchInfo: Data?,
+        activeCounter: UInt16
+    ) -> UInt16 {
+        var value = max(incoming, session.unlockCount)
+        if let storedSession, storedSession.id == session.id,
+           storedSession.representsSameSensor(as: session) {
+            value = max(value, storedSession.unlockCount)
+        }
+        if activeSensorUID == session.sensorUID, activePatchInfo == session.patchInfo {
+            value = max(value, activeCounter)
+        }
+        return value
+    }
+}
+
+extension LibreWatchSessionStore {
+    static func installationID(defaults: UserDefaults = .standard) -> UUID {
+        if let stored = defaults.string(forKey: LibreWatchMessageKey.persistedInstallationID),
+           let id = UUID(uuidString: stored) { return id }
+        let id = UUID()
+        defaults.set(id.uuidString, forKey: LibreWatchMessageKey.persistedInstallationID)
+        return id
+    }
+
+    static func loadHandoffRevision(defaults: UserDefaults = .standard) -> UInt64 {
+        defaults.string(forKey: LibreWatchMessageKey.persistedHandoffRevision).flatMap(UInt64.init) ?? 0
+    }
+
+    static func saveHandoffRevision(_ revision: UInt64, defaults: UserDefaults = .standard) {
+        defaults.set(String(revision), forKey: LibreWatchMessageKey.persistedHandoffRevision)
+    }
+
+    static func nextHandoffRevision(at date: Date = Date(), defaults: UserDefaults = .standard) -> UInt64 {
+        let previous = loadHandoffRevision(defaults: defaults)
+        let revision = max(UInt64(max(1, date.timeIntervalSince1970 * 1_000)),
+                           previous == UInt64.max ? previous : previous + 1)
+        saveHandoffRevision(revision, defaults: defaults)
+        return revision
+    }
 }

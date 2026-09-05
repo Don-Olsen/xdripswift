@@ -18,7 +18,7 @@ extension XDripWatchComplication.EntryView {
                 .foregroundStyle(.colorPrimary)
                 .widgetBackground(backgroundView: Color.clear)
         } else {
-            Gauge(value: entry.widgetState.bgValueInMgDl ?? entry.widgetState.gaugeModel().nilValue, in: entry.widgetState.gaugeModel().minValue...entry.widgetState.gaugeModel().maxValue) {
+            Gauge(value: entry.widgetState.gaugeValue, in: entry.widgetState.gaugeModel().minValue...entry.widgetState.gaugeModel().maxValue) {
                 Text("Not shown")
             } currentValueLabel: {
                 Text(entry.widgetState.bgValueStringInUserChosenUnit())

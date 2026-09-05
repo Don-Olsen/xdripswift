@@ -18,13 +18,11 @@ extension XDripWatchComplication {
         }
         
         func getSnapshot(in context: Context, completion: @escaping (Entry) -> ()) {
-            completion(.placeholder)
+            completion(context.isPreview ? .placeholder : makeEntries(at: .now)[0])
         }
         
         func getTimeline(in context: Context, completion: @escaping (Timeline<Entry>) -> ()) {
-            let entry = Entry(date: .now, widgetState: getWidgetStateFromSharedUserDefaults() ?? sampleWidgetStateFromProvider)
-                
-            completion(.init(entries: [entry], policy: .never))
+            completion(.init(entries: makeEntries(at: .now), policy: .never))
         }
     }
 }
@@ -33,33 +31,15 @@ extension XDripWatchComplication {
 // MARK: - Helpers
 
 extension XDripWatchComplication.Provider {
-    func getWidgetStateFromSharedUserDefaults() -> XDripWatchComplication.Entry.WidgetState? {
-        guard let sharedUserDefaults = UserDefaults(suiteName: Bundle.main.appGroupSuiteName) else {return nil}
-        
-        guard let encodedLatestReadings = sharedUserDefaults.data(forKey: "complicationSharedUserDefaults.\(Bundle.main.mainAppBundleIdentifier)") else {
-            return nil
+    func makeEntries(at date: Date) -> [XDripWatchComplication.Entry] {
+        let sharedUserDefaults = UserDefaults(suiteName: Bundle.main.appGroupSuiteName)
+        let encoded = sharedUserDefaults?.data(forKey: "complicationSharedUserDefaults.\(Bundle.main.mainAppBundleIdentifier)")
+        guard let data = ComplicationSharedUserDefaultsModel.decodeStoredData(encoded) else {
+            return [Entry(date: date, widgetState: Entry.WidgetState())]
         }
-        
-        let decoder = JSONDecoder()
 
-        do {
-            let data = try decoder.decode(ComplicationSharedUserDefaultsModel.self, from: encodedLatestReadings)
-            
-            // because dates aren't Codable we stored them as doubles
-            // we need to convert the bgReadingDatesAsDouble key values to an array of real dates
-            let bgReadingDates: [Date] = data.bgReadingDatesAsDouble.map { date in
-                Date(timeIntervalSince1970: date)
-            }
-            
-            return Entry.WidgetState(bgReadingValues: data.bgReadingValues, bgReadingDates: bgReadingDates, isMgDl: data.isMgDl, slopeOrdinal: data.slopeOrdinal, deltaValueInUserUnit: data.deltaValueInUserUnit, urgentLowLimitInMgDl: data.urgentLowLimitInMgDl, lowLimitInMgDl: data.lowLimitInMgDl, highLimitInMgDl: data.highLimitInMgDl, urgentHighLimitInMgDl: data.urgentHighLimitInMgDl, keepAliveIsDisabled: data.keepAliveIsDisabled)
-        } catch {
-            print(error.localizedDescription)
-        }
-              
-        return sampleWidgetStateFromProvider
-    }
-    
-    private var sampleWidgetStateFromProvider: XDripWatchComplication.Entry.WidgetState {        
-        return Entry.WidgetState(bgReadingValues: ConstantsWatchComplication.bgReadingValuesPlaceholderData, bgReadingDates: ConstantsWatchComplication.bgReadingDatesPlaceholderData(), isMgDl: true, slopeOrdinal: 4, deltaValueInUserUnit: 0, urgentLowLimitInMgDl: 70, lowLimitInMgDl: 90, highLimitInMgDl: 140, urgentHighLimitInMgDl: 180)
+        let bgReadingDates = data.bgReadingDatesAsDouble.map { Date(timeIntervalSince1970: $0) }
+        let widgetState = Entry.WidgetState(bgReadingValues: data.bgReadingValues, bgReadingDates: bgReadingDates, isMgDl: data.isMgDl, slopeOrdinal: data.slopeOrdinal, deltaValueInUserUnit: data.deltaValueInUserUnit, urgentLowLimitInMgDl: data.urgentLowLimitInMgDl, lowLimitInMgDl: data.lowLimitInMgDl, highLimitInMgDl: data.highLimitInMgDl, urgentHighLimitInMgDl: data.urgentHighLimitInMgDl, keepAliveIsDisabled: data.keepAliveIsDisabled, readingSource: data.readingSource, readingExpiresAt: data.readingExpiresAt)
+        return data.timelineDates(startingAt: date).map { Entry(date: $0, widgetState: widgetState) }
     }
 }

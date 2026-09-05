@@ -691,10 +691,18 @@ enum TroubleshootingAlertActivity: Codable, Equatable {
 /// A closed list of optional destinations whose sharing result can be exposed safely.
 enum TroubleshootingIntegration: String, Codable {
     case nightscout
+    case nightscoutGlucose
+    case nightscoutCalibration
+    case nightscoutTreatments
+    case nightscoutDeviceStatus
+    case nightscoutProfile
+    case nightscoutAuth
     case nightscoutImport
     case nightscoutBackfill
     case healthKit
     case watch
+    case watchStatus
+    case watchConnectivity
     case liveActivity
     case calendar
     case contactImage
@@ -703,10 +711,18 @@ enum TroubleshootingIntegration: String, Codable {
     var name: String {
         switch self {
         case .nightscout: return "Nightscout"
+        case .nightscoutGlucose: return "Nightscout glucose"
+        case .nightscoutCalibration: return "Nightscout calibration"
+        case .nightscoutTreatments: return "Nightscout treatments"
+        case .nightscoutDeviceStatus: return "Nightscout device status"
+        case .nightscoutProfile: return "Nightscout profile"
+        case .nightscoutAuth: return "Nightscout authorization"
         case .nightscoutImport: return "Nightscout import"
         case .nightscoutBackfill: return "Nightscout backfill"
         case .healthKit: return "Apple Health"
         case .watch: return "Apple Watch"
+        case .watchStatus: return "iPhone-to-Watch status/graph delivery"
+        case .watchConnectivity: return "iPhone-Watch WatchConnectivity activation"
         case .liveActivity: return "Live Activity"
         case .calendar: return "Calendar sharing"
         case .contactImage: return "Contact Image"
@@ -762,6 +778,7 @@ enum TroubleshootingLogKind: Codable, Equatable {
     case sensorHealthAlert(TroubleshootingSensorHealthAlert)
     /// Hourly aggregate reception quality without transmitter identity or packet contents.
     case transmitterReadSuccess(percent: Int, missedReadings: Int, expectedReadings: Int, windowHours: Int)
+    case sensorCoverage(percent: Int, expected: Int, actual: Int, sourceInterval: Int, timely: Int, delayed: Int)
     /// An accepted calibration value and the optional guidance snapshot shown at submission time.
     ///
     /// Readiness is optional so entries written by older builds and the legacy notification prompt
@@ -780,6 +797,104 @@ enum TroubleshootingLogKind: Codable, Equatable {
     case glucoseManagement(TroubleshootingGlucoseManagementActivity)
     /// A completed treatment change with no dose, note, account name or server identifier.
     case treatment(TroubleshootingTreatmentActivity)
+    case watchDiagnostic(TroubleshootingWatchDiagnostic)
+}
+
+/// Explicit projection for the shareable export. Never include localized errors, raw
+/// peripheral names, sensor bytes, server URLs or arbitrary diagnostic text.
+struct TroubleshootingWatchDiagnostic: Codable, Equatable {
+    let eventID: UUID?
+    let kind: LibreWatchDiagnosticEventKind
+    let watchTime: Date?
+    let build: Int?
+    let commit: String?
+    let watchOS: String?
+    let installationID: UUID?
+    let sessionID: UUID?
+    let owner: LibreWatchOwnership?
+    let sequence: UInt64?
+    let scene: LibreWatchApplicationState?
+    let runtime: Bool?
+    let runtimeInvalidationReason: Int?
+    let bluetoothErrorClassification: String?
+    let source: LibreWatchRecoveryReconcileSource?
+    let peripheral: String?
+    let phase: String?
+    let action: String?
+    let trigger: String?
+    let reason: String?
+    let generation: UUID?
+    let attempt: UUID?
+    let attemptStarted: Date?
+    let isReconnecting: Bool?
+    let errorDomain: String?
+    let errorCode: Int?
+    let unlockCounter: UInt16?
+    let technicalFrameAt: Date?
+    let measuredAt: Date?
+    let remainingBudget: TimeInterval?
+    let deadline: Date?
+    let rotated: UInt64?
+    let unacknowledgedRotated: UInt64?
+    let alarmSettingsRevision: UInt64?
+    let alarmEnabledKinds: [Int]?
+    let alarmSnoozeAllUntil: Date?
+    let alarmSnoozes: [Int: Date]?
+    let alarmNotificationsAuthorized: Bool?
+    let alarmDelegatedToWatch: Bool?
+
+    init(_ event: LibreWatchDiagnosticEvent) {
+        eventID = event.eventID
+        kind = event.kind
+        watchTime = event.watchTimestamp
+        build = event.appBuild.flatMap(Int.init)
+        let hex = CharacterSet(charactersIn: "0123456789abcdefABCDEF")
+        commit = event.appCommit.flatMap { value in
+            (7 ... 40).contains(value.count) && value.unicodeScalars.allSatisfy(hex.contains) ? value : nil
+        }
+        watchOS = event.watchOSVersion.flatMap {
+            $0.range(of: "^Version [0-9]{1,3}\\.[0-9]{1,3}(\\.[0-9]{1,3})? \\(Build [0-9A-Za-z]{1,16}\\)$", options: .regularExpression) != nil ? $0 : nil
+        }
+        installationID = event.installationID
+        sessionID = event.sessionID
+        owner = event.ownership
+        sequence = event.sequenceNumber
+        scene = event.applicationState
+        runtime = event.extendedRuntimeIsRunning
+        runtimeInvalidationReason = event.runtimeInvalidationReason
+        bluetoothErrorClassification = Self.allow(event.bluetoothErrorClassification,
+            in: ["backgroundBudgetNear", "backgroundBudgetExceeded", "recoverBluetoothLink"])
+        source = event.reconcileSource
+        peripheral = Self.allow(event.peripheralState, in: ["connected", "connecting", "disconnected", "disconnecting"])
+        phase = Self.allow(event.connectionPhase, in: ["idle", "connection", "services", "characteristics", "notifications", "unlock", "receiving", "cancelling"])
+        action = Self.allow(event.bluetoothAction, in: ["scan", "connect", "cancel", "discoverServices", "discoverCharacteristics", "setNotifyValue", "unlockRequested", "unlockCompleted"])
+        let causes: Set<String> = ["observedLinkState", "didFailToConnect", "didConnect", "didDisconnect", "didDisconnectLegacy", "didDisconnectModern", "didDiscoverServices", "didDiscoverCharacteristics", "didUpdateNotificationState", "didWriteUnlock", "didUpdateValue", "validBLEFrame", "invalidFrames", "noData", "setupOrBluetoothError", "returnAwaitingDisconnection", "extendedRuntimeWillExpire", "extendedRuntimeInvalidated", "exactNFCConfirmedSensor", "confirmedPeripheral", "notificationSubscriptionReady", "writeAcknowledged", "controlledRecovery", "returnToPhone", "ownershipStopped", "unexpectedPeripheralConnected", "connectionArrivedDuringCancellation", "connectionIdentityOrOwnershipMismatch", "notCurrentPeripheral", "retiredPeripheral", "notCurrentPeripheralOrPendingLegacy", "staleGenerationOrLinkRecovered", "staleSetupGenerationOrPhase", "staleSetupGenerationOrService", "staleCharacteristicOrSetupPhase", "staleCharacteristicGenerationOrOwnership", "willRestoreState", "disconnect", "connectionTimeout", "setupTimeout"]
+        trigger = Self.allow(event.trigger, in: causes)
+        reason = Self.allow(event.actionReason, in: causes)
+        generation = event.generation
+        attempt = event.attemptID
+        attemptStarted = event.attemptStartedAt
+        isReconnecting = event.isReconnecting
+        errorDomain = event.errorDomain.map { ["CBErrorDomain", "CBATTErrorDomain", "WKErrorDomain"].contains($0) ? $0 : "other" }
+        errorCode = event.errorCode
+        unlockCounter = event.unlockCounter
+        technicalFrameAt = event.technicalFrameAt
+        measuredAt = event.measurementAt
+        remainingBudget = event.remainingExecutionBudget.flatMap { $0.isFinite && $0 >= 0 ? $0 : nil }
+        deadline = event.deadlineAt
+        rotated = event.journalDroppedCount
+        unacknowledgedRotated = event.journalUnacknowledgedDropCount
+        alarmSettingsRevision = event.alarmSettingsRevision
+        alarmEnabledKinds = event.alarmEnabledKinds.map { Array(Set($0.filter { (0 ... 4).contains($0) })).sorted() }
+        alarmSnoozeAllUntil = event.alarmSnoozeAllUntil
+        alarmSnoozes = event.alarmSnoozes.map { $0.filter { (0 ... 4).contains($0.key) } }
+        alarmNotificationsAuthorized = event.alarmNotificationsAuthorized
+        alarmDelegatedToWatch = event.alarmDelegatedToWatch
+    }
+
+    private static func allow(_ value: String?, in choices: Set<String>) -> String? {
+        value.flatMap { choices.contains($0) ? $0 : nil }
+    }
 }
 
 /// One immutable record in the consumer troubleshooting history.
@@ -787,22 +902,48 @@ enum TroubleshootingLogKind: Codable, Equatable {
 /// `kind` is the complete payload: there is intentionally no free-form message, metadata dictionary
 /// or `Error` field. Adding one of those would allow private developer-trace data into a report that
 /// users are encouraged to share publicly. Add a new typed case instead when new information is needed.
+struct TroubleshootingLogProvenance: Codable, Equatable {
+    let version: String
+    let build: String?
+    let commit: String?
+    let installationID: UUID
+
+    static let current: Self = {
+        let info = Bundle.main.infoDictionary ?? [:]
+        let sha = info["XDripSourceCommit"] as? String
+        let validatedSHA = sha.flatMap { value in
+            value.count == 40 && value.allSatisfy(\.isHexDigit) ? value.lowercased() : nil
+        }
+        return Self(version: info["CFBundleShortVersionString"] as? String ?? "unknown",
+                    build: info["CFBundleVersion"] as? String, commit: validatedSHA,
+                    installationID: LibreWatchSessionStore.installationID())
+    }()
+
+    var reportText: String {
+        "version=\(version) build=\(build ?? "unknown") SHA=\(commit ?? "unknown") installation=\(installationID.uuidString)"
+    }
+}
+
 struct TroubleshootingLogEntry: Codable, Equatable, Identifiable {
     let id: UUID
     let timestamp: Date
     let level: TroubleshootingLogLevel
     let kind: TroubleshootingLogKind
+    /// Missing on legacy records: never attribute those records to the build exporting them.
+    let provenance: TroubleshootingLogProvenance?
 
     init(
         id: UUID = UUID(),
         timestamp: Date = Date(),
         level: TroubleshootingLogLevel,
-        kind: TroubleshootingLogKind
+        kind: TroubleshootingLogKind,
+        provenance: TroubleshootingLogProvenance? = .current
     ) {
         self.id = id
         self.timestamp = timestamp
         self.level = level
         self.kind = kind
+        self.provenance = provenance
     }
 
     /// Creates a primary troubleshooting fact, such as a reading or user-visible failure.
@@ -824,7 +965,7 @@ struct TroubleshootingLogEntry: Codable, Equatable, Identifiable {
     /// Preserves the identity, time and diagnostic level while replacing a generic healthy outcome
     /// with the more useful recovery milestone derived by the store's signal policy.
     func replacingKind(_ kind: TroubleshootingLogKind) -> TroubleshootingLogEntry {
-        TroubleshootingLogEntry(id: id, timestamp: timestamp, level: level, kind: kind)
+        TroubleshootingLogEntry(id: id, timestamp: timestamp, level: level, kind: kind, provenance: provenance)
     }
 }
 
@@ -846,11 +987,11 @@ final class TroubleshootingLogStore {
     /// is reached first wins, and pruning always removes the oldest records before newer context.
     // Twenty-four hours gives support conversations enough context to include an overnight period.
     // Five thousand entries accommodates 2,880 half-minute heartbeats plus 1,440 one-minute glucose
-    // readings with room for lifecycle and failure rows. The 1 MiB byte cap remains a firm safety
-    // boundary even if a future typed record encodes less compactly than today's entries.
+    // readings with room for lifecycle and failure rows. The 2 MiB byte cap preserves this
+    // existing 24-hour envelope with immutable per-record build/installation provenance.
     static let retentionPeriod: TimeInterval = 24 * 60 * 60
     static let maximumEntryCount = 5_000
-    static let maximumFileSize = 1_024 * 1_024
+    static let maximumFileSize = 2 * 1_024 * 1_024
     static let hourlyDiagnosticInterval: TimeInterval = 60 * 60
 
     private let fileURL: URL
@@ -918,6 +1059,34 @@ final class TroubleshootingLogStore {
     func record(_ entry: TroubleshootingLogEntry) {
         queue.async { [weak self] in
             self?.recordOnQueue(entry)
+        }
+    }
+
+    /// The Watch keeps its journal item until this asynchronous persistence acknowledgement.
+    /// Stable event IDs also cover the crash window before the phone receipt ledger is saved.
+    func recordWatchDiagnostic(_ diagnostic: TroubleshootingWatchDiagnostic, receivedAt: Date,
+                               completion: @escaping (Bool) -> Void) {
+        queue.async { [weak self] in
+            guard let self else {
+                DispatchQueue.main.async { completion(false) }
+                return
+            }
+            self.prepareCacheOnQueue()
+            let alreadyPresent = self.cachedEntries?.contains {
+                if case let .watchDiagnostic(stored) = $0.kind,
+                   let id = diagnostic.eventID { return stored.eventID == id }
+                return false
+            } ?? false
+            if !alreadyPresent {
+                self.recordOnQueue(.detailed(.watchDiagnostic(diagnostic), timestamp: receivedAt))
+            } else if self.persistenceNeedsRewrite {
+                self.persistenceNeedsRewrite = !self.rewriteOnQueue(self.cachedEntries ?? [])
+            }
+            let stored = !self.persistenceNeedsRewrite && (self.cachedEntries?.contains {
+                if case let .watchDiagnostic(value) = $0.kind { return value.eventID == diagnostic.eventID }
+                return false
+            } ?? false)
+            DispatchQueue.main.async { completion(stored) }
         }
     }
 
@@ -1285,7 +1454,7 @@ final class TroubleshootingLogStore {
                 // measurement was retained or external presentation remains intentionally delayed.
                 result.append(entry)
 
-            case .transmitterReadSuccess:
+            case .transmitterReadSuccess, .sensorCoverage:
                 // The producer already calculates this at most hourly. Keep the store-side boundary
                 // as well so force-closing and reopening the app cannot create several near-identical
                 // reception summaries inside one hour.
@@ -1435,7 +1604,7 @@ final class TroubleshootingLogStore {
                 // Each calibration is a discrete user action and must remain independently visible.
                 result.append(entry)
 
-            case .heartbeatReceived, .configuration, .dataManagement, .glucoseManagement, .treatment:
+            case .heartbeatReceived, .configuration, .dataManagement, .glucoseManagement, .treatment, .watchDiagnostic:
                 // Each heartbeat is evidence that the transmitter/app link was alive at that moment.
                 // Configuration, reading-management and treatment rows are explicit user changes.
                 // None is timer-derived polling noise, so every occurrence is meaningful and retained
@@ -1552,7 +1721,8 @@ final class TroubleshootingLogStore {
 /// A fresh, human-readable snapshot of non-secret app configuration placed above every report.
 ///
 /// This information is generated when the viewer reloads and is never written to the JSON-lines
-/// history. It intentionally omits the build number, account details, endpoint URLs and hardware IDs.
+/// history. It omits account details, endpoint URLs and hardware IDs. The random installation ID
+/// is not a hardware identifier, and original event build metadata stays on the event itself.
 struct TroubleshootingLogAppInfo: Equatable {
     /// Stable source-project identity used as the report title. `appName` remains separate because
     /// the installed target's bundle display name can intentionally use different branding and
@@ -1569,6 +1739,7 @@ struct TroubleshootingLogAppInfo: Equatable {
     let keepAliveDescription: String?
     let processingLines: [String]
     let integrationLines: [String]
+    var provenance: TroubleshootingLogProvenance? = nil
 
     /// Reads current settings so a report reflects configuration changes made after older entries.
     static func current(
@@ -1661,7 +1832,8 @@ struct TroubleshootingLogAppInfo: Equatable {
                 "Live Activity: \(defaults.liveActivityType.debugDescription)",
                 "Calendar sharing: \(defaults.createCalendarEvent ? "Enabled" : "Disabled")",
                 "OS-AID sharing: \(osAidDescription)"
-            ]
+            ],
+            provenance: .current
         )
     }
 }
@@ -1709,6 +1881,10 @@ struct TroubleshootingLogReportBuilder {
         if let dexcomBluetoothChannel = appInfo.dexcomBluetoothChannelDescription {
             lines.append("Dexcom Bluetooth channel: \(dexcomBluetoothChannel)")
         }
+        if let provenance = appInfo.provenance {
+            lines.append("Exporting iPhone: " + provenance.reportText)
+            lines.append("Settings below apply at export; rolling history may include older builds and backfill.")
+        }
         if let keepAlive = appInfo.keepAliveDescription {
             lines.append("Background keep-alive: \(keepAlive)")
         }
@@ -1730,6 +1906,7 @@ struct TroubleshootingLogReportBuilder {
         }
 
         var previousDay: Date?
+        var previousProvenance: TroubleshootingLogProvenance?
         let calendar = Calendar.current
         for entry in entries {
             let day = calendar.startOfDay(for: entry.timestamp)
@@ -1737,6 +1914,10 @@ struct TroubleshootingLogReportBuilder {
                 lines.append("")
                 lines.append(Self.dayFormatter(timeZone: timeZone).string(from: entry.timestamp))
                 previousDay = day
+            }
+            if previousProvenance != entry.provenance {
+                lines.append("Recorded on iPhone: " + (entry.provenance?.reportText ?? "original build unavailable (legacy event)"))
+                previousProvenance = entry.provenance
             }
             lines.append("\(Self.timeFormatter(timeZone: timeZone).string(from: entry.timestamp))  \(message(for: entry))")
         }
@@ -1749,6 +1930,41 @@ struct TroubleshootingLogReportBuilder {
     /// payload cannot become shareable until its privacy and wording have been considered explicitly.
     func message(for entry: TroubleshootingLogEntry) -> String {
         switch entry.kind {
+        case let .watchDiagnostic(event):
+            let time: (Date?) -> String = { $0.map { self.measurementTimeText($0, recordedAt: entry.timestamp) } ?? "unknown" }
+            var fields = [
+                "Watch-Libre \(event.kind.rawValue)",
+                "watchTime=\(time(event.watchTime))", "receiptTime=\(time(entry.timestamp))",
+                "build=\(event.build.map(String.init) ?? "unknown")", "SHA=\(event.commit ?? "unknown")",
+                "installation=\(event.installationID?.uuidString ?? "unknown")",
+                "session=\(event.sessionID?.uuidString ?? "unknown")", "owner=\(event.owner?.rawValue ?? "unknown")",
+                "sequence=\(event.sequence.map(String.init) ?? "unknown")",
+                "scene=\(event.scene?.rawValue ?? "unknown")", "runtime=\(event.runtime.map(String.init) ?? "unknown")",
+                "source=\(event.source?.rawValue ?? "unknown")", "peripheral=\(event.peripheral ?? "unknown")",
+                "phase=\(event.phase ?? "unknown")", "trigger=\(event.trigger ?? "unknown")"
+            ]
+            if let action = event.action { fields.append("action=\(action)") }
+            if let watchOS = event.watchOS { fields.append("watchOS=\(watchOS)") }
+            if let reason = event.runtimeInvalidationReason { fields.append("runtimeInvalidationReason=\(reason)") }
+            if let classification = event.bluetoothErrorClassification { fields.append("bluetoothErrorClass=\(classification)") }
+            if let reason = event.reason { fields.append("reason=\(reason)") }
+            if let generation = event.generation { fields.append("generation=\(generation.uuidString)") }
+            if let attempt = event.attempt { fields.append("attempt=\(attempt.uuidString) started=\(time(event.attemptStarted))") }
+            if let reconnecting = event.isReconnecting { fields.append("systemReconnecting=\(reconnecting)") }
+            if let code = event.errorCode { fields.append("error=\(event.errorDomain ?? "unknown")/\(code)") }
+            if let counter = event.unlockCounter { fields.append("unlockCounter=\(counter)") }
+            fields.append("technicalFrame=\(time(event.technicalFrameAt)) measurement=\(time(event.measuredAt))")
+            if let budget = event.remainingBudget { fields.append("executionBudget=\(String(format: "%.1f", budget))s deadline=\(time(event.deadline))") }
+            fields.append("journalRotated=\(event.rotated ?? 0) unacknowledgedRotated=\(event.unacknowledgedRotated ?? 0)")
+            if let revision = event.alarmSettingsRevision {
+                let authorized = event.alarmNotificationsAuthorized.map(String.init) ?? "unknown"
+                let authority = event.alarmDelegatedToWatch.map(String.init) ?? "unknown"
+                fields.append("alarmRevision=\(revision) enabledKinds=\(event.alarmEnabledKinds ?? []) authorized=\(authorized) watchAuthority=\(authority) snoozeAllUntil=\(time(event.alarmSnoozeAllUntil))")
+                for (kind, until) in (event.alarmSnoozes ?? [:]).sorted(by: { $0.key < $1.key }) {
+                    fields.append("alarmSnooze[\(kind)]=\(time(until))")
+                }
+            }
+            return fields.joined(separator: "; ")
         case let .app(activity):
             switch activity {
             case .started: return "App started."
@@ -1872,6 +2088,9 @@ struct TroubleshootingLogReportBuilder {
             case .dexcomTransmitterBatteryFailure:
                 return "Dexcom reported a transmitter battery failure."
             }
+
+        case let .sensorCoverage(percent, expected, actual, interval, timely, delayed):
+            return "Stored sensor coverage including backfill: \(percent)% (\(actual)/\(expected)); configured acquisition \(interval)s. Phone storage with known timing: \(timely) within 3 minutes, \(delayed) delayed/backfilled. Rolling window may span builds; this is not isolated-build BLE stability."
 
         case let .transmitterReadSuccess(percent, missedReadings, expectedReadings, windowHours):
             let window: String

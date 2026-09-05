@@ -21,6 +21,19 @@ enum GlucoseReadingInsertionPolicy {
     }
 }
 
+enum LibreWatchStoredReadingPolicy {
+    static func outcome(isValid: Bool, calculatedValue: Double) -> LibreWatchDeliveryOutcome {
+        if isValid { return .duplicate }
+        // Zero can mean calibration is not yet ready. A completed internal error is a
+        // permanent rejection, not an endlessly retryable successful storage receipt.
+        return calculatedValue == 0 ? .historyNotInserted : .invalidPayload
+    }
+
+    static func requiresHistoricalPath(measuredAt: Date, latestStoredAt: Date?) -> Bool {
+        latestStoredAt.map { measuredAt <= $0 } ?? false
+    }
+}
+
 class BgReadingsAccessor: ObservableObject {
 
     // MARK: - Properties
@@ -299,7 +312,7 @@ class BgReadingsAccessor: ObservableObject {
     ///
     /// This can optionally filter by Sensor relationship, but callers that represent a physical
     /// sensor session should prefer passing nil and clamping `fromDate` to the sensor start date.
-    func getReadingTimestamps(fromDate: Date, toDate: Date, forSensor sensor: Sensor?) -> [Date] {
+    func getReadingTimestamps(fromDate: Date, toDate: Date, forSensor sensor: Sensor?, onlyValidated: Bool = false) -> [Date] {
         var timestamps: [Date] = []
 
         coreDataManager.mainManagedObjectContext.performAndWait {
@@ -327,6 +340,7 @@ class BgReadingsAccessor: ObservableObject {
                 let results = try fetchRequest.execute()
                 timestamps.reserveCapacity(results.count)
                 for reading in results {
+                    if onlyValidated && !reading.isValidForDownstream { continue }
                     timestamps.append(reading.timeStamp)
                 }
             } catch {

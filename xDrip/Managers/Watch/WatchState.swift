@@ -43,6 +43,7 @@ struct WatchStatus: WatchPayload {
     var keepAliveIsDisabled: Bool = false
 
     var aidStatus: AIDStatus?
+    var libreAlarmSettings: LibreWatchAlarmSettings?
 }
 
 /// current BG chart data used to manage watch views
@@ -73,4 +74,294 @@ struct WatchAGP: WatchPayload {
     var medianValues: [Double] = []
     var p75Values: [Double] = []
     var p95Values: [Double] = []
+}
+
+/// Actual alert schedules from iPhone; chart colours are deliberately not inputs.
+enum LibreWatchAlarmKind: Int, Codable, CaseIterable {
+    case veryLow = 0, low = 1, high = 2, veryHigh = 3, missed = 4
+
+    var snoozeGroup: [Self] {
+        switch self {
+        case .veryLow, .low: return [.veryLow, .low]
+        case .veryHigh, .high: return [.veryHigh, .high]
+        case .missed: return [.missed]
+        }
+    }
+}
+
+struct LibreWatchAlarmRule: Codable, Equatable {
+    let kind: LibreWatchAlarmKind
+    let startMinute: Int
+    let value: Double
+    let enabled: Bool
+    let snoozeMinutes: Int
+    let allowsSnooze: Bool
+    let soundEnabled: Bool
+    let vibrate: Bool
+    let title: String
+}
+
+struct LibreWatchAlarmSnooze: Codable, Equatable {
+    let kind: LibreWatchAlarmKind
+    let until: Date
+}
+
+struct LibreWatchAlarmAutomaticThrottle: Codable, Equatable {
+    let kind: LibreWatchAlarmKind
+    let readingID: UUID
+    let until: Date
+}
+
+struct LibreWatchAlarmSettings: Codable, Equatable {
+    let sessionID: UUID
+    let sensorIdentity: String
+    var revision: UInt64
+    var generatedAt: Date
+    let isMgDl: Bool
+    let rules: [LibreWatchAlarmRule]
+    let snoozes: [LibreWatchAlarmSnooze]
+    let snoozeAllUntil: Date?
+
+    func matches(_ session: LibreWatchDirectSession) -> Bool {
+        sessionID == session.id && sensorIdentity == session.redactedIdentity() &&
+            revision > 0 && rules.allSatisfy {
+                (0..<1440).contains($0.startMinute) && $0.value.isFinite &&
+                    (!$0.enabled || $0.value > 0) && $0.snoozeMinutes >= 0
+            }
+    }
+
+    func sameConfiguration(as other: Self) -> Bool {
+        sessionID == other.sessionID && sensorIdentity == other.sensorIdentity &&
+            isMgDl == other.isMgDl && rules == other.rules &&
+            snoozes == other.snoozes && snoozeAllUntil == other.snoozeAllUntil
+    }
+
+    func readinessRevision(notificationsAuthorized: Bool) -> UInt64? {
+        notificationsAuthorized || !rules.contains(where: \.enabled) ? revision : nil
+    }
+
+    func rule(for kind: LibreWatchAlarmKind, at date: Date, calendar: Calendar = .current) -> LibreWatchAlarmRule? {
+        let minute = calendar.component(.hour, from: date) * 60 + calendar.component(.minute, from: date)
+        let schedule = rules.filter { $0.kind == kind }.sorted { $0.startMinute < $1.startMinute }
+        return schedule.last(where: { $0.startMinute <= minute }) ?? schedule.last
+    }
+}
+
+struct LibreWatchAlarmDelegation: Codable, Equatable {
+    let sessionID: UUID
+    let sensorIdentity: String
+    let settingsRevision: UInt64
+    var enabledKinds: [LibreWatchAlarmKind]? = nil
+
+    static func confirmed(for settings: LibreWatchAlarmSettings) -> Self {
+        Self(sessionID: settings.sessionID, sensorIdentity: settings.sensorIdentity,
+            settingsRevision: settings.revision,
+            enabledKinds: LibreWatchAlarmKind.allCases.filter { kind in
+                settings.rules.contains { $0.kind == kind && $0.enabled }
+            })
+    }
+
+    func covers(_ kind: LibreWatchAlarmKind) -> Bool {
+        enabledKinds?.contains(kind) == true
+    }
+
+    func matches(_ settings: LibreWatchAlarmSettings) -> Bool {
+        sessionID == settings.sessionID && sensorIdentity == settings.sensorIdentity &&
+            settingsRevision == settings.revision && enabledKinds == Self.confirmed(for: settings).enabledKinds
+    }
+}
+
+struct LibreWatchAlarmState: Codable, Equatable {
+    var sessionID: UUID?
+    var sensorIdentity: String?
+    var lastReadingID: UUID?
+    var lastReadingAt: Date?
+    var snoozes: [LibreWatchAlarmSnooze] = []
+    var scheduledMissedID: String?
+    var scheduledMissedAt: Date?
+    var scheduledMissedConfirmed: Bool?
+    var automaticThrottle: LibreWatchAlarmAutomaticThrottle?
+
+    mutating func use(_ settings: LibreWatchAlarmSettings) {
+        guard sessionID != settings.sessionID || sensorIdentity != settings.sensorIdentity else { return }
+        self = Self(sessionID: settings.sessionID, sensorIdentity: settings.sensorIdentity)
+    }
+
+    func snoozedUntil(_ kind: LibreWatchAlarmKind, settings: LibreWatchAlarmSettings) -> Date {
+        (snoozes + settings.snoozes).filter { kind.snoozeGroup.contains($0.kind) }.map(\.until).max() ?? .distantPast
+    }
+
+    mutating func snooze(_ kind: LibreWatchAlarmKind, until: Date) {
+        // Explicit snooze must invalidate even an equal/shorter automatic expiry.
+        automaticThrottle = nil
+        for item in kind.snoozeGroup {
+            let previous = snoozes.first(where: { $0.kind == item })?.until ?? .distantPast
+            snoozes.removeAll { $0.kind == item }
+            snoozes.append(LibreWatchAlarmSnooze(kind: item, until: max(previous, until)))
+        }
+    }
+
+    mutating func recordAutomaticThrottle(_ kind: LibreWatchAlarmKind, readingID: UUID, until: Date) {
+        snooze(kind, until: until)
+        automaticThrottle = LibreWatchAlarmAutomaticThrottle(kind: kind, readingID: readingID, until: until)
+    }
+
+    mutating func acknowledgePhoneSnoozes(_ settings: LibreWatchAlarmSettings) {
+        guard sessionID == settings.sessionID, sensorIdentity == settings.sensorIdentity else { return }
+        // Once the phone has stored an equal/later expiry it becomes authoritative again.
+        // A subsequent explicit phone Unsnooze must not be hidden by an old local overlay.
+        snoozes.removeAll { local in
+            settings.snoozes.contains { $0.kind == local.kind && $0.until >= local.until }
+        }
+    }
+
+    func glucoseNotificationIsCurrent(
+        readingID: UUID, rule: LibreWatchAlarmRule, submittedSettings: LibreWatchAlarmSettings,
+        currentSettings: LibreWatchAlarmSettings?, delegation: LibreWatchAlarmDelegation?,
+        watchOwnsSensor: Bool, notificationsAuthorized: Bool, now: Date
+    ) -> Bool {
+        guard watchOwnsSensor, notificationsAuthorized,
+              let currentSettings, currentSettings == submittedSettings,
+              delegation?.matches(currentSettings) == true,
+              sessionID == currentSettings.sessionID, sensorIdentity == currentSettings.sensorIdentity,
+              lastReadingID == readingID, let lastReadingAt, now.timeIntervalSince(lastReadingAt) <= 180,
+              (currentSettings.snoozeAllUntil ?? .distantPast) <= now,
+              snoozedUntil(rule.kind, settings: currentSettings) <= now,
+              currentSettings.rule(for: rule.kind, at: now) == rule
+        else { return false }
+        return rule.enabled
+    }
+
+    /// Do not re-alert a confirmed, already-due notification simply because the user dismissed
+    /// it. Recover a crash between persisting intent and OS acceptance, or a missing future item.
+    func shouldRestoreMissingMissedNotification(at now: Date) -> Bool {
+        scheduledMissedID != nil &&
+            (scheduledMissedConfirmed != true || (scheduledMissedAt ?? .distantPast) > now)
+    }
+
+    func notificationMayBePresented(
+        kind: LibreWatchAlarmKind, notificationSessionID: String, notificationReadingID: UUID?,
+        settings: LibreWatchAlarmSettings?, delegation: LibreWatchAlarmDelegation?,
+        watchOwnsSensor: Bool, notificationsAuthorized: Bool, at date: Date
+    ) -> Bool {
+        guard watchOwnsSensor, notificationsAuthorized, let settings,
+              notificationSessionID == settings.sessionID.uuidString,
+              sessionID == settings.sessionID, sensorIdentity == settings.sensorIdentity,
+              let notificationReadingID, notificationReadingID == lastReadingID,
+              delegation?.matches(settings) == true,
+              (settings.snoozeAllUntil ?? .distantPast) <= date,
+              settings.rule(for: kind, at: date)?.enabled == true
+        else { return false }
+        if kind != .missed {
+            guard let lastReadingAt, date.timeIntervalSince(lastReadingAt) <= 180 else { return false }
+        }
+        let snoozeExpiry = snoozedUntil(kind, settings: settings)
+        if snoozeExpiry > date {
+            guard let automaticThrottle, kind.snoozeGroup.contains(automaticThrottle.kind),
+                  automaticThrottle.readingID == notificationReadingID,
+                  automaticThrottle.until == snoozeExpiry
+            else { return false }
+        }
+        // Missing-reading alarms deliberately retain the old measurement timestamp.
+        // Only this exact glucose notification may pass its own automatic throttle.
+        return true
+    }
+
+    /// Called only for an accepted *new direct* reading, never for graph/backfill updates.
+    mutating func accept(
+        id: UUID, measuredAt: Date, glucose: Double,
+        settings: LibreWatchAlarmSettings, delegation: LibreWatchAlarmDelegation?,
+        watchOwnsSensor: Bool, now: Date, calendar: Calendar = .current
+    ) -> LibreWatchAlarmRule? {
+        guard watchOwnsSensor, delegation?.matches(settings) == true,
+              sessionID == settings.sessionID, sensorIdentity == settings.sensorIdentity,
+              glucose.isFinite, glucose > 0,
+              measuredAt <= now.addingTimeInterval(20), now.timeIntervalSince(measuredAt) <= 180,
+              lastReadingID != id, measuredAt > (lastReadingAt ?? .distantPast)
+        else { return nil }
+        lastReadingID = id
+        lastReadingAt = measuredAt
+        guard (settings.snoozeAllUntil ?? .distantPast) <= now else { return nil }
+
+        for kind: LibreWatchAlarmKind in [.veryLow, .low, .veryHigh, .high] {
+            guard snoozedUntil(kind, settings: settings) <= now,
+                  let rule = settings.rule(for: kind, at: now, calendar: calendar), rule.enabled
+            else { continue }
+            let value = glucose.bgValueRounded(mgDl: settings.isMgDl)
+            let threshold = rule.value.bgValueRounded(mgDl: settings.isMgDl)
+            let needed = kind == .veryLow || kind == .low ? value < threshold : value > threshold
+            if needed { return rule }
+        }
+        return nil
+    }
+
+    /// One system-scheduled deadline; no background timer is needed to detect missing readings.
+    func nextMissedAlarm(
+        settings: LibreWatchAlarmSettings, delegation: LibreWatchAlarmDelegation?,
+        watchOwnsSensor: Bool, now: Date, calendar: Calendar = .current
+    ) -> (date: Date, rule: LibreWatchAlarmRule)? {
+        guard watchOwnsSensor, delegation?.matches(settings) == true,
+              sessionID == settings.sessionID, sensorIdentity == settings.sensorIdentity,
+              let lastReadingAt
+        else { return nil }
+        let rules = settings.rules.filter { $0.kind == .missed }.sorted { $0.startMinute < $1.startMinute }
+        guard !rules.isEmpty else { return nil }
+        let startOfDay = calendar.startOfDay(for: now)
+        for day in 0...1 {
+            guard let dayStart = calendar.date(byAdding: .day, value: day, to: startOfDay),
+                  let nextDay = calendar.date(byAdding: .day, value: 1, to: dayStart)
+            else { continue }
+            for (index, rule) in rules.enumerated() where rule.enabled {
+                let start = calendar.date(byAdding: .minute, value: rule.startMinute, to: dayStart)!
+                let end = index + 1 < rules.count
+                    ? calendar.date(byAdding: .minute, value: rules[index + 1].startMinute, to: dayStart)!
+                    : nextDay
+                let due = [now, start, lastReadingAt.addingTimeInterval(rule.value * 60),
+                           snoozedUntil(.missed, settings: settings), settings.snoozeAllUntil ?? .distantPast].max()!
+                if due < end { return (due, rule) }
+            }
+        }
+        return nil
+    }
+}
+
+enum LibreWatchAlarmStore {
+    private static let settingsKey = "libreWatchAlarmSettings.v1"
+    private static let stateKey = "libreWatchAlarmState.v1"
+    private static let delegationKey = "libreWatchAlarmDelegation.v1"
+
+    static func settings(defaults: UserDefaults = .standard) -> LibreWatchAlarmSettings? {
+        decode(LibreWatchAlarmSettings.self, key: settingsKey, defaults: defaults)
+    }
+    static func state(defaults: UserDefaults = .standard) -> LibreWatchAlarmState {
+        decode(LibreWatchAlarmState.self, key: stateKey, defaults: defaults) ?? LibreWatchAlarmState()
+    }
+    static func delegation(defaults: UserDefaults = .standard) -> LibreWatchAlarmDelegation? {
+        decode(LibreWatchAlarmDelegation.self, key: delegationKey, defaults: defaults)
+    }
+    static func save(_ settings: LibreWatchAlarmSettings, defaults: UserDefaults = .standard) {
+        encode(settings, key: settingsKey, defaults: defaults)
+    }
+    static func save(_ state: LibreWatchAlarmState, defaults: UserDefaults = .standard) {
+        encode(state, key: stateKey, defaults: defaults)
+    }
+    static func save(_ delegation: LibreWatchAlarmDelegation?, defaults: UserDefaults = .standard) {
+        if let delegation { encode(delegation, key: delegationKey, defaults: defaults) }
+        else { defaults.removeObject(forKey: delegationKey) }
+    }
+    static func clearSession(defaults: UserDefaults = .standard) {
+        [settingsKey, stateKey, delegationKey].forEach { defaults.removeObject(forKey: $0) }
+    }
+    private static func decode<T: Decodable>(_ type: T.Type, key: String, defaults: UserDefaults) -> T? {
+        guard let data = defaults.data(forKey: key) else { return nil }
+        return try? JSONDecoder().decode(type, from: data)
+    }
+    private static func encode<T: Encodable>(_ value: T, key: String, defaults: UserDefaults) {
+        guard let data = try? JSONEncoder().encode(value) else { return }
+        defaults.set(data, forKey: key)
+    }
+}
+
+extension Notification.Name {
+    static let libreWatchAlarmDelegationChanged = Notification.Name("libreWatchAlarmDelegationChanged")
 }

@@ -28,6 +28,11 @@ protocol CGMTransmitterDelegate:AnyObject {
         glucoseData: inout [GlucoseData],
         sensorID: String
     ) -> LibreWatchDeliveryOutcome
+
+    func liveWatchGlucoseReceived(glucoseData: inout [GlucoseData], sensorID: String,
+                                 sensorAge: TimeInterval) -> LibreWatchDeliveryOutcome
+    func confirmWatchGlucoseStorage(completion: @escaping (Bool) -> Void)
+    func watchGlucoseIsStored(payloadID: UUID, sensorID: String) -> Bool
     
     /// to pass some text error message, delegate can decide to show to user, log, ...
     func errorOccurred(xDripError: XdripError)
@@ -42,6 +47,11 @@ protocol CGMTransmitterDelegate:AnyObject {
 }
 
 extension CGMTransmitterDelegate {
+    func liveWatchGlucoseReceived(glucoseData: inout [GlucoseData], sensorID: String,
+                                 sensorAge: TimeInterval) -> LibreWatchDeliveryOutcome { .collectorUnavailable }
+    func confirmWatchGlucoseStorage(completion: @escaping (Bool) -> Void) { completion(false) }
+    func watchGlucoseIsStored(payloadID: UUID, sensorID: String) -> Bool { false }
+
     func historicalWatchGlucoseReceived(
         glucoseData: inout [GlucoseData],
         sensorID: String

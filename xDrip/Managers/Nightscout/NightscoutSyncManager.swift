@@ -3,6 +3,90 @@ import Foundation
 import os
 import UIKit
 
+/// HTTP 500/code 66 is not a batch acknowledgement. Reconcile each stable reading ID
+/// and retry only missing entries; a conflicting value or any failed request fails closed.
+enum NightscoutReadingConfirmation {
+    static func isDuplicateBatchFailure(status: Int, data: Data?) -> Bool {
+        guard status == 500, let data,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let description = json["description"] as? [String: Any]
+        else { return false }
+        return description["code"] as? Int == 66
+    }
+
+    static func matches(_ expected: [String: Any], _ stored: [String: Any]) -> Bool {
+        guard let id = expected["_id"] as? String, !id.isEmpty,
+              stored["_id"] as? String == id,
+              expected["type"] as? String == "sgv", stored["type"] as? String == "sgv",
+              let date = expected["date"] as? NSNumber,
+              let storedDate = stored["date"] as? NSNumber,
+              let glucose = expected["sgv"] as? NSNumber,
+              let storedGlucose = stored["sgv"] as? NSNumber
+        else { return false }
+        return date.doubleValue == storedDate.doubleValue &&
+            glucose.doubleValue == storedGlucose.doubleValue
+    }
+
+    static func reconcile(
+        _ readings: [[String: Any]],
+        isUploadAllowed: () async -> Bool = { true },
+        fetch: (String) async throws -> [[String: Any]],
+        upload: ([String: Any]) async -> Bool
+    ) async -> Bool {
+        guard !readings.isEmpty else { return false }
+        do {
+            for reading in readings {
+                guard await isUploadAllowed() else { return false }
+                guard let id = reading["_id"] as? String, !id.isEmpty,
+                      reading["type"] as? String == "sgv"
+                else { return false }
+                let existing = try await fetch(id)
+                if !existing.isEmpty {
+                    guard existing.count == 1, matches(reading, existing[0]) else { return false }
+                    continue
+                }
+                guard await isUploadAllowed(), await upload(reading) else { return false }
+                let confirmed = try await fetch(id)
+                guard confirmed.count == 1, matches(reading, confirmed[0]) else { return false }
+            }
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    static func checkpoint(current: Date?, confirmed: Date) -> Date {
+        max(current ?? .distantPast, confirmed)
+    }
+}
+
+struct NightscoutHistoricalQueue: Codable {
+    struct Entry: Codable, Equatable {
+        let id: String
+        let measuredAt: Date
+        let payload: Data
+    }
+    var siteFingerprint: String
+    private(set) var entries: [Entry] = []
+
+    mutating func enqueue(_ entry: Entry, now: Date) {
+        prune(at: now)
+        entries.removeAll { $0.id == entry.id }
+        guard now.timeIntervalSince(entry.measuredAt) <= 7 * 24 * 3600 else { return }
+        entries.append(entry)
+        entries.sort { $0.measuredAt < $1.measuredAt }
+        if entries.count > 10_080 { entries.removeFirst(entries.count - 10_080) }
+    }
+
+    mutating func confirm(_ confirmed: [Entry]) {
+        entries.removeAll { confirmed.contains($0) }
+    }
+
+    mutating func prune(at now: Date) {
+        entries.removeAll { now.timeIntervalSince($0.measuredAt) > 7 * 24 * 3600 }
+    }
+}
+
 public class NightscoutSyncManager: NSObject, ObservableObject {
     
     private struct NightscoutDeleteEntriesResponse: Decodable {
@@ -113,6 +197,11 @@ public class NightscoutSyncManager: NSObject, ObservableObject {
     private var bgReadingsReplacementBlocksDirectLiveUpload = false
     private var pendingDirectBgUploadAfterReplacement = false
     private var pendingDirectBgUploadLastConnectionStatusChangeTimeStamp: Date?
+    private var directBgUploadInFlight = false
+    private var historicalBgUploadInFlight = false
+    private var historicalBgUploadWaiters: [CheckedContinuation<Void, Never>] = []
+    private var historicalBgRetry: DispatchWorkItem?
+    private let historicalQueueKey = "nightscoutHistoricalReadings.v1"
 
     /// The LibreLinkUp sensor start currently being posted to Nightscout.
     /// This closes the short window between starting the request and persisting its success.
@@ -196,6 +285,7 @@ public class NightscoutSyncManager: NSObject, ObservableObject {
     }
     
     deinit {
+        historicalBgRetry?.cancel()
         // remove KVO observers added in init to avoid crashes
         UserDefaults.standard.removeObserver(self, forKeyPath: UserDefaults.Key.nightscoutAPIKey.rawValue)
         UserDefaults.standard.removeObserver(self, forKeyPath: UserDefaults.Key.nightscoutUrl.rawValue)
@@ -285,6 +375,7 @@ public class NightscoutSyncManager: NSObject, ObservableObject {
     /// - parameters:
     ///     - lastConnectionStatusChangeTimeStamp : when was the last transmitter dis/reconnect
     public func uploadLatestBgReadings(lastConnectionStatusChangeTimeStamp: Date?) {
+        drainHistoricalBgReadings()
         // check that Nightscout is enabled
         // and nightscoutURL exists
         guard UserDefaults.standard.nightscoutEnabled, UserDefaults.standard.nightscoutUrl != nil else {
@@ -391,6 +482,100 @@ public class NightscoutSyncManager: NSObject, ObservableObject {
         }
     }
     
+    /// Backfilled records have their own durable acknowledgement queue. No delete window,
+    /// live cursor, current value, or alarm is involved.
+    public func storeHistoricalBgReadingsInNightscout(bgReadings: [BgReading]) {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in self?.storeHistoricalBgReadingsInNightscout(bgReadings: bgReadings) }
+            return
+        }
+        guard UserDefaults.standard.nightscoutEnabled, shouldAllowNightscoutBgWrites(),
+              var queue = loadHistoricalQueue(), let oldest = bgReadings.map(\.timeStamp).min(),
+              let newest = bgReadings.map(\.timeStamp).max()
+        else { return }
+        let cadence = UserDefaults.standard.storeFrequentReadingsInNightscout
+            ? ConstantsNightscout.minimiumTimeBetweenTwoReadingsInMinutesFrequentUploads
+            : ConstantsNightscout.minimiumTimeBetweenTwoReadingsInMinutes
+        let context = bgReadingsAccessor.getLatestBgReadings(
+            limit: nil, fromDate: oldest.addingTimeInterval(-300), forSensor: nil,
+            ignoreRawData: true, ignoreCalculatedValue: false
+        ).filter { $0.timeStamp <= newest.addingTimeInterval(300) }
+        let eligibleIDs = Set(context.filter(minimumTimeBetweenTwoReadingsInMinutes: cadence,
+            lastConnectionStatusChangeTimeStamp: nil, timeStampLastProcessedBgReading: nil).map(\.id))
+        let formatter = Date.ISODateFormatter()
+        for reading in bgReadings where reading.isValidForDownstream {
+            guard eligibleIDs.contains(reading.id), !NightscoutImportService.isImportedBgReadingID(reading.id),
+                  let payload = try? JSONSerialization.data(withJSONObject: reading.dictionaryRepresentationForNightscoutUpload(reuseDateFormatter: formatter), options: .sortedKeys)
+            else { continue }
+            queue.enqueue(.init(id: reading.id, measuredAt: reading.timeStamp, payload: payload), now: Date())
+        }
+        saveHistoricalQueue(queue)
+        drainHistoricalBgReadings()
+    }
+
+    private func loadHistoricalQueue() -> NightscoutHistoricalQueue? {
+        guard let url = UserDefaults.standard.nightscoutUrl else { return nil }
+        let fingerprint = (url + ":" + UserDefaults.standard.nightscoutPort.description).sha1()
+        if let data = UserDefaults.standard.data(forKey: historicalQueueKey),
+           let queue = try? JSONDecoder().decode(NightscoutHistoricalQueue.self, from: data),
+           queue.siteFingerprint == fingerprint {
+            return queue
+        }
+        return NightscoutHistoricalQueue(siteFingerprint: fingerprint)
+    }
+
+    private func saveHistoricalQueue(_ queue: NightscoutHistoricalQueue) {
+        guard let data = try? JSONEncoder().encode(queue) else { return }
+        UserDefaults.standard.set(data, forKey: historicalQueueKey)
+    }
+
+    private func drainHistoricalBgReadings() {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in self?.drainHistoricalBgReadings() }
+            return
+        }
+        guard !historicalBgUploadInFlight, historicalBgRetry == nil,
+              UserDefaults.standard.nightscoutEnabled, shouldAllowNightscoutBgWrites(),
+              !directBgUploadInFlight, bgReadingsReplacementTask == nil,
+              var queue = loadHistoricalQueue()
+        else { return }
+        queue.prune(at: Date())
+        saveHistoricalQueue(queue)
+        guard !queue.entries.isEmpty else { return }
+        let batch = Array(queue.entries.prefix(ConstantsNightscout.maxReadingsToUpload))
+        let payload = batch.compactMap { try? JSONSerialization.jsonObject(with: $0.payload) as? [String: Any] }
+        guard payload.count == batch.count else { return }
+        historicalBgUploadInFlight = true
+        uploadDataAndGetResponse(dataToUpload: payload, httpMethod: "POST", path: nightscoutEntriesPath) { [weak self] _, result in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.historicalBgUploadInFlight = false
+                let waiters = self.historicalBgUploadWaiters
+                self.historicalBgUploadWaiters.removeAll()
+                waiters.forEach { $0.resume() }
+                guard var current = self.loadHistoricalQueue(), current.siteFingerprint == queue.siteFingerprint else { return }
+                if result.successFull() {
+                    current.confirm(batch)
+                    self.saveHistoricalQueue(current)
+                    self.drainHistoricalBgReadings()
+                } else {
+                    let retry = DispatchWorkItem { [weak self] in
+                        self?.historicalBgRetry = nil
+                        self?.drainHistoricalBgReadings()
+                    }
+                    self.historicalBgRetry = retry
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 60, execute: retry)
+                }
+            }
+        }
+    }
+
+    @MainActor
+    private func waitForHistoricalBgUpload() async {
+        guard historicalBgUploadInFlight else { return }
+        await withCheckedContinuation { historicalBgUploadWaiters.append($0) }
+    }
+
     public func replaceBgReadingsInNightscout(bgReadings: [BgReading], deleteFromTimeStamp: Date? = nil, deleteToTimeStamp: Date? = nil) {
         // Use the same BG write gate as the direct upload path.
         // If master BG upload is disabled, no adjusted, smoothed or rewritten
@@ -424,6 +609,9 @@ public class NightscoutSyncManager: NSObject, ObservableObject {
             _ = await previousReplacementTask?.result
 
             guard let self = self else { return }
+            // A later delete must not race the historical insertion whose receipt is pending.
+            // Registering this replacement already prevents another historical upload starting.
+            await self.waitForHistoricalBgUpload()
             // The user can turn off master Nightscout BG upload while a replacement task is queued.
             // Re-check the write permission after waiting so the delayed task
             // does not continue deleting and re-uploading BG values anyway.
@@ -478,6 +666,7 @@ public class NightscoutSyncManager: NSObject, ObservableObject {
             self.bgReadingsReplacementTask = nil
             self.bgReadingsReplacementTaskIdentifier = nil
             self.bgReadingsReplacementBlocksDirectLiveUpload = false
+            self.drainHistoricalBgReadings()
 
             if self.pendingDirectBgUploadAfterReplacement {
                 let pendingDirectBgUploadLastConnectionStatusChangeTimeStamp = self.pendingDirectBgUploadLastConnectionStatusChangeTimeStamp
@@ -1435,6 +1624,13 @@ public class NightscoutSyncManager: NSObject, ObservableObject {
     /// - parameters:
     ///     - lastConnectionStatusChangeTimeStamp : if there's not been a disconnect in the last 5 minutes, then the latest reading will be uploaded only if the time difference with the latest but one reading is at least 5 minutes.
     private func uploadBgReadingsToNightscout(lastConnectionStatusChangeTimeStamp: Date?) {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in
+                self?.uploadBgReadingsToNightscout(lastConnectionStatusChangeTimeStamp: lastConnectionStatusChangeTimeStamp)
+            }
+            return
+        }
+        guard !directBgUploadInFlight, !historicalBgUploadInFlight else { return }
         // The queued direct upload handoff can call into this function after the
         // original public guard already ran. Check again here so turning off the
         // master Nightscout BG upload switch immediately stops all BG writes.
@@ -1484,23 +1680,26 @@ public class NightscoutSyncManager: NSObject, ObservableObject {
             // the array is sorted oldest first at this point
             let timeStampLastReadingToUpload = bgReadingsToUpload.last?.timeStamp
             
-            uploadData(dataToUpload: bgReadingsDictionaryRepresentation, httpMethod: nil, path: nightscoutEntriesPath, completionHandler: {
-                // change timeStampLatestNightscoutUploadedBgReading
-                if let timeStampLastReadingToUpload = timeStampLastReadingToUpload {
-                    trace("in uploadBgReadingsToNightscout, in uploadBgReadingsToNightscout, upload succeeded, timeStampLatestNightscoutUploadedBgReading = %{public}@", log: self.oslog, category: ConstantsLog.categoryNightscoutSyncManager, type: .info, troubleshooting: .detailed(.integration(name: .nightscout, activity: .succeeded(itemCount: bgReadingsToUpload.count))), timeStampLastReadingToUpload.formatted(date: .abbreviated, time: .standard))
-                    
-                    UserDefaults.standard.timeStampLatestNightscoutUploadedBgReading = timeStampLastReadingToUpload
-                    
-                    // callAgainNeeded means we've limit the amount of readings because size was too big
-                    // if so a new upload is needed
-                    if callAgainNeeded {
-                        // do this in the main thread because the readings are fetched with the main mainManagedObjectContext
-                        DispatchQueue.main.async {
-                            self.uploadBgReadingsToNightscout(lastConnectionStatusChangeTimeStamp: lastConnectionStatusChangeTimeStamp)
+            directBgUploadInFlight = true
+            uploadDataAndGetResponse(dataToUpload: bgReadingsDictionaryRepresentation, httpMethod: nil, path: nightscoutEntriesPath) { _, result in
+                DispatchQueue.main.async {
+                    self.directBgUploadInFlight = false
+                    self.drainHistoricalBgReadings()
+                    guard result.successFull() else { return }
+                    if let timeStampLastReadingToUpload = timeStampLastReadingToUpload {
+                        trace("in uploadBgReadingsToNightscout, upload confirmed, measuredThrough=%{public}@ count=%{public}@", log: self.oslog, category: ConstantsLog.categoryNightscoutSyncManager, type: .info, troubleshooting: .detailed(.integration(name: .nightscoutGlucose, activity: .succeeded(itemCount: bgReadingsToUpload.count))), timeStampLastReadingToUpload.formatted(date: .abbreviated, time: .standard), bgReadingsToUpload.count.description)
+                        UserDefaults.standard.timeStampLatestNightscoutUploadedBgReading = NightscoutReadingConfirmation.checkpoint(
+                            current: UserDefaults.standard.timeStampLatestNightscoutUploadedBgReading,
+                            confirmed: timeStampLastReadingToUpload
+                        )
+                        if callAgainNeeded {
+                            DispatchQueue.main.async {
+                                self.uploadBgReadingsToNightscout(lastConnectionStatusChangeTimeStamp: lastConnectionStatusChangeTimeStamp)
+                            }
                         }
                     }
                 }
-            })
+            }
         } else {
             trace("in uploadBgReadingsToNightscout, no readings to upload", log: oslog, category: ConstantsLog.categoryNightscoutSyncManager, type: .debug)
         }
@@ -1557,7 +1756,10 @@ public class NightscoutSyncManager: NSObject, ObservableObject {
     ///     - path : the path (like /api/v1/treatments)
     ///     - httpMethod : method to use, default POST
     ///     - completionHandler : will be executed with the response Data? and NightscoutResult
-    private func uploadDataAndGetResponse(dataToUpload: Any, httpMethod: String?, path: String, completionHandler: @escaping ((Data?, NightscoutResult) -> Void)) {
+    private func uploadDataAndGetResponse(dataToUpload: Any, httpMethod: String?, path: String, allowDuplicateReconciliation: Bool = true, completionHandler: @escaping ((Data?, NightscoutResult) -> Void)) {
+        let expectedSite = UserDefaults.standard.nightscoutUrl
+        let expectedPort = UserDefaults.standard.nightscoutPort
+        let operation = uploadOperation(for: path, payload: dataToUpload)
         do {
             // transform dataToUpload to json
             let dataToUploadAsJSON = try JSONSerialization.data(withJSONObject: dataToUpload, options: [])
@@ -1609,6 +1811,7 @@ public class NightscoutSyncManager: NSObject, ObservableObject {
                         
                         // will contain result of nightscount sync
                         var nightscoutResult = NightscoutResult.success(0)
+                        var completionIsDeferred = false
                         
                         // before leaving the function, call completionhandler with result
                         // also trace either debug or error, depending on result
@@ -1621,12 +1824,18 @@ public class NightscoutSyncManager: NSObject, ObservableObject {
                                 trace("in uploadDataAndGetResponse, data received = %{public}@", log: self.oslog, category: ConstantsLog.categoryNightscoutSyncManager, type: .debug, dataAsString)
                             }
                             
-                            completionHandler(data, nightscoutResult)
+                            if !completionIsDeferred {
+                                if UserDefaults.standard.nightscoutUrl != expectedSite || UserDefaults.standard.nightscoutPort != expectedPort {
+                                    nightscoutResult = .failed
+                                }
+                                completionHandler(data, nightscoutResult)
+                            }
                         }
                         
                         // error cases
                         if let error = error {
-                            trace("in uploadDataAndGetResponse, failed to upload, error = %{public}@", log: self.oslog, category: ConstantsLog.categoryNightscoutSyncManager, type: .error, troubleshooting: .detailed(.integration(name: .nightscout, activity: .failed)), error.localizedDescription)
+                            let failure = error as NSError
+                            trace("Nightscout operation=%{public}@ failed domain=%{public}@ code=%{public}@", log: self.oslog, category: ConstantsLog.categoryNightscoutSyncManager, type: .error, troubleshooting: .detailed(.integration(name: operation, activity: .failed)), operation.rawValue, failure.domain, failure.code.description)
                             
                             nightscoutResult = NightscoutResult.failed
                             
@@ -1636,36 +1845,27 @@ public class NightscoutSyncManager: NSObject, ObservableObject {
                         // check that response is HTTPURLResponse and error code between 200 and 299
                         if let response = response as? HTTPURLResponse {
                             guard (200 ... 299).contains(response.statusCode) else {
-                                // if the statuscode = 500 and if data has error code 66 then consider this as successful
-                                // it seems to happen sometimes that an attempt is made to re-upload readings that were already uploaded (meaning with same id). That gives error 66
-                                // in that case consider the upload as successful
-                                if response.statusCode == 500 {
-                                    do {
-                                        if let data = data, let json = try JSONSerialization.jsonObject(with: data, options: []) as? [String: Any] {
-                                            // try to read description
-                                            if let description = json["description"] as? [String: Any] {
-                                                // try to read the code
-                                                if let code = description["code"] as? Int {
-                                                    if code == 66 {
-                                                        trace("in uploadDataAndGetResponse, found code = 66, considering the upload as successful", log: self.oslog, category: ConstantsLog.categoryNightscoutSyncManager, type: .error)
-                                                        
-                                                        self.markNightscoutConnectionSucceeded()
-                                                        nightscoutResult = NightscoutResult.success(0)
-                                                        
-                                                        return
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        
-                                    } catch {
-                                        // json decode fails, upload will be considered as failed
-                                        nightscoutResult = NightscoutResult.failed
-                                        return
+                                // A duplicate-ID error may reject a whole mixed batch. Confirm every
+                                // reading before acknowledging it or moving the live upload cursor.
+                                if NightscoutReadingConfirmation.isDuplicateBatchFailure(status: response.statusCode, data: data) {
+                                    nightscoutResult = .failed
+                                    guard allowDuplicateReconciliation,
+                                          path == self.nightscoutEntriesPath,
+                                          let readings = dataToUpload as? [[String: Any]],
+                                          readings.allSatisfy({ $0["type"] as? String == "sgv" })
+                                    else { return }
+                                    completionIsDeferred = true
+                                    Task {
+                                        let reconciled = await self.reconcileNightscoutReadings(readings, expectedSite: expectedSite, expectedPort: expectedPort)
+                                        let confirmed = reconciled && UserDefaults.standard.nightscoutUrl == expectedSite && UserDefaults.standard.nightscoutPort == expectedPort
+                                        self.reportUploadResult(operation: operation, succeeded: confirmed, count: readings.count)
+                                        if confirmed { self.markNightscoutConnectionSucceeded() }
+                                        completionHandler(data, confirmed ? .success(readings.count) : .failed)
                                     }
+                                    return
                                 }
                                 
-                                trace("in uploadDataAndGetResponse, failed to upload, statuscode = %{public}@", log: self.oslog, category: ConstantsLog.categoryNightscoutSyncManager, type: .error, troubleshooting: .detailed(.integration(name: .nightscout, activity: .failed)), response.statusCode.description)
+                                trace("Nightscout operation=%{public}@ failed HTTP=%{public}@", log: self.oslog, category: ConstantsLog.categoryNightscoutSyncManager, type: .error, troubleshooting: .detailed(.integration(name: operation, activity: .failed)), operation.rawValue, response.statusCode.description)
                                 
                                 nightscoutResult = NightscoutResult.failed
                                 
@@ -1680,6 +1880,7 @@ public class NightscoutSyncManager: NSObject, ObservableObject {
                         }
                         
                         // successful cases
+                        self.reportUploadResult(operation: operation, succeeded: true, count: (dataToUpload as? [Any])?.count)
                         self.markNightscoutConnectionSucceeded()
                         nightscoutResult = NightscoutResult.success(0)
                     })
@@ -1704,12 +1905,68 @@ public class NightscoutSyncManager: NSObject, ObservableObject {
         }
     }
 
+    private func reconcileNightscoutReadings(_ readings: [[String: Any]], expectedSite: String?, expectedPort: Int) async -> Bool {
+        await NightscoutReadingConfirmation.reconcile(readings, isUploadAllowed: {
+            await MainActor.run {
+                UserDefaults.standard.nightscoutEnabled && self.shouldAllowNightscoutBgWrites() &&
+                    UserDefaults.standard.nightscoutUrl == expectedSite && UserDefaults.standard.nightscoutPort == expectedPort
+            }
+        }, fetch: { id in
+            guard UserDefaults.standard.nightscoutUrl == expectedSite,
+                  UserDefaults.standard.nightscoutPort == expectedPort else {
+                throw NSError(domain: "NightscoutConfirmation", code: 2)
+            }
+            let data = try await self.nightscoutRequest(
+                path: self.nightscoutEntriesJsonPath,
+                queryItems: [URLQueryItem(name: "find[_id]", value: id), URLQueryItem(name: "count", value: "2")],
+                responseType: Data.self
+            )
+            guard let data,
+                  let entries = try JSONSerialization.jsonObject(with: data) as? [[String: Any]]
+            else { throw NSError(domain: "NightscoutConfirmation", code: 1) }
+            return entries
+        }, upload: { reading in
+            let allowed = await MainActor.run {
+                UserDefaults.standard.nightscoutEnabled && self.shouldAllowNightscoutBgWrites() &&
+                    UserDefaults.standard.nightscoutUrl == expectedSite && UserDefaults.standard.nightscoutPort == expectedPort
+            }
+            guard allowed else { return false }
+            return await withCheckedContinuation { continuation in
+                self.uploadDataAndGetResponse(dataToUpload: [reading], httpMethod: "POST", path: self.nightscoutEntriesPath, allowDuplicateReconciliation: false) { _, result in
+                    continuation.resume(returning: result.successFull())
+                }
+            }
+        })
+    }
+
+    private func uploadOperation(for path: String, payload: Any) -> TroubleshootingIntegration {
+        if path.hasPrefix(nightscoutEntriesPath) {
+            let items = payload as? [[String: Any]] ?? []
+            if !items.isEmpty, items.allSatisfy({ $0["type"] as? String == "cal" }) { return .nightscoutCalibration }
+            return .nightscoutGlucose
+        }
+        if path.hasPrefix(nightscoutTreatmentPath) { return .nightscoutTreatments }
+        if path.hasPrefix(nightscoutDeviceStatusPath) { return .nightscoutDeviceStatus }
+        if path.hasPrefix(nightscoutProfilePath) { return .nightscoutProfile }
+        if path.hasPrefix(nightscoutAuthTestPath) { return .nightscoutAuth }
+        return .nightscout
+    }
+
+    private func reportUploadResult(operation: TroubleshootingIntegration, succeeded: Bool, count: Int?) {
+        trace("Nightscout operation=%{public}@ result=%{public}@ count=%{public}@", log: oslog, category: ConstantsLog.categoryNightscoutSyncManager, type: succeeded ? .info : .error,
+              troubleshooting: .detailed(.integration(name: operation, activity: succeeded ? .succeeded(itemCount: count) : .failed)),
+              operation.rawValue, succeeded ? "confirmed" : "failed", count?.description ?? "unknown")
+    }
+
     /// Stores the time of the last confirmed Nightscout server response. The
     /// Settings UI uses this same timestamp for the connection indicator, so
     /// master-mode uploads/downloads should update it just like follower-mode
     /// downloads and the manual Test Connection action do.
     private func markNightscoutConnectionSucceeded() {
-        UserDefaults.standard.timeStampOfLastFollowerConnection = Date()
+        let responseAt = Date()
+        DispatchQueue.main.async {
+            UserDefaults.standard.timeStampOfLastFollowerConnection = max(UserDefaults.standard.timeStampOfLastFollowerConnection ?? .distantPast, responseAt)
+        }
     }
     
     /// Upload treatments to nightscout, receives the JSON response with the asigned id's and sets the id's in Coredata.

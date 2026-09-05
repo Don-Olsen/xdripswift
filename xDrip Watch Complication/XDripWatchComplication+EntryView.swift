@@ -19,6 +19,11 @@ extension XDripWatchComplication {
         var entry: Entry
         
         var body: some View {
+            content.accessibilityLabel(Text("\(entry.widgetState.bgValueStringInUserChosenUnit()) \(entry.widgetState.bgUnitString), ") + entry.widgetState.sourceAndAgeText)
+        }
+
+        @ViewBuilder
+        private var content: some View {
             switch widgetFamily {
             case .accessoryRectangular:
                 accessoryRectangularView

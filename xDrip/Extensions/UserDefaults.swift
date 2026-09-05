@@ -1079,6 +1079,8 @@ extension UserDefaults {
         }
         set {
             set(newValue, forKey: Key.useFiveMinuteReadings.rawValue)
+            TransmitterReadSuccessEvidence.recordConfiguration(source: cgmTransmitterType,
+                visibleFiveMinutes: newValue, defaults: self)
         }
     }
 
@@ -1953,6 +1955,8 @@ extension UserDefaults {
             // this is also a check to see if transmitterTypeAsString has really changed, because just calling a set without a new value may cause a transmittertype reset in other parts of the call (inclusive stopping sensor etc.)
             if newValue != string(forKey: Key.transmitterTypeAsString.rawValue) {
                 set(newValue, forKey: Key.transmitterTypeAsString.rawValue)
+                TransmitterReadSuccessEvidence.recordConfiguration(source: cgmTransmitterType,
+                    visibleFiveMinutes: useFiveMinuteReadings, defaults: self)
             }
         }
     }
