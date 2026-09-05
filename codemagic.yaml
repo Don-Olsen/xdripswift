@@ -66,6 +66,11 @@ workflows:
         script: |
           set -euo pipefail
           grep -q "XDRIP_MARKETING_VERSION = 7.0.0" xDrip/Version.xcconfig
+          # Record the exact cloned revision in both binaries; never infer it from a later export.
+          source_commit="$(git rev-parse HEAD)"
+          for info_plist in "xDrip/Supporting Files/Info.plist" "xDrip-Watch-App-Info.plist"; do
+            /usr/libexec/PlistBuddy -c "Add :XDripSourceCommit string $source_commit" "$info_plist"
+          done
           printf '%s\n' \
             "XDRIP_DEVELOPMENT_TEAM = ${XDRIP_TEAM_ID}" \
             "XDRIP_CODE_SIGN_IDENTITY_RELEASE = Apple Distribution" \
@@ -268,6 +273,9 @@ workflows:
 
           watch_app="$CM_BUILD_DIR/build/ios/xcarchive/xdrip.xcarchive/Products/Applications/xdrip.app/Watch/xDrip Watch App.app"
           test -d "$watch_app"
+          expected_commit="$(git rev-parse HEAD)"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :XDripSourceCommit' "$watch_app/Info.plist")" = "$expected_commit"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :XDripSourceCommit' "$CM_BUILD_DIR/build/ios/xcarchive/xdrip.xcarchive/Products/Applications/xdrip.app/Info.plist")" = "$expected_commit"
           test "$(/usr/libexec/PlistBuddy -c 'Print :WKBackgroundModes:0' "$watch_app/Info.plist")" = "self-care"
           test "$(/usr/libexec/PlistBuddy -c 'Print :UIBackgroundModes:0' "$watch_app/Info.plist")" = "bluetooth-central"
           codesign --verify --deep --strict "$watch_app"
