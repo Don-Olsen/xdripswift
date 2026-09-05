@@ -167,9 +167,9 @@ extension Calibrator {
                     }
                 }
             }
-            if !last3Readings.isEmpty || !refineCalibration {
-                bgReading.calculatedValue = ((lastCalibration.slope * bgReading.ageAdjustedRawValue) + lastCalibration.intercept)
-            }
+            // A valid calibration is sufficient to calculate this sample. Previous readings
+            // refine calibration/curves; an empty history must not manufacture the error sentinel.
+            bgReading.calculatedValue = ((lastCalibration.slope * bgReading.ageAdjustedRawValue) + lastCalibration.intercept)
             updateCalculatedValue(for: bgReading)
         }
         

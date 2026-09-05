@@ -2,6 +2,99 @@ import XCTest
 import CoreData
 @testable import xdrip
 
+extension LibreWatchValuePipelineTests {
+    @MainActor
+    func testLiveGapBoundariesKeepStoredCalibrationHistory() throws {
+        // 15:03:55 -> 15:06:54 is a 179-second gap, processed later at 15:09:07.
+        // Calibration history comes from storage, not the +/-150-second duplicate window.
+        let start = Date(timeIntervalSince1970: 1_788_613_435)
+        for gap in [149.0, 150, 151, 179, 290, 291] {
+            let stack = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+            let context = stack.mainManagedObjectContext
+            let sensor = Sensor(startDate: start.addingTimeInterval(-3_600), nsManagedObjectContext: context)
+            let calibration = Calibration(timeStamp: start.addingTimeInterval(-1_800), sensor: sensor,
+                bg: 100, rawValue: 100, adjustedRawValue: 100, sensorConfidence: 1,
+                rawTimeStamp: start.addingTimeInterval(-1_800), slope: 1.1, intercept: 4,
+                distanceFromEstimate: 0, estimateRawAtTimeOfCalibration: 100, slopeConfidence: 1,
+                deviceName: nil, nsManagedObjectContext: context)
+            let previous = BgReading(timeStamp: start, sensor: sensor, calibration: calibration,
+                rawData: 100, deviceName: nil, nsManagedObjectContext: context)
+            previous.calculatedValue = 114
+            previous.ageAdjustedRawValue = 100
+            XCTAssertTrue(stack.saveChanges())
+            let incomingAt = start.addingTimeInterval(gap)
+            XCTAssertEqual(GlucoseReadingInsertionPolicy.disposition(measuredAt: incomingAt,
+                latestStoredAt: start, isNewestInBatch: true, historicalOnly: false,
+                hasSameSlot: gap <= 150), .live)
+
+            let accessor = BgReadingsAccessor(coreDataManager: stack)
+            var history = accessor.calibrationHistory(before: incomingAt, for: sensor)
+            XCTAssertEqual(history.map(\.id), [previous.id], "gap=\(gap)")
+            var calibrations = [calibration]
+            let result = Libre1Calibrator().createNewBgReading(rawData: 110_000,
+                timeStamp: incomingAt, sensor: sensor, last3Readings: &history,
+                lastCalibrationsForActiveSensorInLastXDays: &calibrations,
+                firstCalibration: calibration, lastCalibration: calibration, deviceName: nil,
+                nsManagedObjectContext: context)
+            XCTAssertEqual(result.calculatedValue, 125, accuracy: 0.000_001)
+            XCTAssertTrue(result.isValidForDownstream)
+            XCTAssertTrue(stack.saveChanges())
+            XCTAssertEqual(accessor.last(forSensor: sensor, includingSuppressed: true)?.timeStamp, incomingAt)
+        }
+    }
+
+    @MainActor
+    func testExistingCalibrationCalculatesEvenWithoutPreviousRows() {
+        let stack = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let context = stack.mainManagedObjectContext
+        let now = Date(timeIntervalSince1970: 1_788_613_807)
+        let sensor = Sensor(startDate: now.addingTimeInterval(-3_600), nsManagedObjectContext: context)
+        let calibration = Calibration(timeStamp: now.addingTimeInterval(-1_800), sensor: sensor,
+            bg: 100, rawValue: 100, adjustedRawValue: 100, sensorConfidence: 1,
+            rawTimeStamp: now.addingTimeInterval(-1_800), slope: 1.1, intercept: 4,
+            distanceFromEstimate: 0, estimateRawAtTimeOfCalibration: 100, slopeConfidence: 1,
+            deviceName: nil, nsManagedObjectContext: context)
+        let calibrators: [Calibrator] = [Libre1Calibrator(), Libre1NonFixedSlopeCalibrator()]
+        for calibrator in calibrators {
+            var history = [BgReading]()
+            var calibrations = [calibration]
+            let result = calibrator.createNewBgReading(rawData: 110_000, timeStamp: now, sensor: sensor,
+                last3Readings: &history, lastCalibrationsForActiveSensorInLastXDays: &calibrations,
+                firstCalibration: calibration, lastCalibration: calibration, deviceName: nil,
+                nsManagedObjectContext: context)
+            XCTAssertEqual(result.calculatedValue, 125, accuracy: 0.000_001)
+            XCTAssertTrue(result.isValidForDownstream)
+        }
+    }
+
+    @MainActor
+    func testDelayedCalibrationContextExcludesFutureAndOtherSensorRows() {
+        let stack = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let context = stack.mainManagedObjectContext
+        let now = Date(timeIntervalSince1970: 1_788_613_807)
+        let sensor = Sensor(startDate: now.addingTimeInterval(-3_600), nsManagedObjectContext: context)
+        let otherSensor = Sensor(startDate: now.addingTimeInterval(-4_000), nsManagedObjectContext: context)
+        let earlier = BgReading(timeStamp: now.addingTimeInterval(-600), sensor: sensor,
+            calibration: nil, rawData: 100, deviceName: nil, nsManagedObjectContext: context)
+        earlier.calculatedValue = 100
+        let later = BgReading(timeStamp: now, sensor: sensor, calibration: nil,
+            rawData: 120, deviceName: nil, nsManagedObjectContext: context)
+        later.calculatedValue = 120
+        let other = BgReading(timeStamp: now.addingTimeInterval(-450), sensor: otherSensor,
+            calibration: nil, rawData: 110, deviceName: nil, nsManagedObjectContext: context)
+        other.calculatedValue = 110
+        XCTAssertTrue(stack.saveChanges())
+        let delayedAt = now.addingTimeInterval(-300)
+        let disposition = GlucoseReadingInsertionPolicy.disposition(measuredAt: delayedAt,
+            latestStoredAt: now, isNewestInBatch: true, historicalOnly: false, hasSameSlot: false)
+        XCTAssertEqual(disposition, .historical)
+        let history = BgReadingsAccessor(coreDataManager: stack).calibrationHistory(before: delayedAt, for: sensor)
+        XCTAssertEqual(history.map(\.id), [earlier.id])
+        XCTAssertFalse(LibreWatchGlucoseProcessingMode.historicalBackfill.permitsCurrentValueAndLiveSideEffects)
+        XCTAssertEqual(later.calculatedValue, 120)
+    }
+}
+
 final class LibreWatchValuePipelineTests: XCTestCase {
     private let receivedAt = Date(timeIntervalSince1970: 1_788_333_200)
 

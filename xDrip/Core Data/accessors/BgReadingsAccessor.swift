@@ -3,6 +3,24 @@ import Foundation
 import CoreData
 import os
 
+/// Insertion cadence and historical routing must not change calibration context.
+enum GlucoseReadingInsertionPolicy {
+    enum Disposition: Equatable { case skip, live, historical }
+
+    static func disposition(measuredAt: Date, latestStoredAt: Date, isNewestInBatch: Bool,
+                            historicalOnly: Bool, hasSameSlot: Bool) -> Disposition {
+        if historicalOnly { return .historical } // exact persistent-ID collision is checked separately
+        if measuredAt <= latestStoredAt {
+            return hasSameSlot ? .skip : .historical
+        }
+        if !hasSameSlot || measuredAt.timeIntervalSince(latestStoredAt) > 290 ||
+            (isNewestInBatch && measuredAt.timeIntervalSince(latestStoredAt) > 10) {
+            return .live
+        }
+        return .skip
+    }
+}
+
 class BgReadingsAccessor: ObservableObject {
 
     // MARK: - Properties
@@ -22,6 +40,21 @@ class BgReadingsAccessor: ObservableObject {
     }
 
     // MARK: - public functions
+
+    /// Calibration context is independent of the incoming batch's duplicate window. Fetch
+    /// earlier rows for this sensor only, including one-minute rows hidden by display cadence.
+    func calibrationHistory(before date: Date, for sensor: Sensor) -> [BgReading] {
+        var readings: [BgReading] = []
+        coreDataManager.mainManagedObjectContext.performAndWait {
+            let request: NSFetchRequest<BgReading> = BgReading.fetchRequest()
+            request.predicate = NSPredicate(format: "sensor == %@ AND timeStamp < %@ AND rawData > 0", sensor, date as NSDate)
+            request.sortDescriptors = [NSSortDescriptor(key: #keyPath(BgReading.timeStamp), ascending: false)]
+            // Invalid calculated rows are not calibration/curve evidence.
+            readings = Array(((try? coreDataManager.mainManagedObjectContext.fetch(request)) ?? [])
+                .lazy.filter { $0.isValidForDownstream }.prefix(3))
+        }
+        return readings
+    }
 
 
     /// - Gives 2 latest readings with calculatedValue != 0, minimum time between the two readings specified by minimumTimeIntervalInMinutes
