@@ -1259,21 +1259,6 @@ struct LibreWatchFrameLiveness {
     }
 }
 
-struct LibreWatchValidFramePolicy {
-    /// Technical BLE liveness is committed before clinical/ordering acceptance. This ordering
-    /// prevents a duplicate or out-of-order value from making a healthy notification stream look
-    /// disconnected.
-    @discardableResult
-    static func record(
-        liveness: inout LibreWatchFrameLiveness,
-        at date: Date,
-        downstreamAcceptance: (LibreWatchFrameLiveness) -> Bool
-    ) -> Bool {
-        liveness.validFrame(at: date)
-        return downstreamAcceptance(liveness)
-    }
-}
-
 /// Pure lifecycle policy shared by the Watch collector and deterministic iPhone tests.
 /// Timed recovery requires foreground/runtime execution, while Core Bluetooth delegate events
 /// may finish one already-established operation whenever Watch still owns the sensor.

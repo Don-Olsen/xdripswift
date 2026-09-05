@@ -550,19 +550,15 @@ final class LibreWatchValuePipelineTests: XCTestCase {
 
         var liveness = LibreWatchFrameLiveness()
         let frameAt = resumedAt.addingTimeInterval(61)
-        let accepted = LibreWatchValidFramePolicy.record(
-            liveness: &liveness,
-            at: frameAt
-        ) { _ in
-            timing.receivedPacketOrEnabledNotifications(at: frameAt)
-            timing.recordReceivingProgress(
-                at: frameAt,
-                timeout: 120,
-                executionIsAvailable: true,
-                monotonicTime: 961
-            )
-            return false // duplicate/out-of-order clinical payload
-        }
+        liveness.validFrame(at: frameAt)
+        timing.receivedPacketOrEnabledNotifications(at: frameAt)
+        timing.recordReceivingProgress(
+            at: frameAt,
+            timeout: 120,
+            executionIsAvailable: true,
+            monotonicTime: 961
+        )
+        let accepted = false // duplicate/out-of-order clinical payload
 
         XCTAssertFalse(accepted)
         XCTAssertEqual(liveness.lastValidBLEFrameAt, frameAt)
@@ -1493,15 +1489,10 @@ final class LibreWatchValuePipelineTests: XCTestCase {
         XCTAssertFalse(liveness.invalidFrame())
         XCTAssertEqual(liveness.consecutiveInvalidFrames, 2)
         let validFrameAt = receivedAt.addingTimeInterval(45)
-        var livenessWasVisibleBeforeDownstreamRejection = false
-        let downstreamAccepted = LibreWatchValidFramePolicy.record(
-            liveness: &liveness,
-            at: validFrameAt
-        ) { recordedLiveness in
-            livenessWasVisibleBeforeDownstreamRejection =
-                recordedLiveness.lastValidBLEFrameAt == validFrameAt
-            return false
-        }
+        liveness.validFrame(at: validFrameAt)
+        let livenessWasVisibleBeforeDownstreamRejection =
+            liveness.lastValidBLEFrameAt == validFrameAt
+        let downstreamAccepted = false
         XCTAssertFalse(downstreamAccepted)
         XCTAssertTrue(livenessWasVisibleBeforeDownstreamRejection)
         XCTAssertEqual(liveness.consecutiveInvalidFrames, 0)

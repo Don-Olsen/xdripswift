@@ -1685,25 +1685,20 @@ extension LibreWatchDirectCollector: CBPeripheralDelegate {
             )
             // BLE liveness is a property of the technically valid Libre frame, not of later
             // clinical ordering/deduplication. Refresh it before the payload acceptance gate.
-            let wasAccepted = LibreWatchValidFramePolicy.record(
-                liveness: &frameLiveness,
-                at: now
-            ) { _ in
-                cancelReconnectFallback()
-                connectionTiming.receivedPacketOrEnabledNotifications(at: now)
-                connectionTiming.recordReceivingProgress(
-                    at: now,
-                    timeout: receivingExecutionBudget,
-                    executionIsAvailable: timedRecoveryIsAllowed,
-                    monotonicTime: monotonicNow
-                )
-                state.notificationsActive()
-                reportRecoverySuccessIfNeeded()
-                reportFrameProgress(at: now)
-                let accepted = watchState?.submitLibreWatchReading(reading) == true
-                scheduleReconnectFallback(for: peripheral)
-                return accepted
-            }
+            frameLiveness.validFrame(at: now)
+            cancelReconnectFallback()
+            connectionTiming.receivedPacketOrEnabledNotifications(at: now)
+            connectionTiming.recordReceivingProgress(
+                at: now,
+                timeout: receivingExecutionBudget,
+                executionIsAvailable: timedRecoveryIsAllowed,
+                monotonicTime: monotonicNow
+            )
+            state.notificationsActive()
+            reportRecoverySuccessIfNeeded()
+            reportFrameProgress(at: now)
+            let wasAccepted = watchState?.submitLibreWatchReading(reading) == true
+            scheduleReconnectFallback(for: peripheral)
             if wasAccepted {
                 state.recordDirectReading(reading)
             }
