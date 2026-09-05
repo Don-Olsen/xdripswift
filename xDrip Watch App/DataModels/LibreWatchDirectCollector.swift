@@ -86,9 +86,11 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
                 .sink { [weak self] session in self?.updateSession(session) }
                 .store(in: &watchStateObservers)
 
-            watchState.$libreWatchOwnership
-                .dropFirst()
-                .sink { [weak self] ownership in self?.ownershipDidChange(ownership) }
+            LibreWatchLifecyclePolicy.observeCommittedOwnership(
+                watchState.$libreWatchOwnership,
+                current: { [weak watchState] in watchState?.libreWatchOwnership },
+                receive: { [weak self] ownership in self?.ownershipDidChange(ownership) }
+            )
                 .store(in: &watchStateObservers)
         }
 
@@ -1521,6 +1523,11 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
 
     private func evaluateConnectionHealth(at date: Date) {
         currentReconcileSource = .healthTimer
+        // This existing timer also runs while the visible app has returned the sensor.
+        // Retry transport independently of BLE ownership, without another timer/outbox.
+        watchState?.retryPendingLibreDeliveries(
+            at: date, executionIsAvailable: applicationIsActive || extendedRuntimeIsRunning
+        )
         watchState?.refreshDirectLibreReadingFreshness(at: date)
         if connectionTiming.phase == .cancelling {
             evaluateCancellation()
@@ -1809,7 +1816,8 @@ extension LibreWatchDirectCollector: CBCentralManagerDelegate {
             guard self.disconnectGate.legacyIsCurrent(
                 token, scheduledGeneration: generation,
                 currentGeneration: self.connectionTiming.generation,
-                peripheralIsDisconnectedOrDisconnecting: peripheral.state == .disconnected || peripheral.state == .disconnecting
+                peripheralIsDisconnectedOrDisconnecting: peripheral.state == .disconnected || peripheral.state == .disconnecting,
+                peripheralIsConnecting: peripheral.state == .connecting
             ) else {
                 self.reportRejectedCallback("didDisconnectLegacy", reason: "staleGenerationOrLinkRecovered")
                 self.disconnectGate.cancelLegacy()
@@ -1817,7 +1825,9 @@ extension LibreWatchDirectCollector: CBCentralManagerDelegate {
             }
             self.handleDisconnectOnce(
                 peripheral: peripheral,
-                isReconnecting: false,
+                // The link can already be reconnecting before the legacy callback executes.
+                // Adopt that system attempt; do not compete with a manual connect or scan.
+                isReconnecting: peripheral.state == .connecting,
                 disconnectedAt: disconnectedAt,
                 error: error,
                 legacyToken: token

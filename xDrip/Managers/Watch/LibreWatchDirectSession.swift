@@ -1,4 +1,5 @@
 import Foundation
+import Combine
 
 enum LibreWatchMessageKey {
     static let session = "libreWatchDirectSession"
@@ -681,6 +682,12 @@ struct LibreWatchConnectivityOutbox: Codable, Equatable {
         }
     }
 
+    /// Reuse an existing execution opportunity; never create a background polling loop.
+    /// Ownership is deliberately not an input: pre-cutoff readings can finish after return.
+    func retryIsDue(at date: Date, executionIsAvailable: Bool, hasInFlightItem: Bool) -> Bool {
+        executionIsAvailable && !hasInFlightItem && nextEligible(at: date) != nil
+    }
+
     mutating func markSubmitted(id: UUID, at date: Date = Date()) {
         guard items.contains(where: { $0.id == id }) else { return }
         if lastSubmittedAt == nil { lastSubmittedAt = [:] }
@@ -966,9 +973,10 @@ struct LibreWatchLegacyDisconnectGate {
     }
 
     func legacyIsCurrent(_ token: UUID, scheduledGeneration: UUID, currentGeneration: UUID,
-                         peripheralIsDisconnectedOrDisconnecting: Bool) -> Bool {
+                         peripheralIsDisconnectedOrDisconnecting: Bool,
+                         peripheralIsConnecting: Bool = false) -> Bool {
         !handled && pendingToken == token && scheduledGeneration == currentGeneration &&
-            peripheralIsDisconnectedOrDisconnecting
+            (peripheralIsDisconnectedOrDisconnecting || peripheralIsConnecting)
     }
 
     mutating func cancelLegacy() {
@@ -1531,6 +1539,19 @@ struct LibreWatchFrameLiveness {
 struct LibreWatchLifecyclePolicy {
     static let foregroundNoDataRecoveryDelay: TimeInterval = 2 * 60
     static let extendedRuntimeNoDataRecoveryDelay: TimeInterval = 3 * 60
+
+    /// @Published sends in willSet. Apply only the still-current value after the complete
+    /// session/ownership transaction has returned on main, including delayed handoff replies.
+    static func observeCommittedOwnership(
+        _ publisher: Published<LibreWatchOwnership>.Publisher,
+        current: @escaping () -> LibreWatchOwnership?,
+        receive: @escaping (LibreWatchOwnership) -> Void
+    ) -> AnyCancellable {
+        publisher.dropFirst().receive(on: DispatchQueue.main).sink { ownership in
+            guard current() == ownership else { return }
+            receive(ownership)
+        }
+    }
 
     static func recoveryIsAllowed(
         applicationIsActive: Bool,

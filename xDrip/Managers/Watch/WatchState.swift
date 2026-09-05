@@ -152,13 +152,16 @@ struct LibreWatchAlarmDelegation: Codable, Equatable {
     let sensorIdentity: String
     let settingsRevision: UInt64
     var enabledKinds: [LibreWatchAlarmKind]? = nil
+    /// Keep the acknowledged configuration with its authority. A newer offered revision
+    /// may overtake its reply; the Watch can still install this exact committed pair.
+    var confirmedSettings: LibreWatchAlarmSettings? = nil
 
     static func confirmed(for settings: LibreWatchAlarmSettings) -> Self {
         Self(sessionID: settings.sessionID, sensorIdentity: settings.sensorIdentity,
             settingsRevision: settings.revision,
             enabledKinds: LibreWatchAlarmKind.allCases.filter { kind in
                 settings.rules.contains { $0.kind == kind && $0.enabled }
-            })
+            }, confirmedSettings: settings)
     }
 
     func covers(_ kind: LibreWatchAlarmKind) -> Bool {
@@ -168,6 +171,76 @@ struct LibreWatchAlarmDelegation: Codable, Equatable {
     func matches(_ settings: LibreWatchAlarmSettings) -> Bool {
         sessionID == settings.sessionID && sensorIdentity == settings.sensorIdentity &&
             settingsRevision == settings.revision && enabledKinds == Self.confirmed(for: settings).enabledKinds
+    }
+}
+
+/// Watch-only negotiation state. Persist the active pair atomically; a candidate must not
+/// remove the last working alarm configuration while its acknowledgement is in flight.
+struct LibreWatchAlarmConfiguration: Codable, Equatable {
+    private(set) var settings: LibreWatchAlarmSettings?
+    private(set) var delegation: LibreWatchAlarmDelegation?
+    private(set) var pendingSettings: LibreWatchAlarmSettings?
+    private var authorityRevision: UInt64?
+
+    init(settings: LibreWatchAlarmSettings? = nil, delegation: LibreWatchAlarmDelegation? = nil) {
+        self.settings = settings
+        self.delegation = delegation
+        authorityRevision = delegation?.settingsRevision
+    }
+
+    var offeredSettings: LibreWatchAlarmSettings? { pendingSettings ?? settings }
+
+    @discardableResult
+    mutating func propose(_ candidate: LibreWatchAlarmSettings, session: LibreWatchDirectSession) -> Bool {
+        guard candidate.matches(session) else { return false }
+        if settings?.sessionID != candidate.sessionID || settings?.sensorIdentity != candidate.sensorIdentity {
+            self = Self(settings: candidate)
+            return true
+        }
+        guard candidate.revision >= (offeredSettings?.revision ?? 0) else { return false }
+        if candidate.revision == offeredSettings?.revision {
+            return candidate == offeredSettings
+        }
+        if let settings, delegation?.matches(settings) == true {
+            pendingSettings = candidate
+        } else {
+            settings = candidate
+            pendingSettings = nil
+        }
+        return true
+    }
+
+    @discardableResult
+    mutating func confirm(_ candidate: LibreWatchAlarmDelegation?, session: LibreWatchDirectSession) -> Bool {
+        guard offeredSettings?.matches(session) == true else { return false }
+        guard let candidate else {
+            authorityRevision = max(authorityRevision ?? 0, offeredSettings?.revision ?? 0)
+            delegation = nil
+            if let pendingSettings { settings = pendingSettings; self.pendingSettings = nil }
+            return true
+        }
+        guard candidate.sessionID == session.id, candidate.sensorIdentity == session.redactedIdentity(),
+              candidate.settingsRevision >= (authorityRevision ?? delegation?.settingsRevision ?? 0),
+              candidate.confirmedSettings.map({ $0.matches(session) && candidate.matches($0) }) ?? true
+        else { return false }
+        let matchingSettings = [candidate.confirmedSettings, pendingSettings, settings]
+            .compactMap { $0 }.first { $0.matches(session) && candidate.matches($0) }
+        guard let matchingSettings else { return false }
+        settings = matchingSettings
+        delegation = candidate
+        authorityRevision = candidate.settingsRevision
+        if (pendingSettings?.revision ?? 0) <= matchingSettings.revision { pendingSettings = nil }
+        return true
+    }
+
+    /// Snooze is conservative during negotiation: receiving a later suppression takes
+    /// effect immediately; removing it requires confirmation of the new configuration.
+    var effectiveSettings: LibreWatchAlarmSettings? {
+        guard let settings, let pendingSettings else { return settings }
+        return LibreWatchAlarmSettings(sessionID: settings.sessionID, sensorIdentity: settings.sensorIdentity,
+            revision: settings.revision, generatedAt: settings.generatedAt, isMgDl: settings.isMgDl,
+            rules: settings.rules, snoozes: settings.snoozes + pendingSettings.snoozes,
+            snoozeAllUntil: [settings.snoozeAllUntil, pendingSettings.snoozeAllUntil].compactMap { $0 }.max())
     }
 }
 
@@ -181,6 +254,19 @@ struct LibreWatchAlarmState: Codable, Equatable {
     var scheduledMissedAt: Date?
     var scheduledMissedConfirmed: Bool?
     var automaticThrottle: LibreWatchAlarmAutomaticThrottle?
+    var ownershipStartedAt: Date?
+
+    /// An alarm baseline is not a glucose reading. It survives restart/wrist wakes and
+    /// covers a takeover that never produces its first packet without fabricating an ID/value.
+    mutating func beginWatchOwnership(at date: Date) {
+        if ownershipStartedAt == nil { ownershipStartedAt = date }
+    }
+
+    mutating func endWatchOwnership() { ownershipStartedAt = nil }
+
+    var missedReadingBaseline: Date? {
+        [lastReadingAt, ownershipStartedAt].compactMap { $0 }.max()
+    }
 
     mutating func use(_ settings: LibreWatchAlarmSettings) {
         guard sessionID != settings.sessionID || sensorIdentity != settings.sensorIdentity else { return }
@@ -242,16 +328,26 @@ struct LibreWatchAlarmState: Codable, Equatable {
     func notificationMayBePresented(
         kind: LibreWatchAlarmKind, notificationSessionID: String, notificationReadingID: UUID?,
         settings: LibreWatchAlarmSettings?, delegation: LibreWatchAlarmDelegation?,
-        watchOwnsSensor: Bool, notificationsAuthorized: Bool, at date: Date
+        watchOwnsSensor: Bool, notificationsAuthorized: Bool, at date: Date,
+        notificationMissedBaseline: Date? = nil
     ) -> Bool {
         guard watchOwnsSensor, notificationsAuthorized, let settings,
               notificationSessionID == settings.sessionID.uuidString,
               sessionID == settings.sessionID, sensorIdentity == settings.sensorIdentity,
-              let notificationReadingID, notificationReadingID == lastReadingID,
               delegation?.matches(settings) == true,
               (settings.snoozeAllUntil ?? .distantPast) <= date,
               settings.rule(for: kind, at: date)?.enabled == true
         else { return false }
+        if kind == .missed {
+            // New first-packet watchdogs carry a baseline, never a fabricated reading ID.
+            if let notificationMissedBaseline {
+                guard notificationMissedBaseline == missedReadingBaseline else { return false }
+            } else {
+                guard let notificationReadingID, notificationReadingID == lastReadingID else { return false }
+            }
+        } else {
+            guard let notificationReadingID, notificationReadingID == lastReadingID else { return false }
+        }
         if kind != .missed {
             guard let lastReadingAt, date.timeIntervalSince(lastReadingAt) <= 180 else { return false }
         }
@@ -302,7 +398,7 @@ struct LibreWatchAlarmState: Codable, Equatable {
     ) -> (date: Date, rule: LibreWatchAlarmRule)? {
         guard watchOwnsSensor, delegation?.matches(settings) == true,
               sessionID == settings.sessionID, sensorIdentity == settings.sensorIdentity,
-              let lastReadingAt
+              let baseline = missedReadingBaseline
         else { return nil }
         let rules = settings.rules.filter { $0.kind == .missed }.sorted { $0.startMinute < $1.startMinute }
         guard !rules.isEmpty else { return nil }
@@ -316,7 +412,7 @@ struct LibreWatchAlarmState: Codable, Equatable {
                 let end = index + 1 < rules.count
                     ? calendar.date(byAdding: .minute, value: rules[index + 1].startMinute, to: dayStart)!
                     : nextDay
-                let due = [now, start, lastReadingAt.addingTimeInterval(rule.value * 60),
+                let due = [now, start, baseline.addingTimeInterval(rule.value * 60),
                            snoozedUntil(.missed, settings: settings), settings.snoozeAllUntil ?? .distantPast].max()!
                 if due < end { return (due, rule) }
             }
@@ -329,6 +425,16 @@ enum LibreWatchAlarmStore {
     private static let settingsKey = "libreWatchAlarmSettings.v1"
     private static let stateKey = "libreWatchAlarmState.v1"
     private static let delegationKey = "libreWatchAlarmDelegation.v1"
+    private static let configurationKey = "libreWatchAlarmConfiguration.v1"
+
+    static func configuration(defaults: UserDefaults = .standard) -> LibreWatchAlarmConfiguration {
+        decode(LibreWatchAlarmConfiguration.self, key: configurationKey, defaults: defaults) ??
+            LibreWatchAlarmConfiguration(settings: settings(defaults: defaults), delegation: delegation(defaults: defaults))
+    }
+
+    static func save(_ configuration: LibreWatchAlarmConfiguration, defaults: UserDefaults = .standard) {
+        encode(configuration, key: configurationKey, defaults: defaults)
+    }
 
     static func settings(defaults: UserDefaults = .standard) -> LibreWatchAlarmSettings? {
         decode(LibreWatchAlarmSettings.self, key: settingsKey, defaults: defaults)
@@ -350,7 +456,7 @@ enum LibreWatchAlarmStore {
         else { defaults.removeObject(forKey: delegationKey) }
     }
     static func clearSession(defaults: UserDefaults = .standard) {
-        [settingsKey, stateKey, delegationKey].forEach { defaults.removeObject(forKey: $0) }
+        [settingsKey, stateKey, delegationKey, configurationKey].forEach { defaults.removeObject(forKey: $0) }
     }
     private static func decode<T: Decodable>(_ type: T.Type, key: String, defaults: UserDefaults) -> T? {
         guard let data = defaults.data(forKey: key) else { return nil }

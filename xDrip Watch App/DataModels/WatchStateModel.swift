@@ -144,6 +144,7 @@ final class WatchStateModel: NSObject, ObservableObject {
     private var diagnosticJournal = LibreWatchSessionStore.loadDiagnosticJournal()
     private var outboxInFlightID: UUID?
     private var activationWasRequested = false
+    private var lastAlarmAcknowledgementAttemptAt: Date?
     private var acceptedHandoffRevision = LibreWatchSessionStore.loadHandoffRevision()
 
     @Published var aidStatus: AIDStatus?
@@ -873,8 +874,7 @@ final class WatchStateModel: NSObject, ObservableObject {
                 return until > at ? (kind.rawValue, until) : nil
             })
             event.alarmNotificationsAuthorized = localAlarms.notificationsAreAuthorized
-            event.alarmDelegatedToWatch = libreWatchOwnership == .watch &&
-                LibreWatchAlarmStore.delegation()?.matches(settings) == true
+            event.alarmDelegatedToWatch = localAlarms.alarmsAreDelegatedToWatch
         }
         let result = diagnosticJournal.append(event)
         LibreWatchSessionStore.saveDiagnosticJournal(diagnosticJournal)
@@ -1237,6 +1237,20 @@ final class WatchStateModel: NSObject, ObservableObject {
         flushWatchConnectivityOutbox()
     }
 
+    /// Called by the collector's existing health/activation opportunity, even after return.
+    /// A final transient failure must not need another sensor frame to become eligible.
+    func retryPendingLibreDeliveries(at date: Date, executionIsAvailable: Bool) {
+        if executionIsAvailable, phoneIsReachable, localAlarms.hasPendingConfiguration,
+           date.timeIntervalSince(lastAlarmAcknowledgementAttemptAt ?? .distantPast) >= LibreWatchConnectivityOutbox.retryInterval {
+            synchronizeLocalAlarmState()
+        }
+        guard session.activationState == .activated,
+              connectivityOutbox.retryIsDue(at: date, executionIsAvailable: executionIsAvailable,
+                                           hasInFlightItem: outboxInFlightID != nil)
+        else { return }
+        flushWatchConnectivityOutbox()
+    }
+
     /// Recovers the narrow crash window between journal persistence and outbox persistence.
     /// Existing IDs make this idempotent; normal delivery remains the per-event outbox path.
     private func restorePendingDiagnosticJournalToOutbox(at date: Date = Date()) {
@@ -1424,7 +1438,7 @@ final class WatchStateModel: NSObject, ObservableObject {
             message[LibreWatchMessageKey.diagnosticEvent] = diagnosticEvent
         }
         if [.requestOwnership, .releaseOwnership, .acknowledgeSession].contains(command),
-           let settings = localAlarms.settings, settings.sessionID == sessionID {
+           let settings = localAlarms.offeredSettings, settings.sessionID == sessionID {
             message[LibreWatchMessageKey.alarmSettingsRevision] = String(settings.revision)
             message[LibreWatchMessageKey.alarmsReady] = localAlarms.readinessRevision == settings.revision
             message[LibreWatchMessageKey.alarmState] = try? JSONEncoder().encode(localAlarms.state)
@@ -1476,6 +1490,7 @@ final class WatchStateModel: NSObject, ObservableObject {
 
     private func synchronizeLocalAlarmState() {
         guard let sessionID = libreWatchDirectSession?.id else { return }
+        lastAlarmAcknowledgementAttemptAt = Date()
         // The latest snooze state is persisted independently of transport, attached again on
         // reconnection and included in release before the phone resumes its own alarm role.
         sendLibreWatchCommand(.acknowledgeSession, sessionID: sessionID, completion: nil)
@@ -1484,14 +1499,18 @@ final class WatchStateModel: NSObject, ObservableObject {
     private func processLibreWatchAlarmResponse(_ payload: [String: Any]) {
         guard let data = payload[LibreWatchMessageKey.alarmSettings] as? Data,
               let settings = try? JSONDecoder().decode(LibreWatchAlarmSettings.self, from: data),
-              let session = libreWatchDirectSession, settings.matches(session),
-              localAlarms.settings?.sessionID != settings.sessionID || settings.revision >= (localAlarms.settings?.revision ?? 0)
+              let session = libreWatchDirectSession, settings.matches(session)
         else { return }
         localAlarms.apply(settings: settings, session: session)
-        if payload[LibreWatchMessageKey.alarmsReady] != nil {
-            let delegation = (payload[LibreWatchMessageKey.alarmDelegation] as? Data)
-                .flatMap { try? JSONDecoder().decode(LibreWatchAlarmDelegation.self, from: $0) }
-            localAlarms.apply(delegation: delegation)
+        if let data = payload[LibreWatchMessageKey.alarmDelegation] as? Data,
+           let delegation = try? JSONDecoder().decode(LibreWatchAlarmDelegation.self, from: data) {
+            // alarmsReady describes the offered revision, not revocation of an older
+            // explicit delegation that the phone still holds while waiting for our reply.
+            localAlarms.apply(delegation: delegation, session: session)
+        } else if payload[LibreWatchMessageKey.alarmsReady] as? Bool == false,
+                  payload[LibreWatchMessageKey.alarmDelegation] == nil,
+                  settings.revision >= (localAlarms.offeredSettings?.revision ?? 0) {
+            localAlarms.apply(delegation: nil, session: session)
         }
     }
 

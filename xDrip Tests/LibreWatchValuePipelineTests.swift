@@ -1,7 +1,278 @@
 import XCTest
 import CoreData
 import HealthKit
+import Combine
 @testable import xdrip
+
+private final class LibreWatchOwnershipPublicationFixture {
+    @Published var ownership: LibreWatchOwnership = .iphone
+}
+
+extension LibreWatchValuePipelineTests {
+    func testCommittedOwnershipObserverStartsAfterAssignmentWithoutTakeoverCompletion() {
+        let fixture = LibreWatchOwnershipPublicationFixture()
+        let applied = expectation(description: "committed ownership delivered")
+        var events: [LibreWatchOwnership] = []
+        let subscription = LibreWatchLifecyclePolicy.observeCommittedOwnership(fixture.$ownership,
+            current: { fixture.ownership }, receive: { value in
+                XCTAssertTrue(Thread.isMainThread)
+                XCTAssertEqual(fixture.ownership, .watch)
+                events.append(value)
+                applied.fulfill()
+            })
+        DispatchQueue.main.async {
+            fixture.ownership = .watch
+            XCTAssertTrue(events.isEmpty, "Reconciliation must not run inside Published.willSet")
+        }
+        wait(for: [applied], timeout: 5)
+        withExtendedLifetime(subscription) { XCTAssertEqual(events, [.watch]) }
+    }
+
+    func testCommittedOwnershipObserverRejectsQueuedTakeoverAfterReturn() {
+        let fixture = LibreWatchOwnershipPublicationFixture()
+        let applied = expectation(description: "current phone ownership delivered")
+        var events: [LibreWatchOwnership] = []
+        let subscription = LibreWatchLifecyclePolicy.observeCommittedOwnership(fixture.$ownership,
+            current: { fixture.ownership }, receive: { value in events.append(value); applied.fulfill() })
+        DispatchQueue.main.async {
+            fixture.ownership = .watch
+            fixture.ownership = .iphone
+        }
+        wait(for: [applied], timeout: 5)
+        withExtendedLifetime(subscription) { XCTAssertEqual(events, [.iphone]) }
+    }
+
+    func testLegacyConnectingCallbackAdoptsExistingSystemAttemptWithoutManualConnect() throws {
+        var timing = LibreWatchConnectionTiming()
+        timing.receivedPacketOrEnabledNotifications(at: receivedAt)
+        XCTAssertNil(timing.deadline, "Do not fabricate a connection deadline in this fixture")
+        var gate = LibreWatchLegacyDisconnectGate()
+        let generation = timing.generation
+        let token = try XCTUnwrap(gate.scheduleLegacy())
+        XCTAssertTrue(gate.legacyIsCurrent(token, scheduledGeneration: generation,
+            currentGeneration: timing.generation, peripheralIsDisconnectedOrDisconnecting: false,
+            peripheralIsConnecting: true))
+        XCTAssertTrue(gate.accept(legacyToken: token))
+        XCTAssertEqual(LibreWatchLifecyclePolicy.disconnectRecoveryAction(isDeliberate: false,
+            systemIsReconnecting: true, ownership: .watch), .waitForSystemReconnect)
+        timing.invalidate()
+        timing.beginConnection(at: receivedAt, applicationIsActive: false, executionIsAvailable: false)
+        let adoptedGeneration = timing.generation
+        XCTAssertFalse(timing.canConnect(at: receivedAt, peripheralIsDisconnected: false, retiredPeripheralIsReleased: true))
+        timing.beginConnection(at: receivedAt.addingTimeInterval(600), applicationIsActive: true)
+        XCTAssertEqual(timing.generation, adoptedGeneration)
+        XCTAssertEqual(timing.remainingExecutionTime(at: receivedAt.addingTimeInterval(600)), 90)
+        XCTAssertFalse(gate.accept(), "A following modern callback cannot create a second recovery")
+    }
+
+    func testLegacyConnectingFallbackStillRejectsOldGenerationAndNewDidConnect() throws {
+        var gate = LibreWatchLegacyDisconnectGate()
+        let generation = UUID()
+        let token = try XCTUnwrap(gate.scheduleLegacy())
+        XCTAssertFalse(gate.legacyIsCurrent(token, scheduledGeneration: generation,
+            currentGeneration: UUID(), peripheralIsDisconnectedOrDisconnecting: false, peripheralIsConnecting: true))
+        gate.reset()
+        XCTAssertFalse(gate.legacyIsCurrent(token, scheduledGeneration: generation,
+            currentGeneration: generation, peripheralIsDisconnectedOrDisconnecting: false, peripheralIsConnecting: true))
+        XCTAssertEqual(LibreWatchLifecyclePolicy.disconnectRecoveryAction(isDeliberate: false,
+            systemIsReconnecting: true, ownership: .iphone), .noAdditionalWork)
+    }
+
+    func testFinalTransientOutboxItemRetriesOnExistingExecutionOpportunityAfterReturn() throws {
+        let item = LibreWatchOutboxItem.reading(payload(raw: 847, previousRaw: 829, domain: .factoryNativeMGDL))
+        var outbox = LibreWatchConnectivityOutbox()
+        outbox.enqueue(item, now: receivedAt)
+        XCTAssertFalse(LibreWatchConnectivityDeliveryPolicy.shouldFinish(item, success: false, outcome: .historyNotInserted))
+        outbox.markSubmitted(id: item.id, at: receivedAt)
+        XCTAssertFalse(outbox.retryIsDue(at: receivedAt.addingTimeInterval(59), executionIsAvailable: true, hasInFlightItem: false))
+        let restored = try JSONDecoder().decode(LibreWatchConnectivityOutbox.self, from: JSONEncoder().encode(outbox))
+        let next = receivedAt.addingTimeInterval(60)
+        XCTAssertFalse(restored.retryIsDue(at: next, executionIsAvailable: false, hasInFlightItem: false))
+        XCTAssertFalse(restored.retryIsDue(at: next, executionIsAvailable: true, hasInFlightItem: true))
+        XCTAssertTrue(restored.retryIsDue(at: next, executionIsAvailable: true, hasInFlightItem: false))
+        XCTAssertEqual(restored.nextEligible(at: next)?.id, item.id)
+        // Ownership isn't an input to transport retry; the historical receiver still enforces cutoff.
+        outbox.remove(id: item.id)
+        XCTAssertFalse(outbox.retryIsDue(at: next, executionIsAvailable: true, hasInFlightItem: false))
+    }
+
+    func testFirstWatchPacketMissedDeadlineExistsWithoutInventingAReading() throws {
+        let settings = alarmSettings()
+        var state = LibreWatchAlarmState()
+        state.use(settings)
+        state.beginWatchOwnership(at: receivedAt)
+        let due = try XCTUnwrap(state.nextMissedAlarm(settings: settings, delegation: alarmDelegation(settings),
+            watchOwnsSensor: true, now: receivedAt))
+        XCTAssertEqual(due.date, receivedAt.addingTimeInterval(300))
+        XCTAssertNil(state.lastReadingAt)
+        XCTAssertNil(state.lastReadingID)
+        XCTAssertTrue(state.notificationMayBePresented(kind: .missed,
+            notificationSessionID: session.id.uuidString, notificationReadingID: nil,
+            settings: settings, delegation: alarmDelegation(settings), watchOwnsSensor: true,
+            notificationsAuthorized: true, at: due.date, notificationMissedBaseline: receivedAt))
+        XCTAssertFalse(state.notificationMayBePresented(kind: .low,
+            notificationSessionID: session.id.uuidString, notificationReadingID: nil,
+            settings: settings, delegation: alarmDelegation(settings), watchOwnsSensor: true,
+            notificationsAuthorized: true, at: due.date))
+    }
+
+    func testFirstPacketDeadlinePersistsWithoutRenewingOnWakeAndRespectsSnooze() throws {
+        let settings = alarmSettings(snoozeAllUntil: receivedAt.addingTimeInterval(600))
+        var state = LibreWatchAlarmState()
+        state.use(settings)
+        state.beginWatchOwnership(at: receivedAt)
+        state.snooze(.missed, until: receivedAt.addingTimeInterval(900))
+        let defaults = isolatedDefaults()
+        LibreWatchAlarmStore.save(state, defaults: defaults)
+        var restored = LibreWatchAlarmStore.state(defaults: defaults)
+        restored.beginWatchOwnership(at: receivedAt.addingTimeInterval(200))
+        XCTAssertEqual(restored.ownershipStartedAt, receivedAt)
+        XCTAssertEqual(restored.nextMissedAlarm(settings: settings, delegation: alarmDelegation(settings),
+            watchOwnsSensor: true, now: receivedAt.addingTimeInterval(200))?.date, receivedAt.addingTimeInterval(900))
+        XCTAssertNil(restored.nextMissedAlarm(settings: settings, delegation: alarmDelegation(settings),
+            watchOwnsSensor: false, now: receivedAt))
+    }
+
+    func testFreshFrameInvalidatesFirstPacketDeadlineWithoutChangingMeasurementTime() {
+        let settings = alarmSettings()
+        var state = LibreWatchAlarmState()
+        state.use(settings)
+        state.beginWatchOwnership(at: receivedAt)
+        let measured = receivedAt.addingTimeInterval(60)
+        _ = state.accept(id: UUID(), measuredAt: measured, glucose: 120, settings: settings,
+            delegation: alarmDelegation(settings), watchOwnsSensor: true, now: measured)
+        XCTAssertEqual(state.lastReadingAt, measured)
+        XCTAssertEqual(state.nextMissedAlarm(settings: settings, delegation: alarmDelegation(settings),
+            watchOwnsSensor: true, now: measured)?.date, measured.addingTimeInterval(300))
+        XCTAssertFalse(state.notificationMayBePresented(kind: .missed,
+            notificationSessionID: session.id.uuidString, notificationReadingID: nil,
+            settings: settings, delegation: alarmDelegation(settings), watchOwnsSensor: true,
+            notificationsAuthorized: true, at: measured, notificationMissedBaseline: receivedAt))
+        state.endWatchOwnership()
+        state.beginWatchOwnership(at: measured.addingTimeInterval(600))
+        XCTAssertEqual(state.missedReadingBaseline, measured.addingTimeInterval(600))
+    }
+
+    func testPendingAlarmRevisionKeepsCommittedEvaluationAndMissedDeadline() throws {
+        let initial = alarmSettings()
+        let changedRules = initial.rules.map { rule in
+            LibreWatchAlarmRule(kind: rule.kind, startMinute: rule.startMinute,
+                value: rule.kind == .veryLow ? 70 : rule.value, enabled: rule.enabled,
+                snoozeMinutes: rule.snoozeMinutes, allowsSnooze: rule.allowsSnooze,
+                soundEnabled: rule.soundEnabled, vibrate: rule.vibrate, title: rule.title)
+        }
+        let next = LibreWatchAlarmSettings(sessionID: initial.sessionID, sensorIdentity: initial.sensorIdentity,
+            revision: 2, generatedAt: receivedAt, isMgDl: initial.isMgDl, rules: changedRules,
+            snoozes: initial.snoozes, snoozeAllUntil: initial.snoozeAllUntil)
+        var configuration = LibreWatchAlarmConfiguration(settings: initial, delegation: alarmDelegation(initial))
+        var state = LibreWatchAlarmState()
+        state.use(initial)
+        state.beginWatchOwnership(at: receivedAt)
+        state.scheduledMissedID = "previous-system-request"
+        let before = state.nextMissedAlarm(settings: initial, delegation: configuration.delegation, watchOwnsSensor: true, now: receivedAt)?.date
+        XCTAssertTrue(configuration.propose(next, session: session))
+        let effective = try XCTUnwrap(configuration.effectiveSettings)
+        state.use(try XCTUnwrap(configuration.settings))
+        XCTAssertEqual(configuration.offeredSettings?.revision, 2, "Acknowledge the candidate, not the old active revision")
+        XCTAssertEqual(effective.revision, 1)
+        XCTAssertEqual(state.scheduledMissedID, "previous-system-request")
+        XCTAssertEqual(state.nextMissedAlarm(settings: effective, delegation: configuration.delegation,
+            watchOwnsSensor: true, now: receivedAt)?.date, before)
+        // A reply to an older ACK still carries D1, even when its R2-ready flag is false.
+        XCTAssertTrue(configuration.confirm(alarmDelegation(initial), session: session))
+        XCTAssertEqual(configuration.pendingSettings, next)
+        XCTAssertEqual(configuration.effectiveSettings?.rules, initial.rules)
+        XCTAssertEqual(state.accept(id: UUID(), measuredAt: receivedAt, glucose: 38,
+            settings: effective, delegation: configuration.delegation, watchOwnsSensor: true, now: receivedAt)?.kind, .veryLow)
+        XCTAssertTrue(configuration.confirm(alarmDelegation(next), session: session))
+        XCTAssertNil(configuration.pendingSettings)
+        XCTAssertEqual(configuration.settings?.revision, 2)
+        XCTAssertEqual(configuration.effectiveSettings?.rules, changedRules)
+        XCTAssertTrue(configuration.delegation?.matches(next) == true)
+    }
+
+    func testCommittedAlarmPairAndPendingRevisionSurviveRestartAtomically() throws {
+        let initial = alarmSettings()
+        var next = initial
+        next.revision = 2
+        var configuration = LibreWatchAlarmConfiguration(settings: initial, delegation: alarmDelegation(initial))
+        XCTAssertTrue(configuration.propose(next, session: session))
+        let defaults = isolatedDefaults()
+        LibreWatchAlarmStore.save(configuration, defaults: defaults)
+        let restored = LibreWatchAlarmStore.configuration(defaults: defaults)
+        XCTAssertEqual(restored, configuration)
+        XCTAssertTrue(restored.delegation?.matches(try XCTUnwrap(restored.settings)) == true)
+        XCTAssertEqual(restored.offeredSettings?.revision, 2)
+    }
+
+    func testAlarmDelegationCarriesExactSettingsWhenNewerOfferOvertakesReply() throws {
+        let first = alarmSettings()
+        var second = first
+        second.revision = 2
+        var third = second
+        third.revision = 3
+        var configuration = LibreWatchAlarmConfiguration(settings: first, delegation: alarmDelegation(first))
+        XCTAssertTrue(configuration.propose(third, session: session))
+        XCTAssertTrue(configuration.confirm(alarmDelegation(second), session: session))
+        XCTAssertEqual(configuration.settings, second)
+        XCTAssertEqual(configuration.pendingSettings, third)
+        XCTAssertFalse(configuration.confirm(alarmDelegation(first), session: session))
+        XCTAssertTrue(configuration.confirm(alarmDelegation(third), session: session))
+        XCTAssertEqual(configuration.settings, third)
+        XCTAssertNil(configuration.pendingSettings)
+    }
+
+    func testPendingAlarmSnoozeAppliesImmediatelyButUnsnoozeWaitsForConfirmation() throws {
+        let initial = alarmSettings()
+        var snoozed = alarmSettings(snoozeAllUntil: receivedAt.addingTimeInterval(600))
+        snoozed.revision = 2
+        var configuration = LibreWatchAlarmConfiguration(settings: initial, delegation: alarmDelegation(initial))
+        XCTAssertTrue(configuration.propose(snoozed, session: session))
+        let effective = try XCTUnwrap(configuration.effectiveSettings)
+        XCTAssertEqual(effective.snoozeAllUntil, snoozed.snoozeAllUntil)
+        XCTAssertEqual(effective.rules, initial.rules)
+        XCTAssertTrue(configuration.delegation?.matches(effective) == true)
+        XCTAssertTrue(configuration.confirm(alarmDelegation(snoozed), session: session))
+        var unsnoozed = initial
+        unsnoozed.revision = 3
+        XCTAssertTrue(configuration.propose(unsnoozed, session: session))
+        XCTAssertEqual(configuration.effectiveSettings?.snoozeAllUntil, snoozed.snoozeAllUntil)
+        XCTAssertTrue(configuration.confirm(alarmDelegation(unsnoozed), session: session))
+        XCTAssertNil(configuration.effectiveSettings?.snoozeAllUntil)
+    }
+
+    func testAlarmRevocationRejectsDelayedOldDelegationAndSessionMismatch() {
+        let first = alarmSettings()
+        var second = first
+        second.revision = 2
+        var configuration = LibreWatchAlarmConfiguration(settings: first, delegation: alarmDelegation(first))
+        XCTAssertTrue(configuration.propose(second, session: session))
+        XCTAssertTrue(configuration.confirm(nil, session: session))
+        XCTAssertNil(configuration.delegation)
+        XCTAssertFalse(configuration.confirm(alarmDelegation(first), session: session))
+        XCTAssertFalse(configuration.confirm(LibreWatchAlarmDelegation(sessionID: UUID(),
+            sensorIdentity: first.sensorIdentity, settingsRevision: 3), session: session))
+        XCTAssertEqual(configuration.settings, second)
+    }
+
+    func testLegacyAlarmConfigurationAndStateDecodeWithoutNewFields() throws {
+        let settings = alarmSettings()
+        let defaults = isolatedDefaults()
+        var legacyDelegation = alarmDelegation(settings)
+        legacyDelegation.confirmedSettings = nil
+        LibreWatchAlarmStore.save(settings, defaults: defaults)
+        LibreWatchAlarmStore.save(legacyDelegation, defaults: defaults)
+        let restored = LibreWatchAlarmStore.configuration(defaults: defaults)
+        XCTAssertEqual(restored.settings, settings)
+        XCTAssertTrue(restored.delegation?.matches(settings) == true)
+        XCTAssertNil(restored.pendingSettings)
+        let state = try JSONDecoder().decode(LibreWatchAlarmState.self, from: Data("{\"snoozes\":[]}".utf8))
+        XCTAssertNil(state.ownershipStartedAt)
+        XCTAssertNil(state.lastReadingAt)
+        LibreWatchAlarmStore.clearSession(defaults: defaults)
+        XCTAssertNil(LibreWatchAlarmStore.configuration(defaults: defaults).settings)
+    }
+}
 
 extension LibreWatchValuePipelineTests {
     func testConfiguredReadSuccessCadenceDoesNotShrinkDuringOutageOrBackfill() {

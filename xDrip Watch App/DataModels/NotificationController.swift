@@ -88,9 +88,12 @@ class NotificationController: WKUserNotificationHostingController<NotificationVi
 /// persisted copy of the user's real phone alert settings.
 final class LibreWatchAlarmController: NSObject, UNUserNotificationCenterDelegate {
     private let center = UNUserNotificationCenter.current()
-    private(set) var settings = LibreWatchAlarmStore.settings()
+    private var configuration = LibreWatchAlarmStore.configuration()
+    var settings: LibreWatchAlarmSettings? { configuration.effectiveSettings }
+    var offeredSettings: LibreWatchAlarmSettings? { configuration.offeredSettings }
+    var hasPendingConfiguration: Bool { configuration.pendingSettings != nil }
     private(set) var state = LibreWatchAlarmStore.state()
-    private var delegation = LibreWatchAlarmStore.delegation()
+    private var delegation: LibreWatchAlarmDelegation? { configuration.delegation }
     private var watchOwnsSensor = false
     private var notificationsAuthorized = false
     private var pendingGlucoseAlarm = false
@@ -106,7 +109,7 @@ final class LibreWatchAlarmController: NSObject, UNUserNotificationCenterDelegat
     }
 
     var readinessRevision: UInt64? {
-        settings?.readinessRevision(notificationsAuthorized: notificationsAuthorized)
+        offeredSettings?.readinessRevision(notificationsAuthorized: notificationsAuthorized)
     }
 
     override init() {
@@ -123,21 +126,16 @@ final class LibreWatchAlarmController: NSObject, UNUserNotificationCenterDelegat
     }
 
     func apply(settings candidate: LibreWatchAlarmSettings, session: LibreWatchDirectSession) {
-        guard candidate.matches(session),
-              settings?.sessionID != candidate.sessionID || candidate.revision >= (settings?.revision ?? 0)
-        else { return }
         let previousRevision = readinessRevision
-        if settings?.sessionID != candidate.sessionID {
-            cancelScheduledAlarms()
-        } else if settings?.revision != candidate.revision, let previous = state.scheduledMissedID {
-            center.removePendingNotificationRequests(withIdentifiers: [previous])
-            state.scheduledMissedID = nil
-        }
-        settings = candidate
-        state.use(candidate)
-        state.acknowledgePhoneSnoozes(candidate)
-        LibreWatchAlarmStore.save(candidate)
+        guard configuration.propose(candidate, session: session), let committed = configuration.settings else { return }
+        if state.sessionID != committed.sessionID { cancelScheduledAlarms() }
+        state.use(committed)
+        state.acknowledgePhoneSnoozes(committed)
+        LibreWatchAlarmStore.save(configuration)
         LibreWatchAlarmStore.save(state)
+        // Unconfirmed revisions do not delete the previous missed-reading deadline.
+        // Only a confirmed change (or an explicit later snooze) changes its identity.
+        scheduleMissedIfNeeded()
         publishStatus()
         if previousRevision != readinessRevision { onReadinessChange?() }
     }
@@ -145,8 +143,7 @@ final class LibreWatchAlarmController: NSObject, UNUserNotificationCenterDelegat
     func validate(session: LibreWatchDirectSession?) {
         guard let session, settings?.matches(session) == true else {
             cancelScheduledAlarms()
-            settings = nil
-            delegation = nil
+            configuration = LibreWatchAlarmConfiguration()
             state = LibreWatchAlarmState()
             LibreWatchAlarmStore.clearSession()
             publishStatus()
@@ -154,9 +151,14 @@ final class LibreWatchAlarmController: NSObject, UNUserNotificationCenterDelegat
         }
     }
 
-    func apply(delegation: LibreWatchAlarmDelegation?) {
-        self.delegation = delegation
-        LibreWatchAlarmStore.save(delegation)
+    func apply(delegation: LibreWatchAlarmDelegation?, session: LibreWatchDirectSession) {
+        guard configuration.confirm(delegation, session: session) else { return }
+        if let committed = configuration.settings {
+            state.use(committed)
+            state.acknowledgePhoneSnoozes(committed)
+        }
+        LibreWatchAlarmStore.save(configuration)
+        LibreWatchAlarmStore.save(state)
         if delegation == nil { cancelScheduledAlarms() }
         scheduleMissedIfNeeded()
         publishStatus()
@@ -164,8 +166,14 @@ final class LibreWatchAlarmController: NSObject, UNUserNotificationCenterDelegat
 
     func ownershipDidChange(_ ownership: LibreWatchOwnership) {
         watchOwnsSensor = ownership == .watch
-        if !watchOwnsSensor { cancelScheduledAlarms() }
-        else { scheduleMissedIfNeeded() }
+        if !watchOwnsSensor {
+            state.endWatchOwnership()
+            cancelScheduledAlarms()
+        } else {
+            state.beginWatchOwnership(at: Date())
+            LibreWatchAlarmStore.save(state)
+            scheduleMissedIfNeeded()
+        }
         publishStatus()
     }
 
@@ -256,14 +264,20 @@ final class LibreWatchAlarmController: NSObject, UNUserNotificationCenterDelegat
         guard notificationsAuthorized, let settings,
               let missed = state.nextMissedAlarm(settings: settings, delegation: delegation,
                 watchOwnsSensor: watchOwnsSensor, now: now),
-              let readingAt = state.lastReadingAt
+              let baseline = state.missedReadingBaseline
         else { return }
         let snoozedUntil = state.snoozedUntil(.missed, settings: settings).timeIntervalSince1970
-        let identifier = "libreWatchAlarm.missed.\(settings.sessionID.uuidString).\(readingAt.timeIntervalSince1970).\(settings.revision).\(snoozedUntil)"
+        let snoozeAllUntil = settings.snoozeAllUntil?.timeIntervalSince1970 ?? 0
+        let identifier = "libreWatchAlarm.missed.\(settings.sessionID.uuidString).\(baseline.timeIntervalSince1970).\(settings.revision).\(snoozedUntil).\(snoozeAllUntil)"
         guard state.scheduledMissedID != identifier else { return }
         if let previous = state.scheduledMissedID { center.removePendingNotificationRequests(withIdentifiers: [previous]) }
         let content = content(for: missed.rule)
-        content.body = "Ingen ny direkte Libre-måling siden \(readingAt.formatted(date: .omitted, time: .shortened))."
+        content.userInfo["libreWatchAlarmBaseline"] = baseline.timeIntervalSince1970
+        if let readingAt = state.lastReadingAt, readingAt >= baseline {
+            content.body = "Ingen ny direkte Libre-måling siden \(readingAt.formatted(date: .omitted, time: .shortened))."
+        } else {
+            content.body = "Ingen direkte Libre-måling efter overtagelsen kl. \(baseline.formatted(date: .omitted, time: .shortened))."
+        }
         let request = UNNotificationRequest(identifier: identifier, content: content,
             trigger: UNTimeIntervalNotificationTrigger(timeInterval: max(1, missed.date.timeIntervalSince(now)), repeats: false))
         state.scheduledMissedID = identifier
@@ -321,7 +335,9 @@ final class LibreWatchAlarmController: NSObject, UNUserNotificationCenterDelegat
         } else if !notificationsAuthorized {
             onStatusChange?("Watch-notifikationer er ikke tilladt. iPhone skal bekræfte alarmansvaret.")
         } else if watchOwnsSensor, delegation?.matches(settings) == true {
-            onStatusChange?("Lokale Watch-alarmer er aktive; watchOS styrer lyd og baggrundslevering")
+            onStatusChange?(configuration.pendingSettings == nil
+                ? "Lokale Watch-alarmer er aktive; watchOS styrer lyd og baggrundslevering"
+                : "Watch-alarmer bruger bekræftede indstillinger; afventer opdatering fra iPhone")
         } else {
             onStatusChange?("Alarmansvaret er hos iPhone")
         }
@@ -342,7 +358,8 @@ final class LibreWatchAlarmController: NSObject, UNUserNotificationCenterDelegat
                     notificationReadingID: (info["libreWatchAlarmReading"] as? String).flatMap(UUID.init(uuidString:)),
                     settings: self.settings, delegation: self.delegation,
                     watchOwnsSensor: self.watchOwnsSensor, notificationsAuthorized: self.notificationsAuthorized,
-                    at: Date())
+                    at: Date(), notificationMissedBaseline: (info["libreWatchAlarmBaseline"] as? Double)
+                        .map { Date(timeIntervalSince1970: $0) })
             else { completionHandler([]); return }
             completionHandler([.banner, .sound])
         }
