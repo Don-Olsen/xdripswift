@@ -139,6 +139,7 @@ final class WatchStateModel: NSObject, ObservableObject {
     private var latestDirectSourceDelta: Double?
     private var directReadingAcceptance = LibreWatchReadingAcceptancePolicy()
     private var connectivityOutbox = LibreWatchSessionStore.loadOutbox()
+    private var diagnosticJournal = LibreWatchSessionStore.loadDiagnosticJournal()
     private var outboxInFlightID: UUID?
     private var activationWasRequested = false
 
@@ -162,6 +163,7 @@ final class WatchStateModel: NSObject, ObservableObject {
             LibreWatchSessionStore.clearCalibration()
         }
         restorePersistedLibreWatchReadingIfPossible()
+        restorePendingDiagnosticJournalToOutbox()
 
         session.delegate = self
         if session.activationState == .activated {
@@ -831,8 +833,12 @@ final class WatchStateModel: NSObject, ObservableObject {
     }
 
     func reportLibreWatchDiagnostic(_ event: LibreWatchDiagnosticEvent) {
-        guard let preparedSession = libreWatchDirectSession,
-              let encoded = try? JSONEncoder().encode(event)
+        guard let preparedSession = libreWatchDirectSession else { return }
+
+        let result = diagnosticJournal.append(event)
+        LibreWatchSessionStore.saveDiagnosticJournal(diagnosticJournal)
+        guard result.inserted,
+              let encoded = try? JSONEncoder().encode(result.event)
         else { return }
 
         sendLibreWatchCommand(
@@ -1156,7 +1162,35 @@ final class WatchStateModel: NSObject, ObservableObject {
         flushWatchConnectivityOutbox()
     }
 
+    /// Recovers the narrow crash window between journal persistence and outbox persistence.
+    /// Existing IDs make this idempotent; normal delivery remains the per-event outbox path.
+    private func restorePendingDiagnosticJournalToOutbox(at date: Date = Date()) {
+        guard let sessionID = libreWatchDirectSession?.id else { return }
+        let pending = diagnosticJournal.pendingEvents(for: sessionID)
+        guard !pending.isEmpty else { return }
+
+        for (index, event) in pending.enumerated() {
+            guard let eventID = event.eventID,
+                  let sessionID = event.sessionID,
+                  let encoded = try? JSONEncoder().encode(event)
+            else { continue }
+            connectivityOutbox.enqueue(.command(
+                .reportDiagnostic,
+                sessionID: sessionID,
+                diagnosticEvent: encoded,
+                id: eventID,
+                createdAt: date.addingTimeInterval(-1 + Double(index) / 1_000)
+            ), now: date)
+        }
+        LibreWatchSessionStore.saveOutbox(connectivityOutbox)
+    }
+
     private func finishOutboxItem(_ id: UUID) {
+        if let item = connectivityOutbox.items.first(where: { $0.id == id }),
+           item.command == .reportDiagnostic {
+            diagnosticJournal.markHandedToWatchConnectivity(eventID: id)
+            LibreWatchSessionStore.saveDiagnosticJournal(diagnosticJournal)
+        }
         connectivityOutbox.remove(id: id)
         LibreWatchSessionStore.saveOutbox(connectivityOutbox)
         outboxInFlightID = nil
@@ -1175,6 +1209,9 @@ final class WatchStateModel: NSObject, ObservableObject {
 
     private func flushWatchConnectivityOutbox() {
         guard outboxInFlightID == nil else { return }
+        // A journal entry is persisted before its outbox item. Reconcile that crash/eviction
+        // window on every activation/reachability opportunity, not only at process launch.
+        restorePendingDiagnosticJournalToOutbox()
         connectivityOutbox.prune()
         LibreWatchSessionStore.saveOutbox(connectivityOutbox)
         guard let item = connectivityOutbox.next else { return }

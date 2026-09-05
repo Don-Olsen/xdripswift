@@ -21,6 +21,7 @@ enum LibreWatchMessageKey {
     static let legacyPersistedReading = "libreWatchDirectPersistedReading.v1"
     static let persistedOutbox = "libreWatchConnectivityOutbox.v1"
     static let persistedDiagnosticReceipts = "libreWatchDiagnosticReceipts.v1"
+    static let persistedDiagnosticJournal = "libreWatchDiagnosticJournal.v1"
     static let persistedRecoveryAttempt = "libreWatchRecoveryAttempt.v1"
     static let persistedReleaseReceipt = "libreWatchReleaseReceipt.v1"
 }
@@ -115,12 +116,28 @@ enum LibreWatchDiagnosticEventKind: String, Codable, Equatable {
     case recoveryFailed
     case extendedRuntimeWillExpire
     case extendedRuntimeInvalidated
+    case lifecycleChanged
+    case bluetoothAction
+    case coreBluetoothCallback
+    case frameProgress
+    case callbackRejected
+    case journalRotated
+}
+
+enum LibreWatchApplicationState: String, Codable, Equatable {
+    case active
+    case inactive
+    case background
+
+    var applicationIsActive: Bool { self == .active }
 }
 
 enum LibreWatchRecoveryReconcileSource: String, Codable, Equatable {
     case initialPreparation
     case sceneActivation
     case sceneDeactivation
+    case sceneInactive
+    case sceneBackground
     case extendedRuntimeStarted
     case extendedRuntimeWillExpire
     case extendedRuntimeInvalidated
@@ -205,7 +222,7 @@ struct LibreWatchRecoveryAttemptState: Codable, Equatable {
 /// A bounded, privacy-safe Watch diagnostic. Sensor identity is derived on iPhone from
 /// the validated session and never crosses as a raw peripheral identifier.
 struct LibreWatchDiagnosticEvent: Codable, Equatable {
-    let eventID: UUID?
+    var eventID: UUID?
     let kind: LibreWatchDiagnosticEventKind
     let isReconnecting: Bool?
     let errorCode: Int?
@@ -227,6 +244,21 @@ struct LibreWatchDiagnosticEvent: Codable, Equatable {
     let remainingExecutionBudget: TimeInterval?
     let runtimeInvalidationReason: Int?
     let runtimeError: String?
+    let applicationState: LibreWatchApplicationState?
+    let appVersion: String?
+    let appBuild: String?
+    let watchOSVersion: String?
+    var sequenceNumber: UInt64?
+    let bluetoothAction: String?
+    let actionReason: String?
+    let errorDomain: String?
+    let technicalFrameAt: Date?
+    let measurementAt: Date?
+    let receivingBudgetDeadline: Date?
+    var journalDroppedCount: UInt64?
+    let bluetoothErrorClassification: String?
+    let extendedRuntimeState: String?
+    let extendedRuntimeStartRequested: Bool?
 
     init(
         eventID: UUID? = UUID(),
@@ -249,29 +281,64 @@ struct LibreWatchDiagnosticEvent: Codable, Equatable {
         reconcileSource: LibreWatchRecoveryReconcileSource? = nil,
         remainingExecutionBudget: TimeInterval? = nil,
         runtimeInvalidationReason: Int? = nil,
-        runtimeError: String? = nil
+        runtimeError: String? = nil,
+        applicationState: LibreWatchApplicationState? = nil,
+        appVersion: String? = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String,
+        appBuild: String? = Bundle.main.infoDictionary?["CFBundleVersion"] as? String,
+        watchOSVersion: String? = ProcessInfo.processInfo.operatingSystemVersionString,
+        sequenceNumber: UInt64? = nil,
+        bluetoothAction: String? = nil,
+        actionReason: String? = nil,
+        errorDomain: String? = nil,
+        technicalFrameAt: Date? = nil,
+        measurementAt: Date? = nil,
+        receivingBudgetDeadline: Date? = nil,
+        journalDroppedCount: UInt64? = nil,
+        bluetoothErrorClassification: String? = nil,
+        extendedRuntimeState: String? = nil,
+        extendedRuntimeStartRequested: Bool? = nil
     ) {
         self.eventID = eventID
         self.kind = kind
         self.isReconnecting = isReconnecting
         self.errorCode = errorCode
         self.watchTimestamp = watchTimestamp
-        self.trigger = trigger
+        self.trigger = Self.bounded(trigger)
         self.applicationIsActive = applicationIsActive
         self.extendedRuntimeIsRunning = extendedRuntimeIsRunning
-        self.peripheralState = peripheralState
-        self.connectionPhase = connectionPhase
-        self.deadlinePhase = deadlinePhase
+        self.peripheralState = Self.bounded(peripheralState)
+        self.connectionPhase = Self.bounded(connectionPhase)
+        self.deadlinePhase = Self.bounded(deadlinePhase)
         self.deadlineAt = deadlineAt
         self.generation = generation
         self.attemptID = attemptID
         self.attemptStartedAt = attemptStartedAt
         self.sessionID = sessionID
-        self.sensorIdentity = sensorIdentity
+        self.sensorIdentity = Self.bounded(sensorIdentity)
         self.reconcileSource = reconcileSource
         self.remainingExecutionBudget = remainingExecutionBudget
         self.runtimeInvalidationReason = runtimeInvalidationReason
-        self.runtimeError = runtimeError
+        self.runtimeError = Self.bounded(runtimeError)
+        self.applicationState = applicationState
+        self.appVersion = Self.bounded(appVersion)
+        self.appBuild = Self.bounded(appBuild)
+        self.watchOSVersion = Self.bounded(watchOSVersion)
+        self.sequenceNumber = sequenceNumber
+        self.bluetoothAction = Self.bounded(bluetoothAction)
+        self.actionReason = Self.bounded(actionReason)
+        self.errorDomain = Self.bounded(errorDomain)
+        self.technicalFrameAt = technicalFrameAt
+        self.measurementAt = measurementAt
+        self.receivingBudgetDeadline = receivingBudgetDeadline
+        self.journalDroppedCount = journalDroppedCount
+        self.bluetoothErrorClassification = Self.bounded(bluetoothErrorClassification)
+        self.extendedRuntimeState = Self.bounded(extendedRuntimeState)
+        self.extendedRuntimeStartRequested = extendedRuntimeStartRequested
+    }
+
+    private static func bounded(_ value: String?, maximumLength: Int = 512) -> String? {
+        guard let value, value.count > maximumLength else { return value }
+        return String(value.prefix(maximumLength)) + "…"
     }
 }
 
@@ -593,8 +660,10 @@ struct LibreWatchConnectivityDeliveryPolicy {
 }
 
 struct LibreWatchDiagnosticReceiptLedger: Codable, Equatable {
-    static let maximumItems = 256
-    static let maximumAge: TimeInterval = 12 * 60 * 60
+    // Retain dedupe evidence longer than the bounded 24-hour Watch journal so a delayed
+    // WatchConnectivity retry cannot recreate an already exported diagnostic event.
+    static let maximumItems = 512
+    static let maximumAge: TimeInterval = 48 * 60 * 60
     private(set) var receipts: [UUID: Date] = [:]
 
     mutating func accept(_ eventID: UUID?, at date: Date = Date()) -> Bool {
@@ -611,6 +680,144 @@ struct LibreWatchDiagnosticReceiptLedger: Codable, Equatable {
 
     mutating func prune(at date: Date = Date()) {
         receipts = receipts.filter { date.timeIntervalSince($0.value) <= Self.maximumAge }
+    }
+}
+
+/// A small local Watch record independent of current WatchConnectivity reachability.
+/// Entries remain after delivery so a physical test can be reconstructed from original
+/// Watch timestamps; only redacted session context is stored.
+struct LibreWatchDiagnosticJournal: Codable, Equatable {
+    struct Entry: Codable, Equatable {
+        var event: LibreWatchDiagnosticEvent
+        /// Local insertion time is independent of an absent or skewed event timestamp.
+        let recordedAt: Date?
+        var handedToWatchConnectivityAt: Date?
+    }
+
+    struct AppendResult: Equatable {
+        let event: LibreWatchDiagnosticEvent
+        let rotated: Bool
+        let inserted: Bool
+    }
+
+    static let maximumEntries = 128
+    static let maximumAge: TimeInterval = 24 * 60 * 60
+    static let maximumEncodedBytes = 64 * 1024
+
+    private(set) var entries: [Entry] = []
+    private(set) var nextSequenceNumber: UInt64 = 1
+    private(set) var droppedCount: UInt64 = 0
+
+    mutating func append(
+        _ sourceEvent: LibreWatchDiagnosticEvent,
+        at date: Date = Date()
+    ) -> AppendResult {
+        let droppedBeforeAppend = droppedCount
+        prune(at: date)
+
+        if let eventID = sourceEvent.eventID,
+           let existing = entries.first(where: { $0.event.eventID == eventID }) {
+            return AppendResult(event: existing.event, rotated: false, inserted: false)
+        }
+
+        var event = sourceEvent
+        if event.eventID == nil { event.eventID = UUID() }
+        event.sequenceNumber = nextSequenceNumber
+        nextSequenceNumber &+= 1
+
+        if entries.count >= Self.maximumEntries {
+            let removalCount = entries.count - Self.maximumEntries + 1
+            entries.removeFirst(removalCount)
+            droppedCount &+= UInt64(removalCount)
+        }
+        event.journalDroppedCount = droppedCount
+        entries.append(Entry(
+            event: event,
+            recordedAt: date,
+            handedToWatchConnectivityAt: nil
+        ))
+        trimToEncodedSize()
+        let inserted = entries.last?.event.eventID == event.eventID
+        if inserted, var appended = entries.last {
+            appended.event.journalDroppedCount = droppedCount
+            entries[entries.count - 1] = appended
+            event = appended.event
+        }
+        return AppendResult(
+            event: event,
+            rotated: droppedCount != droppedBeforeAppend,
+            inserted: inserted
+        )
+    }
+
+    mutating func markHandedToWatchConnectivity(eventID: UUID?, at date: Date = Date()) {
+        guard let eventID,
+              let index = entries.firstIndex(where: { $0.event.eventID == eventID })
+        else { return }
+        entries[index].handedToWatchConnectivityAt = date
+        trimToEncodedSize()
+    }
+
+    func pendingEvents(for sessionID: UUID) -> [LibreWatchDiagnosticEvent] {
+        entries
+            .filter {
+                $0.handedToWatchConnectivityAt == nil &&
+                    $0.event.sessionID == sessionID
+            }
+            .map(\.event)
+    }
+
+    mutating func prune(at date: Date = Date()) {
+        let retained = entries.filter {
+            let timestamp = $0.recordedAt ?? $0.event.watchTimestamp ?? date
+            return date.timeIntervalSince(timestamp) <= Self.maximumAge
+        }
+        let removed = entries.count - retained.count
+        entries = retained
+        if removed > 0 { droppedCount &+= UInt64(removed) }
+        if let highest = entries.compactMap({ $0.event.sequenceNumber }).max() {
+            nextSequenceNumber = max(nextSequenceNumber, highest &+ 1)
+        }
+        trimToEncodedSize()
+    }
+
+    private mutating func trimToEncodedSize() {
+        while !entries.isEmpty,
+              (try? JSONEncoder().encode(self).count).map({ $0 > Self.maximumEncodedBytes }) == true {
+            entries.removeFirst()
+            droppedCount &+= 1
+        }
+    }
+}
+
+enum LibreWatchNotificationErrorAction: Equatable {
+    case preserveConnectionNearBackgroundLimit
+    case preserveConnectionExceededBackgroundLimit
+    case recoverBluetoothLink
+
+    var diagnosticName: String {
+        switch self {
+        case .preserveConnectionNearBackgroundLimit: return "backgroundBudgetNear"
+        case .preserveConnectionExceededBackgroundLimit: return "backgroundBudgetExceeded"
+        case .recoverBluetoothLink: return "recoverBluetoothLink"
+        }
+    }
+}
+
+/// The quota callbacks describe watchOS background delivery, not corrupt Libre bytes.
+/// CoreBluetooth-to-semantic mapping remains at the delegate boundary.
+struct LibreWatchNotificationErrorPolicy {
+    static func action(
+        isNearBackgroundNotificationLimit: Bool,
+        isExceededBackgroundNotificationLimit: Bool
+    ) -> LibreWatchNotificationErrorAction {
+        if isNearBackgroundNotificationLimit {
+            return .preserveConnectionNearBackgroundLimit
+        }
+        if isExceededBackgroundNotificationLimit {
+            return .preserveConnectionExceededBackgroundLimit
+        }
+        return .recoverBluetoothLink
     }
 }
 
@@ -662,7 +869,7 @@ struct LibreWatchLegacyDisconnectGate {
     }
 }
 
-/// Only connection/setup timing; Bluetooth operations remain in the existing collector.
+/// Connection/setup/technical-liveness timing; Bluetooth operations remain in the collector.
 struct LibreWatchConnectionTiming {
     enum Phase: String, Equatable {
         case connection, services, characteristics, notifications, unlock, receiving, cancelling
@@ -680,6 +887,7 @@ struct LibreWatchConnectionTiming {
         let phase: Phase
         let token: UUID
         let expiresAt: Date
+        let monotonicExpiresAt: TimeInterval?
     }
 
     struct ExecutionBudget: Equatable {
@@ -688,39 +896,68 @@ struct LibreWatchConnectionTiming {
         private(set) var armToken: UUID
         private(set) var remaining: TimeInterval
         private(set) var armedAt: Date?
+        private(set) var armedAtMonotonic: TimeInterval?
         private(set) var expiresAt: Date?
+        private(set) var monotonicExpiresAt: TimeInterval?
 
-        init(phase: Phase, duration: TimeInterval, at date: Date, executionIsAvailable: Bool) {
+        init(
+            phase: Phase,
+            duration: TimeInterval,
+            at date: Date,
+            executionIsAvailable: Bool,
+            monotonicTime: TimeInterval? = nil
+        ) {
             self.phase = phase
             token = UUID()
             armToken = UUID()
             remaining = duration
             armedAt = executionIsAvailable ? date : nil
+            let instant = monotonicTime ?? date.timeIntervalSinceReferenceDate
+            armedAtMonotonic = executionIsAvailable ? instant : nil
             expiresAt = executionIsAvailable ? date.addingTimeInterval(duration) : nil
+            monotonicExpiresAt = executionIsAvailable ? instant + duration : nil
         }
 
-        mutating func setExecutionAvailable(_ available: Bool, at date: Date) {
+        mutating func setExecutionAvailable(
+            _ available: Bool,
+            at date: Date,
+            monotonicTime: TimeInterval? = nil
+        ) {
+            let instant = monotonicTime ?? date.timeIntervalSinceReferenceDate
             if available {
                 guard armedAt == nil else { return }
                 armToken = UUID()
                 armedAt = date
+                armedAtMonotonic = instant
                 expiresAt = date.addingTimeInterval(remaining)
+                monotonicExpiresAt = instant + remaining
             } else {
-                guard let armedAt else { return }
-                remaining = max(0, remaining - max(0, date.timeIntervalSince(armedAt)))
+                guard armedAt != nil, let armedAtMonotonic else { return }
+                remaining = max(0, remaining - max(0, instant - armedAtMonotonic))
                 self.armedAt = nil
+                self.armedAtMonotonic = nil
                 expiresAt = nil
+                monotonicExpiresAt = nil
             }
         }
 
-        func remainingExecutionTime(at date: Date) -> TimeInterval {
-            guard let armedAt else { return remaining }
-            return max(0, remaining - max(0, date.timeIntervalSince(armedAt)))
+        func remainingExecutionTime(
+            at date: Date,
+            monotonicTime: TimeInterval? = nil
+        ) -> TimeInterval {
+            guard let armedAtMonotonic else { return remaining }
+            let instant = monotonicTime ?? date.timeIntervalSinceReferenceDate
+            return max(0, remaining - max(0, instant - armedAtMonotonic))
         }
 
         var activeDeadline: Deadline? {
-            guard let expiresAt else { return nil }
-            return Deadline(phase: phase, token: armToken, expiresAt: expiresAt)
+            guard let expiresAt, let monotonicExpiresAt else { return nil }
+            return Deadline(
+                phase: phase,
+                token: armToken,
+                expiresAt: expiresAt,
+                monotonicExpiresAt: monotonicExpiresAt
+            )
         }
     }
 
@@ -735,8 +972,11 @@ struct LibreWatchConnectionTiming {
         phase == .cancelling ? cancellationDeadline : executionBudget?.activeDeadline
     }
 
-    func remainingExecutionTime(at date: Date) -> TimeInterval? {
-        executionBudget?.remainingExecutionTime(at: date)
+    func remainingExecutionTime(
+        at date: Date,
+        monotonicTime: TimeInterval? = nil
+    ) -> TimeInterval? {
+        executionBudget?.remainingExecutionTime(at: date, monotonicTime: monotonicTime)
     }
 
     // One bounded cancellation observation, using the collector's existing one-shot work item.
@@ -754,7 +994,8 @@ struct LibreWatchConnectionTiming {
     mutating func beginConnection(
         at date: Date,
         applicationIsActive: Bool,
-        executionIsAvailable: Bool = true
+        executionIsAvailable: Bool = true,
+        monotonicTime: TimeInterval? = nil
     ) {
         // Retries belong to the same logical generation until it is explicitly retired.
         guard phase == nil else { return }
@@ -767,17 +1008,26 @@ struct LibreWatchConnectionTiming {
             phase: .connection,
             duration: applicationIsActive ? 60 : 90,
             at: date,
-            executionIsAvailable: executionIsAvailable
+            executionIsAvailable: executionIsAvailable,
+            monotonicTime: monotonicTime
         )
     }
 
-    mutating func beginSetup(at date: Date, executionIsAvailable: Bool = true) {
+    mutating func beginSetup(
+        at date: Date,
+        executionIsAvailable: Bool = true,
+        monotonicTime: TimeInterval? = nil
+    ) {
         guard phase != .cancelling else { return }
         executionBudget = nil
         cancellationDeadline = nil
         dataExpectedSince = nil
         phase = .services
-        refreshSetupBudget(at: date, executionIsAvailable: executionIsAvailable)
+        refreshSetupBudget(
+            at: date,
+            executionIsAvailable: executionIsAvailable,
+            monotonicTime: monotonicTime
+        )
     }
 
     func acceptsSetup(_ expected: Phase) -> Bool {
@@ -788,7 +1038,8 @@ struct LibreWatchConnectionTiming {
     mutating func setupProgress(
         _ completed: Phase,
         at date: Date,
-        executionIsAvailable: Bool = true
+        executionIsAvailable: Bool = true,
+        monotonicTime: TimeInterval? = nil
     ) -> Bool {
         guard acceptsSetup(completed) else { return false }
         switch completed {
@@ -800,7 +1051,11 @@ struct LibreWatchConnectionTiming {
             return true
         default: return false
         }
-        refreshSetupBudget(at: date, executionIsAvailable: executionIsAvailable)
+        refreshSetupBudget(
+            at: date,
+            executionIsAvailable: executionIsAvailable,
+            monotonicTime: monotonicTime
+        )
         return true
     }
 
@@ -812,13 +1067,53 @@ struct LibreWatchConnectionTiming {
         dataExpectedSince = date
     }
 
+    /// Starts or refreshes the technical BLE liveness budget without changing the timestamp
+    /// of the most recently accepted clinical reading. Suspension never consumes this budget.
+    mutating func recordReceivingProgress(
+        at date: Date,
+        timeout: TimeInterval,
+        executionIsAvailable: Bool,
+        monotonicTime: TimeInterval? = nil
+    ) {
+        guard phase == .receiving else { return }
+        dataExpectedSince = date
+        executionBudget = ExecutionBudget(
+            phase: .receiving,
+            duration: timeout,
+            at: date,
+            executionIsAvailable: executionIsAvailable,
+            monotonicTime: monotonicTime
+        )
+    }
+
+    /// Migration/safety path for a healthy notification state created before a liveness budget.
+    /// It is deliberately one-shot and therefore cannot be refilled by lifecycle churn.
+    mutating func ensureReceivingBudget(
+        at date: Date,
+        timeout: TimeInterval,
+        executionIsAvailable: Bool,
+        monotonicTime: TimeInterval? = nil
+    ) {
+        guard phase == .receiving, executionBudget == nil else { return }
+        recordReceivingProgress(
+            at: date,
+            timeout: timeout,
+            executionIsAvailable: executionIsAvailable,
+            monotonicTime: monotonicTime
+        )
+    }
+
     /// Execution budgets consume only foreground or valid extended-runtime time.
     /// Pausing and resuming preserve phase, token, generation and the exact remainder.
     @discardableResult
-    mutating func setExecutionAvailable(_ available: Bool, at date: Date) -> Bool {
+    mutating func setExecutionAvailable(
+        _ available: Bool,
+        at date: Date,
+        monotonicTime: TimeInterval? = nil
+    ) -> Bool {
         guard phase != .cancelling, var budget = executionBudget else { return false }
         let previous = budget
-        budget.setExecutionAvailable(available, at: date)
+        budget.setExecutionAvailable(available, at: date, monotonicTime: monotonicTime)
         executionBudget = budget
         return budget != previous
     }
@@ -828,7 +1123,8 @@ struct LibreWatchConnectionTiming {
     @discardableResult
     mutating func observeLink(
         connected: Bool, connecting: Bool, hasReceptionState: Bool,
-        at date: Date, applicationIsActive: Bool, executionIsAvailable: Bool = true
+        at date: Date, applicationIsActive: Bool, executionIsAvailable: Bool = true,
+        monotonicTime: TimeInterval? = nil
     ) -> Bool {
         guard !connected, phase != .cancelling else { return false }
         let staleReception = hasReceptionState || setupInProgress || phase == .receiving
@@ -840,7 +1136,8 @@ struct LibreWatchConnectionTiming {
                 beginConnection(
                     at: date,
                     applicationIsActive: applicationIsActive,
-                    executionIsAvailable: executionIsAvailable
+                    executionIsAvailable: executionIsAvailable,
+                    monotonicTime: monotonicTime
                 )
             }
         }
@@ -848,9 +1145,12 @@ struct LibreWatchConnectionTiming {
     }
 
     func timeoutIsCurrent(_ captured: Deadline, ownership: LibreWatchOwnership,
-                          cancelling: Bool, at date: Date) -> Bool {
-        ownership == .watch && !cancelling && deadline == captured &&
-            phase == captured.phase && date >= captured.expiresAt
+                          cancelling: Bool, at date: Date,
+                          monotonicTime: TimeInterval? = nil) -> Bool {
+        let instant = monotonicTime ?? date.timeIntervalSinceReferenceDate
+        return ownership == .watch && !cancelling && deadline == captured &&
+            phase == captured.phase &&
+            captured.monotonicExpiresAt.map { instant >= $0 } == true
     }
 
     func noDataIsOverdue(lastPacketAt: Date?, at date: Date, timeout: TimeInterval) -> Bool {
@@ -860,15 +1160,24 @@ struct LibreWatchConnectionTiming {
     }
 
     func canConnect(at date: Date, peripheralIsDisconnected: Bool,
-                    retiredPeripheralIsReleased: Bool) -> Bool {
-        phase == .connection && executionBudget.map { $0.remainingExecutionTime(at: date) > 0 } == true &&
+                    retiredPeripheralIsReleased: Bool,
+                    monotonicTime: TimeInterval? = nil) -> Bool {
+        phase == .connection && executionBudget.map {
+            $0.remainingExecutionTime(at: date, monotonicTime: monotonicTime) > 0
+        } == true &&
             peripheralIsDisconnected && retiredPeripheralIsReleased
     }
 
-    func failedConnectionAction(at date: Date, bluetoothIsPoweredOn: Bool) -> FailedConnectionAction {
+    func failedConnectionAction(
+        at date: Date,
+        bluetoothIsPoweredOn: Bool,
+        monotonicTime: TimeInterval? = nil
+    ) -> FailedConnectionAction {
         guard bluetoothIsPoweredOn else { return .waitForBluetooth }
         guard phase == .connection,
-              executionBudget.map({ $0.remainingExecutionTime(at: date) > 0 }) == true
+              executionBudget.map({
+                  $0.remainingExecutionTime(at: date, monotonicTime: monotonicTime) > 0
+              }) == true
         else { return .scanConfirmedSensor }
         return .retryConfirmedPeripheral
     }
@@ -882,7 +1191,8 @@ struct LibreWatchConnectionTiming {
         cancellationDeadline = Deadline(
             phase: .cancelling,
             token: UUID(),
-            expiresAt: date.addingTimeInterval(Self.cancellationTimeout)
+            expiresAt: date.addingTimeInterval(Self.cancellationTimeout),
+            monotonicExpiresAt: nil
         )
     }
 
@@ -911,13 +1221,18 @@ struct LibreWatchConnectionTiming {
         cancellationWatchdogDidFire = false
     }
 
-    private mutating func refreshSetupBudget(at date: Date, executionIsAvailable: Bool) {
+    private mutating func refreshSetupBudget(
+        at date: Date,
+        executionIsAvailable: Bool,
+        monotonicTime: TimeInterval? = nil
+    ) {
         guard let phase else { return }
         executionBudget = ExecutionBudget(
             phase: phase,
             duration: 60,
             at: date,
-            executionIsAvailable: executionIsAvailable
+            executionIsAvailable: executionIsAvailable,
+            monotonicTime: monotonicTime
         )
     }
 }
@@ -971,7 +1286,20 @@ struct LibreWatchLifecyclePolicy {
         extendedRuntimeIsRunning: Bool,
         ownership: LibreWatchOwnership
     ) -> Bool {
-        ownership == .watch && (applicationIsActive || extendedRuntimeIsRunning)
+        recoveryIsAllowed(
+            applicationState: applicationIsActive ? .active : .background,
+            extendedRuntimeIsRunning: extendedRuntimeIsRunning,
+            ownership: ownership
+        )
+    }
+
+    static func recoveryIsAllowed(
+        applicationState: LibreWatchApplicationState,
+        extendedRuntimeIsRunning: Bool,
+        ownership: LibreWatchOwnership
+    ) -> Bool {
+        ownership == .watch &&
+            (applicationState == .active || extendedRuntimeIsRunning)
     }
 
     static func eventDrivenRecoveryIsAllowed(ownership: LibreWatchOwnership) -> Bool {
@@ -1040,15 +1368,83 @@ struct LibreWatchLifecyclePolicy {
         extendedRuntimeIsRunning: Bool,
         ownership: LibreWatchOwnership
     ) -> TimeInterval? {
+        noDataRecoveryDelay(
+            applicationState: applicationIsActive ? .active : .background,
+            extendedRuntimeIsRunning: extendedRuntimeIsRunning,
+            ownership: ownership
+        )
+    }
+
+    static func noDataRecoveryDelay(
+        applicationState: LibreWatchApplicationState,
+        extendedRuntimeIsRunning: Bool,
+        ownership: LibreWatchOwnership
+    ) -> TimeInterval? {
         guard recoveryIsAllowed(
-            applicationIsActive: applicationIsActive,
+            applicationState: applicationState,
             extendedRuntimeIsRunning: extendedRuntimeIsRunning,
             ownership: ownership
         ) else { return nil }
 
-        return applicationIsActive
+        return applicationState == .active
             ? foregroundNoDataRecoveryDelay
             : extendedRuntimeNoDataRecoveryDelay
+    }
+
+    /// Chooses one finite liveness budget when notification reception begins. If no continuous
+    /// timer execution is currently available, the background-sized budget is created paused.
+    static func receivingExecutionBudget(
+        applicationState: LibreWatchApplicationState,
+        extendedRuntimeIsRunning: Bool
+    ) -> TimeInterval {
+        applicationState == .active
+            ? foregroundNoDataRecoveryDelay
+            : extendedRuntimeNoDataRecoveryDelay
+    }
+}
+
+enum LibreWatchExpiredPhaseAction: Equatable {
+    case beginGATTSetup
+    case reconcileObservedLink
+    case beginControlledRecovery
+    case noAdditionalWork
+}
+
+enum LibreWatchObservedPeripheralState: String, Codable, Equatable {
+    case disconnected
+    case connecting
+    case connected
+    case disconnecting
+    case unknown
+}
+
+/// A receiving/setup deadline cancels only a still-connected phase that made no newer progress.
+/// Native link transitions are reconciled first; once the current connection phase itself has
+/// exhausted its immutable budget, every non-connected state is retired through one controlled
+/// recovery instead of rescheduling the same expired deadline.
+struct LibreWatchExpiredPhasePolicy {
+    static func action(
+        phase: LibreWatchConnectionTiming.Phase?,
+        peripheralState: LibreWatchObservedPeripheralState,
+        ownership: LibreWatchOwnership,
+        cancellationIsActive: Bool
+    ) -> LibreWatchExpiredPhaseAction {
+        guard ownership == .watch, !cancellationIsActive, let phase else {
+            return .noAdditionalWork
+        }
+        if phase == .connection {
+            switch peripheralState {
+            case .connected: return .beginGATTSetup
+            case .disconnected, .connecting, .disconnecting, .unknown:
+                // This connection generation has consumed its immutable execution budget.
+                // Retire it once before returning to the exact-sensor scan; merely reconciling
+                // a disconnected auto-reconnect would reschedule the same expired deadline.
+                return .beginControlledRecovery
+            }
+        }
+        return peripheralState == .connected
+            ? .beginControlledRecovery
+            : .reconcileObservedLink
     }
 }
 
@@ -1697,6 +2093,28 @@ enum LibreWatchSessionStore {
     ) {
         guard let data = try? JSONEncoder().encode(ledger) else { return }
         defaults.set(data, forKey: LibreWatchMessageKey.persistedDiagnosticReceipts)
+    }
+
+    static func loadDiagnosticJournal(
+        defaults: UserDefaults = .standard,
+        at date: Date = Date()
+    ) -> LibreWatchDiagnosticJournal {
+        guard let data = defaults.data(forKey: LibreWatchMessageKey.persistedDiagnosticJournal),
+              var journal = try? JSONDecoder().decode(LibreWatchDiagnosticJournal.self, from: data)
+        else { return LibreWatchDiagnosticJournal() }
+        journal.prune(at: date)
+        return journal
+    }
+
+    static func saveDiagnosticJournal(
+        _ journal: LibreWatchDiagnosticJournal,
+        defaults: UserDefaults = .standard,
+        at date: Date = Date()
+    ) {
+        var boundedJournal = journal
+        boundedJournal.prune(at: date)
+        guard let data = try? JSONEncoder().encode(boundedJournal) else { return }
+        defaults.set(data, forKey: LibreWatchMessageKey.persistedDiagnosticJournal)
     }
 
     static func loadRecoveryAttempt(

@@ -925,7 +925,9 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
                     troubleshooting = .detailed(.integration(name: .watch, activity: .recovered))
                 case .recoveryFailed:
                     troubleshooting = .standard(.integration(name: .watch, activity: .failed))
-                case .extendedRuntimeWillExpire, .extendedRuntimeInvalidated:
+                case .extendedRuntimeWillExpire, .extendedRuntimeInvalidated,
+                     .lifecycleChanged, .bluetoothAction, .coreBluetoothCallback,
+                     .frameProgress, .callbackRejected, .journalRotated:
                     troubleshooting = nil
             }
 
@@ -938,13 +940,27 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
                     "attempt=\(event.attemptID?.uuidString ?? "n/a")",
                     "attemptStarted=\(event.attemptStartedAt.map { ISO8601DateFormatter().string(from: $0) } ?? "n/a")",
                     "source=\(event.reconcileSource?.rawValue ?? "n/a")",
+                    "scene=\(event.applicationState?.rawValue ?? "n/a")",
                     "sceneActive=\(event.applicationIsActive.map { String($0) } ?? "n/a")",
                     "runtime=\(event.extendedRuntimeIsRunning.map { String($0) } ?? "n/a")",
+                    "runtimeState=\(event.extendedRuntimeState ?? "none")",
+                    "runtimeStartRequested=\(event.extendedRuntimeStartRequested.map { String($0) } ?? "n/a")",
+                    "app=\(event.appVersion ?? "n/a") (\(event.appBuild ?? "n/a"))",
+                    "watchOS=\(event.watchOSVersion ?? "n/a")",
+                    "sequence=\(event.sequenceNumber.map { String($0) } ?? "n/a")",
                     "peripheral=\(event.peripheralState ?? "n/a")",
                     "phase=\(event.connectionPhase ?? "n/a")",
                     "deadlinePhase=\(event.deadlinePhase ?? "none")",
                     "deadline=\(event.deadlineAt.map { ISO8601DateFormatter().string(from: $0) } ?? "none")",
                     "remainingBudget=\(event.remainingExecutionBudget.map { String(format: "%.1f", $0) } ?? "none")",
+                    "receivingDeadline=\(event.receivingBudgetDeadline.map { ISO8601DateFormatter().string(from: $0) } ?? "none")",
+                    "technicalFrame=\(event.technicalFrameAt.map { ISO8601DateFormatter().string(from: $0) } ?? "none")",
+                    "measurement=\(event.measurementAt.map { ISO8601DateFormatter().string(from: $0) } ?? "none")",
+                    "action=\(event.bluetoothAction ?? "none")",
+                    "reason=\(event.actionReason ?? "none")",
+                    "errorDomain=\(event.errorDomain ?? "none")",
+                    "errorClass=\(event.bluetoothErrorClassification ?? "none")",
+                    "journalDropped=\(event.journalDroppedCount.map { String($0) } ?? "0")",
                     "generation=\(event.generation?.uuidString ?? "n/a")",
                     "runtimeReason=\(event.runtimeInvalidationReason.map { String($0) } ?? "none")",
                     "runtimeError=\(event.runtimeError ?? "none")"

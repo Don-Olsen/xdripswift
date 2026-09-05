@@ -47,10 +47,10 @@ struct RootView: View {
                 // if a saved tab value from an older build is invalid, fall back to the normal main page
                 selectedPage = WatchAppPage.main.rawValue
             }
-            libreDirectCollector.applicationActivityDidChange(isActive: scenePhase == .active)
+            libreDirectCollector.applicationActivityDidChange(scenePhase.libreWatchApplicationState)
         }
         .onChange(of: scenePhase) { newPhase in
-            libreDirectCollector.applicationActivityDidChange(isActive: newPhase == .active)
+            libreDirectCollector.applicationActivityDidChange(newPhase.libreWatchApplicationState)
             if newPhase == .active, watchState.libreWatchOwnership == .watch {
                 selectedPage = WatchAppPage.bigNumber.rawValue
             }
@@ -59,6 +59,17 @@ struct RootView: View {
             if ownership == .watch {
                 selectedPage = WatchAppPage.bigNumber.rawValue
             }
+        }
+    }
+}
+
+private extension ScenePhase {
+    var libreWatchApplicationState: LibreWatchApplicationState {
+        switch self {
+        case .active: return .active
+        case .inactive: return .inactive
+        case .background: return .background
+        @unknown default: return .background
         }
     }
 }

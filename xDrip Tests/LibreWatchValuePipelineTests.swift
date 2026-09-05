@@ -455,6 +455,321 @@ final class LibreWatchValuePipelineTests: XCTestCase {
         ))
     }
 
+    func testReceivingSuspensionResumesBudgetWithoutImmediateBluetoothAction() throws {
+        var timing = LibreWatchConnectionTiming()
+        let firstFrameAt = receivedAt
+        timing.receivedPacketOrEnabledNotifications(at: firstFrameAt)
+        timing.recordReceivingProgress(
+            at: firstFrameAt,
+            timeout: 120,
+            executionIsAvailable: true,
+            monotonicTime: 1_000
+        )
+        let generation = timing.generation
+        let beforeSuspension = try XCTUnwrap(timing.deadline)
+
+        let suspendedAt = firstFrameAt.addingTimeInterval(30)
+        XCTAssertTrue(timing.setExecutionAvailable(
+            false,
+            at: suspendedAt,
+            monotonicTime: 1_030
+        ))
+        XCTAssertNil(timing.deadline)
+        XCTAssertEqual(
+            try XCTUnwrap(timing.remainingExecutionTime(
+                at: suspendedAt,
+                monotonicTime: 1_030
+            )),
+            90,
+            accuracy: 0.000_001
+        )
+
+        // Several wall-clock minutes without execution do not consume the paused allowance.
+        let resumedAt = suspendedAt.addingTimeInterval(20 * 60)
+        XCTAssertTrue(timing.setExecutionAvailable(
+            true,
+            at: resumedAt,
+            monotonicTime: 2_500
+        ))
+        let resumed = try XCTUnwrap(timing.deadline)
+        XCTAssertEqual(timing.generation, generation)
+        XCTAssertEqual(resumed.expiresAt, resumedAt.addingTimeInterval(90))
+        XCTAssertFalse(timing.timeoutIsCurrent(
+            beforeSuspension,
+            ownership: .watch,
+            cancelling: false,
+            at: resumedAt,
+            monotonicTime: 2_500
+        ))
+        XCTAssertFalse(timing.timeoutIsCurrent(
+            resumed,
+            ownership: .watch,
+            cancelling: false,
+            at: resumedAt,
+            monotonicTime: 2_500
+        ))
+        let timeoutIsDue = timing.timeoutIsCurrent(
+            resumed,
+            ownership: .watch,
+            cancelling: false,
+            at: resumedAt,
+            monotonicTime: 2_500
+        )
+        let recordedBluetoothActions: [LibreWatchExpiredPhaseAction] = timeoutIsDue
+            ? [LibreWatchExpiredPhasePolicy.action(
+                phase: timing.phase,
+                peripheralState: .connected,
+                ownership: .watch,
+                cancellationIsActive: false
+            )]
+            : []
+        XCTAssertTrue(recordedBluetoothActions.isEmpty) // no cancel, scan, or connect
+    }
+
+    func testValidFrameAfterResumeInvalidatesOldTimerBeforeDownstreamDecision() throws {
+        var timing = LibreWatchConnectionTiming()
+        timing.receivedPacketOrEnabledNotifications(at: receivedAt)
+        timing.recordReceivingProgress(
+            at: receivedAt,
+            timeout: 120,
+            executionIsAvailable: true,
+            monotonicTime: 100
+        )
+        XCTAssertTrue(timing.setExecutionAvailable(
+            false,
+            at: receivedAt.addingTimeInterval(20),
+            monotonicTime: 120
+        ))
+        let resumedAt = receivedAt.addingTimeInterval(900)
+        XCTAssertTrue(timing.setExecutionAvailable(
+            true,
+            at: resumedAt,
+            monotonicTime: 900
+        ))
+        let resumeTimer = try XCTUnwrap(timing.deadline)
+
+        var liveness = LibreWatchFrameLiveness()
+        let frameAt = resumedAt.addingTimeInterval(61)
+        let accepted = LibreWatchValidFramePolicy.record(
+            liveness: &liveness,
+            at: frameAt
+        ) { _ in
+            timing.receivedPacketOrEnabledNotifications(at: frameAt)
+            timing.recordReceivingProgress(
+                at: frameAt,
+                timeout: 120,
+                executionIsAvailable: true,
+                monotonicTime: 961
+            )
+            return false // duplicate/out-of-order clinical payload
+        }
+
+        XCTAssertFalse(accepted)
+        XCTAssertEqual(liveness.lastValidBLEFrameAt, frameAt)
+        XCTAssertEqual(timing.dataExpectedSince, frameAt)
+        XCTAssertFalse(timing.timeoutIsCurrent(
+            resumeTimer,
+            ownership: .watch,
+            cancelling: false,
+            at: resumeTimer.expiresAt,
+            monotonicTime: try XCTUnwrap(resumeTimer.monotonicExpiresAt)
+        ))
+        XCTAssertNotEqual(timing.deadline?.token, resumeTimer.token)
+    }
+
+    func testReceivingBudgetExpiresOnceAndStillRequiresConfirmedCancellation() throws {
+        var timing = LibreWatchConnectionTiming()
+        timing.receivedPacketOrEnabledNotifications(at: receivedAt)
+        timing.recordReceivingProgress(
+            at: receivedAt,
+            timeout: 120,
+            executionIsAvailable: true,
+            monotonicTime: 1_000
+        )
+        let deadline = try XCTUnwrap(timing.deadline)
+        let expiryUptime = try XCTUnwrap(deadline.monotonicExpiresAt)
+        XCTAssertTrue(timing.timeoutIsCurrent(
+            deadline,
+            ownership: .watch,
+            cancelling: false,
+            at: deadline.expiresAt,
+            monotonicTime: expiryUptime
+        ))
+        XCTAssertEqual(
+            LibreWatchExpiredPhasePolicy.action(
+                phase: timing.phase,
+                peripheralState: .connected,
+                ownership: .watch,
+                cancellationIsActive: false
+            ),
+            .beginControlledRecovery
+        )
+
+        timing.beginCancellation(at: deadline.expiresAt)
+        XCTAssertFalse(timing.timeoutIsCurrent(
+            deadline,
+            ownership: .watch,
+            cancelling: true,
+            at: deadline.expiresAt,
+            monotonicTime: expiryUptime
+        ))
+        XCTAssertFalse(timing.canStartBluetoothOperation)
+        let cancellation = try XCTUnwrap(timing.deadline)
+        XCTAssertEqual(timing.finishCancellation(
+            cancellation,
+            ownership: .watch,
+            returningToPhone: false,
+            peripheralIsDisconnected: true,
+            at: deadline.expiresAt.addingTimeInterval(1)
+        ), .confirmedDisconnected)
+        XCTAssertTrue(timing.canStartBluetoothOperation)
+    }
+
+    func testReceivingLifecycleChurnCannotRefillFiniteExecutionBudget() throws {
+        var timing = LibreWatchConnectionTiming()
+        timing.receivedPacketOrEnabledNotifications(at: receivedAt)
+        timing.recordReceivingProgress(
+            at: receivedAt,
+            timeout: 120,
+            executionIsAvailable: true,
+            monotonicTime: 0
+        )
+        let generation = timing.generation
+        var wallTime = receivedAt
+        var uptime: TimeInterval = 0
+
+        for (cycle, consumed) in [30.0, 20.0, 20.0].enumerated() {
+            wallTime = wallTime.addingTimeInterval(consumed)
+            uptime += consumed
+            XCTAssertTrue(timing.setExecutionAvailable(
+                false,
+                at: wallTime,
+                monotonicTime: uptime
+            ))
+            wallTime = wallTime.addingTimeInterval(10_000)
+            let remaining = try XCTUnwrap(timing.remainingExecutionTime(
+                at: wallTime,
+                monotonicTime: uptime
+            ))
+            XCTAssertEqual(remaining, 90 - TimeInterval(cycle * 20), accuracy: 0.000_001)
+            XCTAssertFalse(timing.setExecutionAvailable(
+                false,
+                at: wallTime,
+                monotonicTime: uptime
+            ))
+            XCTAssertTrue(timing.setExecutionAvailable(
+                true,
+                at: wallTime,
+                monotonicTime: uptime
+            ))
+        }
+
+        XCTAssertEqual(timing.generation, generation)
+        XCTAssertEqual(
+            try XCTUnwrap(timing.remainingExecutionTime(
+                at: wallTime.addingTimeInterval(20),
+                monotonicTime: 90
+            )),
+            30,
+            accuracy: 0.000_001
+        )
+    }
+
+    func testInactiveAndBackgroundRemainDistinctWithoutClaimingTimerExecution() {
+        XCTAssertTrue(LibreWatchLifecyclePolicy.recoveryIsAllowed(
+            applicationState: .active,
+            extendedRuntimeIsRunning: false,
+            ownership: .watch
+        ))
+        XCTAssertFalse(LibreWatchLifecyclePolicy.recoveryIsAllowed(
+            applicationState: .inactive,
+            extendedRuntimeIsRunning: false,
+            ownership: .watch
+        ))
+        XCTAssertFalse(LibreWatchLifecyclePolicy.recoveryIsAllowed(
+            applicationState: .background,
+            extendedRuntimeIsRunning: false,
+            ownership: .watch
+        ))
+        XCTAssertTrue(LibreWatchLifecyclePolicy.recoveryIsAllowed(
+            applicationState: .inactive,
+            extendedRuntimeIsRunning: true,
+            ownership: .watch
+        ))
+        XCTAssertEqual(
+            LibreWatchLifecyclePolicy.receivingExecutionBudget(
+                applicationState: .active,
+                extendedRuntimeIsRunning: false
+            ),
+            120
+        )
+        XCTAssertEqual(
+            LibreWatchLifecyclePolicy.receivingExecutionBudget(
+                applicationState: .background,
+                extendedRuntimeIsRunning: true
+            ),
+            180
+        )
+    }
+
+    func testExpiredReceivingTimerReconcilesSystemReconnectInsteadOfCancellingIt() {
+        XCTAssertEqual(
+            LibreWatchExpiredPhasePolicy.action(
+                phase: .receiving,
+                peripheralState: .connecting,
+                ownership: .watch,
+                cancellationIsActive: false
+            ),
+            .reconcileObservedLink
+        )
+        XCTAssertEqual(
+            LibreWatchExpiredPhasePolicy.action(
+                phase: .notifications,
+                peripheralState: .disconnected,
+                ownership: .watch,
+                cancellationIsActive: false
+            ),
+            .reconcileObservedLink
+        )
+        XCTAssertEqual(
+            LibreWatchExpiredPhasePolicy.action(
+                phase: .connection,
+                peripheralState: .connected,
+                ownership: .watch,
+                cancellationIsActive: false
+            ),
+            .beginGATTSetup
+        )
+        XCTAssertEqual(
+            LibreWatchExpiredPhasePolicy.action(
+                phase: .connection,
+                peripheralState: .connecting,
+                ownership: .watch,
+                cancellationIsActive: false
+            ),
+            .beginControlledRecovery
+        )
+        XCTAssertEqual(
+            LibreWatchExpiredPhasePolicy.action(
+                phase: .connection,
+                peripheralState: .disconnected,
+                ownership: .watch,
+                cancellationIsActive: false
+            ),
+            .beginControlledRecovery,
+            "an expired system reconnect must not reschedule the same zero-second deadline"
+        )
+        XCTAssertEqual(
+            LibreWatchExpiredPhasePolicy.action(
+                phase: .receiving,
+                peripheralState: .connected,
+                ownership: .iphone,
+                cancellationIsActive: false
+            ),
+            .noAdditionalWork
+        )
+    }
+
     func testConnectionBudgetsStartWithSixtyForegroundOrNinetyRuntimeSeconds() throws {
         for (active, duration) in [(true, 60.0), (false, 90.0)] {
             var timing = LibreWatchConnectionTiming()
@@ -567,6 +882,8 @@ final class LibreWatchValuePipelineTests: XCTestCase {
             .initialPreparation,
             .sceneActivation,
             .sceneDeactivation,
+            .sceneInactive,
+            .sceneBackground,
             .extendedRuntimeStarted,
             .extendedRuntimeWillExpire,
             .extendedRuntimeInvalidated,
@@ -1264,6 +1581,163 @@ final class LibreWatchValuePipelineTests: XCTestCase {
         XCTAssertNil(event.remainingExecutionBudget)
         XCTAssertNil(event.runtimeInvalidationReason)
         XCTAssertNil(event.runtimeError)
+        XCTAssertNil(event.applicationState)
+        XCTAssertNil(event.sequenceNumber)
+        XCTAssertNil(event.bluetoothErrorClassification)
+        XCTAssertNil(event.extendedRuntimeState)
+        XCTAssertNil(event.extendedRuntimeStartRequested)
+    }
+
+    func testBackgroundNotificationQuotaErrorsNeverCountAsInvalidFramesOrStartRecovery() {
+        let quotaActions: [LibreWatchNotificationErrorAction] = [
+            LibreWatchNotificationErrorPolicy.action(
+                isNearBackgroundNotificationLimit: true,
+                isExceededBackgroundNotificationLimit: false
+            ),
+            LibreWatchNotificationErrorPolicy.action(
+                isNearBackgroundNotificationLimit: false,
+                isExceededBackgroundNotificationLimit: true
+            )
+        ]
+        var liveness = LibreWatchFrameLiveness()
+        var recoveryCount = 0
+
+        for action in quotaActions {
+            switch action {
+            case .recoverBluetoothLink:
+                if liveness.invalidFrame() { recoveryCount += 1 }
+            case .preserveConnectionNearBackgroundLimit,
+                 .preserveConnectionExceededBackgroundLimit:
+                break
+            }
+        }
+
+        XCTAssertEqual(quotaActions.map(\.diagnosticName), [
+            "backgroundBudgetNear",
+            "backgroundBudgetExceeded"
+        ])
+        XCTAssertEqual(liveness.consecutiveInvalidFrames, 0)
+        XCTAssertEqual(recoveryCount, 0)
+        XCTAssertEqual(
+            LibreWatchNotificationErrorPolicy.action(
+                isNearBackgroundNotificationLimit: false,
+                isExceededBackgroundNotificationLimit: false
+            ),
+            .recoverBluetoothLink
+        )
+    }
+
+    func testDiagnosticJournalPersistsOriginalOrderAndPendingDeliveryAcrossRestart() throws {
+        let defaults = isolatedDefaults()
+        let firstID = UUID(uuidString: "A1000000-0000-0000-0000-000000000001")!
+        let secondID = UUID(uuidString: "A2000000-0000-0000-0000-000000000002")!
+        let first = LibreWatchDiagnosticEvent(
+            eventID: firstID,
+            kind: .lifecycleChanged,
+            watchTimestamp: receivedAt,
+            trigger: "background",
+            sessionID: session.id,
+            sensorIdentity: session.redactedIdentity(),
+            applicationState: .background
+        )
+        let second = LibreWatchDiagnosticEvent(
+            eventID: secondID,
+            kind: .coreBluetoothCallback,
+            watchTimestamp: receivedAt.addingTimeInterval(5),
+            trigger: "didConnect",
+            sessionID: session.id,
+            sensorIdentity: session.redactedIdentity(),
+            applicationState: .active
+        )
+        var journal = LibreWatchDiagnosticJournal()
+
+        let firstResult = journal.append(first, at: receivedAt.addingTimeInterval(1))
+        let secondResult = journal.append(second, at: receivedAt.addingTimeInterval(6))
+        XCTAssertTrue(firstResult.inserted)
+        XCTAssertTrue(secondResult.inserted)
+        XCTAssertEqual(firstResult.event.sequenceNumber, 1)
+        XCTAssertEqual(secondResult.event.sequenceNumber, 2)
+        XCTAssertFalse(journal.append(first, at: receivedAt.addingTimeInterval(7)).inserted)
+
+        LibreWatchSessionStore.saveDiagnosticJournal(
+            journal,
+            defaults: defaults,
+            at: receivedAt.addingTimeInterval(7)
+        )
+        var restored = LibreWatchSessionStore.loadDiagnosticJournal(
+            defaults: defaults,
+            at: receivedAt.addingTimeInterval(8)
+        )
+        XCTAssertEqual(
+            restored.pendingEvents(for: session.id).compactMap(\.eventID),
+            [firstID, secondID]
+        )
+        XCTAssertTrue(restored.pendingEvents(for: UUID()).isEmpty)
+        restored.markHandedToWatchConnectivity(
+            eventID: firstID,
+            at: receivedAt.addingTimeInterval(10)
+        )
+        LibreWatchSessionStore.saveDiagnosticJournal(
+            restored,
+            defaults: defaults,
+            at: receivedAt.addingTimeInterval(11)
+        )
+        let deliveredState = LibreWatchSessionStore.loadDiagnosticJournal(
+            defaults: defaults,
+            at: receivedAt.addingTimeInterval(12)
+        )
+        XCTAssertEqual(
+            deliveredState.pendingEvents(for: session.id).compactMap(\.eventID),
+            [secondID]
+        )
+        XCTAssertEqual(deliveredState.entries.first?.event.watchTimestamp, receivedAt)
+    }
+
+    func testDiagnosticJournalIsBoundedAndRecordsDroppedEntriesWithoutRecursiveEvents() throws {
+        var journal = LibreWatchDiagnosticJournal()
+        let start = receivedAt
+        for index in 0 ..< 300 {
+            _ = journal.append(LibreWatchDiagnosticEvent(
+                kind: .coreBluetoothCallback,
+                watchTimestamp: start.addingTimeInterval(TimeInterval(index)),
+                trigger: "centralState:poweredOn",
+                sessionID: session.id,
+                sensorIdentity: session.redactedIdentity(),
+                applicationState: .active,
+                actionReason: String(repeating: "x", count: 2_000)
+            ), at: start.addingTimeInterval(TimeInterval(index)))
+        }
+
+        let encoded = try JSONEncoder().encode(journal)
+        XCTAssertLessThanOrEqual(journal.entries.count, LibreWatchDiagnosticJournal.maximumEntries)
+        XCTAssertLessThanOrEqual(encoded.count, LibreWatchDiagnosticJournal.maximumEncodedBytes)
+        XCTAssertGreaterThan(journal.droppedCount, 0)
+        XCTAssertTrue(journal.entries.allSatisfy { $0.event.actionReason?.count == 513 })
+        XCTAssertEqual(
+            journal.entries.compactMap { $0.event.sequenceNumber },
+            journal.entries.compactMap { $0.event.sequenceNumber }.sorted()
+        )
+        XCTAssertFalse(journal.entries.contains { $0.event.kind == .journalRotated })
+    }
+
+    func testDiagnosticJournalAssignsStableIDAndExpiresByLocalRecordTime() throws {
+        var journal = LibreWatchDiagnosticJournal()
+        let event = LibreWatchDiagnosticEvent(
+            eventID: nil,
+            kind: .callbackRejected,
+            watchTimestamp: receivedAt.addingTimeInterval(365 * 24 * 60 * 60),
+            trigger: "staleSetupGeneration",
+            sessionID: session.id
+        )
+        let result = journal.append(event, at: receivedAt)
+        let generatedID = try XCTUnwrap(result.event.eventID)
+        XCTAssertEqual(journal.entries.first?.event.eventID, generatedID)
+
+        journal.prune(at: receivedAt.addingTimeInterval(
+            LibreWatchDiagnosticJournal.maximumAge + 0.001
+        ))
+        XCTAssertTrue(journal.entries.isEmpty)
+        XCTAssertGreaterThan(journal.droppedCount, 0)
     }
 
     func testQueuedDiagnosticPreservesWatchTimestampAndPhaseContext() throws {
