@@ -573,6 +573,234 @@ final class LibreWatchValuePipelineTests: XCTestCase {
         XCTAssertNotEqual(timing.deadline?.token, resumeTimer.token)
     }
 
+    func testRestoredConnectedStreamWaitsForPoweredOnThenReusesExactNotificationStream() {
+        let generation = UUID()
+        var restoration = LibreWatchRestorationState(
+            sessionID: session.id,
+            sensorIdentity: session.redactedIdentity(),
+            generation: generation
+        )
+
+        XCTAssertEqual(restorationAction(
+            &restoration,
+            generation: generation,
+            centralIsPoweredOn: false
+        ), .waitForBluetooth)
+        XCTAssertFalse(restoration.awaitingStreamEvidence)
+
+        XCTAssertEqual(restorationAction(
+            &restoration,
+            generation: generation
+        ), .awaitExistingStream)
+        XCTAssertTrue(restoration.awaitingStreamEvidence)
+    }
+
+    func testPartialRestorationDiscoversOnlyTheFirstMissingLayer() {
+        let generation = UUID()
+        XCTAssertEqual(freshRestorationAction(
+            generation: generation,
+            hasService: false,
+            hasWriteCharacteristic: false,
+            hasReceiveCharacteristic: false,
+            receiveIsNotifying: false
+        ),
+                       .discoverServices)
+        XCTAssertEqual(freshRestorationAction(
+            generation: generation,
+            hasService: true,
+            hasWriteCharacteristic: true,
+            hasReceiveCharacteristic: false,
+            receiveIsNotifying: false
+        ),
+                       .discoverCharacteristics)
+        XCTAssertEqual(freshRestorationAction(
+            generation: generation,
+            hasService: true,
+            hasWriteCharacteristic: true,
+            hasReceiveCharacteristic: true,
+            receiveIsNotifying: false
+        ),
+                       .enableNotifications)
+        XCTAssertEqual(freshRestorationAction(
+            generation: generation,
+            hasService: true,
+            hasWriteCharacteristic: true,
+            hasReceiveCharacteristic: true,
+            receiveIsNotifying: true
+        ),
+                       .awaitExistingStream)
+    }
+
+    func testRepeatedRestorationCallbacksDoNotRenewInFlightGATTBudget() throws {
+        let generation = UUID()
+        var restoration = LibreWatchRestorationState(
+            sessionID: session.id,
+            sensorIdentity: session.redactedIdentity(),
+            generation: generation
+        )
+        var timing = LibreWatchConnectionTiming()
+        timing.beginSetup(at: receivedAt, startingAt: .notifications)
+        let original = try XCTUnwrap(timing.deadline)
+
+        for _ in 0 ..< 5 {
+            XCTAssertEqual(restorationAction(
+                &restoration,
+                generation: generation,
+                connectionPhase: timing.phase
+            ), .waitForCurrentOperation)
+        }
+        XCTAssertEqual(timing.deadline, original)
+    }
+
+    func testUnknownRestoredUnlockStatusGetsOneBoundedUnlockAttempt() throws {
+        let generation = UUID()
+        let token = UUID()
+        var restoration = LibreWatchRestorationState(
+            token: token,
+            sessionID: session.id,
+            sensorIdentity: session.redactedIdentity(),
+            generation: generation
+        )
+        XCTAssertEqual(restorationAction(
+            &restoration,
+            generation: generation
+        ), .awaitExistingStream)
+
+        XCTAssertTrue(restoration.claimUnknownUnlockRecovery(
+            capturedToken: token,
+            currentGeneration: generation,
+            phase: .notifications,
+            sessionID: session.id,
+            sensorIdentity: session.redactedIdentity(),
+            ownership: .watch,
+            cancellationIsActive: false
+        ))
+        XCTAssertFalse(restoration.claimUnknownUnlockRecovery(
+            capturedToken: token,
+            currentGeneration: generation,
+            phase: .notifications,
+            sessionID: session.id,
+            sensorIdentity: session.redactedIdentity(),
+            ownership: .watch,
+            cancellationIsActive: false
+        ))
+    }
+
+    func testRestoredFrameEvidencePreventsFallbackUnlockAndPreservesStream() {
+        let generation = UUID()
+        let token = UUID()
+        var restoration = LibreWatchRestorationState(
+            token: token,
+            sessionID: session.id,
+            sensorIdentity: session.redactedIdentity(),
+            generation: generation
+        )
+        restoration.beginAwaitingStreamEvidence()
+        restoration.recordStreamEvidence()
+
+        XCTAssertFalse(restoration.claimUnknownUnlockRecovery(
+            capturedToken: token,
+            currentGeneration: generation,
+            phase: .notifications,
+            sessionID: session.id,
+            sensorIdentity: session.redactedIdentity(),
+            ownership: .watch,
+            cancellationIsActive: false
+        ))
+        XCTAssertEqual(restorationAction(
+            &restoration,
+            generation: generation,
+            connectionPhase: .receiving
+        ), .preserveActiveStream)
+    }
+
+    func testNewRestoredConnectionGenerationRequiresFreshStreamEvidence() {
+        let oldGeneration = UUID()
+        var restoration = LibreWatchRestorationState(
+            sessionID: session.id,
+            sensorIdentity: session.redactedIdentity(),
+            generation: oldGeneration
+        )
+        restoration.beginAwaitingStreamEvidence()
+        restoration.recordStreamEvidence()
+
+        let newGeneration = UUID()
+        restoration.beginConnectionGeneration(newGeneration)
+
+        XCTAssertEqual(restoration.generation, newGeneration)
+        XCTAssertFalse(restoration.streamEvidenceWasReceived)
+        XCTAssertFalse(restoration.awaitingStreamEvidence)
+        XCTAssertFalse(restoration.unlockWasRequested)
+        XCTAssertEqual(restorationAction(
+            &restoration,
+            generation: newGeneration
+        ), .awaitExistingStream)
+    }
+
+    func testRestorationRejectsChangedOwnershipSessionGenerationAndStaleObjects() {
+        let generation = UUID()
+        let token = UUID()
+        var restoration = LibreWatchRestorationState(
+            token: token,
+            sessionID: session.id,
+            sensorIdentity: session.redactedIdentity(),
+            generation: generation
+        )
+        restoration.beginAwaitingStreamEvidence()
+
+        XCTAssertFalse(restoration.claimUnknownUnlockRecovery(
+            capturedToken: token,
+            currentGeneration: generation,
+            phase: .notifications,
+            sessionID: session.id,
+            sensorIdentity: session.redactedIdentity(),
+            ownership: .iphone,
+            cancellationIsActive: false
+        ))
+        XCTAssertFalse(restoration.claimUnknownUnlockRecovery(
+            capturedToken: token,
+            currentGeneration: UUID(),
+            phase: .notifications,
+            sessionID: session.id,
+            sensorIdentity: session.redactedIdentity(),
+            ownership: .watch,
+            cancellationIsActive: false
+        ))
+        XCTAssertFalse(restoration.claimUnknownUnlockRecovery(
+            capturedToken: token,
+            currentGeneration: generation,
+            phase: .notifications,
+            sessionID: UUID(),
+            sensorIdentity: session.redactedIdentity(),
+            ownership: .watch,
+            cancellationIsActive: false
+        ))
+
+        let current = NSObject()
+        let stale = NSObject()
+        XCTAssertTrue(LibreWatchRestoredObjectIdentity.isCurrent(current, expected: current))
+        XCTAssertFalse(LibreWatchRestoredObjectIdentity.isCurrent(stale, expected: current))
+        XCTAssertFalse(LibreWatchRestoredObjectIdentity.isCurrent(current, expected: nil))
+    }
+
+    func testRestoredGATTPhaseHasFreshBudgetIndependentOfOldConnectionAge() throws {
+        var timing = LibreWatchConnectionTiming()
+        timing.beginConnection(at: receivedAt, applicationIsActive: false)
+        let oldConnection = try XCTUnwrap(timing.deadline)
+        let connectedAt = receivedAt.addingTimeInterval(300)
+        timing.beginSetup(at: connectedAt, startingAt: .notifications)
+        let restoredSetup = try XCTUnwrap(timing.deadline)
+
+        XCTAssertEqual(timing.phase, .notifications)
+        XCTAssertEqual(restoredSetup.expiresAt, connectedAt.addingTimeInterval(60))
+        XCTAssertFalse(timing.timeoutIsCurrent(
+            oldConnection,
+            ownership: .watch,
+            cancelling: false,
+            at: oldConnection.expiresAt
+        ))
+    }
+
     func testReceivingBudgetExpiresOnceAndStillRequiresConfirmedCancellation() throws {
         var timing = LibreWatchConnectionTiming()
         timing.receivedPacketOrEnabledNotifications(at: receivedAt)
@@ -2909,6 +3137,57 @@ final class LibreWatchValuePipelineTests: XCTestCase {
                 ownership: .watch
             ),
             .finishDeliberateDisconnect
+        )
+    }
+
+    private func restorationAction(
+        _ restoration: inout LibreWatchRestorationState,
+        generation: UUID,
+        centralIsPoweredOn: Bool = true,
+        peripheralState: LibreWatchObservedPeripheralState = .connected,
+        hasService: Bool = true,
+        hasWriteCharacteristic: Bool = true,
+        hasReceiveCharacteristic: Bool = true,
+        receiveIsNotifying: Bool = true,
+        connectionPhase: LibreWatchConnectionTiming.Phase? = nil,
+        ownership: LibreWatchOwnership = .watch,
+        cancellationIsActive: Bool = false
+    ) -> LibreWatchRestorationState.Action {
+        restoration.nextAction(
+            centralIsPoweredOn: centralIsPoweredOn,
+            peripheralState: peripheralState,
+            hasService: hasService,
+            hasWriteCharacteristic: hasWriteCharacteristic,
+            hasReceiveCharacteristic: hasReceiveCharacteristic,
+            receiveIsNotifying: receiveIsNotifying,
+            connectionPhase: connectionPhase,
+            currentGeneration: generation,
+            sessionID: session.id,
+            sensorIdentity: session.redactedIdentity(),
+            ownership: ownership,
+            cancellationIsActive: cancellationIsActive
+        )
+    }
+
+    private func freshRestorationAction(
+        generation: UUID,
+        hasService: Bool,
+        hasWriteCharacteristic: Bool,
+        hasReceiveCharacteristic: Bool,
+        receiveIsNotifying: Bool
+    ) -> LibreWatchRestorationState.Action {
+        var restoration = LibreWatchRestorationState(
+            sessionID: session.id,
+            sensorIdentity: session.redactedIdentity(),
+            generation: generation
+        )
+        return restorationAction(
+            &restoration,
+            generation: generation,
+            hasService: hasService,
+            hasWriteCharacteristic: hasWriteCharacteristic,
+            hasReceiveCharacteristic: hasReceiveCharacteristic,
+            receiveIsNotifying: receiveIsNotifying
         )
     }
 

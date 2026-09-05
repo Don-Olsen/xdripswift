@@ -1015,14 +1015,21 @@ struct LibreWatchConnectionTiming {
 
     mutating func beginSetup(
         at date: Date,
+        startingAt setupPhase: Phase = .services,
         executionIsAvailable: Bool = true,
         monotonicTime: TimeInterval? = nil
     ) {
         guard phase != .cancelling else { return }
+        switch setupPhase {
+        case .services, .characteristics, .notifications, .unlock:
+            break
+        case .connection, .receiving, .cancelling:
+            return
+        }
         executionBudget = nil
         cancellationDeadline = nil
         dataExpectedSince = nil
-        phase = .services
+        phase = setupPhase
         refreshSetupBudget(
             at: date,
             executionIsAvailable: executionIsAvailable,
@@ -1234,6 +1241,158 @@ struct LibreWatchConnectionTiming {
             executionIsAvailable: executionIsAvailable,
             monotonicTime: monotonicTime
         )
+    }
+}
+
+/// Tracks one restored Core Bluetooth object graph without weakening the normal identity gates.
+/// The collector executes these actions against the exact restored peripheral/service/characteristics.
+struct LibreWatchRestorationState: Equatable {
+    enum Action: Equatable {
+        case stop
+        case waitForBluetooth
+        case waitForConnection
+        case waitForCurrentOperation
+        case discoverServices
+        case discoverCharacteristics
+        case enableNotifications
+        case awaitExistingStream
+        case preserveActiveStream
+    }
+
+    let token: UUID
+    let sessionID: UUID
+    let sensorIdentity: String
+    private(set) var generation: UUID
+    private(set) var awaitingStreamEvidence = false
+    private(set) var unlockWasRequested = false
+    private(set) var streamEvidenceWasReceived = false
+
+    init(
+        token: UUID = UUID(),
+        sessionID: UUID,
+        sensorIdentity: String,
+        generation: UUID
+    ) {
+        self.token = token
+        self.sessionID = sessionID
+        self.sensorIdentity = sensorIdentity
+        self.generation = generation
+    }
+
+    mutating func bind(to generation: UUID) {
+        self.generation = generation
+    }
+
+    mutating func beginConnectionGeneration(_ generation: UUID) {
+        self.generation = generation
+        awaitingStreamEvidence = false
+        unlockWasRequested = false
+        streamEvidenceWasReceived = false
+    }
+
+    func belongsTo(
+        sessionID: UUID?,
+        sensorIdentity: String?,
+        ownership: LibreWatchOwnership
+    ) -> Bool {
+        ownership == .watch && self.sessionID == sessionID &&
+            self.sensorIdentity == sensorIdentity
+    }
+
+    mutating func nextAction(
+        centralIsPoweredOn: Bool,
+        peripheralState: LibreWatchObservedPeripheralState,
+        hasService: Bool,
+        hasWriteCharacteristic: Bool,
+        hasReceiveCharacteristic: Bool,
+        receiveIsNotifying: Bool,
+        connectionPhase: LibreWatchConnectionTiming.Phase?,
+        currentGeneration: UUID,
+        sessionID: UUID?,
+        sensorIdentity: String?,
+        ownership: LibreWatchOwnership,
+        cancellationIsActive: Bool
+    ) -> Action {
+        guard belongsTo(
+            sessionID: sessionID,
+            sensorIdentity: sensorIdentity,
+            ownership: ownership
+        ), generation == currentGeneration, !cancellationIsActive else {
+            return .stop
+        }
+        guard centralIsPoweredOn else { return .waitForBluetooth }
+        guard peripheralState == .connected else { return .waitForConnection }
+
+        if streamEvidenceWasReceived || connectionPhase == .receiving {
+            return .preserveActiveStream
+        }
+        switch connectionPhase {
+        case .some(.services), .some(.characteristics), .some(.notifications), .some(.unlock):
+            return .waitForCurrentOperation
+        case .some(.cancelling):
+            return .stop
+        case .some(.connection), .none:
+            break
+        case .some(.receiving):
+            return .preserveActiveStream
+        }
+
+        guard hasService else { return .discoverServices }
+        guard hasWriteCharacteristic, hasReceiveCharacteristic else {
+            return .discoverCharacteristics
+        }
+        guard receiveIsNotifying else { return .enableNotifications }
+
+        awaitingStreamEvidence = true
+        return .awaitExistingStream
+    }
+
+    mutating func recordStreamEvidence() {
+        streamEvidenceWasReceived = true
+        awaitingStreamEvidence = false
+    }
+
+    mutating func beginAwaitingStreamEvidence() {
+        guard !streamEvidenceWasReceived, !unlockWasRequested else { return }
+        awaitingStreamEvidence = true
+    }
+
+    mutating func markUnlockRequested() {
+        unlockWasRequested = true
+        awaitingStreamEvidence = false
+    }
+
+    mutating func claimUnknownUnlockRecovery(
+        capturedToken: UUID?,
+        currentGeneration: UUID,
+        phase: LibreWatchConnectionTiming.Phase?,
+        sessionID: UUID?,
+        sensorIdentity: String?,
+        ownership: LibreWatchOwnership,
+        cancellationIsActive: Bool
+    ) -> Bool {
+        guard capturedToken == token,
+              belongsTo(
+                  sessionID: sessionID,
+                  sensorIdentity: sensorIdentity,
+                  ownership: ownership
+              ),
+              generation == currentGeneration,
+              phase == .notifications,
+              awaitingStreamEvidence,
+              !streamEvidenceWasReceived,
+              !unlockWasRequested,
+              !cancellationIsActive
+        else { return false }
+        markUnlockRequested()
+        return true
+    }
+}
+
+/// Object identity, rather than a matching characteristic UUID, defines the current GATT graph.
+struct LibreWatchRestoredObjectIdentity {
+    static func isCurrent(_ candidate: AnyObject, expected: AnyObject?) -> Bool {
+        candidate === expected
     }
 }
 
