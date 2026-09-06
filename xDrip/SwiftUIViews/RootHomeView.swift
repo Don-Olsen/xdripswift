@@ -1222,11 +1222,16 @@ private struct IPadExpandedLandscapeChartView: View {
 /// view property would therefore run repeatedly while SwiftUI evaluates the same body. This cache
 /// loads a buffered range on a serial background queue, then resolves each timestamp from immutable
 /// value snapshots already held in memory.
-private final class RootHomeHistoricalDataCache: ObservableObject {
+final class RootHomeHistoricalDataCache: ObservableObject {
 
     struct Selection {
         let deviceStatus: NightscoutDeviceStatus?
         let siteChangeDate: Date?
+    }
+
+    private struct RequestedRange {
+        let startDate: Date
+        let endDate: Date
     }
 
     private struct Load {
@@ -1242,25 +1247,35 @@ private final class RootHomeHistoricalDataCache: ObservableObject {
 
     private let deviceStatusAccessor: NightscoutDeviceStatusAccessor
     private let treatmentEntryAccessor: TreatmentEntryAccessor
-    private let operationQueue = OperationQueue()
+    private let operationQueue: OperationQueue
+    private let now: () -> Date
+    private let scheduleLoad: (@escaping () -> Void) -> Void
 
     private var deviceStatuses = [NightscoutDeviceStatusSnapshot]()
     private var siteChangeDates = [Date]()
     private var cacheStartDate: Date?
     private var cacheEndDate: Date?
-    private var requestedDate: Date?
-    private var requestedVisibleTimeInterval: TimeInterval = 0
+    private var requestedRange: RequestedRange?
     private var isLoading = false
     private var generation = 0
 
     private static let minimumBufferTimeInterval: TimeInterval = .hours(1)
     private static let maximumBufferTimeInterval: TimeInterval = .hours(6)
 
-    init(coreDataManager: CoreDataManager) {
+    init(
+        coreDataManager: CoreDataManager,
+        now: @escaping () -> Date = Date.init,
+        scheduleLoad: ((@escaping () -> Void) -> Void)? = nil
+    ) {
         deviceStatusAccessor = NightscoutDeviceStatusAccessor(coreDataManager: coreDataManager)
         treatmentEntryAccessor = TreatmentEntryAccessor(coreDataManager: coreDataManager)
-        operationQueue.maxConcurrentOperationCount = 1
-        operationQueue.name = "RootHomeHistoricalDataCache"
+        let queue = OperationQueue()
+        queue.maxConcurrentOperationCount = 1
+        queue.name = "RootHomeHistoricalDataCache"
+        operationQueue = queue
+        self.now = now
+        // Tests control execution order while exercising the same accessors and completion path.
+        self.scheduleLoad = scheduleLoad ?? { queue.addOperation($0) }
     }
 
     /// Extends the cache only when the requested timestamp approaches an unloaded edge.
@@ -1268,17 +1283,23 @@ private final class RootHomeHistoricalDataCache: ObservableObject {
     /// Site changes are initially loaded through the requested range because CAGE may depend on an
     /// entry many days earlier. Later forward extensions fetch only newly possible site changes.
     func prepare(around date: Date, visibleTimeInterval: TimeInterval) {
-        requestedDate = date
-        requestedVisibleTimeInterval = abs(visibleTimeInterval)
-
-        guard !isLoading else { return }
-
         let buffer = min(
-            max(requestedVisibleTimeInterval * 0.5, Self.minimumBufferTimeInterval),
+            max(abs(visibleTimeInterval) * 0.5, Self.minimumBufferTimeInterval),
             Self.maximumBufferTimeInterval
         )
-        let desiredStartDate = date.addingTimeInterval(-buffer)
-        let desiredEndDate = min(date.addingTimeInterval(buffer), Date())
+        // Capture "now" once per external request, including requests received during a load.
+        // A completion may fill remaining edges, but must not chase a continuously moving end.
+        requestedRange = RequestedRange(
+            startDate: date.addingTimeInterval(-buffer),
+            endDate: min(date.addingTimeInterval(buffer), now())
+        )
+        loadRequestedRange()
+    }
+
+    private func loadRequestedRange() {
+        guard !isLoading, let requestedRange else { return }
+        let desiredStartDate = requestedRange.startDate
+        let desiredEndDate = requestedRange.endDate
 
         let load: Load?
 
@@ -1302,7 +1323,7 @@ private final class RootHomeHistoricalDataCache: ObservableObject {
         isLoading = true
         let statusStartDate = load.startDate.addingTimeInterval(-ConstantsHomeView.loopShowNoDataAfterMinutes)
 
-        operationQueue.addOperation { [weak self] in
+        scheduleLoad { [weak self] in
             guard let self else { return }
 
             let statuses = self.deviceStatusAccessor.fetch(fromDate: statusStartDate, toDate: load.endDate)
@@ -1331,12 +1352,7 @@ private final class RootHomeHistoricalDataCache: ObservableObject {
                 self.isLoading = false
                 self.revision &+= 1
 
-                if let requestedDate = self.requestedDate {
-                    self.prepare(
-                        around: requestedDate,
-                        visibleTimeInterval: self.requestedVisibleTimeInterval
-                    )
-                }
+                self.loadRequestedRange()
             }
         }
     }
@@ -1381,8 +1397,7 @@ private final class RootHomeHistoricalDataCache: ObservableObject {
         siteChangeDates.removeAll()
         cacheStartDate = nil
         cacheEndDate = nil
-        requestedDate = nil
-        requestedVisibleTimeInterval = 0
+        requestedRange = nil
         isLoading = false
         revision &+= 1
     }
