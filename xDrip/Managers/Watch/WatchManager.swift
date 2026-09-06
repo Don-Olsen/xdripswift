@@ -1044,7 +1044,7 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
         // The typed journal export above is the sole consumer-facing BLE fact. Do not also
         // turn Watch-Libre recovery into generic phone Bluetooth or phone-to-Watch sharing.
         // Receipt time remains the trace timestamp; queued Watch events carry their origin time.
-        let context = [
+        var context = [
                 "watchTime=\(event.watchTimestamp.map { ISO8601DateFormatter().string(from: $0) } ?? "n/a")",
                 "receiptTime=\(ISO8601DateFormatter().string(from: receiptTime))",
                 "trigger=\(event.trigger ?? "n/a")",
@@ -1076,6 +1076,9 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
                 "runtimeReason=\(event.runtimeInvalidationReason.map { String($0) } ?? "none")",
                 "runtimeError=\(event.runtimeError ?? "none")"
         ].joined(separator: " ")
+        if let returnAttempt = event.returnAttempt {
+            context += " " + returnAttempt.summary { ISO8601DateFormatter().string(from: $0) }
+        }
         trace(
                 "Watch Libre diagnostic: event=%{public}@ sensor=%{public}@ isReconnecting=%{public}@ errorCode=%{public}@ %{public}@",
                 log: self.log,

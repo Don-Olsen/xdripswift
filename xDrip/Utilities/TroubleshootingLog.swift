@@ -842,6 +842,7 @@ struct TroubleshootingWatchDiagnostic: Codable, Equatable {
     let alarmSnoozes: [Int: Date]?
     let alarmNotificationsAuthorized: Bool?
     let alarmDelegatedToWatch: Bool?
+    let returnAttempt: LibreWatchReturnDiagnostic?
 
     init(_ event: LibreWatchDiagnosticEvent) {
         eventID = event.eventID
@@ -875,7 +876,7 @@ struct TroubleshootingWatchDiagnostic: Codable, Equatable {
         attempt = event.attemptID
         attemptStarted = event.attemptStartedAt
         isReconnecting = event.isReconnecting
-        errorDomain = event.errorDomain.map { ["CBErrorDomain", "CBATTErrorDomain", "WKErrorDomain"].contains($0) ? $0 : "other" }
+        errorDomain = event.errorDomain.map { ["CBErrorDomain", "CBATTErrorDomain", "WKErrorDomain", "WCErrorDomain"].contains($0) ? $0 : "other" }
         errorCode = event.errorCode
         unlockCounter = event.unlockCounter
         technicalFrameAt = event.technicalFrameAt
@@ -890,6 +891,7 @@ struct TroubleshootingWatchDiagnostic: Codable, Equatable {
         alarmSnoozes = event.alarmSnoozes.map { $0.filter { (0 ... 4).contains($0.key) } }
         alarmNotificationsAuthorized = event.alarmNotificationsAuthorized
         alarmDelegatedToWatch = event.alarmDelegatedToWatch
+        returnAttempt = event.returnAttempt
     }
 
     private static func allow(_ value: String?, in choices: Set<String>) -> String? {
@@ -1933,7 +1935,7 @@ struct TroubleshootingLogReportBuilder {
         case let .watchDiagnostic(event):
             let time: (Date?) -> String = { $0.map { self.measurementTimeText($0, recordedAt: entry.timestamp) } ?? "unknown" }
             var fields = [
-                "Watch-Libre \(event.kind.rawValue)",
+                event.returnAttempt == nil ? "Watch-Libre \(event.kind.rawValue)" : "Watch-to-iPhone return",
                 "watchTime=\(time(event.watchTime))", "receiptTime=\(time(entry.timestamp))",
                 "build=\(event.build.map(String.init) ?? "unknown")", "SHA=\(event.commit ?? "unknown")",
                 "installation=\(event.installationID?.uuidString ?? "unknown")",
@@ -1943,6 +1945,9 @@ struct TroubleshootingLogReportBuilder {
                 "source=\(event.source?.rawValue ?? "unknown")", "peripheral=\(event.peripheral ?? "unknown")",
                 "phase=\(event.phase ?? "unknown")", "trigger=\(event.trigger ?? "unknown")"
             ]
+            if let returnAttempt = event.returnAttempt {
+                fields.append(returnAttempt.summary { time($0) })
+            }
             if let action = event.action { fields.append("action=\(action)") }
             if let watchOS = event.watchOS { fields.append("watchOS=\(watchOS)") }
             if let reason = event.runtimeInvalidationReason { fields.append("runtimeInvalidationReason=\(reason)") }

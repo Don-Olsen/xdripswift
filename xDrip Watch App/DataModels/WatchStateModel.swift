@@ -544,6 +544,10 @@ final class WatchStateModel: NSObject, ObservableObject {
         session.activationState == .activated && session.isReachable
     }
 
+    var libreWatchConnectivityIsActivated: Bool { session.activationState == .activated }
+    var libreWatchConnectivityActivationState: Int { session.activationState.rawValue }
+    var libreWatchConnectivityIsReachable: Bool { session.isReachable }
+
     func requestLibreWatchOwnership(completion: @escaping (Bool, String?) -> Void) {
         guard let preparedSession = libreWatchDirectSession, preparedSession.isValid else {
             completion(false, LibreWatchDirectFailure.noSession.rawValue)
@@ -570,13 +574,17 @@ final class WatchStateModel: NSObject, ObservableObject {
 
     func releaseLibreWatchOwnership(
         unlockCounter: UInt16?,
+        diagnostic: ((LibreWatchReturnDiagnostic.Stage, LibreWatchReturnDiagnostic.Reason?, NSError?) -> Void)? = nil,
         completion: @escaping (Bool, String?) -> Void
     ) {
+        diagnostic?(.releasePreparing, nil, nil)
         guard let preparedSession = libreWatchDirectSession else {
+            diagnostic?(.failed, .noSession, nil)
             completion(false, LibreWatchDirectFailure.noSession.rawValue)
             return
         }
         guard phoneIsReachable else {
+            diagnostic?(.failed, session.activationState == .activated ? .phoneUnreachable : .notActivated, nil)
             completion(false, LibreWatchDirectFailure.phoneUnavailable.rawValue)
             return
         }
@@ -588,7 +596,8 @@ final class WatchStateModel: NSObject, ObservableObject {
             .releaseOwnership,
             sessionID: preparedSession.id,
             unlockCounter: unlockCounter,
-            releaseCutoff: releaseCutoff
+            releaseCutoff: releaseCutoff,
+            returnDiagnostic: diagnostic
         ) { [weak self] success, error in
             guard let self else { return }
             let snapshotConfirmed = self.acceptedHandoffRevision > startingRevision &&
@@ -596,6 +605,8 @@ final class WatchStateModel: NSObject, ObservableObject {
             if self.libreWatchOwnership == .releasingToPhone {
                 self.setLibreWatchOwnership(success ? .iphone : .watch)
             }
+            diagnostic?(success || snapshotConfirmed ? .completed : .failed,
+                        snapshotConfirmed ? .authoritativeSnapshot : nil, nil)
             completion(success || snapshotConfirmed, snapshotConfirmed ? nil : error)
         }
     }
@@ -859,9 +870,8 @@ final class WatchStateModel: NSObject, ObservableObject {
     }
 
     func reportLibreWatchDiagnostic(_ event: LibreWatchDiagnosticEvent) {
-        guard let preparedSession = libreWatchDirectSession else { return }
         var event = event
-        let eventSessionID = event.sessionID ?? preparedSession.id
+        let eventSessionID = event.sessionID ?? libreWatchDirectSession?.id
         if let settings = localAlarms.settings, settings.sessionID == eventSessionID {
             let at = event.watchTimestamp ?? Date()
             event.alarmSettingsRevision = settings.revision
@@ -879,7 +889,8 @@ final class WatchStateModel: NSObject, ObservableObject {
         let result = diagnosticJournal.append(event)
         LibreWatchSessionStore.saveDiagnosticJournal(diagnosticJournal)
         guard result.inserted,
-              let encoded = try? JSONEncoder().encode(result.event)
+              let encoded = try? JSONEncoder().encode(result.event),
+              let eventSessionID
         else { return }
 
         sendLibreWatchCommand(
@@ -1403,6 +1414,7 @@ final class WatchStateModel: NSObject, ObservableObject {
         releaseCutoff: Date? = nil,
         diagnosticEvent: Data? = nil,
         queueIfUnreachable: Bool = false,
+        returnDiagnostic: ((LibreWatchReturnDiagnostic.Stage, LibreWatchReturnDiagnostic.Reason?, NSError?) -> Void)? = nil,
         completion: ((Bool, String?) -> Void)?
     ) {
         if queueIfUnreachable {
@@ -1445,16 +1457,19 @@ final class WatchStateModel: NSObject, ObservableObject {
         }
 
         guard session.activationState == .activated else {
+            returnDiagnostic?(.transportFailed, .notActivated, nil)
             requestSessionActivationIfNeeded()
             completion?(false, "WatchConnectivity is not activated")
             return
         }
 
         guard session.isReachable else {
+            returnDiagnostic?(.transportFailed, .phoneUnreachable, nil)
             completion?(false, LibreWatchDirectFailure.phoneUnavailable.rawValue)
             return
         }
 
+        returnDiagnostic?(.releaseSent, nil, nil)
         session.sendMessage(message, replyHandler: { reply in
             DispatchQueue.main.async {
                 let success = reply[LibreWatchMessageKey.success] as? Bool ?? false
@@ -1462,6 +1477,7 @@ final class WatchStateModel: NSObject, ObservableObject {
                 self.processLibreWatchAlarmResponse(reply)
                 if reply[LibreWatchMessageKey.handoffSnapshot] is Data {
                     guard self.processLibreWatchPayload(reply) else {
+                        returnDiagnostic?(.snapshotRejected, .staleSnapshot, nil)
                         completion?(false, "Stale or invalid Libre handoff snapshot")
                         return
                     }
@@ -1473,10 +1489,13 @@ final class WatchStateModel: NSObject, ObservableObject {
                    let ownership = LibreWatchOwnership(rawValue: rawOwnership) {
                     self.setLibreWatchOwnership(ownership)
                 }
+                returnDiagnostic?(success ? .replyAccepted : .replyRejected,
+                                  success ? nil : .phoneRejected, nil)
                 completion?(success, error)
             }
         }, errorHandler: { error in
             DispatchQueue.main.async {
+                returnDiagnostic?(.transportFailed, .transportError, error as NSError)
                 completion?(false, error.localizedDescription)
             }
         })

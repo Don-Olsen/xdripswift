@@ -136,6 +136,92 @@ enum LibreWatchDiagnosticEventKind: String, Codable, Equatable {
     case journalRotated
 }
 
+/// Return diagnostics are not BLE recovery attempts. Keep the wire event kind compatible
+/// with older phones; this optional, typed context adds no ownership or transport authority.
+struct LibreWatchReturnDiagnostic: Codable, Equatable {
+    enum Origin: String, Codable { case user, sensorChanged }
+    enum Stage: String, Codable {
+        case requested, preflightRejected, disconnectRequested, awaitingDisconnection
+        case disconnectionConfirmed, releasePreparing, releaseSent
+        case replyAccepted, replyRejected, snapshotRejected, transportFailed
+        case completed, failed
+    }
+
+    enum Reason: String, Codable {
+        case notWatchOwner, notActivated, phoneUnreachable, noSession
+        case currentPeripheralConnected, retiredPeripheralConnected
+        case staleSnapshot, phoneRejected, transportError, authoritativeSnapshot
+    }
+
+    let attemptID: UUID
+    let startedAt: Date
+    let initialGeneration: UUID
+    let origin: Origin
+    let stage: Stage
+    // WCSessionActivationState raw value; no WatchConnectivity dependency in shared tests.
+    let activationState: Int
+    let reachable: Bool
+    let reason: Reason?
+
+    func summary(formatDate: (Date) -> String) -> String {
+        ["returnAttempt=\(attemptID.uuidString)", "returnStarted=\(formatDate(startedAt))",
+         "returnGeneration=\(initialGeneration.uuidString)", "returnOrigin=\(origin.rawValue)", "returnStage=\(stage.rawValue)",
+         "wcActivation=\(activationState)", "wcReachable=\(reachable)",
+         "returnReason=\(reason?.rawValue ?? "none")"].joined(separator: " ")
+    }
+}
+
+struct LibreWatchReturnAttempt {
+    let id: UUID
+    let startedAt: Date
+    let generation: UUID
+    let sessionID: UUID?
+    let origin: LibreWatchReturnDiagnostic.Origin
+
+    init(id: UUID = UUID(), startedAt: Date, generation: UUID, sessionID: UUID?,
+         origin: LibreWatchReturnDiagnostic.Origin = .user) {
+        self.id = id
+        self.startedAt = startedAt
+        self.generation = generation
+        self.sessionID = sessionID
+        self.origin = origin
+    }
+
+    func diagnostic(
+        _ stage: LibreWatchReturnDiagnostic.Stage,
+        activationState: Int,
+        reachable: Bool,
+        reason: LibreWatchReturnDiagnostic.Reason? = nil
+    ) -> LibreWatchReturnDiagnostic {
+        LibreWatchReturnDiagnostic(attemptID: id, startedAt: startedAt,
+            initialGeneration: generation, origin: origin, stage: stage, activationState: activationState,
+            reachable: reachable, reason: reason)
+    }
+
+    /// The collector's actual preflight: persist intent even when no Bluetooth action is
+    /// allowed. The injected action makes ordering/guard tests independent of a BLE radio.
+    static func performPreflight(
+        ownership: LibreWatchOwnership,
+        activated: Bool,
+        reachable: Bool,
+        record: (LibreWatchReturnDiagnostic.Stage, LibreWatchReturnDiagnostic.Reason?) -> Void,
+        disconnect: () -> Void
+    ) -> LibreWatchReturnDiagnostic.Reason? {
+        record(.requested, nil)
+        let failure: LibreWatchReturnDiagnostic.Reason?
+        if ownership != .watch { failure = .notWatchOwner }
+        else if !activated { failure = .notActivated }
+        else if !reachable { failure = .phoneUnreachable }
+        else { failure = nil }
+        if let failure {
+            record(.preflightRejected, failure)
+        } else {
+            disconnect()
+        }
+        return failure
+    }
+}
+
 enum LibreWatchApplicationState: String, Codable, Equatable {
     case active
     case inactive
@@ -282,6 +368,7 @@ struct LibreWatchDiagnosticEvent: Codable, Equatable {
     var alarmSnoozes: [Int: Date]?
     var alarmNotificationsAuthorized: Bool?
     var alarmDelegatedToWatch: Bool?
+    var returnAttempt: LibreWatchReturnDiagnostic?
 
     init(
         eventID: UUID? = UUID(),

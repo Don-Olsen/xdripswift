@@ -2470,6 +2470,111 @@ final class LibreWatchValuePipelineTests: XCTestCase {
         XCTAssertNil(event.bluetoothErrorClassification)
         XCTAssertNil(event.extendedRuntimeState)
         XCTAssertNil(event.extendedRuntimeStartRequested)
+        XCTAssertNil(event.returnAttempt)
+    }
+
+    func testReturnPreflightRecordsIntentBeforePermittedDisconnect() {
+        var order: [String] = []
+        let rejection = LibreWatchReturnAttempt.performPreflight(
+            ownership: .watch, activated: true, reachable: true,
+            record: { stage, reason in
+                order.append(stage.rawValue)
+                XCTAssertNil(reason)
+            },
+            disconnect: { order.append("disconnect") }
+        )
+        XCTAssertNil(rejection)
+        XCTAssertEqual(order, ["requested", "disconnect"])
+    }
+
+    func testReturnPreflightRecordsEveryRejectionWithoutDisconnecting() {
+        let cases: [(LibreWatchOwnership, Bool, Bool, LibreWatchReturnDiagnostic.Reason)] = [
+            (.iphone, true, true, .notWatchOwner),
+            (.releasingToWatch, true, true, .notWatchOwner),
+            (.releasingToPhone, true, true, .notWatchOwner),
+            (.recovery, true, true, .notWatchOwner),
+            (.watch, false, false, .notActivated),
+            (.watch, false, true, .notActivated),
+            (.watch, true, false, .phoneUnreachable)
+        ]
+        for (ownership, activated, reachable, expected) in cases {
+            var stages: [LibreWatchReturnDiagnostic.Stage] = []
+            var reasons: [LibreWatchReturnDiagnostic.Reason?] = []
+            var disconnectCount = 0
+            let rejection = LibreWatchReturnAttempt.performPreflight(
+                ownership: ownership, activated: activated, reachable: reachable,
+                record: { stage, reason in
+                    stages.append(stage)
+                    reasons.append(reason)
+                },
+                disconnect: { disconnectCount += 1 }
+            )
+            XCTAssertEqual(rejection, expected)
+            XCTAssertEqual(stages, [.requested, .preflightRejected])
+            XCTAssertEqual(reasons, [nil, expected])
+            XCTAssertEqual(disconnectCount, 0)
+        }
+    }
+
+    func testReturnStagesKeepOriginalAttemptContextAndDistinctEventIDs() throws {
+        let attempt = LibreWatchReturnAttempt(
+            startedAt: receivedAt, generation: UUID(), sessionID: session.id, origin: .sensorChanged)
+        let stages: [LibreWatchReturnDiagnostic.Stage] = [
+            .requested, .preflightRejected, .disconnectRequested, .awaitingDisconnection,
+            .disconnectionConfirmed, .releasePreparing, .releaseSent, .replyAccepted,
+            .replyRejected, .snapshotRejected, .transportFailed, .completed, .failed
+        ]
+        var eventIDs = Set<UUID>()
+        for (index, stage) in stages.enumerated() {
+            var event = LibreWatchDiagnosticEvent(kind: .lifecycleChanged,
+                watchTimestamp: receivedAt.addingTimeInterval(TimeInterval(index)),
+                generation: UUID(), sessionID: attempt.sessionID)
+            event.returnAttempt = attempt.diagnostic(stage,
+                activationState: index % 3, reachable: index.isMultiple(of: 2))
+            let restored = try JSONDecoder().decode(LibreWatchDiagnosticEvent.self,
+                from: JSONEncoder().encode(event))
+            let context = try XCTUnwrap(restored.returnAttempt)
+            XCTAssertEqual(context.attemptID, attempt.id)
+            XCTAssertEqual(context.startedAt, receivedAt)
+            XCTAssertEqual(context.initialGeneration, attempt.generation)
+            XCTAssertEqual(context.origin, .sensorChanged)
+            XCTAssertEqual(context.stage, stage)
+            XCTAssertEqual(context.activationState, index % 3)
+            XCTAssertEqual(context.reachable, index.isMultiple(of: 2))
+            XCTAssertNil(restored.attemptID) // A return is not a BLE recovery attempt.
+            XCTAssertNil(restored.attemptStartedAt)
+            XCTAssertTrue(eventIDs.insert(try XCTUnwrap(restored.eventID)).inserted)
+        }
+        XCTAssertEqual(eventIDs.count, stages.count)
+    }
+
+    func testUnreachableReturnIntentAndRejectionSurviveOfflineJournalRestart() {
+        let defaults = isolatedDefaults()
+        let attempt = LibreWatchReturnAttempt(
+            startedAt: receivedAt, generation: UUID(), sessionID: session.id)
+        var journal = LibreWatchDiagnosticJournal()
+        let rejection = LibreWatchReturnAttempt.performPreflight(
+            ownership: .watch, activated: true, reachable: false,
+            record: { stage, reason in
+                var event = LibreWatchDiagnosticEvent(kind: .lifecycleChanged,
+                    watchTimestamp: self.receivedAt, sessionID: attempt.sessionID)
+                event.returnAttempt = attempt.diagnostic(stage,
+                    activationState: 2, reachable: false, reason: reason)
+                XCTAssertTrue(journal.append(event, at: self.receivedAt).inserted)
+            },
+            disconnect: { XCTFail("An unreachable return must not disconnect Watch") }
+        )
+        XCTAssertEqual(rejection, .phoneUnreachable)
+        LibreWatchSessionStore.saveDiagnosticJournal(journal, defaults: defaults, at: receivedAt)
+        let restored = LibreWatchSessionStore.loadDiagnosticJournal(
+            defaults: defaults, at: receivedAt.addingTimeInterval(600))
+        let pending = restored.pendingEvents(for: session.id)
+        XCTAssertEqual(pending.compactMap(\.returnAttempt).map(\.stage), [.requested, .preflightRejected])
+        XCTAssertEqual(pending.compactMap(\.returnAttempt).map(\.reason), [nil, .phoneUnreachable])
+        XCTAssertEqual(pending.compactMap(\.returnAttempt).map(\.attemptID), [attempt.id, attempt.id])
+        XCTAssertEqual(pending.map(\.watchTimestamp), [receivedAt, receivedAt])
+        XCTAssertEqual(pending.map(\.sequenceNumber), [1, 2])
+        XCTAssertEqual(pending.map(\.eventID), journal.pendingEvents(for: session.id).map(\.eventID))
     }
 
     func testBackgroundNotificationQuotaErrorsNeverCountAsInvalidFramesOrStartRecovery() {

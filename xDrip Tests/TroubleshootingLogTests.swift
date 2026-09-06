@@ -1755,6 +1755,100 @@ private extension Data.SubSequence {
 }
 
 extension TroubleshootingLogTests {
+    func testReturnDiagnosticDurableExportKeepsAttemptAndDeduplicatesOnlyEventID() throws {
+        let fixture = makeStore()
+        defer { removeFixture(fixture.directory) }
+        let watchTime = referenceDate.addingTimeInterval(-600)
+        let attempt = LibreWatchReturnAttempt(
+            startedAt: watchTime, generation: UUID(), sessionID: UUID())
+        var events: [TroubleshootingWatchDiagnostic] = []
+        for stage in [LibreWatchReturnDiagnostic.Stage.requested, .preflightRejected] {
+            var event = LibreWatchDiagnosticEvent(kind: .lifecycleChanged,
+                watchTimestamp: watchTime, sessionID: attempt.sessionID, appBuild: "4255")
+            event.returnAttempt = attempt.diagnostic(stage, activationState: 2,
+                reachable: false, reason: stage == .preflightRejected ? .phoneUnreachable : nil)
+            events.append(TroubleshootingWatchDiagnostic(event))
+        }
+        let persisted = expectation(description: "both return stages persisted")
+        persisted.expectedFulfillmentCount = events.count
+        for event in events {
+            fixture.store.recordWatchDiagnostic(event, receivedAt: referenceDate) { stored in
+                XCTAssertTrue(stored)
+                persisted.fulfill()
+            }
+        }
+        wait(for: [persisted], timeout: 5)
+        let reloaded = TroubleshootingLogStore(fileURL: fixture.fileURL, now: { self.referenceDate })
+        let duplicate = expectation(description: "same event acknowledged without duplicate")
+        reloaded.recordWatchDiagnostic(events[1], receivedAt: referenceDate.addingTimeInterval(1)) { stored in
+            XCTAssertTrue(stored)
+            duplicate.fulfill()
+        }
+        wait(for: [duplicate], timeout: 5)
+        let entries = reloaded.snapshot()
+        let exported = entries.compactMap { entry -> TroubleshootingWatchDiagnostic? in
+            guard case let .watchDiagnostic(value) = entry.kind else { return nil }
+            return value
+        }
+        XCTAssertEqual(exported.count, 2)
+        XCTAssertEqual(Set(exported.map(\.eventID)).count, 2)
+        XCTAssertEqual(exported.compactMap(\.returnAttempt).map(\.attemptID), [attempt.id, attempt.id])
+        XCTAssertEqual(Set(exported.compactMap(\.returnAttempt).map { $0.stage.rawValue }),
+                       Set(["requested", "preflightRejected"]))
+        XCTAssertTrue(exported.allSatisfy { $0.watchTime == watchTime && $0.build == 4255 })
+        XCTAssertTrue(entries.allSatisfy { $0.timestamp == referenceDate })
+        let report = makeReport(entries: entries).reportText
+        for field in [
+            "Watch-to-iPhone return", "returnAttempt=\(attempt.id.uuidString)",
+            "returnStarted=", "returnGeneration=\(attempt.generation.uuidString)",
+            "returnOrigin=user",
+            "returnStage=requested", "returnStage=preflightRejected",
+            "wcActivation=2", "wcReachable=false", "returnReason=none",
+            "returnReason=phoneUnreachable", "watchTime=", "receiptTime="
+        ] {
+            XCTAssertTrue(report.contains(field), "Missing return export field: \(field)")
+        }
+        XCTAssertFalse(report.contains("Watch-Libre recoveryFailed"))
+    }
+
+    func testReturnTransportFailureExportsTypedReasonWithoutFreeErrorText() throws {
+        let secret = "secret=https://user:password@example.invalid"
+        let attempt = LibreWatchReturnAttempt(
+            startedAt: referenceDate, generation: UUID(), sessionID: UUID())
+        var event = LibreWatchDiagnosticEvent(kind: .lifecycleChanged, errorCode: 7007,
+            watchTimestamp: referenceDate, trigger: secret, runtimeError: secret,
+            actionReason: secret, errorDomain: "WCErrorDomain")
+        event.returnAttempt = attempt.diagnostic(.transportFailed,
+            activationState: 2, reachable: false, reason: .transportError)
+        let projection = TroubleshootingWatchDiagnostic(event)
+        let entry = TroubleshootingLogEntry.detailed(.watchDiagnostic(projection), timestamp: referenceDate)
+        let report = makeReport(entries: [entry]).reportText
+        XCTAssertEqual(projection.errorDomain, "WCErrorDomain")
+        XCTAssertTrue(report.contains("returnStage=transportFailed"))
+        XCTAssertTrue(report.contains("returnReason=transportError"))
+        XCTAssertTrue(report.contains("error=WCErrorDomain/7007"))
+        XCTAssertFalse(report.contains("phoneRejected"))
+        XCTAssertFalse(report.contains("password"))
+        XCTAssertFalse(report.contains("example.invalid"))
+        let encoded = String(decoding: try JSONEncoder().encode(entry), as: UTF8.self)
+        XCTAssertFalse(encoded.contains("password"))
+        XCTAssertFalse(encoded.contains("example.invalid"))
+        var untrustedDomain = LibreWatchDiagnosticEvent(kind: .lifecycleChanged, errorDomain: secret)
+        untrustedDomain.returnAttempt = event.returnAttempt
+        XCTAssertEqual(TroubleshootingWatchDiagnostic(untrustedDomain).errorDomain, "other")
+    }
+
+    func testLegacyWatchDiagnosticProjectionDecodesWithoutReturnContext() throws {
+        let projection = TroubleshootingWatchDiagnostic(LibreWatchDiagnosticEvent(
+            kind: .disconnected, watchTimestamp: referenceDate))
+        let encoded = try JSONEncoder().encode(projection)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        XCTAssertNil(object["returnAttempt"])
+        let restored = try JSONDecoder().decode(TroubleshootingWatchDiagnostic.self, from: encoded)
+        XCTAssertNil(restored.returnAttempt)
+        XCTAssertEqual(restored, projection)
+    }
+
     func testWatchDiagnosticExportKeepsOriginalBuildAndSeparateEventReceiptClocks() throws {
         let event = LibreWatchDiagnosticEvent(kind: .bluetoothAction,
             watchTimestamp: referenceDate, trigger: "notificationSubscriptionReady",

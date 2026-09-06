@@ -24,6 +24,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
     private var scanIsPending = false
     private var deliberatelyDisconnecting = false
     private var returnAfterDisconnect: (() -> Void)?
+    private var pendingReturnDiagnosticAttempt: LibreWatchReturnAttempt?
     private var connectionTiming = LibreWatchConnectionTiming()
     private var setupService: CBService?
     private var setupGeneration: UUID?
@@ -161,7 +162,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         }
 
         if sensorChanged, watchState?.libreWatchOwnership == .watch {
-            returnLibreToPhone()
+            returnLibreToPhone(origin: .sensorChanged)
             return
         }
         state.sessionAvailable(
@@ -247,17 +248,29 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         beginScanningIfPossible(allowsEventDrivenStart: allowsEventDrivenStart)
     }
 
-    func returnLibreToPhone() {
+    func returnLibreToPhone(origin: LibreWatchReturnDiagnostic.Origin = .user) {
         guard let watchState else { return }
-        guard watchState.libreWatchOwnership == .watch else {
+        let attempt = LibreWatchReturnAttempt(startedAt: Date(),
+            generation: connectionTiming.generation, sessionID: preparedSession?.id, origin: origin)
+        let failure = LibreWatchReturnAttempt.performPreflight(
+            ownership: watchState.libreWatchOwnership,
+            activated: watchState.libreWatchConnectivityIsActivated,
+            reachable: watchState.libreWatchConnectivityIsReachable,
+            record: { stage, reason in
+                self.reportReturnDiagnostic(attempt, stage: stage, reason: reason)
+            },
+            disconnect: { self.beginReturnToPhone(attempt: attempt) }
+        )
+        if failure == .notWatchOwner {
             ownershipDidChange(.iphone)
-            return
+        } else if failure != nil {
+            state.fail(.phoneUnavailable,
+                error: "iPhone app is not reachable. Sensor stays on Watch. Open xDrip on iPhone, then retry Return to iPhone.")
         }
-        guard watchState.phoneIsReachable else {
-            state.fail(.phoneUnavailable, error: "Bring iPhone nearby before returning the sensor")
-            return
-        }
+    }
 
+    private func beginReturnToPhone(attempt: LibreWatchReturnAttempt) {
+        pendingReturnDiagnosticAttempt = attempt
         state.beginReturn()
         deliberatelyDisconnecting = true
         scanAfterReconnectCancellation = false
@@ -268,19 +281,34 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         scanIsPending = false
         centralManager?.stopScan()
         if let peripheral = peripheralToRelease() {
-            returnAfterDisconnect = { [weak self] in self?.completeReturnToPhone() }
+            returnAfterDisconnect = { [weak self] in self?.completeReturnToPhone(attempt: attempt) }
             beginCancellation(of: peripheral)
         } else {
-            completeReturnToPhone()
+            completeReturnToPhone(attempt: attempt)
         }
     }
 
-    private func completeReturnToPhone() {
-        guard let watchState,
-              sensorPeripheral == nil || sensorPeripheral?.state == .disconnected,
-              releaseRetiredPeripheralIfDisconnected() else { return }
-        watchState.releaseLibreWatchOwnership(unlockCounter: preparedSession?.unlockCount) { [weak self] success, error in
+    private func completeReturnToPhone(attempt: LibreWatchReturnAttempt) {
+        guard let watchState else { return }
+        guard sensorPeripheral == nil || sensorPeripheral?.state == .disconnected else {
+            reportReturnDiagnostic(attempt, stage: .awaitingDisconnection, reason: .currentPeripheralConnected)
+            return
+        }
+        guard releaseRetiredPeripheralIfDisconnected() else {
+            reportReturnDiagnostic(attempt, stage: .awaitingDisconnection, reason: .retiredPeripheralConnected)
+            return
+        }
+        reportReturnDiagnostic(attempt, stage: .disconnectionConfirmed)
+        watchState.releaseLibreWatchOwnership(
+            unlockCounter: preparedSession?.unlockCount,
+            diagnostic: { [weak self] stage, reason, error in
+                self?.reportReturnDiagnostic(attempt, stage: stage, reason: reason, error: error)
+            }
+        ) { [weak self] success, error in
             guard let self else { return }
+            if self.pendingReturnDiagnosticAttempt?.id == attempt.id {
+                self.pendingReturnDiagnosticAttempt = nil
+            }
             if success {
                 self.clearTransientBluetoothState()
                 self.state.returnedToPhone(session: self.preparedSession)
@@ -1090,6 +1118,9 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         reportBluetoothAction("cancel", reason: scanAfterReconnectCancellation
             ? "controlledRecovery"
             : (deliberatelyDisconnecting ? "returnToPhone" : "ownershipStopped"))
+        if returnAfterDisconnect != nil, let attempt = pendingReturnDiagnosticAttempt {
+            reportReturnDiagnostic(attempt, stage: .disconnectRequested)
+        }
         centralManager?.cancelPeripheralConnection(peripheral)
         evaluateCancellation()
     }
@@ -1125,7 +1156,9 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
             finishReconnectCancellationAndScan(allowsEventDrivenStart: allowsEventDrivenStart)
         case .awaitConfirmedDisconnection:
             cancelReconnectFallback()
-            if recoveryAttemptState.context != nil {
+            if let attempt = pendingReturnDiagnosticAttempt, returnAfterDisconnect != nil {
+                reportReturnDiagnostic(attempt, stage: .awaitingDisconnection, reason: .currentPeripheralConnected)
+            } else if recoveryAttemptState.context != nil {
                 reportRecoveryFailureIfNeeded()
             } else {
                 reportDiagnostic(.recoveryFailed, trigger: "returnAwaitingDisconnection")
@@ -1356,9 +1389,12 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         runtimeError: String? = nil,
         bluetoothErrorClassification: String? = nil,
         attempt: LibreWatchRecoveryAttemptContext? = nil,
-        reconcileSource: LibreWatchRecoveryReconcileSource? = nil
+        reconcileSource: LibreWatchRecoveryReconcileSource? = nil,
+        returnContext: (attempt: LibreWatchReturnAttempt, event: LibreWatchReturnDiagnostic)? = nil
     ) {
         let attempt = attempt ?? recoveryAttemptState.context
+        let eventSessionID = returnContext != nil ? returnContext?.attempt.sessionID
+            : (attempt?.sessionID ?? preparedSession?.id)
         let belongsToRecoveryAttempt: Bool
         switch kind {
         case .recoveryStarted, .recoverySucceeded, .recoveryFailed:
@@ -1368,7 +1404,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
              .frameProgress, .callbackRejected, .journalRotated:
             belongsToRecoveryAttempt = false
         }
-        watchState?.reportLibreWatchDiagnostic(LibreWatchDiagnosticEvent(
+        var event = LibreWatchDiagnosticEvent(
             kind: kind, isReconnecting: isReconnecting, errorCode: errorCode,
             watchTimestamp: date,
             trigger: belongsToRecoveryAttempt ? (attempt?.originalTrigger ?? trigger) : trigger,
@@ -1381,10 +1417,10 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
             generation: belongsToRecoveryAttempt
                 ? (attempt?.generation ?? connectionTiming.generation)
                 : connectionTiming.generation,
-            attemptID: attempt?.attemptID,
-            attemptStartedAt: attempt?.startedAt,
-            sessionID: attempt?.sessionID ?? preparedSession?.id,
-            sensorIdentity: attempt?.sensorIdentity ?? preparedSession?.redactedIdentity(),
+            attemptID: returnContext == nil ? attempt?.attemptID : nil,
+            attemptStartedAt: returnContext == nil ? attempt?.startedAt : nil,
+            sessionID: eventSessionID,
+            sensorIdentity: returnContext == nil ? (attempt?.sensorIdentity ?? preparedSession?.redactedIdentity()) : nil,
             reconcileSource: reconcileSource ?? currentReconcileSource,
             remainingExecutionBudget: connectionTiming.remainingExecutionTime(
                 at: date,
@@ -1406,7 +1442,25 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
             extendedRuntimeStartRequested: userInitiatedRuntimeStart,
             ownership: watchState?.libreWatchOwnership,
             unlockCounter: preparedSession?.unlockCount
-        ))
+        )
+        event.returnAttempt = returnContext?.event
+        watchState?.reportLibreWatchDiagnostic(event)
+    }
+
+    private func reportReturnDiagnostic(
+        _ attempt: LibreWatchReturnAttempt,
+        stage: LibreWatchReturnDiagnostic.Stage,
+        reason: LibreWatchReturnDiagnostic.Reason? = nil,
+        error: NSError? = nil
+    ) {
+        guard let watchState else { return }
+        let context = attempt.diagnostic(stage,
+            activationState: watchState.libreWatchConnectivityActivationState,
+            reachable: watchState.libreWatchConnectivityIsReachable, reason: reason)
+        reportDiagnostic(.lifecycleChanged, trigger: "returnToPhone",
+            errorDomain: error.map { $0.domain == "WCErrorDomain" ? $0.domain : "other" },
+            errorCode: error?.code,
+            returnContext: (attempt, context))
     }
 
     private func reportBluetoothAction(_ action: String, reason: String) {
