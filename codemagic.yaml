@@ -301,3 +301,68 @@ workflows:
     publishing:
       app_store_connect:
         auth: integration
+
+  xdrip-verify:
+    name: xDrip verification only (no publishing)
+    instance_type: mac_mini_m2
+    max_build_duration: 120
+
+    environment:
+      xcode: latest
+
+    # Manual-only verification: no release integration, signing or publishing.
+    scripts:
+      - name: Record verification source and initialize dependencies
+        script: |
+          set -euo pipefail
+          mkdir -p "$CM_BUILD_DIR/build/verification"
+          git rev-parse HEAD | tee "$CM_BUILD_DIR/build/verification/source-commit.txt"
+          xcodebuild -version | tee "$CM_BUILD_DIR/build/verification/xcode-version.txt"
+          sw_vers | tee "$CM_BUILD_DIR/build/verification/macos-version.txt"
+          git submodule sync --recursive
+          git submodule update --init --recursive
+
+      - name: Test history cache, Libre Watch pipeline and troubleshooting
+        script: |
+          set -euo pipefail
+          simulator_id="$(xcrun simctl list devices available -j | jq -r '[.devices[][] | select(.name | startswith("iPhone"))][0].udid // empty')"
+          test -n "$simulator_id"
+          printf '%s\n' "$simulator_id" > "$CM_BUILD_DIR/build/verification/simulator-id.txt"
+          xcodebuild test \
+            -workspace "$CM_BUILD_DIR/xdrip.xcworkspace" \
+            -scheme "xdrip" \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,id=$simulator_id" \
+            -only-testing:xdripTests/RootHomeInteractionTests \
+            -only-testing:xdripTests/LibreWatchValuePipelineTests \
+            -only-testing:xdripTests/TroubleshootingLogTests \
+            -resultBundlePath "$CM_BUILD_DIR/build/verification/Verification.xcresult" \
+            CODE_SIGNING_ALLOWED=NO \
+            2>&1 | tee "$CM_BUILD_DIR/build/verification/xctest.log"
+
+      - name: Compile iPhone app target without signing
+        script: |
+          set -euo pipefail
+          xcodebuild build \
+            -workspace "$CM_BUILD_DIR/xdrip.xcworkspace" \
+            -scheme "xdrip" \
+            -configuration Debug \
+            -destination "generic/platform=iOS Simulator" \
+            CODE_SIGNING_ALLOWED=NO \
+            2>&1 | tee "$CM_BUILD_DIR/build/verification/iphone-build.log"
+
+      - name: Compile Watch app target without signing
+        script: |
+          set -euo pipefail
+          xcodebuild build \
+            -workspace "$CM_BUILD_DIR/xdrip.xcworkspace" \
+            -scheme "xDrip Watch App" \
+            -configuration Debug \
+            -destination "generic/platform=watchOS Simulator" \
+            CODE_SIGNING_ALLOWED=NO \
+            2>&1 | tee "$CM_BUILD_DIR/build/verification/watch-build.log"
+
+    artifacts:
+      - build/verification/*.txt
+      - build/verification/*.log
+      - build/verification/*.xcresult
