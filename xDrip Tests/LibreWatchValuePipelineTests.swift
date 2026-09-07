@@ -4,8 +4,390 @@ import HealthKit
 import Combine
 @testable import xdrip
 
+extension LibreWatchValuePipelineTests {
+    func testPhoneStatusPreservesIndependentlyConfiguredFiniteChartThresholds() throws {
+        let (defaults, suite) = displaySnapshotDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        var status = displayStatusSnapshot(at: now)
+        status["urgentLowLimitInMgDl"] = 90.0
+        status["lowLimitInMgDl"] = 80.0
+        status["highLimitInMgDl"] = 0.0
+        status["urgentHighLimitInMgDl"] = -1.0
+        XCTAssertTrue(WatchPhoneSnapshotStore.accept(status, stream: .status, sessionID: nil, at: now, defaults: defaults))
+        let saved = try XCTUnwrap(WatchPhoneSnapshotStore.stored(.status, defaults: defaults))
+        XCTAssertEqual(saved["urgentLowLimitInMgDl"] as? Double, 90)
+        XCTAssertEqual(saved["lowLimitInMgDl"] as? Double, 80)
+        XCTAssertEqual(saved["highLimitInMgDl"] as? Double, 0)
+        XCTAssertEqual(saved["urgentHighLimitInMgDl"] as? Double, -1)
+        let invalidThresholds: [Any] = [Double.nan, Double.infinity, true, "80"]
+        for invalid in invalidThresholds {
+            var malformed = status
+            malformed["generatedAt"] = now.addingTimeInterval(1).timeIntervalSince1970
+            malformed["lowLimitInMgDl"] = invalid
+            XCTAssertFalse(WatchPhoneSnapshotStore.accept(malformed, stream: .status, sessionID: nil, at: now, defaults: defaults))
+        }
+        XCTAssertEqual(WatchPhoneSnapshotStore.stored(.status, defaults: defaults)?["lowLimitInMgDl"] as? Double, 80)
+    }
+
+    func testUnscopedReinstalledPhoneSnapshotRequiresExplicitPhoneOwnedOptIn() {
+        let (watch, watchSuite) = displaySnapshotDefaults()
+        let (newPhone, phoneSuite) = displaySnapshotDefaults()
+        defer { watch.removePersistentDomain(forName: watchSuite); newPhone.removePersistentDomain(forName: phoneSuite) }
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let retainedWatchSession = UUID()
+        let earlier = now.addingTimeInterval(-10)
+        let previous = displayBGSnapshot(at: earlier, generation:
+            WatchPhoneSnapshotStore.nextGeneration(sessionID: retainedWatchSession, at: earlier, defaults: watch))
+        XCTAssertTrue(WatchPhoneSnapshotStore.accept(previous, stream: .bgReadings,
+            sessionID: retainedWatchSession, at: now, defaults: watch))
+
+        for stream in WatchPhoneSnapshotStore.Stream.allCases {
+            let generation = WatchPhoneSnapshotStore.nextGeneration(sessionID: nil, at: now, defaults: newPhone)
+            let unscoped = stream == .bgReadings
+                ? displayBGSnapshot(at: now, generation: generation)
+                : displayStatusSnapshot(at: now, generation: generation)
+            // Default/Watch-owned validation stays strict, including after a new installation.
+            XCTAssertFalse(WatchPhoneSnapshotStore.isValid(unscoped, stream: stream,
+                sessionID: retainedWatchSession, at: now))
+            XCTAssertFalse(WatchPhoneSnapshotStore.accept(unscoped, stream: stream,
+                sessionID: retainedWatchSession, at: now, defaults: watch))
+            XCTAssertFalse(WatchPhoneSnapshotStore.accept(unscoped, stream: stream,
+                sessionID: retainedWatchSession, allowUnscopedPhoneSession: false, at: now, defaults: watch))
+            // WatchStateModel supplies true only for its already-committed .iphone owner.
+            XCTAssertTrue(WatchPhoneSnapshotStore.isValid(unscoped, stream: stream,
+                sessionID: retainedWatchSession, allowUnscopedPhoneSession: true, at: now))
+            XCTAssertTrue(WatchPhoneSnapshotStore.accept(unscoped, stream: stream,
+                sessionID: retainedWatchSession, allowUnscopedPhoneSession: true, at: now, defaults: watch))
+        }
+        let differentSession = displayBGSnapshot(at: now, generation:
+            WatchPhoneSnapshotStore.nextGeneration(sessionID: UUID(), at: now, defaults: newPhone))
+        XCTAssertFalse(WatchPhoneSnapshotStore.isValid(differentSession, stream: .bgReadings,
+            sessionID: retainedWatchSession, allowUnscopedPhoneSession: true, at: now))
+        XCTAssertFalse(WatchPhoneSnapshotStore.accept(differentSession, stream: .bgReadings,
+            sessionID: retainedWatchSession, allowUnscopedPhoneSession: true, at: now, defaults: watch))
+        XCTAssertFalse(WatchPhoneSnapshotStore.accept(previous, stream: .bgReadings,
+            sessionID: retainedWatchSession, allowUnscopedPhoneSession: true, at: now, defaults: watch))
+    }
+}
+
+// Tests exercise the production shared storage/validation/expiry helpers, not a copied policy.
+extension LibreWatchValuePipelineTests {
+    private func displaySnapshotDefaults() -> (UserDefaults, String) {
+        let suite = "WatchPhoneSnapshotTests.\(UUID().uuidString)"
+        return (UserDefaults(suiteName: suite)!, suite)
+    }
+
+    private func displayBGSnapshot(at date: Date, value: Double = 123,
+                                   generation: [String: Any]? = nil) -> [String: Any] {
+        let payload: [String: Any] = ["generatedAt": date.timeIntervalSince1970,
+            "bgReadingValues": [value, 120.0],
+            "bgReadingDatesAsDouble": [date.timeIntervalSince1970 - 10, date.timeIntervalSince1970 - 70],
+            "slopeOrdinal": 4, "deltaValueInUserUnit": 3.0]
+        return generation.map { WatchPhoneSnapshotStore.attaching($0, to: payload) } ?? payload
+    }
+
+    private func displayStatusSnapshot(at date: Date, generation: [String: Any]? = nil) -> [String: Any] {
+        let payload: [String: Any] = ["generatedAt": date.timeIntervalSince1970,
+            "isMgDl": true, "isMaster": true, "keepAliveIsDisabled": false,
+            "urgentLowLimitInMgDl": 60.0, "lowLimitInMgDl": 80.0,
+            "highLimitInMgDl": 170.0, "urgentHighLimitInMgDl": 250.0,
+            "sensorAgeInMinutes": 100.0, "sensorMaxAgeInMinutes": 14400.0]
+        return generation.map { WatchPhoneSnapshotStore.attaching($0, to: payload) } ?? payload
+    }
+
+    func testDisplayedDirectProvenanceKeepsThreeMinuteExpiryAcrossPersistence() throws {
+        let measuredAt = Date(timeIntervalSince1970: 1_800_000_000)
+        var cached = ComplicationSharedUserDefaultsModel(bgReadingValues: [123],
+            bgReadingDatesAsDouble: [measuredAt.timeIntervalSince1970], isMgDl: true,
+            slopeOrdinal: 4, deltaValueInUserUnit: 3, urgentLowLimitInMgDl: 60,
+            lowLimitInMgDl: 80, highLimitInMgDl: 170, urgentHighLimitInMgDl: 250,
+            keepAliveIsDisabled: false, readingSource: .directLibre)
+        // Physical ownership is deliberately absent from the measurement expiry model.
+        let restored = try XCTUnwrap(ComplicationSharedUserDefaultsModel.decodeStoredData(JSONEncoder().encode(cached)))
+        XCTAssertEqual(restored.latestReadingDate, measuredAt)
+        XCTAssertEqual(restored.readingSource, .directLibre)
+        XCTAssertTrue(restored.readingIsCurrent(at: measuredAt.addingTimeInterval(180)))
+        XCTAssertFalse(restored.readingIsCurrent(at: measuredAt.addingTimeInterval(181)))
+        XCTAssertFalse(ComplicationReadingSource.directLibre.isCurrent(measuredAt: measuredAt, at: measuredAt.addingTimeInterval(181)))
+        cached.readingSource = .phone // A validated phone replacement uses its own source window.
+        XCTAssertTrue(cached.readingIsCurrent(at: measuredAt.addingTimeInterval(181)))
+    }
+
+    func testPhoneBGRejectsOutOfOrderAndAllowsNewerSnapshotCorrection() throws {
+        let (defaults, suite) = displaySnapshotDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let a = displayBGSnapshot(at: now.addingTimeInterval(-5), generation:
+            WatchPhoneSnapshotStore.nextGeneration(sessionID: nil, at: now.addingTimeInterval(-5), defaults: defaults))
+        let b = displayBGSnapshot(at: now, generation:
+            WatchPhoneSnapshotStore.nextGeneration(sessionID: nil, at: now, defaults: defaults))
+        XCTAssertTrue(WatchPhoneSnapshotStore.accept(b, stream: .bgReadings, sessionID: nil, at: now, defaults: defaults))
+        XCTAssertFalse(WatchPhoneSnapshotStore.accept(a, stream: .bgReadings, sessionID: nil, at: now, defaults: defaults))
+        var correction = displayBGSnapshot(at: now, value: 125, generation:
+            WatchPhoneSnapshotStore.nextGeneration(sessionID: nil, at: now, defaults: defaults))
+        correction["generatedAt"] = now.addingTimeInterval(1).timeIntervalSince1970
+        XCTAssertTrue(WatchPhoneSnapshotStore.accept(correction, stream: .bgReadings, sessionID: nil, at: now, defaults: defaults))
+        XCTAssertEqual((WatchPhoneSnapshotStore.stored(.bgReadings, defaults: defaults)?["bgReadingValues"] as? [Double])?.first, 125)
+        XCTAssertFalse(WatchPhoneSnapshotStore.accept(correction, stream: .bgReadings, sessionID: nil, at: now, defaults: defaults))
+    }
+
+    func testStatusOrderingDoesNotConsumeIndependentBGWatermark() {
+        let (defaults, suite) = displaySnapshotDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let bg = displayBGSnapshot(at: now.addingTimeInterval(-10), generation:
+            WatchPhoneSnapshotStore.nextGeneration(sessionID: nil, at: now.addingTimeInterval(-10), defaults: defaults))
+        let a = displayStatusSnapshot(at: now.addingTimeInterval(-5), generation:
+            WatchPhoneSnapshotStore.nextGeneration(sessionID: nil, at: now.addingTimeInterval(-5), defaults: defaults))
+        let b = displayStatusSnapshot(at: now, generation:
+            WatchPhoneSnapshotStore.nextGeneration(sessionID: nil, at: now, defaults: defaults))
+        XCTAssertTrue(WatchPhoneSnapshotStore.accept(b, stream: .status, sessionID: nil, at: now, defaults: defaults))
+        XCTAssertFalse(WatchPhoneSnapshotStore.accept(a, stream: .status, sessionID: nil, at: now, defaults: defaults))
+        XCTAssertTrue(WatchPhoneSnapshotStore.accept(bg, stream: .bgReadings, sessionID: nil, at: now, defaults: defaults))
+    }
+
+    func testPhoneSnapshotAndWatermarkRestoreTogetherAfterRestart() throws {
+        let (defaults, suite) = displaySnapshotDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let firstGeneration = WatchPhoneSnapshotStore.nextGeneration(sessionID: nil, at: now, defaults: defaults)
+        let bg = displayBGSnapshot(at: now, value: 147, generation: firstGeneration)
+        XCTAssertTrue(WatchPhoneSnapshotStore.accept(bg, stream: .bgReadings, sessionID: nil, at: now, defaults: defaults))
+        let restarted = try XCTUnwrap(UserDefaults(suiteName: suite))
+        let restored = try XCTUnwrap(WatchPhoneSnapshotStore.stored(.bgReadings, defaults: restarted))
+        XCTAssertTrue(WatchPhoneSnapshotStore.isValid(restored, stream: .bgReadings, sessionID: nil, at: now))
+        XCTAssertEqual(restored["bgReadingValues"] as? [Double], [147, 120])
+        XCTAssertFalse(WatchPhoneSnapshotStore.accept(bg, stream: .bgReadings, sessionID: nil, at: now, defaults: restarted))
+        let next = WatchPhoneSnapshotStore.nextGeneration(sessionID: nil, at: now, defaults: restarted)
+        XCTAssertEqual(next["installationID"] as? String, firstGeneration["installationID"] as? String)
+        XCTAssertEqual(next["revision"] as? String, "2")
+    }
+
+    func testNewPhoneInstallationRetiresOldSnapshotsAcrossBothStreams() throws {
+        let (watch, watchSuite) = displaySnapshotDefaults()
+        let (newPhone, phoneSuite) = displaySnapshotDefaults()
+        defer { watch.removePersistentDomain(forName: watchSuite); newPhone.removePersistentDomain(forName: phoneSuite) }
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let old = displayBGSnapshot(at: now, generation:
+            WatchPhoneSnapshotStore.nextGeneration(sessionID: nil, at: now, defaults: watch))
+        XCTAssertTrue(WatchPhoneSnapshotStore.accept(old, stream: .bgReadings, sessionID: nil, at: now, defaults: watch))
+        let later = now.addingTimeInterval(10)
+        let newStatus = displayStatusSnapshot(at: later, generation:
+            WatchPhoneSnapshotStore.nextGeneration(sessionID: nil, at: later, defaults: newPhone))
+        XCTAssertTrue(WatchPhoneSnapshotStore.accept(newStatus, stream: .status, sessionID: nil, at: later, defaults: watch))
+        XCTAssertNil(WatchPhoneSnapshotStore.stored(.bgReadings, defaults: watch))
+        let oldPhoneDelayed = displayBGSnapshot(at: later, generation:
+            WatchPhoneSnapshotStore.nextGeneration(sessionID: nil, at: later, defaults: watch))
+        XCTAssertFalse(WatchPhoneSnapshotStore.accept(oldPhoneDelayed, stream: .bgReadings, sessionID: nil, at: later, defaults: watch))
+        let newBG = displayBGSnapshot(at: later, generation:
+            WatchPhoneSnapshotStore.nextGeneration(sessionID: nil, at: later, defaults: newPhone))
+        XCTAssertTrue(WatchPhoneSnapshotStore.accept(newBG, stream: .bgReadings, sessionID: nil, at: later, defaults: watch))
+    }
+
+    func testSnapshotSessionChangeRejectsPriorSensorSession() {
+        let (defaults, suite) = displaySnapshotDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let oldSession = UUID(), newSession = UUID()
+        let old = displayBGSnapshot(at: now, generation:
+            WatchPhoneSnapshotStore.nextGeneration(sessionID: oldSession, at: now, defaults: defaults))
+        let current = displayBGSnapshot(at: now, generation:
+            WatchPhoneSnapshotStore.nextGeneration(sessionID: newSession, at: now, defaults: defaults))
+        XCTAssertFalse(WatchPhoneSnapshotStore.accept(old, stream: .bgReadings, sessionID: newSession, at: now, defaults: defaults))
+        XCTAssertTrue(WatchPhoneSnapshotStore.accept(current, stream: .bgReadings, sessionID: newSession, at: now, defaults: defaults))
+        XCTAssertFalse(WatchPhoneSnapshotStore.isValid(current, stream: .bgReadings, sessionID: nil, at: now))
+    }
+
+    func testLegacySnapshotsRemainMonotonicAndCannotDowngradeVersionedPhone() {
+        let (defaults, suite) = displaySnapshotDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let a = displayBGSnapshot(at: now.addingTimeInterval(-10))
+        let b = displayBGSnapshot(at: now.addingTimeInterval(-5))
+        XCTAssertTrue(WatchPhoneSnapshotStore.accept(b, stream: .bgReadings, sessionID: nil, at: now, defaults: defaults))
+        XCTAssertFalse(WatchPhoneSnapshotStore.accept(a, stream: .bgReadings, sessionID: nil, at: now, defaults: defaults))
+        let versioned = displayBGSnapshot(at: now, generation:
+            WatchPhoneSnapshotStore.nextGeneration(sessionID: nil, at: now, defaults: defaults))
+        XCTAssertTrue(WatchPhoneSnapshotStore.accept(versioned, stream: .bgReadings, sessionID: nil, at: now, defaults: defaults))
+        XCTAssertFalse(WatchPhoneSnapshotStore.accept(displayBGSnapshot(at: now.addingTimeInterval(1)), stream: .bgReadings,
+            sessionID: nil, at: now, defaults: defaults))
+        XCTAssertFalse(WatchPhoneSnapshotStore.accept(displayStatusSnapshot(at: now), stream: .status,
+            sessionID: nil, at: now, defaults: defaults))
+    }
+
+    func testInvalidPhoneArraysNeverAdvanceSnapshotOrInventGlucose() {
+        let (defaults, suite) = displaySnapshotDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let valid = displayBGSnapshot(at: now)
+        var missing = valid; missing.removeValue(forKey: "bgReadingValues")
+        var mismatch = valid; mismatch["bgReadingValues"] = [123.0]
+        var empty = valid; empty["bgReadingValues"] = [Double](); empty["bgReadingDatesAsDouble"] = [Double]()
+        var nonfinite = valid; nonfinite["bgReadingValues"] = [Double.nan, 120]
+        var future = valid; future["bgReadingDatesAsDouble"] = [now.timeIntervalSince1970 + 21, now.timeIntervalSince1970]
+        var unsorted = valid; unsorted["bgReadingDatesAsDouble"] = [now.timeIntervalSince1970 - 70, now.timeIntervalSince1970 - 10]
+        var boolean = valid; boolean["bgReadingValues"] = [true, false]
+        for bad in [missing, mismatch, empty, nonfinite, future, unsorted, boolean] {
+            XCTAssertFalse(WatchPhoneSnapshotStore.accept(bad, stream: .bgReadings, sessionID: nil, at: now, defaults: defaults))
+            XCTAssertNil(WatchPhoneSnapshotStore.stored(.bgReadings, defaults: defaults))
+        }
+        XCTAssertFalse(WatchPhoneSnapshotStore.accept(valid, stream: .bgReadings, sessionID: nil,
+            displayedReadingDate: now, at: now, defaults: defaults))
+        XCTAssertTrue(WatchPhoneSnapshotStore.accept(valid, stream: .bgReadings, sessionID: nil, at: now, defaults: defaults))
+    }
+}
+
 private final class LibreWatchOwnershipPublicationFixture {
     @Published var ownership: LibreWatchOwnership = .iphone
+}
+
+extension LibreWatchValuePipelineTests {
+    func testSubmittedPhoneReturnKeepsUnknownOutcomeAndCutoffThroughRestart() throws {
+        let (defaults, suite) = displaySnapshotDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        var pending = LibreWatchPhoneReturnTransaction(session: session, cutoff: receivedAt, startingRevision: 11)
+        pending.wasSubmitted = true
+        LibreWatchSessionStore.saveSession(session, defaults: defaults)
+        LibreWatchSessionStore.saveOwnership(.releasingToPhone, defaults: defaults)
+        LibreWatchSessionStore.savePhoneReturn(pending, defaults: defaults)
+        let restarted = try XCTUnwrap(UserDefaults(suiteName: suite))
+        let restored = try XCTUnwrap(LibreWatchSessionStore.loadPhoneReturn(defaults: restarted))
+        XCTAssertEqual(restored, pending)
+        for _ in 0..<4 {
+            XCTAssertEqual(restored.resolution(for: .unknown,
+                currentSession: LibreWatchSessionStore.loadSession(defaults: restarted),
+                ownership: LibreWatchSessionStore.loadOwnership(defaults: restarted), acceptedRevision: 11), .pending)
+            XCTAssertEqual(restored.resolution(for: .notSent, currentSession: session,
+                ownership: .releasingToPhone, acceptedRevision: 11), .pending)
+        }
+        XCTAssertEqual(restored.cutoff, receivedAt)
+        XCTAssertEqual(restored.id, pending.id)
+    }
+
+    func testPhoneReturnRequiresDefiniteResponseOrNewerAuthoritativePhoneOwner() {
+        var pending = LibreWatchPhoneReturnTransaction(session: session, cutoff: receivedAt, startingRevision: 11)
+        XCTAssertEqual(pending.resolution(for: .notSent, currentSession: session,
+            ownership: .releasingToPhone, acceptedRevision: 11), .watch, "Nothing was submitted: local retry is safe")
+        pending.wasSubmitted = true
+        XCTAssertEqual(pending.resolution(for: .unknown, currentSession: session,
+            ownership: .releasingToPhone, acceptedRevision: 99), .pending, "A revision alone is not a release receipt")
+        XCTAssertEqual(pending.resolution(for: .unknown, currentSession: session,
+            ownership: .iphone, acceptedRevision: 11), .obsolete, "An equal/old snapshot must not resolve this transaction")
+        XCTAssertEqual(pending.resolution(for: .unknown, currentSession: session,
+            ownership: .iphone, acceptedRevision: 12), .phone)
+        XCTAssertEqual(pending.resolution(for: .accepted, currentSession: session,
+            ownership: .releasingToPhone, acceptedRevision: 11), .phone)
+        XCTAssertEqual(pending.resolution(for: .rejectedByWatchOwner, currentSession: session,
+            ownership: .releasingToPhone, acceptedRevision: 11), .watch)
+    }
+
+    func testPhoneReturnReplyClassificationNeverReclaimsFromAmbiguousOrWrongSessionReply() {
+        let pending = LibreWatchPhoneReturnTransaction(session: session, cutoff: receivedAt, startingRevision: 11)
+        let replies: [(Bool, LibreWatchOwnership?, LibreWatchDeliveryOutcome?, LibreWatchPhoneReturnTransaction.Resolution)] = [
+            (true, .iphone, nil, .phone),
+            (false, .watch, .wrongOwnership, .watch),
+            (false, .watch, .invalidPayload, .watch),
+            (false, .watch, .wrongSession, .pending),
+            (false, .iphone, .invalidPayload, .pending),
+            (true, .watch, nil, .pending),
+            (false, nil, nil, .pending)
+        ]
+        for (success, owner, outcome, expected) in replies {
+            let response = LibreWatchPhoneReturnTransaction.response(success: success, owner: owner, outcome: outcome)
+            XCTAssertEqual(pending.resolution(for: response, currentSession: session,
+                ownership: .releasingToPhone, acceptedRevision: 11), expected)
+        }
+    }
+
+    func testPhoneReturnRejectsChangedSessionAndChangedSensorWithSameSessionID() {
+        let current = session
+        let pending = LibreWatchPhoneReturnTransaction(session: current, cutoff: receivedAt, startingRevision: 11)
+        func replacement(id: UUID, uid: Data) -> LibreWatchDirectSession {
+            LibreWatchDirectSession(id: id, createdAt: current.createdAt, sensorUID: uid,
+                patchInfo: current.patchInfo, sensorSerialNumber: current.sensorSerialNumber,
+                sensorTypeRawValue: current.sensorTypeRawValue, expectedPeripheralName: current.expectedPeripheralName,
+                unlockCode: current.unlockCode, unlockCount: current.unlockCount, algorithmParameters: current.algorithmParameters)
+        }
+        for changed in [replacement(id: UUID(), uid: current.sensorUID),
+                        replacement(id: current.id, uid: Data([8, 7, 6, 5, 4, 3, 2, 1]))] {
+            XCTAssertFalse(pending.matches(changed))
+            XCTAssertEqual(pending.resolution(for: .accepted, currentSession: changed,
+                ownership: .releasingToPhone, acceptedRevision: 12), .obsolete)
+        }
+        XCTAssertEqual(pending.resolution(for: .accepted, currentSession: nil,
+            ownership: .releasingToPhone, acceptedRevision: 12), .obsolete)
+    }
+
+    func testInterruptedPhoneReturnCleanupRetainsResolvedOwnerAndDoesNotReclaimWatch() throws {
+        let (defaults, suite) = displaySnapshotDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        var pending = LibreWatchPhoneReturnTransaction(session: session, cutoff: receivedAt, startingRevision: 11)
+        pending.wasSubmitted = true
+        LibreWatchSessionStore.saveSession(session, defaults: defaults)
+        LibreWatchSessionStore.savePhoneReturn(pending, defaults: defaults)
+        LibreWatchSessionStore.saveHandoffRevision(12, defaults: defaults)
+        LibreWatchSessionStore.saveOwnership(.iphone, defaults: defaults)
+        // Simulate termination before the redundant transaction record is removed.
+        let restored = try XCTUnwrap(LibreWatchSessionStore.loadPhoneReturn(defaults: defaults))
+        XCTAssertEqual(restored.resolution(for: .unknown, currentSession: LibreWatchSessionStore.loadSession(defaults: defaults),
+            ownership: LibreWatchSessionStore.loadOwnership(defaults: defaults), acceptedRevision: 12), .phone)
+        LibreWatchSessionStore.savePhoneReturn(nil, defaults: defaults)
+        XCTAssertNil(LibreWatchSessionStore.loadPhoneReturn(defaults: defaults))
+        XCTAssertEqual(LibreWatchSessionStore.loadOwnership(defaults: defaults), .iphone)
+    }
+
+    func testPhoneReturnPersistenceIsOptionalAndSessionClearRemovesIt() {
+        let (defaults, suite) = displaySnapshotDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        XCTAssertNil(LibreWatchSessionStore.loadPhoneReturn(defaults: defaults))
+        LibreWatchSessionStore.savePhoneReturn(.init(session: session, cutoff: receivedAt, startingRevision: 1), defaults: defaults)
+        XCTAssertNotNil(LibreWatchSessionStore.loadPhoneReturn(defaults: defaults))
+        LibreWatchSessionStore.clear(defaults: defaults)
+        XCTAssertNil(LibreWatchSessionStore.loadPhoneReturn(defaults: defaults))
+    }
+
+    @MainActor
+    func testWatchReceiptIsWithheldAfterParentSaveFailureAndRetryPersistsExactlyOnce() async throws {
+        let stack = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let sensor = Sensor(startDate: receivedAt.addingTimeInterval(-3600), nsManagedObjectContext: stack.mainManagedObjectContext)
+        let reading = BgReading(timeStamp: receivedAt, sensor: sensor, calibration: nil, rawData: 85,
+            deviceName: nil, nsManagedObjectContext: stack.mainManagedObjectContext)
+        reading.calculatedValue = 85
+        reading.ageAdjustedRawValue = 85
+        let id = reading.id
+        let parent = stack.privateManagedObjectContext
+        // An invalid object only in the parent allows the child save to succeed, then
+        // fails the actual durable-save step (distinct from the existing child-failure test).
+        var invalidParentObject: NSManagedObject?
+        parent.performAndWait {
+            invalidParentObject = NSEntityDescription.insertNewObject(forEntityName: "BgReading", into: parent)
+            invalidParentObject?.setValue(nil, forKey: "id")
+        }
+        let failed = expectation(description: "Parent validation failure must withhold receipt")
+        stack.saveChanges { saved in
+            XCTAssertFalse(saved)
+            XCTAssertFalse(stack.mainManagedObjectContext.hasChanges, "Child save already succeeded")
+            failed.fulfill()
+        }
+        await fulfillment(of: [failed], timeout: 5)
+        parent.performAndWait {
+            if let invalidParentObject { parent.delete(invalidParentObject) }
+        }
+        let confirmed = expectation(description: "Retry flushes pending parent changes exactly once")
+        stack.saveChanges { saved in
+            XCTAssertTrue(saved)
+            let reader = NSManagedObjectContext(concurrencyType: .privateQueueConcurrencyType)
+            reader.persistentStoreCoordinator = parent.persistentStoreCoordinator
+            reader.perform {
+                let request: NSFetchRequest<BgReading> = BgReading.fetchRequest()
+                request.predicate = NSPredicate(format: "id == %@", id)
+                XCTAssertEqual(try? reader.count(for: request), 1)
+                confirmed.fulfill()
+            }
+        }
+        await fulfillment(of: [confirmed], timeout: 5)
+    }
 }
 
 extension LibreWatchValuePipelineTests {
@@ -2953,30 +3335,223 @@ final class LibreWatchValuePipelineTests: XCTestCase {
         XCTAssertNotNil(restored.items.first(where: { $0.id == commandID }))
     }
 
-    func testOutboxCapacityTrimsOldestPayloadRegardlessOfKind() {
+    func testOutboxDiagnosticStormRetainsOldestUnacknowledgedReading() {
         let now = receivedAt.addingTimeInterval(1_000)
+        let reading = outboxReading(index: 0)
         var outbox = LibreWatchConnectivityOutbox()
-        for offset in 0 ..< LibreWatchConnectivityOutbox.maximumItems {
+        outbox.enqueue(reading, now: now)
+        outbox.markSubmitted(id: reading.id, at: now)
+        for offset in 1 ... (LibreWatchConnectivityOutbox.maximumItems + 16) {
             outbox.enqueue(.command(
                 .reportDiagnostic,
                 sessionID: session.id,
                 diagnosticEvent: Data([UInt8(offset & 0xFF)]),
-                createdAt: now.addingTimeInterval(TimeInterval(offset))
+                id: outboxFixtureID(offset),
+                createdAt: receivedAt.addingTimeInterval(Double(offset))
             ), now: now)
         }
-        let reading = payload(
-            raw: 800,
-            previousRaw: 790,
-            domain: .xDripRawGlucose,
-            sensorTime: 1_500,
-            at: now.addingTimeInterval(TimeInterval(LibreWatchConnectivityOutbox.maximumItems))
-        )
-
-        outbox.enqueue(.reading(reading), now: now)
-
         XCTAssertEqual(outbox.items.count, LibreWatchConnectivityOutbox.maximumItems)
-        XCTAssertEqual(outbox.items.last?.id, reading.id)
-        XCTAssertTrue(outbox.items.contains(where: { $0.id == reading.id }))
+        XCTAssertEqual(outbox.items.first, reading)
+        XCTAssertEqual(outbox.lastSubmittedAt?[reading.id], now)
+        XCTAssertEqual(outbox.nextEligible(at: now)?.id, outboxFixtureID(1))
+        XCTAssertEqual(outbox.capacityDroppedReadings ?? 0, 0)
+        XCTAssertEqual(outbox.capacityDroppedDiagnostics, 17)
+    }
+
+    func testOutboxMixedCapacityEvictsDiagnosticsThenCommandsAndPersistsSeparateCounts() throws {
+        let now = receivedAt.addingTimeInterval(1_000)
+        var outbox = LibreWatchConnectivityOutbox()
+        for index in 0 ..< (LibreWatchConnectivityOutbox.maximumItems - 2) {
+            outbox.enqueue(outboxReading(index: index), now: now)
+        }
+        let counter = LibreWatchOutboxItem.command(.updateUnlockCounter,
+            sessionID: session.id, unlockCounter: 42, id: outboxFixtureID(900),
+            createdAt: receivedAt.addingTimeInterval(-2))
+        let diagnostic = LibreWatchOutboxItem.command(.reportDiagnostic,
+            sessionID: session.id, diagnosticEvent: Data("{}".utf8), id: outboxFixtureID(901),
+            createdAt: receivedAt.addingTimeInterval(-1))
+        outbox.enqueue(counter, now: now)
+        outbox.enqueue(diagnostic, now: now)
+        outbox.markSubmitted(id: diagnostic.id, at: now)
+        outbox.markSubmitted(id: counter.id, at: now)
+
+        XCTAssertTrue(outbox.enqueue(outboxReading(index: 254), now: now))
+        XCTAssertFalse(outbox.items.contains { $0.id == diagnostic.id })
+        XCTAssertTrue(outbox.items.contains { $0.id == counter.id })
+        XCTAssertNil(outbox.lastSubmittedAt?[diagnostic.id])
+        XCTAssertTrue(outbox.enqueue(outboxReading(index: 255), now: now))
+        XCTAssertFalse(outbox.items.contains { $0.id == counter.id })
+        XCTAssertNil(outbox.lastSubmittedAt?[counter.id])
+        XCTAssertEqual(outbox.items.map(\.id), (0 ..< 256).map(outboxFixtureID))
+        XCTAssertEqual(outbox.capacityDroppedDiagnostics, 1)
+        XCTAssertEqual(outbox.capacityDroppedCommands, 1)
+        XCTAssertEqual(outbox.capacityDroppedReadings ?? 0, 0)
+        XCTAssertEqual(try JSONDecoder().decode(LibreWatchConnectivityOutbox.self,
+            from: JSONEncoder().encode(outbox)), outbox)
+    }
+
+    func testOutboxReadingOnlyOverflowPreservesOldestFirstWithDeterministicTieBreak() {
+        let now = receivedAt.addingTimeInterval(1_000)
+        var outbox = LibreWatchConnectivityOutbox()
+        for index in (1 ... LibreWatchConnectivityOutbox.maximumItems).reversed() {
+            outbox.enqueue(outboxReading(index: index, at: receivedAt), now: now)
+        }
+        let rejected = outboxReading(index: 257, at: receivedAt)
+        XCTAssertFalse(outbox.enqueue(rejected, now: now))
+        XCTAssertTrue(outbox.enqueue(outboxReading(index: 0, at: receivedAt), now: now))
+        XCTAssertEqual(outbox.items.map(\.id), (0 ..< 256).map(outboxFixtureID))
+        XCTAssertEqual(outbox.capacityDroppedReadings, 2)
+        XCTAssertEqual(outbox.capacityDroppedDiagnostics ?? 0, 0)
+    }
+
+    func testOutboxFullDiagnosticReplayDoesNotChurnOrResetSubmissionThrottle() throws {
+        let now = receivedAt.addingTimeInterval(1_000)
+        var outbox = LibreWatchConnectivityOutbox()
+        for index in 0 ..< (LibreWatchConnectivityOutbox.maximumItems - 1) {
+            let item = outboxReading(index: index)
+            outbox.enqueue(item, now: now)
+            outbox.markSubmitted(id: item.id, at: now)
+        }
+        var journal = LibreWatchDiagnosticJournal()
+        for index in 0 ..< 3 {
+            _ = journal.append(LibreWatchDiagnosticEvent(eventID: outboxFixtureID(900 + index),
+                kind: .disconnected, watchTimestamp: now,
+                sessionID: session.id), at: now)
+        }
+        let events = journal.pendingEvents()
+        let firstID = try XCTUnwrap(events.first?.eventID)
+        let first = LibreWatchOutboxItem.command(.reportDiagnostic,
+            sessionID: session.id, diagnosticEvent: try JSONEncoder().encode(events[0]),
+            id: firstID, createdAt: now)
+        XCTAssertTrue(outbox.enqueue(first, now: now))
+        outbox.markSubmitted(id: firstID, at: now)
+        let retainedIDs = outbox.items.map(\.id)
+
+        // Reconciliation on consecutive flush opportunities must not create fresh eligible
+        // replacements of submitted payloads merely because the journal remains unacked.
+        for second in 1 ... 3 {
+            let retryDate = now.addingTimeInterval(Double(second))
+            for event in journal.pendingEvents() {
+                outbox.enqueue(.command(.reportDiagnostic, sessionID: session.id,
+                    diagnosticEvent: try JSONEncoder().encode(event),
+                    id: try XCTUnwrap(event.eventID), createdAt: retryDate), now: retryDate)
+            }
+            XCTAssertEqual(outbox.items.map(\.id), retainedIDs)
+            XCTAssertNil(outbox.nextEligible(at: retryDate))
+            XCTAssertEqual(outbox.lastSubmittedAt?[firstID], now)
+        }
+        XCTAssertEqual(journal.pendingEvents().count, 3)
+        journal.markAcknowledgedByPhone(eventID: firstID, at: now.addingTimeInterval(4))
+        outbox.remove(id: firstID)
+        let next = try XCTUnwrap(journal.pendingEvents().first)
+        let nextID = try XCTUnwrap(next.eventID)
+        XCTAssertTrue(outbox.enqueue(.command(.reportDiagnostic, sessionID: session.id,
+            diagnosticEvent: try JSONEncoder().encode(next), id: nextID,
+            createdAt: now.addingTimeInterval(4)), now: now.addingTimeInterval(4)))
+        XCTAssertEqual(outbox.nextEligible(at: now.addingTimeInterval(4))?.id, nextID)
+        XCTAssertEqual(outbox.items.filter { $0.kind == .reading }.count, 255)
+    }
+
+    func testOutboxDuplicateExpiredAndInvalidAdmissionsCannotEvictRetainedPayloads() {
+        let now = receivedAt.addingTimeInterval(1_000)
+        var outbox = LibreWatchConnectivityOutbox()
+        for index in 0 ..< LibreWatchConnectivityOutbox.maximumItems {
+            outbox.enqueue(outboxReading(index: index), now: now)
+        }
+        outbox.markSubmitted(id: outboxFixtureID(0), at: now)
+        let before = outbox
+        XCTAssertTrue(outbox.enqueue(outboxReading(index: 0), now: now))
+        XCTAssertFalse(outbox.enqueue(outboxReading(index: 900,
+            at: now.addingTimeInterval(-LibreWatchConnectivityOutbox.maximumAge - 0.001)), now: now))
+        XCTAssertFalse(outbox.enqueue(.command(.reportDiagnostic, sessionID: session.id,
+            id: outboxFixtureID(901), createdAt: now), now: now))
+        XCTAssertEqual(outbox, before)
+    }
+
+    func testOutboxLegacyOversizedQueuePrunesCapacityWithoutDroppingOldestReading() throws {
+        let now = receivedAt.addingTimeInterval(1_000)
+        let reading = outboxReading(index: 0)
+        let diagnostics = (1 ... 256).map { index in
+            LibreWatchOutboxItem.command(.reportDiagnostic, sessionID: session.id,
+                diagnosticEvent: Data("{}".utf8), id: outboxFixtureID(index),
+                createdAt: receivedAt.addingTimeInterval(Double(index)))
+        }
+        let legacy = try JSONSerialization.data(withJSONObject: [
+            "items": try JSONSerialization.jsonObject(with: JSONEncoder().encode(Array(diagnostics.reversed()) + [reading]))
+        ])
+        var outbox = try JSONDecoder().decode(LibreWatchConnectivityOutbox.self, from: legacy)
+        outbox.prune(at: now)
+        XCTAssertEqual(outbox.items.count, LibreWatchConnectivityOutbox.maximumItems)
+        XCTAssertEqual(outbox.items.first, reading)
+        XCTAssertEqual(outbox.items.last?.id, outboxFixtureID(255))
+        XCTAssertEqual(outbox.capacityDroppedDiagnostics, 1)
+    }
+
+    private func outboxFixtureID(_ index: Int) -> UUID {
+        UUID(uuidString: String(format: "A0000000-0000-0000-0000-%012d", index))!
+    }
+
+    private func outboxReading(index: Int, at date: Date? = nil) -> LibreWatchOutboxItem {
+        .reading(payload(
+            id: outboxFixtureID(index), raw: 800, previousRaw: 790,
+            domain: .xDripRawGlucose, sensorTime: UInt16(1_000 + index),
+            at: date ?? receivedAt.addingTimeInterval(Double(index))
+        ))
+    }
+
+    func testOutboxSendAttemptRejectsBusyBeginAndStaleSamePayloadCallbacks() throws {
+        let payloadID = outboxFixtureID(0)
+        var gate = LibreWatchConnectivitySendAttemptGate()
+        let attemptA = try XCTUnwrap(gate.begin(payloadID: payloadID, token: outboxFixtureID(1)))
+        XCTAssertFalse(gate.isIdle)
+        XCTAssertNil(gate.begin(payloadID: outboxFixtureID(10), token: outboxFixtureID(2)))
+        XCTAssertTrue(gate.finish(attemptA))
+        let attemptB = try XCTUnwrap(gate.begin(payloadID: payloadID, token: outboxFixtureID(3)))
+        XCTAssertFalse(gate.matches(attemptA), "A delayed reply/error from attempt A is not attempt B")
+        XCTAssertFalse(gate.finish(attemptA))
+        XCTAssertTrue(gate.matches(attemptB))
+        XCTAssertFalse(gate.finish(.init(payloadID: outboxFixtureID(10), token: attemptB.token)))
+        XCTAssertTrue(gate.finish(attemptB))
+        XCTAssertTrue(gate.isIdle)
+    }
+
+    func testOutboxSendAttemptInvalidationRejectsEveryOldSessionCallback() throws {
+        var gate = LibreWatchConnectivitySendAttemptGate()
+        let old = try XCTUnwrap(gate.begin(payloadID: outboxFixtureID(0), token: outboxFixtureID(1)))
+        gate.invalidate()
+        XCTAssertFalse(gate.matches(old))
+        XCTAssertFalse(gate.finish(old))
+        let current = try XCTUnwrap(gate.begin(payloadID: old.payloadID, token: outboxFixtureID(2)))
+        XCTAssertFalse(gate.finish(old))
+        XCTAssertEqual(gate.activeAttempt, current)
+    }
+
+    func testOutboxDurableReceiptReleasesOnlyMatchingActivePayloadAndRevokesItsCallback() throws {
+        var outbox = LibreWatchConnectivityOutbox()
+        let first = outboxReading(index: 0)
+        let second = outboxReading(index: 1)
+        outbox.enqueue(first, now: receivedAt.addingTimeInterval(1))
+        outbox.enqueue(second, now: receivedAt.addingTimeInterval(1))
+        var gate = LibreWatchConnectivitySendAttemptGate()
+        let attempt = try XCTUnwrap(gate.begin(payloadID: second.id, token: outboxFixtureID(9)))
+
+        XCTAssertTrue(LibreWatchConnectivityDeliveryPolicy.shouldFinish(first,
+            success: true, outcome: .historicalInserted, durableReceipt: true))
+        outbox.remove(id: first.id)
+        if let active = gate.activeAttempt, active.payloadID == first.id { gate.finish(active) }
+        XCTAssertEqual(gate.activeAttempt, attempt, "A receipt for another payload cannot release this attempt")
+
+        XCTAssertFalse(LibreWatchConnectivityDeliveryPolicy.shouldFinish(second,
+            success: true, outcome: .liveAccepted, durableReceipt: false))
+        XCTAssertEqual(outbox.next?.id, second.id)
+        XCTAssertTrue(LibreWatchConnectivityDeliveryPolicy.shouldFinish(second,
+            success: true, outcome: .liveAccepted, durableReceipt: true))
+        outbox.remove(id: second.id)
+        if let active = gate.activeAttempt, active.payloadID == second.id { gate.finish(active) }
+        XCTAssertTrue(gate.isIdle)
+        XCTAssertFalse(gate.matches(attempt), "The later interactive callback is revoked by the durable receipt")
+        XCTAssertFalse(gate.finish(attempt))
+        XCTAssertTrue(outbox.items.isEmpty)
     }
 
     func testOutboxPrunesStrictlyAfterSixtyMinutesAndRetainsOnlyActiveSession() {
@@ -2999,6 +3574,10 @@ final class LibreWatchValuePipelineTests: XCTestCase {
         outbox.enqueue(.reading(active), now: receivedAt.addingTimeInterval(1))
         outbox.enqueue(.reading(other), now: receivedAt.addingTimeInterval(1))
 
+        XCTAssertEqual(LibreWatchReadingAcceptancePolicy.maximumTransportAge, 3 * 60)
+        XCTAssertTrue(active.isCurrent(at: receivedAt.addingTimeInterval(3 * 60)))
+        XCTAssertFalse(active.isCurrent(at: receivedAt.addingTimeInterval(3 * 60 + 0.001)))
+        XCTAssertEqual(LibreWatchConnectivityOutbox.maximumAge, 60 * 60)
         outbox.prune(at: receivedAt.addingTimeInterval(LibreWatchConnectivityOutbox.maximumAge))
         XCTAssertEqual(Set(outbox.items.map(\.id)), Set([active.id, other.id]))
         outbox.retain(sessionID: session.id)
@@ -4612,6 +5191,10 @@ extension LibreWatchValuePipelineTests {
         ])
         let outbox = try JSONDecoder().decode(LibreWatchConnectivityOutbox.self, from: legacy)
         XCTAssertEqual(outbox.nextEligible(at: receivedAt)?.id, item.id)
+        XCTAssertNil(outbox.lastSubmittedAt)
+        XCTAssertNil(outbox.capacityDroppedReadings)
+        XCTAssertNil(outbox.capacityDroppedDiagnostics)
+        XCTAssertNil(outbox.capacityDroppedCommands)
         XCTAssertTrue(LibreWatchConnectivityDeliveryPolicy.shouldRetryReadingAsQueued(after: .outOfOrder))
         XCTAssertFalse(LibreWatchConnectivityDeliveryPolicy.isTerminal(.outOfOrder))
     }

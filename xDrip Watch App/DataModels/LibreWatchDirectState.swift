@@ -132,10 +132,12 @@ struct LibreWatchDirectState: Equatable {
         lastBluetoothError = nil
     }
 
-    mutating func beginReturn() {
+    mutating func beginReturn(awaitingConfirmation: Bool = false) {
         stage = .returningToPhone
         failure = nil
-        detailText = "Disconnecting Watch and restoring iPhone"
+        detailText = awaitingConfirmation
+            ? "Awaiting iPhone confirmation; Watch remains disconnected"
+            : "Disconnecting Watch and restoring iPhone"
     }
 
     mutating func returnedToPhone(session: LibreWatchDirectSession?) {

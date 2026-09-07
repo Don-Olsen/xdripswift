@@ -111,6 +111,8 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
 
         if watchState.libreWatchOwnership == .watch {
             resumeDirectReceptionIfOwned()
+        } else if watchState.libreWatchOwnership == .releasingToPhone {
+            state.beginReturn(awaitingConfirmation: watchState.hasPendingLibrePhoneReturn)
         }
     }
 
@@ -169,6 +171,9 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
             resolvedSession,
             preserveRuntimeState: watchState?.libreWatchOwnership == .watch
         )
+        if watchState?.libreWatchOwnership == .releasingToPhone {
+            state.beginReturn(awaitingConfirmation: watchState?.hasPendingLibrePhoneReturn == true)
+        }
     }
 
     func ownershipDidChange(_ ownership: LibreWatchOwnership) {
@@ -200,6 +205,9 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
             connectionTiming.invalidate()
             invalidateRestoration()
             invalidateRecoveryAttempt()
+            if ownership == .releasingToPhone {
+                state.beginReturn(awaitingConfirmation: watchState?.hasPendingLibrePhoneReturn == true)
+            }
         }
     }
 
@@ -250,6 +258,20 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
 
     func returnLibreToPhone(origin: LibreWatchReturnDiagnostic.Origin = .user) {
         guard let watchState else { return }
+        if watchState.libreWatchOwnership == .releasingToPhone {
+            state.beginReturn(awaitingConfirmation: watchState.hasPendingLibrePhoneReturn)
+            if watchState.hasPendingLibrePhoneReturn {
+                watchState.retryPendingPhoneReturn(force: true)
+            } else {
+                guard returnAfterDisconnect == nil else { return }
+                // Recover an interrupted pre-upgrade return only through the same native
+                // disconnection/retired-peripheral gates, never by assuming Watch ownership.
+                let attempt = LibreWatchReturnAttempt(startedAt: Date(),
+                    generation: connectionTiming.generation, sessionID: preparedSession?.id, origin: origin)
+                beginReturnToPhone(attempt: attempt)
+            }
+            return
+        }
         let attempt = LibreWatchReturnAttempt(startedAt: Date(),
             generation: connectionTiming.generation, sessionID: preparedSession?.id, origin: origin)
         let failure = LibreWatchReturnAttempt.performPreflight(
@@ -289,7 +311,9 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
     }
 
     private func completeReturnToPhone(attempt: LibreWatchReturnAttempt) {
-        guard let watchState else { return }
+        guard let watchState, preparedSession?.id == attempt.sessionID,
+              watchState.libreWatchDirectSession?.id == attempt.sessionID,
+              pendingReturnDiagnosticAttempt?.id == attempt.id else { return }
         guard sensorPeripheral == nil || sensorPeripheral?.state == .disconnected else {
             reportReturnDiagnostic(attempt, stage: .awaitingDisconnection, reason: .currentPeripheralConnected)
             return
@@ -305,7 +329,15 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
                 self?.reportReturnDiagnostic(attempt, stage: stage, reason: reason, error: error)
             }
         ) { [weak self] success, error in
-            guard let self else { return }
+            guard let self, self.preparedSession?.id == attempt.sessionID,
+                  self.pendingReturnDiagnosticAttempt?.id == attempt.id else { return }
+            if !success, self.watchState?.libreWatchOwnership == .releasingToPhone {
+                // The phone may already own the sensor. Keep native Bluetooth stopped until
+                // an authoritative reply/snapshot resolves this same persisted transaction.
+                self.deliberatelyDisconnecting = true
+                self.state.beginReturn(awaitingConfirmation: true)
+                return
+            }
             if self.pendingReturnDiagnosticAttempt?.id == attempt.id {
                 self.pendingReturnDiagnosticAttempt = nil
             }

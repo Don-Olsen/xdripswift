@@ -139,6 +139,10 @@ struct LibreDirectView: View {
 
         case .releasingToPhone:
             ProgressView("Restoring iPhone")
+            Button("Retry confirmation") {
+                collector.returnLibreToPhone()
+            }
+            .disabled(!watchState.phoneIsReachable)
 
         case .recovery:
             Button("Return to iPhone") {

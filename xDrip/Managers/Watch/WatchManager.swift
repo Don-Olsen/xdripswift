@@ -56,9 +56,11 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
 
     /// hold the current watch status model
     private var status = WatchStatus()
+    private var statusGeneration: [String: Any] = [:]
 
     /// hold the current watch BG readings model
     private var bgReadings = WatchBgReadings()
+    private var bgReadingsGeneration: [String: Any] = [:]
 
     /// hold the current AGP chart background model
     private var agp = WatchAGP()
@@ -239,10 +241,14 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
     private func processWatchUpdate(updateTypes: Set<WatchUpdateType>, forceComplicationUpdate: Bool) {
         if updateTypes.contains(.status) {
             status = currentStatus()
+            statusGeneration = WatchPhoneSnapshotStore.nextGeneration(
+                sessionID: libreWatchDirectSession?.id, at: Date(timeIntervalSince1970: status.generatedAt))
         }
 
         if updateTypes.contains(.bgReadings) {
             bgReadings = currentBgReadings()
+            bgReadingsGeneration = WatchPhoneSnapshotStore.nextGeneration(
+                sessionID: libreWatchDirectSession?.id, at: Date(timeIntervalSince1970: bgReadings.generatedAt))
         }
 
         sendUpdateToWatch(updateTypes: updateTypes, forceComplicationUpdate: forceComplicationUpdate)
@@ -408,11 +414,11 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
         var payload: [String: Any] = [:]
 
         if updateTypes.contains(.status), let statusDictionary = status.asDictionary {
-            payload["status"] = statusDictionary
+            payload["status"] = WatchPhoneSnapshotStore.attaching(statusGeneration, to: statusDictionary)
         }
 
         if updateTypes.contains(.bgReadings), let bgReadingsDictionary = bgReadings.asDictionary {
-            payload["bgReadings"] = bgReadingsDictionary
+            payload["bgReadings"] = WatchPhoneSnapshotStore.attaching(bgReadingsGeneration, to: bgReadingsDictionary)
         }
 
         if updateTypes.contains(.agp), let agpDictionary = agp.asDictionary {

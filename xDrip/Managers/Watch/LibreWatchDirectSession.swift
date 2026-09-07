@@ -36,6 +36,7 @@ enum LibreWatchMessageKey {
     static let persistedDiagnosticJournal = "libreWatchDiagnosticJournal.v1"
     static let persistedRecoveryAttempt = "libreWatchRecoveryAttempt.v1"
     static let persistedReleaseReceipt = "libreWatchReleaseReceipt.v1"
+    static let persistedPhoneReturn = "libreWatchPendingPhoneReturn.v1"
 }
 
 enum LibreWatchCommand: String, Codable {
@@ -723,20 +724,31 @@ struct LibreWatchConnectivityOutbox: Codable, Equatable {
     // Optional for decoding the persisted v1 queue after an upgrade. Submission is not
     // storage acknowledgement; retain payloads until a receiver reports a terminal result.
     private(set) var lastSubmittedAt: [UUID: Date]?
+    // Optional fields preserve decoding of the persisted v1 queue. Capacity loss is not
+    // age expiry or acknowledgement; count evictions/refused admissions, not unique IDs.
+    // A diagnostic dropped here can still be replayed from the separate journal.
+    private(set) var capacityDroppedReadings: UInt64?
+    private(set) var capacityDroppedDiagnostics: UInt64?
+    private(set) var capacityDroppedCommands: UInt64?
     static let retryInterval: TimeInterval = 60
 
-    mutating func enqueue(_ item: LibreWatchOutboxItem, now: Date = Date()) {
+    /// Returns whether the stable payload is retained (including an existing duplicate).
+    @discardableResult
+    mutating func enqueue(_ item: LibreWatchOutboxItem, now: Date = Date()) -> Bool {
         prune(at: now)
         guard item.isStructurallyValid,
-              !items.contains(where: { $0.id == item.id }) else { return }
+              now.timeIntervalSince(item.createdAt) <= Self.maximumAge else { return false }
+        if items.contains(where: { $0.id == item.id }) { return true }
+        if item.command == .reportDiagnostic, items.count >= Self.maximumItems {
+            // A replayed journal event must not displace a submitted diagnostic and erase
+            // its retry throttle. Leave this event pending in the journal until room opens.
+            recordCapacityDrop(item)
+            return false
+        }
         items.append(item)
-        items.sort {
-            if $0.createdAt != $1.createdAt { return $0.createdAt < $1.createdAt }
-            return $0.id.uuidString < $1.id.uuidString
-        }
-        if items.count > Self.maximumItems {
-            items.removeFirst(items.count - Self.maximumItems)
-        }
+        sortAndLimitCapacity()
+        removeOrphanedSubmissionMetadata()
+        return items.contains { $0.id == item.id }
     }
 
     mutating func remove(id: UUID) {
@@ -747,15 +759,48 @@ struct LibreWatchConnectivityOutbox: Codable, Equatable {
     mutating func retain(sessionID: UUID?) {
         guard let sessionID else {
             items.removeAll()
+            removeOrphanedSubmissionMetadata()
             return
         }
         items.removeAll { $0.sessionID != sessionID && $0.command != .reportDiagnostic }
+        removeOrphanedSubmissionMetadata()
     }
 
     mutating func prune(at date: Date = Date()) {
         items.removeAll {
             !$0.isStructurallyValid || date.timeIntervalSince($0.createdAt) > Self.maximumAge
         }
+        sortAndLimitCapacity()
+        removeOrphanedSubmissionMetadata()
+    }
+
+    private mutating func sortAndLimitCapacity() {
+        items.sort {
+            if $0.createdAt != $1.createdAt { return $0.createdAt < $1.createdAt }
+            return $0.id.uuidString < $1.id.uuidString
+        }
+        while items.count > Self.maximumItems {
+            // Readings win over diagnostics and counter updates. Within a kind preserve
+            // the oldest pending payloads, which must still be delivered oldest-first.
+            let index = items.lastIndex { $0.command == .reportDiagnostic }
+                ?? items.lastIndex { $0.kind == .command }
+                ?? items.index(before: items.endIndex)
+            let removed = items.remove(at: index)
+            recordCapacityDrop(removed)
+        }
+    }
+
+    private mutating func recordCapacityDrop(_ item: LibreWatchOutboxItem) {
+        if item.kind == .reading {
+            capacityDroppedReadings = (capacityDroppedReadings ?? 0) &+ 1
+        } else if item.command == .reportDiagnostic {
+            capacityDroppedDiagnostics = (capacityDroppedDiagnostics ?? 0) &+ 1
+        } else {
+            capacityDroppedCommands = (capacityDroppedCommands ?? 0) &+ 1
+        }
+    }
+
+    private mutating func removeOrphanedSubmissionMetadata() {
         let retained = Set(items.map(\.id))
         lastSubmittedAt = lastSubmittedAt?.filter { retained.contains($0.key) }
     }
@@ -784,6 +829,37 @@ struct LibreWatchConnectivityOutbox: Codable, Equatable {
     mutating func retry(id: UUID) {
         lastSubmittedAt?.removeValue(forKey: id)
     }
+}
+
+/// A payload keeps its ID across retries, but each interactive attempt has its own token.
+/// Main-queue callers must match the captured attempt before callbacks mutate transport.
+struct LibreWatchConnectivitySendAttemptGate {
+    struct Attempt: Equatable {
+        let payloadID: UUID
+        let token: UUID
+    }
+
+    private(set) var activeAttempt: Attempt?
+    var isIdle: Bool { activeAttempt == nil }
+
+    mutating func begin(payloadID: UUID, token: UUID = UUID()) -> Attempt? {
+        guard isIdle else { return nil }
+        let attempt = Attempt(payloadID: payloadID, token: token)
+        activeAttempt = attempt
+        return attempt
+    }
+
+    func matches(_ attempt: Attempt) -> Bool { activeAttempt == attempt }
+
+    @discardableResult
+    mutating func finish(_ attempt: Attempt) -> Bool {
+        guard matches(attempt) else { return false }
+        activeAttempt = nil
+        return true
+    }
+
+    /// Explicit transport/session invalidation revokes every callback from that attempt.
+    mutating func invalidate() { activeAttempt = nil }
 }
 
 enum LibreWatchConnectivityDeliveryAction: Equatable {
@@ -2528,12 +2604,79 @@ enum LibreWatchSessionStore {
         defaults.removeObject(forKey: LibreWatchMessageKey.persistedDiagnosticReceipts)
         defaults.removeObject(forKey: LibreWatchMessageKey.persistedRecoveryAttempt)
         defaults.removeObject(forKey: LibreWatchMessageKey.persistedReleaseReceipt)
+        defaults.removeObject(forKey: LibreWatchMessageKey.persistedPhoneReturn)
     }
 }
 
 extension Notification.Name {
     static let libreWatchDirectSessionPrepared = Notification.Name("libreWatchDirectSessionPrepared")
     static let libreWatchDirectOwnershipForcedToPhone = Notification.Name("libreWatchDirectOwnershipForcedToPhone")
+}
+
+/// A transport error after submission is not proof that iPhone rejected ownership.
+/// Persist the same cutoff through retries/restart, only after confirmed Watch disconnection.
+struct LibreWatchPhoneReturnTransaction: Codable, Equatable {
+    enum Response { case accepted, rejectedByWatchOwner, notSent, unknown }
+    enum Resolution: Equatable { case pending, phone, watch, obsolete }
+    let id: UUID
+    let session: LibreWatchDirectSession
+    let cutoff: Date
+    let startingRevision: UInt64
+    var wasSubmitted = false
+
+    init(session: LibreWatchDirectSession, cutoff: Date, startingRevision: UInt64, id: UUID = UUID()) {
+        self.id = id
+        self.session = session
+        self.cutoff = cutoff
+        self.startingRevision = startingRevision
+    }
+
+    func matches(_ current: LibreWatchDirectSession?) -> Bool {
+        guard let current, current.isValid else { return false }
+        return current.id == session.id && current.representsSameSensor(as: session)
+    }
+
+    static func response(success: Bool, owner: LibreWatchOwnership?,
+                         outcome: LibreWatchDeliveryOutcome?) -> Response {
+        if success, owner == .iphone { return .accepted }
+        if !success, owner == .watch, outcome == .wrongOwnership || outcome == .invalidPayload {
+            return .rejectedByWatchOwner
+        }
+        // Wrong session, malformed replies and transport errors cannot authorize reclaim.
+        return .unknown
+    }
+
+    func resolution(for response: Response, currentSession: LibreWatchDirectSession?,
+                    ownership: LibreWatchOwnership, acceptedRevision: UInt64) -> Resolution {
+        guard matches(currentSession) else { return .obsolete }
+        if ownership == .iphone, acceptedRevision > startingRevision { return .phone }
+        guard ownership == .releasingToPhone else { return .obsolete }
+        switch response {
+        case .accepted: return .phone
+        case .rejectedByWatchOwner: return .watch
+        case .notSent: return wasSubmitted ? .pending : .watch
+        case .unknown: return .pending
+        }
+    }
+}
+
+extension LibreWatchSessionStore {
+    static func loadPhoneReturn(defaults: UserDefaults = .standard) -> LibreWatchPhoneReturnTransaction? {
+        guard let data = defaults.data(forKey: LibreWatchMessageKey.persistedPhoneReturn),
+              let pending = try? JSONDecoder().decode(LibreWatchPhoneReturnTransaction.self, from: data),
+              pending.session.isValid, pending.cutoff.timeIntervalSince1970.isFinite
+        else { return nil }
+        return pending
+    }
+
+    static func savePhoneReturn(_ pending: LibreWatchPhoneReturnTransaction?, defaults: UserDefaults = .standard) {
+        guard let pending else {
+            defaults.removeObject(forKey: LibreWatchMessageKey.persistedPhoneReturn)
+            return
+        }
+        guard let data = try? JSONEncoder().encode(pending) else { return }
+        defaults.set(data, forKey: LibreWatchMessageKey.persistedPhoneReturn)
+    }
 }
 
 /// One phone-authored transaction: connection ownership is applied only after its exact
