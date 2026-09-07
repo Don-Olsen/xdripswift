@@ -10,6 +10,81 @@ import XCTest
 @testable import xdrip
 
 extension TroubleshootingLogTests {
+    func testNormalTraceAttachmentIncludesSafePhoneAndReceivedWatchHistoryWithOriginalClocksAndBuild() throws {
+        let fixture = makeStore()
+        defer { removeFixture(fixture.directory) }
+        fixture.store.record(.standard(.app(.started), timestamp: referenceDate.addingTimeInterval(-300)))
+        let secret = "secret=https://user:password@example.invalid/raw-payload"
+        let event = LibreWatchDiagnosticEvent(kind: .recoveryFailed,
+            watchTimestamp: referenceDate.addingTimeInterval(-26 * 60 * 60),
+            trigger: secret, peripheralState: secret, connectionPhase: secret,
+            sensorIdentity: secret, runtimeError: secret, appBuild: "4252",
+            bluetoothAction: secret, actionReason: secret, errorDomain: secret,
+            journalDroppedCount: 9, appCommit: String(repeating: "a", count: 40),
+            journalUnacknowledgedDropCount: 2)
+        let persisted = expectation(description: "received Watch event persisted for trace attachment")
+        fixture.store.recordWatchDiagnostic(TroubleshootingWatchDiagnostic(event),
+            receivedAt: referenceDate.addingTimeInterval(-120)) { stored in
+            XCTAssertTrue(stored)
+            persisted.fulfill()
+        }
+        wait(for: [persisted], timeout: 5)
+
+        var exportAppInfo = appInfo
+        exportAppInfo.provenance = TroubleshootingLogProvenance(version: "7.2.1", build: "9999",
+            commit: String(repeating: "b", count: 40), installationID: UUID())
+        let report = TroubleshootingLogReportBuilder(entries: fixture.store.snapshot(), usesMgDl: true,
+            appInfo: exportAppInfo, generatedAt: referenceDate, timeZone: .gmt)
+        let attachment = try XCTUnwrap(String(data: report.attachmentData, encoding: .utf8))
+        XCTAssertEqual(TroubleshootingLogReportBuilder.attachmentFileName, "TroubleshootingLog.txt")
+        XCTAssertEqual(attachment, report.reportText, "Normal attachment must reuse the safe Copy/Share formatter")
+        XCTAssertTrue(attachment.contains("App started."))
+        XCTAssertTrue(attachment.contains("Created on iPhone (export time): 15 January 2027 at 08:00:00"))
+        XCTAssertTrue(attachment.contains("Exporting iPhone: version=7.2.1 build=9999"))
+        XCTAssertTrue(attachment.contains("Received Watch journal entries retained: 1."))
+        let watchLine = try XCTUnwrap(attachment.components(separatedBy: "\n").first {
+            $0.contains("Watch-Libre recoveryFailed;")
+        })
+        XCTAssertTrue(watchLine.contains("watchTime=14 January at 06:00:00; receiptTime=07:58:00; build=4252"))
+        XCTAssertTrue(watchLine.contains("SHA=" + String(repeating: "a", count: 40)))
+        XCTAssertFalse(watchLine.contains("build=9999"))
+        XCTAssertTrue(watchLine.contains("journalRotated=9 unacknowledgedRotated=2"))
+        XCTAssertTrue(attachment.contains("journalRotated counts total local Watch journal rotation, not necessarily missing phone history."))
+        XCTAssertTrue(attachment.contains("unacknowledgedRotated counts known Watch journal losses before phone storage acknowledgement"))
+        for privateText in [secret, "password", "example.invalid", "raw-payload", "sensorIdentity"] {
+            XCTAssertFalse(attachment.contains(privateText), "Private payload must not reach the normal attachment")
+        }
+    }
+
+    func testNormalTraceAttachmentDoesNotClaimUnreceivedWatchJournalCoverage() throws {
+        let fixture = makeStore()
+        defer { removeFixture(fixture.directory) }
+        fixture.store.record(.standard(.app(.started), timestamp: referenceDate))
+        var undeliveredJournal = LibreWatchDiagnosticJournal()
+        _ = undeliveredJournal.append(LibreWatchDiagnosticEvent(kind: .recoveryStarted,
+            watchTimestamp: referenceDate, appBuild: "4242"), at: referenceDate)
+        XCTAssertEqual(undeliveredJournal.pendingEvents().count, 1)
+
+        let attachment = try XCTUnwrap(String(
+            data: makeReport(entries: fixture.store.snapshot()).attachmentData, encoding: .utf8))
+        XCTAssertTrue(attachment.contains("Received Watch journal entries retained: 0."))
+        XCTAssertTrue(attachment.contains("undelivered Watch events are not included and their coverage is unknown."))
+        XCTAssertTrue(attachment.contains("count and size limits may shorten it."))
+        XCTAssertFalse(attachment.contains("Watch-Libre recoveryStarted"))
+        XCTAssertFalse(attachment.contains("build=4242"))
+    }
+
+    func testNormalTraceAttachmentPreservesUnknownLegacyWatchLossCounters() throws {
+        let legacyEvent = TroubleshootingWatchDiagnostic(LibreWatchDiagnosticEvent(
+            kind: .disconnected, watchTimestamp: referenceDate))
+        let attachment = try XCTUnwrap(String(data: makeReport(entries: [
+            .detailed(.watchDiagnostic(legacyEvent), timestamp: referenceDate)
+        ]).attachmentData, encoding: .utf8))
+        XCTAssertTrue(attachment.contains("journalRotated=unknown unacknowledgedRotated=unknown"))
+        XCTAssertFalse(attachment.contains("unacknowledgedRotated=0"))
+        XCTAssertTrue(attachment.contains("Missing counters are unknown."))
+    }
+
     func testOriginalPhoneBuildSurvivesExportAndLegacyBuildStaysUnknown() throws {
         let identity = TroubleshootingLogProvenance(version: "7.0.0", build: "4252",
             commit: "a001908a9b752d909ff3cb8b1efe2e844de4c90f", installationID: UUID())

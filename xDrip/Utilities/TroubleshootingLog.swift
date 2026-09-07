@@ -1846,11 +1846,17 @@ struct TroubleshootingLogAppInfo: Equatable {
 /// interpretation from drifting away from the text a user sends to support. Inputs are expected in
 /// newest-first order, matching `TroubleshootingLogStore.snapshot()`.
 struct TroubleshootingLogReportBuilder {
+    static let attachmentFileName = "TroubleshootingLog.txt"
+
     let entries: [TroubleshootingLogEntry]
     let usesMgDl: Bool
     let appInfo: TroubleshootingLogAppInfo
     let generatedAt: Date
     let timeZone: TimeZone
+
+    /// The normal trace export uses exactly the same privacy-filtered text as Copy and Share.
+    /// Never attach the JSON-lines store or reconstruct messages from developer trace payloads.
+    var attachmentData: Data { Data(reportText.utf8) }
 
     /// Returns entries whose controlled, user-facing sentence contains the supplied text.
     ///
@@ -1873,7 +1879,7 @@ struct TroubleshootingLogReportBuilder {
     var headerLines: [String] {
         var lines = [
             "\(appInfo.projectName) Troubleshooting Log",
-            "Created: \(Self.fullDateFormatter(timeZone: timeZone).string(from: generatedAt)) \(timeZone.abbreviation(for: generatedAt) ?? timeZone.identifier)",
+            "Created on iPhone (export time): \(Self.fullDateFormatter(timeZone: timeZone).string(from: generatedAt)) \(timeZone.abbreviation(for: generatedAt) ?? timeZone.identifier)",
             "App Name: \(appInfo.appName)",
             "Version: \(appInfo.version)",
             "Device: \(appInfo.deviceClass), iOS \(appInfo.systemVersion)",
@@ -1893,6 +1899,14 @@ struct TroubleshootingLogReportBuilder {
         lines.append("Glucose unit: \(appInfo.unitDescription)")
         lines.append(contentsOf: appInfo.processingLines)
         lines.append(contentsOf: appInfo.integrationLines)
+        let receivedWatchEntryCount = entries.filter {
+            if case .watchDiagnostic = $0.kind { return true }
+            return false
+        }.count
+        lines.append("History coverage: retained iPhone log, up to 24 hours by phone recording/receipt time; count and size limits may shorten it.")
+        lines.append("Received Watch journal entries retained: \(receivedWatchEntryCount). Only events received by this iPhone and still retained are included; undelivered Watch events are not included and their coverage is unknown.")
+        lines.append("Watch watchTime/build/SHA describe the original Watch event; receiptTime is the iPhone receipt time, not the export time above. Delayed Watch events may originate before the phone retention window.")
+        lines.append("journalRotated counts total local Watch journal rotation, not necessarily missing phone history. unacknowledgedRotated counts known Watch journal losses before phone storage acknowledgement; it is not a total of all undelivered events. Missing counters are unknown.")
         return lines
     }
 
@@ -1960,7 +1974,7 @@ struct TroubleshootingLogReportBuilder {
             if let counter = event.unlockCounter { fields.append("unlockCounter=\(counter)") }
             fields.append("technicalFrame=\(time(event.technicalFrameAt)) measurement=\(time(event.measuredAt))")
             if let budget = event.remainingBudget { fields.append("executionBudget=\(String(format: "%.1f", budget))s deadline=\(time(event.deadline))") }
-            fields.append("journalRotated=\(event.rotated ?? 0) unacknowledgedRotated=\(event.unacknowledgedRotated ?? 0)")
+            fields.append("journalRotated=\(event.rotated.map(String.init) ?? "unknown") unacknowledgedRotated=\(event.unacknowledgedRotated.map(String.init) ?? "unknown")")
             if let revision = event.alarmSettingsRevision {
                 let authorized = event.alarmNotificationsAuthorized.map(String.init) ?? "unknown"
                 let authority = event.alarmDelegatedToWatch.map(String.init) ?? "unknown"

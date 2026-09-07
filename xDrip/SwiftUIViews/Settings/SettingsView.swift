@@ -404,6 +404,20 @@ private struct SettingsTraceMailView: UIViewControllerRepresentable {
             )
         }
 
+        // Snapshot only already-received local history. Export never requests a Watch journal sync.
+        let troubleshootingReport = TroubleshootingLogReportBuilder(
+            entries: TroubleshootingLogStore.shared.snapshot(),
+            usesMgDl: UserDefaults.standard.bloodGlucoseUnitIsMgDl,
+            appInfo: .current(),
+            generatedAt: Date(),
+            timeZone: .current
+        )
+        mailViewController.addAttachmentData(
+            troubleshootingReport.attachmentData,
+            mimeType: "text/plain",
+            fileName: TroubleshootingLogReportBuilder.attachmentFileName
+        )
+
         return mailViewController
     }
 
