@@ -724,6 +724,9 @@ struct LibreWatchConnectivityOutbox: Codable, Equatable {
     // Optional for decoding the persisted v1 queue after an upgrade. Submission is not
     // storage acknowledgement; retain payloads until a receiver reports a terminal result.
     private(set) var lastSubmittedAt: [UUID: Date]?
+    // Optional for legacy queues. Persist the one-off freshness promotion across retries
+    // and process restoration; new arrivals must not repeatedly overtake this backlog.
+    private(set) var didPrioritizeLatestReading: Bool?
     // Optional fields preserve decoding of the persisted v1 queue. Capacity loss is not
     // age expiry or acknowledgement; count evictions/refused admissions, not unique IDs.
     // A diagnostic dropped here can still be replayed from the separate journal.
@@ -754,6 +757,7 @@ struct LibreWatchConnectivityOutbox: Codable, Equatable {
     mutating func remove(id: UUID) {
         items.removeAll { $0.id == id }
         lastSubmittedAt?.removeValue(forKey: id)
+        removeOrphanedSubmissionMetadata()
     }
 
     mutating func retain(sessionID: UUID?) {
@@ -781,7 +785,7 @@ struct LibreWatchConnectivityOutbox: Codable, Equatable {
         }
         while items.count > Self.maximumItems {
             // Readings win over diagnostics and counter updates. Within a kind preserve
-            // the oldest pending payloads, which must still be delivered oldest-first.
+            // the oldest pending payloads; delivery priority must not change retention.
             let index = items.lastIndex { $0.command == .reportDiagnostic }
                 ?? items.lastIndex { $0.kind == .command }
                 ?? items.index(before: items.endIndex)
@@ -803,31 +807,66 @@ struct LibreWatchConnectivityOutbox: Codable, Equatable {
     private mutating func removeOrphanedSubmissionMetadata() {
         let retained = Set(items.map(\.id))
         lastSubmittedAt = lastSubmittedAt?.filter { retained.contains($0.key) }
+        if items.isEmpty { didPrioritizeLatestReading = nil }
     }
 
     var next: LibreWatchOutboxItem? { items.first }
 
     func nextEligible(at date: Date = Date()) -> LibreWatchOutboxItem? {
-        items.first { item in
+        func isEligible(_ item: LibreWatchOutboxItem) -> Bool {
             guard let last = lastSubmittedAt?[item.id] else { return true }
             return date.timeIntervalSince(last) >= Self.retryInterval
         }
+        // Submission order: newest eligible reading ONCE per nonempty queue, then
+        // ascending (createdAt, stable ID) for every remaining eligible item. Reserve
+        // the promotion before transport, even on failure. New arrivals/retries cannot
+        // promote another reading over the same backlog. Backoff still skips submitted
+        // items; this is not a guarantee of WatchConnectivity's remote arrival order.
+        if didPrioritizeLatestReading != true,
+           let latest = items.last(where: { $0.kind == .reading && isEligible($0) }) {
+            return latest
+        }
+        return items.first(where: isEligible)
+    }
+
+    /// Reserve after acquiring the send gate, or when observing an existing OS transfer.
+    /// Persist before initiating transport; eligibility checks alone never reserve it.
+    mutating func markSelected(id: UUID) {
+        guard items.contains(where: { $0.id == id && $0.kind == .reading }) else { return }
+        didPrioritizeLatestReading = true
     }
 
     /// Reuse an existing execution opportunity; never create a background polling loop.
-    /// Ownership is deliberately not an input: pre-cutoff readings can finish after return.
-    func retryIsDue(at date: Date, executionIsAvailable: Bool, hasInFlightItem: Bool) -> Bool {
-        executionIsAvailable && !hasInFlightItem && nextEligible(at: date) != nil
+    func retryIsDue(at date: Date, opportunity: LibreWatchOutboxDeliveryOpportunity,
+                    hasInFlightItem: Bool) -> Bool {
+        opportunity.allowsDelivery && !hasInFlightItem && nextEligible(at: date) != nil
     }
 
     mutating func markSubmitted(id: UUID, at date: Date = Date()) {
         guard items.contains(where: { $0.id == id }) else { return }
+        markSelected(id: id)
         if lastSubmittedAt == nil { lastSubmittedAt = [:] }
         lastSubmittedAt?[id] = date
     }
 
     mutating func retry(id: UUID) {
         lastSubmittedAt?.removeValue(forKey: id)
+    }
+}
+
+/// A delegate callback permits handing off already-persisted data, not arming timers or
+/// starting Bluetooth work. Existing foreground opportunities also drain pre-return data.
+enum LibreWatchOutboxDeliveryOpportunity {
+    case existingExecution(isAvailable: Bool)
+    case validatedBLENotification(ownership: LibreWatchOwnership)
+
+    var allowsDelivery: Bool {
+        switch self {
+        case .existingExecution(let isAvailable):
+            return isAvailable
+        case .validatedBLENotification(let ownership):
+            return LibreWatchLifecyclePolicy.eventDrivenRecoveryIsAllowed(ownership: ownership)
+        }
     }
 }
 
@@ -869,6 +908,22 @@ enum LibreWatchConnectivityDeliveryAction: Equatable {
 }
 
 struct LibreWatchConnectivityDeliveryPolicy {
+    /// Shared dispatch boundary: callbacks can hand off existing data, but only an active
+    /// WC session and a due, idle outbox may reach the real transport operation.
+    static func retryPendingDelivery(
+        outbox: LibreWatchConnectivityOutbox,
+        at date: Date,
+        opportunity: LibreWatchOutboxDeliveryOpportunity,
+        sessionIsActivated: Bool,
+        hasInFlightItem: Bool,
+        deliver: () -> Void
+    ) {
+        guard sessionIsActivated,
+              outbox.retryIsDue(at: date, opportunity: opportunity, hasInFlightItem: hasInFlightItem)
+        else { return }
+        deliver()
+    }
+
     static func action(sessionIsActivated: Bool, phoneIsReachable: Bool) -> LibreWatchConnectivityDeliveryAction {
         guard sessionIsActivated else { return .activateAndQueue }
         return phoneIsReachable ? .sendMessage : .transferUserInfo

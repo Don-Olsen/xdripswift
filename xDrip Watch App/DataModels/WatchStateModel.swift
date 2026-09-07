@@ -1365,11 +1365,24 @@ final class WatchStateModel: NSObject, ObservableObject {
            date.timeIntervalSince(lastAlarmAcknowledgementAttemptAt ?? .distantPast) >= LibreWatchConnectivityOutbox.retryInterval {
             synchronizeLocalAlarmState()
         }
-        guard session.activationState == .activated,
-              connectivityOutbox.retryIsDue(at: date, executionIsAvailable: executionIsAvailable,
-                                           hasInFlightItem: !outboxSendGate.isIdle)
-        else { return }
-        flushWatchConnectivityOutbox()
+        retryWatchConnectivityOutbox(at: date, opportunity: .existingExecution(isAvailable: executionIsAvailable))
+    }
+
+    /// Reuse only this validated delegate call, including partial/duplicate frames. Do not
+    /// grant timer execution, retry a handoff, or synchronize alarm settings from here.
+    func retryPendingLibreReadingsAfterBLENotification(at date: Date) {
+        retryWatchConnectivityOutbox(at: date,
+            opportunity: .validatedBLENotification(ownership: libreWatchOwnership))
+    }
+
+    private func retryWatchConnectivityOutbox(at date: Date, opportunity: LibreWatchOutboxDeliveryOpportunity) {
+        LibreWatchConnectivityDeliveryPolicy.retryPendingDelivery(
+            outbox: connectivityOutbox, at: date, opportunity: opportunity,
+            sessionIsActivated: session.activationState == .activated,
+            hasInFlightItem: !outboxSendGate.isIdle
+        ) {
+            flushWatchConnectivityOutbox()
+        }
     }
 
     /// Recovers the narrow crash window between journal persistence and outbox persistence.
@@ -1435,6 +1448,13 @@ final class WatchStateModel: NSObject, ObservableObject {
         DispatchQueue.main.async { [weak self] in self?.flushWatchConnectivityOutbox() }
     }
 
+    private func beginOutboxAttempt(for item: LibreWatchOutboxItem) -> LibreWatchConnectivitySendAttemptGate.Attempt? {
+        guard let attempt = outboxSendGate.begin(payloadID: item.id) else { return nil }
+        connectivityOutbox.markSelected(id: item.id)
+        LibreWatchSessionStore.saveOutbox(connectivityOutbox)
+        return attempt
+    }
+
     private func flushWatchConnectivityOutbox() {
         guard outboxSendGate.isIdle else { return }
         // A journal entry is persisted before its outbox item. Reconcile that crash/eviction
@@ -1460,7 +1480,7 @@ final class WatchStateModel: NSObject, ObservableObject {
         if session.activationState == .activated,
            let reading = item.reading,
            Date().timeIntervalSince(reading.receivedAt) > LibreWatchReadingAcceptancePolicy.maximumTransportAge {
-            guard let attempt = outboxSendGate.begin(payloadID: item.id) else { return }
+            guard let attempt = beginOutboxAttempt(for: item) else { return }
             transferOutboxItemIfActivated(item, message: message, attempt: attempt)
             return
         }
@@ -1472,10 +1492,10 @@ final class WatchStateModel: NSObject, ObservableObject {
         case .activateAndQueue:
             requestSessionActivationIfNeeded()
         case .transferUserInfo:
-            guard let attempt = outboxSendGate.begin(payloadID: item.id) else { return }
+            guard let attempt = beginOutboxAttempt(for: item) else { return }
             transferOutboxItemIfActivated(item, message: message, attempt: attempt)
         case .sendMessage:
-            guard let attempt = outboxSendGate.begin(payloadID: item.id) else { return }
+            guard let attempt = beginOutboxAttempt(for: item) else { return }
             if item.command == .reportDiagnostic {
                 diagnosticJournal.markHandedToWatchConnectivity(eventID: item.id)
                 LibreWatchSessionStore.saveDiagnosticJournal(diagnosticJournal)

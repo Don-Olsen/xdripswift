@@ -466,16 +466,16 @@ extension LibreWatchValuePipelineTests {
         outbox.enqueue(item, now: receivedAt)
         XCTAssertFalse(LibreWatchConnectivityDeliveryPolicy.shouldFinish(item, success: false, outcome: .historyNotInserted))
         outbox.markSubmitted(id: item.id, at: receivedAt)
-        XCTAssertFalse(outbox.retryIsDue(at: receivedAt.addingTimeInterval(59), executionIsAvailable: true, hasInFlightItem: false))
+        XCTAssertFalse(outbox.retryIsDue(at: receivedAt.addingTimeInterval(59), opportunity: .existingExecution(isAvailable: true), hasInFlightItem: false))
         let restored = try JSONDecoder().decode(LibreWatchConnectivityOutbox.self, from: JSONEncoder().encode(outbox))
         let next = receivedAt.addingTimeInterval(60)
-        XCTAssertFalse(restored.retryIsDue(at: next, executionIsAvailable: false, hasInFlightItem: false))
-        XCTAssertFalse(restored.retryIsDue(at: next, executionIsAvailable: true, hasInFlightItem: true))
-        XCTAssertTrue(restored.retryIsDue(at: next, executionIsAvailable: true, hasInFlightItem: false))
+        XCTAssertFalse(restored.retryIsDue(at: next, opportunity: .existingExecution(isAvailable: false), hasInFlightItem: false))
+        XCTAssertFalse(restored.retryIsDue(at: next, opportunity: .existingExecution(isAvailable: true), hasInFlightItem: true))
+        XCTAssertTrue(restored.retryIsDue(at: next, opportunity: .existingExecution(isAvailable: true), hasInFlightItem: false))
         XCTAssertEqual(restored.nextEligible(at: next)?.id, item.id)
         // Ownership isn't an input to transport retry; the historical receiver still enforces cutoff.
         outbox.remove(id: item.id)
-        XCTAssertFalse(outbox.retryIsDue(at: next, executionIsAvailable: true, hasInFlightItem: false))
+        XCTAssertFalse(outbox.retryIsDue(at: next, opportunity: .existingExecution(isAvailable: true), hasInFlightItem: false))
     }
 
     func testFirstWatchPacketMissedDeadlineExistsWithoutInventingAReading() throws {
@@ -3288,6 +3288,215 @@ final class LibreWatchValuePipelineTests: XCTestCase {
         XCTAssertFalse(historical.routing.resetsMissedReadingState)
         XCTAssertFalse(historical.routing.triggersAlerts)
         XCTAssertFalse(historical.routing.exportsToIntegrations)
+    }
+
+    func testBackgroundBLENotificationRetriesPersistedReadingsWithoutTimerPermission() throws {
+        let now = receivedAt.addingTimeInterval(8 * 60)
+        var outbox = LibreWatchConnectivityOutbox()
+        let reading = outboxReading(index: 0, at: receivedAt)
+        outbox.enqueue(reading, now: now)
+        outbox.markSubmitted(id: reading.id, at: now.addingTimeInterval(-60))
+        let restored = try JSONDecoder().decode(LibreWatchConnectivityOutbox.self,
+            from: JSONEncoder().encode(outbox))
+        let timed = LibreWatchLifecyclePolicy.recoveryIsAllowed(applicationState: .background,
+            extendedRuntimeIsRunning: false, ownership: .watch)
+        XCTAssertFalse(timed)
+        XCTAssertFalse(restored.retryIsDue(at: now, opportunity: .existingExecution(isAvailable: timed),
+            hasInFlightItem: false))
+        XCTAssertTrue(restored.retryIsDue(at: now, opportunity: .validatedBLENotification(ownership: .watch),
+            hasInFlightItem: false))
+        XCTAssertEqual(restored.nextEligible(at: now)?.id, reading.id)
+        var delivered: [UUID] = []
+        LibreWatchConnectivityDeliveryPolicy.retryPendingDelivery(outbox: restored, at: now,
+            opportunity: .validatedBLENotification(ownership: .watch), sessionIsActivated: true,
+            hasInFlightItem: false) {
+            delivered.append(reading.id)
+        }
+        XCTAssertEqual(delivered, [reading.id], "Drive the same dispatch boundary used by WatchStateModel")
+        // A short callback can enqueue with the OS; it does not make the phone reachable
+        // and does not authorize a timer, scan or connect in the lifecycle policy.
+        XCTAssertEqual(LibreWatchConnectivityDeliveryPolicy.action(sessionIsActivated: true,
+            phoneIsReachable: false), .transferUserInfo)
+        XCTAssertFalse(LibreWatchLifecyclePolicy.recoveryIsAllowed(applicationState: .background,
+            extendedRuntimeIsRunning: false, ownership: .watch))
+    }
+
+    func testPendingReadingsDoNotGrantBackgroundTimerExecutionWithoutBLEEvent() {
+        var outbox = LibreWatchConnectivityOutbox()
+        outbox.enqueue(outboxReading(index: 0), now: receivedAt)
+        var deliveries = 0
+        for seconds in [0.0, 60, 480, 1_800] {
+            let timed = LibreWatchLifecyclePolicy.recoveryIsAllowed(applicationState: .background,
+                extendedRuntimeIsRunning: false, ownership: .watch)
+            XCTAssertFalse(outbox.retryIsDue(at: receivedAt.addingTimeInterval(seconds),
+                opportunity: .existingExecution(isAvailable: timed), hasInFlightItem: false))
+            LibreWatchConnectivityDeliveryPolicy.retryPendingDelivery(outbox: outbox,
+                at: receivedAt.addingTimeInterval(seconds), opportunity: .existingExecution(isAvailable: timed),
+                sessionIsActivated: true, hasInFlightItem: false) { deliveries += 1 }
+        }
+        XCTAssertEqual(deliveries, 0)
+        XCTAssertNil(outbox.lastSubmittedAt)
+        XCTAssertNil(outbox.didPrioritizeLatestReading)
+    }
+
+    func testBLENotificationCannotGrantDeliveryAfterOwnershipChanges() {
+        var outbox = LibreWatchConnectivityOutbox()
+        outbox.enqueue(outboxReading(index: 0), now: receivedAt)
+        var deliveries = 0
+        let nonWatchOwners: [LibreWatchOwnership] = [.iphone, .releasingToPhone, .releasingToWatch, .recovery]
+        for owner in nonWatchOwners {
+            XCTAssertFalse(outbox.retryIsDue(at: receivedAt,
+                opportunity: .validatedBLENotification(ownership: owner), hasInFlightItem: false))
+            LibreWatchConnectivityDeliveryPolicy.retryPendingDelivery(outbox: outbox, at: receivedAt,
+                opportunity: .validatedBLENotification(ownership: owner), sessionIsActivated: true,
+                hasInFlightItem: false) { deliveries += 1 }
+        }
+        XCTAssertEqual(deliveries, 0)
+        // This restriction is on BLE-origin retries, not on the existing foreground/WC
+        // path which must still drain already-owned pre-cutoff readings after a handoff.
+        XCTAssertTrue(outbox.retryIsDue(at: receivedAt,
+            opportunity: .existingExecution(isAvailable: true), hasInFlightItem: false))
+    }
+
+    func testBLEDeliveryOpportunityPreservesRetryBackoffAndInFlightGate() throws {
+        var outbox = LibreWatchConnectivityOutbox()
+        let reading = outboxReading(index: 0)
+        outbox.enqueue(reading, now: receivedAt)
+        outbox.markSubmitted(id: reading.id, at: receivedAt)
+        let opportunity = LibreWatchOutboxDeliveryOpportunity.validatedBLENotification(ownership: .watch)
+        var gate = LibreWatchConnectivitySendAttemptGate()
+        XCTAssertEqual(LibreWatchConnectivityOutbox.retryInterval, 60)
+        XCTAssertFalse(outbox.retryIsDue(at: receivedAt.addingTimeInterval(59.999),
+            opportunity: opportunity, hasInFlightItem: !gate.isIdle))
+        let due = receivedAt.addingTimeInterval(60)
+        XCTAssertTrue(outbox.retryIsDue(at: due, opportunity: opportunity, hasInFlightItem: !gate.isIdle))
+        let attempt = try XCTUnwrap(gate.begin(payloadID: reading.id))
+        XCTAssertFalse(outbox.retryIsDue(at: due, opportunity: opportunity, hasInFlightItem: !gate.isIdle))
+        XCTAssertTrue(gate.finish(attempt))
+        XCTAssertTrue(outbox.retryIsDue(at: due, opportunity: opportunity, hasInFlightItem: !gate.isIdle))
+        var deliveries = 0
+        LibreWatchConnectivityDeliveryPolicy.retryPendingDelivery(outbox: outbox, at: due,
+            opportunity: opportunity, sessionIsActivated: false, hasInFlightItem: false) { deliveries += 1 }
+        LibreWatchConnectivityDeliveryPolicy.retryPendingDelivery(outbox: outbox, at: due,
+            opportunity: opportunity, sessionIsActivated: true, hasInFlightItem: true) { deliveries += 1 }
+        LibreWatchConnectivityDeliveryPolicy.retryPendingDelivery(outbox: outbox,
+            at: receivedAt.addingTimeInterval(59.999), opportunity: opportunity,
+            sessionIsActivated: true, hasInFlightItem: false) { deliveries += 1 }
+        XCTAssertEqual(deliveries, 0)
+        LibreWatchConnectivityDeliveryPolicy.retryPendingDelivery(outbox: outbox, at: due,
+            opportunity: opportunity, sessionIsActivated: true, hasInFlightItem: false) { deliveries += 1 }
+        XCTAssertEqual(deliveries, 1)
+        XCTAssertEqual(LibreWatchConnectivityDeliveryPolicy.action(sessionIsActivated: false,
+            phoneIsReachable: true), .activateAndQueue)
+    }
+
+    func testEightMinuteOutboxSelectsNewestOnceThenAscendingCreatedAt() throws {
+        let now = receivedAt.addingTimeInterval(8 * 60)
+        var outbox = LibreWatchConnectivityOutbox()
+        for minute in [3, 8, 0, 6, 2, 7, 1, 5, 4] {
+            outbox.enqueue(outboxReading(index: minute,
+                at: receivedAt.addingTimeInterval(Double(minute) * 60)), now: now)
+        }
+        var submitted: [UUID] = []
+        while let item = outbox.nextEligible(at: now) {
+            submitted.append(item.id)
+            // Same reservation/persistence order as beginOutboxAttempt, before transport.
+            outbox.markSelected(id: item.id)
+            outbox = try JSONDecoder().decode(LibreWatchConnectivityOutbox.self,
+                from: JSONEncoder().encode(outbox))
+            outbox.remove(id: item.id)
+        }
+        XCTAssertEqual(submitted, ([8] + Array(0 ... 7)).map(outboxFixtureID))
+        XCTAssertNil(outbox.didPrioritizeLatestReading)
+    }
+
+    func testFailedFreshnessPromotionAndNewArrivalsDoNotOvertakeBacklogAgain() throws {
+        let now = receivedAt.addingTimeInterval(8 * 60)
+        var outbox = LibreWatchConnectivityOutbox()
+        for minute in [0, 4, 8] {
+            outbox.enqueue(outboxReading(index: minute,
+                at: receivedAt.addingTimeInterval(Double(minute) * 60)), now: now)
+        }
+        let latest = try XCTUnwrap(outbox.nextEligible(at: now))
+        XCTAssertEqual(latest.id, outboxFixtureID(8))
+        // A failed interactive attempt reserves its promotion before the error callback,
+        // which records the unchanged retry backoff. Restore between those operations.
+        outbox.markSelected(id: latest.id)
+        outbox = try JSONDecoder().decode(LibreWatchConnectivityOutbox.self,
+            from: JSONEncoder().encode(outbox))
+        outbox.markSubmitted(id: latest.id, at: now)
+        outbox.enqueue(outboxReading(index: 9, at: now.addingTimeInterval(1)), now: now.addingTimeInterval(1))
+        XCTAssertEqual(outbox.nextEligible(at: now.addingTimeInterval(1))?.id, outboxFixtureID(0))
+        outbox.markSubmitted(id: outboxFixtureID(0), at: now.addingTimeInterval(1))
+        XCTAssertEqual(outbox.nextEligible(at: now.addingTimeInterval(1))?.id, outboxFixtureID(4))
+        outbox.remove(id: outboxFixtureID(4))
+        // Expired backoff rejoins by createdAt, not another newest-first promotion.
+        XCTAssertEqual(outbox.nextEligible(at: now.addingTimeInterval(61))?.id, outboxFixtureID(0))
+        outbox.remove(id: outboxFixtureID(0))
+        XCTAssertEqual(outbox.nextEligible(at: now.addingTimeInterval(61))?.id, latest.id)
+        outbox.retry(id: latest.id)
+        XCTAssertEqual(outbox.nextEligible(at: now.addingTimeInterval(61))?.id, latest.id)
+        outbox.remove(id: latest.id)
+        XCTAssertEqual(outbox.nextEligible(at: now.addingTimeInterval(61))?.id, outboxFixtureID(9))
+    }
+
+    func testOutboxPromotionIsReservedBeforeReplyAndResetsOnlyWhenEmpty() throws {
+        let now = receivedAt.addingTimeInterval(10)
+        var outbox = LibreWatchConnectivityOutbox()
+        for index in 0 ... 2 { outbox.enqueue(outboxReading(index: index), now: now) }
+        let selected = try XCTUnwrap(outbox.nextEligible(at: now))
+        XCTAssertEqual(selected.id, outboxFixtureID(2))
+        // Merely evaluating retry eligibility must not consume the priority.
+        XCTAssertEqual(outbox.nextEligible(at: now)?.id, selected.id)
+        outbox.markSelected(id: selected.id)
+        outbox = try JSONDecoder().decode(LibreWatchConnectivityOutbox.self,
+            from: JSONEncoder().encode(outbox))
+        XCTAssertEqual(outbox.nextEligible(at: now)?.id, outboxFixtureID(0))
+        outbox.remove(id: selected.id)
+        outbox.enqueue(outboxReading(index: 3), now: now)
+        XCTAssertEqual(outbox.nextEligible(at: now)?.id, outboxFixtureID(0))
+        for id in outbox.items.map(\.id) { outbox.remove(id: id) }
+        for index in 4 ... 5 { outbox.enqueue(outboxReading(index: index), now: now) }
+        XCTAssertEqual(outbox.nextEligible(at: now)?.id, outboxFixtureID(5))
+    }
+
+    func testLegacyOutboxPromotionUsesStableTieBreakAndCommandsKeepFIFOAfterward() throws {
+        let now = receivedAt
+        let olderCommand = LibreWatchOutboxItem.command(.updateUnlockCounter,
+            sessionID: session.id, unlockCounter: 9, id: outboxFixtureID(10),
+            createdAt: now.addingTimeInterval(-1))
+        let items = [outboxReading(index: 2, at: now), olderCommand, outboxReading(index: 1, at: now)]
+        let legacy = try JSONSerialization.data(withJSONObject: [
+            "items": try JSONSerialization.jsonObject(with: JSONEncoder().encode(items))
+        ])
+        var outbox = try JSONDecoder().decode(LibreWatchConnectivityOutbox.self, from: legacy)
+        outbox.prune(at: now)
+        XCTAssertEqual(outbox.nextEligible(at: now)?.id, outboxFixtureID(2))
+        outbox.markSelected(id: outboxFixtureID(2))
+        outbox.remove(id: outboxFixtureID(2))
+        XCTAssertEqual(outbox.nextEligible(at: now)?.id, olderCommand.id)
+        outbox.remove(id: olderCommand.id)
+        XCTAssertEqual(outbox.nextEligible(at: now)?.id, outboxFixtureID(1))
+    }
+
+    func testOutboxPriorityCannotExtendAgeOrChangeCapacityBounds() {
+        let now = receivedAt.addingTimeInterval(300)
+        var outbox = LibreWatchConnectivityOutbox()
+        for index in 0 ..< LibreWatchConnectivityOutbox.maximumItems {
+            outbox.enqueue(outboxReading(index: index, at: receivedAt), now: now)
+        }
+        outbox.markSelected(id: outboxFixtureID(255))
+        XCTAssertFalse(outbox.enqueue(outboxReading(index: 256, at: receivedAt), now: now))
+        XCTAssertEqual(outbox.items.count, 256)
+        XCTAssertEqual(LibreWatchConnectivityOutbox.maximumItems, 256)
+        XCTAssertEqual(LibreWatchConnectivityOutbox.maximumAge, 3_600)
+        XCTAssertEqual(LibreWatchDiagnosticJournal.maximumEncodedBytes, 64 * 1_024)
+        outbox.prune(at: receivedAt.addingTimeInterval(3_600))
+        XCTAssertEqual(outbox.items.count, 256)
+        XCTAssertEqual(outbox.didPrioritizeLatestReading, true)
+        outbox.prune(at: receivedAt.addingTimeInterval(3_600.001))
+        XCTAssertTrue(outbox.items.isEmpty)
+        XCTAssertNil(outbox.didPrioritizeLatestReading)
     }
 
     func testOutboxDeduplicatesOrdersPersistsAndAcknowledgesByStableID() throws {

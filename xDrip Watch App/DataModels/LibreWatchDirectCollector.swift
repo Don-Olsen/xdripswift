@@ -2109,6 +2109,10 @@ extension LibreWatchDirectCollector: CBPeripheralDelegate {
             }
             return
         }
+        // The current, owned peripheral granted this execution opportunity. Drain data
+        // already in the outbox even if this fragment is partial or downstream rejects it.
+        // This grants no timer, scan, reconnect, handoff, or alarm-configuration work.
+        defer { watchState?.retryPendingLibreReadingsAfterBLENotification(at: Date()) }
         if let error {
             let errorAction = notificationErrorAction(for: error)
             reportCoreBluetoothCallback(
