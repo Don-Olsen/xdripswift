@@ -1376,6 +1376,9 @@ final class WatchStateModel: NSObject, ObservableObject {
     }
 
     private func retryWatchConnectivityOutbox(at date: Date, opportunity: LibreWatchOutboxDeliveryOpportunity) {
+        guard opportunity.allowsDelivery,
+              LibreWatchSessionStore.prepareOutboxForDelivery(&connectivityOutbox,
+                  sessionID: libreWatchDirectSession?.id, at: date) else { return }
         LibreWatchConnectivityDeliveryPolicy.retryPendingDelivery(
             outbox: connectivityOutbox, at: date, opportunity: opportunity,
             sessionIsActivated: session.activationState == .activated,
@@ -1451,7 +1454,11 @@ final class WatchStateModel: NSObject, ObservableObject {
     private func beginOutboxAttempt(for item: LibreWatchOutboxItem) -> LibreWatchConnectivitySendAttemptGate.Attempt? {
         guard let attempt = outboxSendGate.begin(payloadID: item.id) else { return nil }
         connectivityOutbox.markSelected(id: item.id)
-        LibreWatchSessionStore.saveOutbox(connectivityOutbox)
+        guard LibreWatchSessionStore.saveOutbox(connectivityOutbox),
+              connectivityOutbox.items.contains(where: { $0.id == item.id }) else {
+            outboxSendGate.finish(attempt)
+            return nil
+        }
         return attempt
     }
 
@@ -1461,7 +1468,10 @@ final class WatchStateModel: NSObject, ObservableObject {
         // window on every activation/reachability opportunity, not only at process launch.
         connectivityOutbox.prune()
         restorePendingDiagnosticJournalToOutbox()
-        LibreWatchSessionStore.saveOutbox(connectivityOutbox)
+        // A failed write leaves the in-memory queue intact for the next existing execution
+        // opportunity; do not send/reload an older snapshot or create a retry timer.
+        guard LibreWatchSessionStore.prepareOutboxForDelivery(&connectivityOutbox,
+            sessionID: libreWatchDirectSession?.id) else { return }
         guard let item = connectivityOutbox.nextEligible() else { return }
         if session.activationState == .activated,
            session.outstandingUserInfoTransfers.contains(where: {

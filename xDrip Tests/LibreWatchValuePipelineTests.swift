@@ -3481,20 +3481,21 @@ final class LibreWatchValuePipelineTests: XCTestCase {
 
     func testOutboxPriorityCannotExtendAgeOrChangeCapacityBounds() {
         let now = receivedAt.addingTimeInterval(300)
+        let maximumItems = LibreWatchConnectivityOutbox.maximumItems
         var outbox = LibreWatchConnectivityOutbox()
         for index in 0 ..< LibreWatchConnectivityOutbox.maximumItems {
             outbox.enqueue(outboxReading(index: index, at: receivedAt), now: now)
         }
-        outbox.markSelected(id: outboxFixtureID(255))
-        XCTAssertFalse(outbox.enqueue(outboxReading(index: 256, at: receivedAt), now: now))
-        XCTAssertEqual(outbox.items.count, 256)
-        XCTAssertEqual(LibreWatchConnectivityOutbox.maximumItems, 256)
-        XCTAssertEqual(LibreWatchConnectivityOutbox.maximumAge, 3_600)
+        outbox.markSelected(id: outboxFixtureID(maximumItems - 1))
+        XCTAssertFalse(outbox.enqueue(outboxReading(index: maximumItems, at: receivedAt), now: now))
+        XCTAssertEqual(outbox.items.count, maximumItems)
+        XCTAssertEqual(LibreWatchConnectivityOutbox.maximumItems, 512)
+        XCTAssertEqual(LibreWatchConnectivityOutbox.maximumAge, 6 * 60 * 60)
         XCTAssertEqual(LibreWatchDiagnosticJournal.maximumEncodedBytes, 64 * 1_024)
-        outbox.prune(at: receivedAt.addingTimeInterval(3_600))
-        XCTAssertEqual(outbox.items.count, 256)
+        outbox.prune(at: receivedAt.addingTimeInterval(LibreWatchConnectivityOutbox.maximumAge))
+        XCTAssertEqual(outbox.items.count, maximumItems)
         XCTAssertEqual(outbox.didPrioritizeLatestReading, true)
-        outbox.prune(at: receivedAt.addingTimeInterval(3_600.001))
+        outbox.prune(at: receivedAt.addingTimeInterval(LibreWatchConnectivityOutbox.maximumAge + 0.001))
         XCTAssertTrue(outbox.items.isEmpty)
         XCTAssertNil(outbox.didPrioritizeLatestReading)
     }
@@ -3569,6 +3570,7 @@ final class LibreWatchValuePipelineTests: XCTestCase {
 
     func testOutboxMixedCapacityEvictsDiagnosticsThenCommandsAndPersistsSeparateCounts() throws {
         let now = receivedAt.addingTimeInterval(1_000)
+        let maximumItems = LibreWatchConnectivityOutbox.maximumItems
         var outbox = LibreWatchConnectivityOutbox()
         for index in 0 ..< (LibreWatchConnectivityOutbox.maximumItems - 2) {
             outbox.enqueue(outboxReading(index: index), now: now)
@@ -3584,14 +3586,14 @@ final class LibreWatchValuePipelineTests: XCTestCase {
         outbox.markSubmitted(id: diagnostic.id, at: now)
         outbox.markSubmitted(id: counter.id, at: now)
 
-        XCTAssertTrue(outbox.enqueue(outboxReading(index: 254), now: now))
+        XCTAssertTrue(outbox.enqueue(outboxReading(index: maximumItems - 2), now: now))
         XCTAssertFalse(outbox.items.contains { $0.id == diagnostic.id })
         XCTAssertTrue(outbox.items.contains { $0.id == counter.id })
         XCTAssertNil(outbox.lastSubmittedAt?[diagnostic.id])
-        XCTAssertTrue(outbox.enqueue(outboxReading(index: 255), now: now))
+        XCTAssertTrue(outbox.enqueue(outboxReading(index: maximumItems - 1), now: now))
         XCTAssertFalse(outbox.items.contains { $0.id == counter.id })
         XCTAssertNil(outbox.lastSubmittedAt?[counter.id])
-        XCTAssertEqual(outbox.items.map(\.id), (0 ..< 256).map(outboxFixtureID))
+        XCTAssertEqual(outbox.items.map(\.id), (0 ..< maximumItems).map(outboxFixtureID))
         XCTAssertEqual(outbox.capacityDroppedDiagnostics, 1)
         XCTAssertEqual(outbox.capacityDroppedCommands, 1)
         XCTAssertEqual(outbox.capacityDroppedReadings ?? 0, 0)
@@ -3601,14 +3603,15 @@ final class LibreWatchValuePipelineTests: XCTestCase {
 
     func testOutboxReadingOnlyOverflowPreservesOldestFirstWithDeterministicTieBreak() {
         let now = receivedAt.addingTimeInterval(1_000)
+        let maximumItems = LibreWatchConnectivityOutbox.maximumItems
         var outbox = LibreWatchConnectivityOutbox()
         for index in (1 ... LibreWatchConnectivityOutbox.maximumItems).reversed() {
             outbox.enqueue(outboxReading(index: index, at: receivedAt), now: now)
         }
-        let rejected = outboxReading(index: 257, at: receivedAt)
+        let rejected = outboxReading(index: maximumItems + 1, at: receivedAt)
         XCTAssertFalse(outbox.enqueue(rejected, now: now))
         XCTAssertTrue(outbox.enqueue(outboxReading(index: 0, at: receivedAt), now: now))
-        XCTAssertEqual(outbox.items.map(\.id), (0 ..< 256).map(outboxFixtureID))
+        XCTAssertEqual(outbox.items.map(\.id), (0 ..< maximumItems).map(outboxFixtureID))
         XCTAssertEqual(outbox.capacityDroppedReadings, 2)
         XCTAssertEqual(outbox.capacityDroppedDiagnostics ?? 0, 0)
     }
@@ -3658,7 +3661,8 @@ final class LibreWatchValuePipelineTests: XCTestCase {
             diagnosticEvent: try JSONEncoder().encode(next), id: nextID,
             createdAt: now.addingTimeInterval(4)), now: now.addingTimeInterval(4)))
         XCTAssertEqual(outbox.nextEligible(at: now.addingTimeInterval(4))?.id, nextID)
-        XCTAssertEqual(outbox.items.filter { $0.kind == .reading }.count, 255)
+        XCTAssertEqual(outbox.items.filter { $0.kind == .reading }.count,
+            LibreWatchConnectivityOutbox.maximumItems - 1)
     }
 
     func testOutboxDuplicateExpiredAndInvalidAdmissionsCannotEvictRetainedPayloads() {
@@ -3680,7 +3684,7 @@ final class LibreWatchValuePipelineTests: XCTestCase {
     func testOutboxLegacyOversizedQueuePrunesCapacityWithoutDroppingOldestReading() throws {
         let now = receivedAt.addingTimeInterval(1_000)
         let reading = outboxReading(index: 0)
-        let diagnostics = (1 ... 256).map { index in
+        let diagnostics = (1 ... LibreWatchConnectivityOutbox.maximumItems).map { index in
             LibreWatchOutboxItem.command(.reportDiagnostic, sessionID: session.id,
                 diagnosticEvent: Data("{}".utf8), id: outboxFixtureID(index),
                 createdAt: receivedAt.addingTimeInterval(Double(index)))
@@ -3692,8 +3696,127 @@ final class LibreWatchValuePipelineTests: XCTestCase {
         outbox.prune(at: now)
         XCTAssertEqual(outbox.items.count, LibreWatchConnectivityOutbox.maximumItems)
         XCTAssertEqual(outbox.items.first, reading)
-        XCTAssertEqual(outbox.items.last?.id, outboxFixtureID(255))
+        XCTAssertEqual(outbox.items.last?.id, outboxFixtureID(LibreWatchConnectivityOutbox.maximumItems - 1))
         XCTAssertEqual(outbox.capacityDroppedDiagnostics, 1)
+    }
+
+    func testOutboxRejectsSingleOversizedDiagnosticWithoutChangingRetainedRetries() throws {
+        let now = receivedAt.addingTimeInterval(1_000)
+        let reading = outboxReading(index: 0)
+        let diagnostic = LibreWatchOutboxItem.command(.reportDiagnostic, sessionID: session.id,
+            diagnosticEvent: Data("{}".utf8), id: outboxFixtureID(900), createdAt: receivedAt)
+        var outbox = LibreWatchConnectivityOutbox()
+        XCTAssertTrue(outbox.enqueue(reading, now: now))
+        XCTAssertTrue(outbox.enqueue(diagnostic, now: now))
+        for item in outbox.items { outbox.markSubmitted(id: item.id, at: now) }
+        let retainedIDs = outbox.items.map(\.id)
+        let submittedAt = outbox.lastSubmittedAt
+
+        XCTAssertFalse(outbox.enqueue(.command(.reportDiagnostic, sessionID: session.id,
+            diagnosticEvent: Data(repeating: 0, count: 512 * 1_024),
+            id: outboxFixtureID(901), createdAt: now), now: now))
+        XCTAssertEqual(outbox.items.map(\.id), retainedIDs)
+        XCTAssertEqual(outbox.lastSubmittedAt, submittedAt)
+        XCTAssertNil(outbox.nextEligible(at: now.addingTimeInterval(1)))
+        XCTAssertEqual(outbox.capacityDroppedDiagnostics, 1)
+        XCTAssertEqual(outbox.capacityDroppedReadings ?? 0, 0)
+        XCTAssertLessThanOrEqual(try JSONEncoder().encode(outbox).count,
+            LibreWatchConnectivityOutbox.maximumEncodedBytes)
+    }
+
+    func testOutboxByteFullDiagnosticReplayPreservesIDsAndSubmissionThrottleBelowItemLimit() throws {
+        let now = receivedAt.addingTimeInterval(1_000)
+        var outbox = LibreWatchConnectivityOutbox()
+        XCTAssertTrue(outbox.enqueue(outboxReading(index: 0), now: now))
+        XCTAssertTrue(outbox.enqueue(.command(.reportDiagnostic, sessionID: session.id,
+            diagnosticEvent: Data("{}".utf8), id: outboxFixtureID(900), createdAt: now), now: now))
+        for item in outbox.items { outbox.markSubmitted(id: item.id, at: now) }
+
+        // Measure the empty Data wrapper, then fill its base64 in whole four-byte groups.
+        var probe = outbox
+        XCTAssertTrue(probe.enqueue(.command(.reportDiagnostic, sessionID: session.id,
+            diagnosticEvent: Data(), id: outboxFixtureID(901), createdAt: now), now: now))
+        let remainingBytes = LibreWatchConnectivityOutbox.maximumEncodedBytes - 1_024 -
+            (try JSONEncoder().encode(probe).count)
+        XCTAssertGreaterThan(remainingBytes, 0)
+        XCTAssertTrue(outbox.enqueue(.command(.reportDiagnostic, sessionID: session.id,
+            diagnosticEvent: Data(repeating: 0, count: remainingBytes / 4 * 3),
+            id: outboxFixtureID(901), createdAt: now), now: now))
+        outbox.markSubmitted(id: outboxFixtureID(901), at: now)
+        XCTAssertLessThan(outbox.items.count, LibreWatchConnectivityOutbox.maximumItems)
+        XCTAssertGreaterThan(try JSONEncoder().encode(outbox).count,
+            LibreWatchConnectivityOutbox.maximumEncodedBytes - 1_024 - 4)
+        let retainedIDs = outbox.items.map(\.id)
+        let submittedAt = outbox.lastSubmittedAt
+
+        var journal = LibreWatchDiagnosticJournal()
+        for index in 0 ..< 3 {
+            _ = journal.append(LibreWatchDiagnosticEvent(eventID: outboxFixtureID(910 + index),
+                kind: .disconnected, watchTimestamp: now, sessionID: session.id), at: now)
+        }
+        for second in 1 ... 3 {
+            let retryDate = now.addingTimeInterval(Double(second))
+            for event in journal.pendingEvents() {
+                XCTAssertFalse(outbox.enqueue(.command(.reportDiagnostic, sessionID: session.id,
+                    diagnosticEvent: try JSONEncoder().encode(event),
+                    id: try XCTUnwrap(event.eventID), createdAt: retryDate), now: retryDate))
+            }
+            XCTAssertEqual(outbox.items.map(\.id), retainedIDs)
+            XCTAssertEqual(outbox.lastSubmittedAt, submittedAt)
+            XCTAssertNil(outbox.nextEligible(at: retryDate))
+            XCTAssertLessThanOrEqual(try JSONEncoder().encode(outbox).count,
+                LibreWatchConnectivityOutbox.maximumEncodedBytes)
+        }
+        XCTAssertEqual(journal.pendingEvents().count, 3)
+        XCTAssertEqual(outbox.capacityDroppedDiagnostics, 9)
+        XCTAssertEqual(outbox.capacityDroppedReadings ?? 0, 0)
+    }
+
+    func testOutboxAllFiveHundredTwelveReadingsFitByteBoundWithSubmissionMetadata() throws {
+        let now = receivedAt.addingTimeInterval(1_000)
+        var outbox = LibreWatchConnectivityOutbox()
+        XCTAssertEqual(LibreWatchConnectivityOutbox.maximumItems, 512)
+        XCTAssertEqual(LibreWatchConnectivityOutbox.maximumEncodedBytes, 512 * 1_024)
+        for index in 0 ..< LibreWatchConnectivityOutbox.maximumItems {
+            XCTAssertTrue(outbox.enqueue(outboxReading(index: index), now: now))
+        }
+        for item in outbox.items { outbox.markSubmitted(id: item.id, at: now) }
+        XCTAssertEqual(outbox.items.count, 512)
+        XCTAssertEqual(outbox.lastSubmittedAt?.count, 512)
+        XCTAssertEqual(outbox.didPrioritizeLatestReading, true)
+        XCTAssertEqual(outbox.capacityDroppedReadings ?? 0, 0)
+        XCTAssertLessThanOrEqual(try JSONEncoder().encode(outbox).count,
+            LibreWatchConnectivityOutbox.maximumEncodedBytes)
+    }
+
+    func testOutboxLegacyOversizedDataPrunesDiagnosticsBeforeCommandsOrReadings() throws {
+        let now = receivedAt.addingTimeInterval(1_000)
+        let counter = LibreWatchOutboxItem.command(.updateUnlockCounter, sessionID: session.id,
+            unlockCounter: 42, id: outboxFixtureID(900), createdAt: receivedAt.addingTimeInterval(-2))
+        let oversized = LibreWatchOutboxItem.command(.reportDiagnostic, sessionID: session.id,
+            diagnosticEvent: Data(repeating: 0, count: 512 * 1_024), id: outboxFixtureID(901),
+            createdAt: receivedAt.addingTimeInterval(-1))
+        let newerDiagnostic = LibreWatchOutboxItem.command(.reportDiagnostic, sessionID: session.id,
+            diagnosticEvent: Data("{}".utf8), id: outboxFixtureID(902), createdAt: now)
+        let items = [newerDiagnostic, outboxReading(index: 1), oversized, outboxReading(index: 0), counter]
+        let legacy = try JSONSerialization.data(withJSONObject: [
+            "items": try JSONSerialization.jsonObject(with: JSONEncoder().encode(items))
+        ])
+        var outbox = try JSONDecoder().decode(LibreWatchConnectivityOutbox.self, from: legacy)
+        XCTAssertLessThan(outbox.items.count, LibreWatchConnectivityOutbox.maximumItems)
+        XCTAssertGreaterThan(try JSONEncoder().encode(outbox).count,
+            LibreWatchConnectivityOutbox.maximumEncodedBytes)
+        XCTAssertNil(outbox.didPrioritizeLatestReading)
+        outbox.prune(at: now)
+        // Byte pressure uses the same newest-diagnostic-first retention priority as count pressure.
+        XCTAssertEqual(outbox.items.map(\.id), [counter.id, outboxFixtureID(0), outboxFixtureID(1)])
+        XCTAssertEqual(outbox.capacityDroppedDiagnostics, 2)
+        XCTAssertEqual(outbox.capacityDroppedCommands ?? 0, 0)
+        XCTAssertEqual(outbox.capacityDroppedReadings ?? 0, 0)
+        XCTAssertLessThanOrEqual(try JSONEncoder().encode(outbox).count,
+            LibreWatchConnectivityOutbox.maximumEncodedBytes)
+        XCTAssertEqual(try JSONDecoder().decode(LibreWatchConnectivityOutbox.self,
+            from: JSONEncoder().encode(outbox)), outbox)
     }
 
     private func outboxFixtureID(_ index: Int) -> UUID {
@@ -3763,7 +3886,7 @@ final class LibreWatchValuePipelineTests: XCTestCase {
         XCTAssertTrue(outbox.items.isEmpty)
     }
 
-    func testOutboxPrunesStrictlyAfterSixtyMinutesAndRetainsOnlyActiveSession() {
+    func testOutboxPrunesStrictlyAfterSixHoursAndRetainsOnlyActiveSession() {
         let active = payload(
             raw: 800,
             previousRaw: 790,
@@ -3786,7 +3909,7 @@ final class LibreWatchValuePipelineTests: XCTestCase {
         XCTAssertEqual(LibreWatchReadingAcceptancePolicy.maximumTransportAge, 3 * 60)
         XCTAssertTrue(active.isCurrent(at: receivedAt.addingTimeInterval(3 * 60)))
         XCTAssertFalse(active.isCurrent(at: receivedAt.addingTimeInterval(3 * 60 + 0.001)))
-        XCTAssertEqual(LibreWatchConnectivityOutbox.maximumAge, 60 * 60)
+        XCTAssertEqual(LibreWatchConnectivityOutbox.maximumAge, 6 * 60 * 60)
         outbox.prune(at: receivedAt.addingTimeInterval(LibreWatchConnectivityOutbox.maximumAge))
         XCTAssertEqual(Set(outbox.items.map(\.id)), Set([active.id, other.id]))
         outbox.retain(sessionID: session.id)
@@ -3876,9 +3999,11 @@ final class LibreWatchValuePipelineTests: XCTestCase {
         XCTAssertFalse(staleAcceptance.accept(pastBoundary, for: session.id, now: now))
     }
 
-    func testQueuedHistoryUsesReceiverTransportAndSixtyMinuteBoundary() {
+    func testQueuedHistoryUsesReceiverTransportAndSixHourBoundary() {
         let snapshot = calibration(type: .fixedSlope, slope: 1, intercept: 0)
-        let now = receivedAt.addingTimeInterval(4_000)
+        // Keep both age-boundary fixtures after the unchanged session start.
+        let now = receivedAt.addingTimeInterval(LibreWatchHistoryPolicy.maximumAge + 400)
+        XCTAssertEqual(LibreWatchHistoryPolicy.maximumAge, 6 * 60 * 60)
         let exactBoundary = payload(
             raw: 800,
             previousRaw: 790,
@@ -3954,6 +4079,50 @@ final class LibreWatchValuePipelineTests: XCTestCase {
             LibreWatchQueuedReadingRoutingPolicy.route(transportAge: 30, ownership: .iphone),
             .historicalBackfill
         )
+    }
+
+    func testFourHundredSecondQueuedReadingRemainsHistoricalWithSixHourRetention() {
+        let now = receivedAt.addingTimeInterval(600)
+        let snapshot = calibration(type: .fixedSlope, slope: 1, intercept: 0)
+        let reading = payload(raw: 800, previousRaw: 790, domain: .xDripRawGlucose,
+            sensorTime: 1_000, at: now.addingTimeInterval(-400))
+        var outbox = LibreWatchConnectivityOutbox()
+        XCTAssertTrue(outbox.enqueue(.reading(reading), now: now))
+        XCTAssertEqual(outbox.items.map(\.id), [reading.id])
+        XCTAssertEqual(LibreWatchQueuedReadingRoutingPolicy.route(
+            transportAge: now.timeIntervalSince(reading.receivedAt), ownership: .watch), .historicalBackfill)
+
+        var liveAcceptance = LibreWatchReadingAcceptancePolicy()
+        XCTAssertFalse(liveAcceptance.accept(reading, for: session.id, now: now))
+        XCTAssertNil(liveAcceptance.lastReceivedAt)
+        XCTAssertNil(liveAcceptance.lastSensorTimeInMinutes)
+        XCTAssertNil(LibreWatchHistoryPolicy.rejection(
+            reading: reading, transport: .queuedUserInfo, session: session,
+            calibration: snapshot, ownership: .watch, now: now))
+        let historical = LibreWatchGlucoseProcessingMode.historicalBackfill
+        XCTAssertFalse(historical.permitsCurrentValueAndLiveSideEffects)
+        XCTAssertFalse(historical.routing.updatesCurrentValue)
+        XCTAssertFalse(historical.routing.resetsMissedReadingState)
+        XCTAssertFalse(historical.routing.triggersAlerts)
+        XCTAssertFalse(historical.routing.exportsToIntegrations)
+    }
+
+    func testSixtySecondQueuedReadingStillUsesLiveAcceptanceWithSixHourRetention() {
+        let now = receivedAt.addingTimeInterval(600)
+        let reading = payload(raw: 800, previousRaw: 790, domain: .xDripRawGlucose,
+            sensorTime: 1_000, at: now.addingTimeInterval(-60))
+        var outbox = LibreWatchConnectivityOutbox()
+        XCTAssertTrue(outbox.enqueue(.reading(reading), now: now))
+        XCTAssertEqual(outbox.items.map(\.id), [reading.id])
+        XCTAssertEqual(LibreWatchReadingAcceptancePolicy.maximumTransportAge, 3 * 60)
+        XCTAssertEqual(LibreWatchQueuedReadingRoutingPolicy.route(
+            transportAge: now.timeIntervalSince(reading.receivedAt), ownership: .watch), .attemptLiveAcceptance)
+
+        var liveAcceptance = LibreWatchReadingAcceptancePolicy()
+        XCTAssertTrue(liveAcceptance.accept(reading, for: session.id, now: now))
+        XCTAssertEqual(liveAcceptance.lastReceivedAt, reading.receivedAt)
+        XCTAssertEqual(liveAcceptance.lastSensorTimeInMinutes, reading.sensorTimeInMinutes)
+        XCTAssertTrue(LibreWatchGlucoseProcessingMode.live.permitsCurrentValueAndLiveSideEffects)
     }
 
     func testReleaseReceiptAllowsOnlyPreCutoffQueuedHistoryAcrossPhoneReturn() throws {
@@ -4106,6 +4275,49 @@ final class LibreWatchValuePipelineTests: XCTestCase {
             receipt: receipt,
             now: receipt.expiresAt.addingTimeInterval(0.001)
         ), .tooOld)
+    }
+
+    func testReleaseReceiptExpiresStrictlyAtSixHoursWhileReadingAgeBoundaryIsInclusive() throws {
+        let snapshot = calibration(type: .fixedSlope, slope: 1, intercept: 0)
+        let cutoff = receivedAt.addingTimeInterval(600)
+        var receipt = try XCTUnwrap(LibreWatchReleaseReceipt(
+            session: session, calibration: snapshot, cutoff: cutoff, now: cutoff))
+        receipt.complete()
+        XCTAssertEqual(receipt.expiresAt, cutoff.addingTimeInterval(6 * 60 * 60))
+        // A reading exactly at cutoff stays age-valid at expiry, isolating the receipt guard.
+        let reading = payload(raw: 800, previousRaw: 790, domain: .xDripRawGlucose,
+            sensorTime: 1_000, at: cutoff)
+
+        XCTAssertNil(LibreWatchHistoryPolicy.rejection(
+            reading: reading, transport: .queuedUserInfo, session: session,
+            calibration: snapshot, ownership: .iphone, receipt: receipt,
+            now: receipt.expiresAt.addingTimeInterval(-0.001)))
+        XCTAssertNil(LibreWatchHistoryPolicy.rejection(
+            reading: reading, transport: .queuedUserInfo, session: session,
+            calibration: snapshot, ownership: .watch, now: receipt.expiresAt))
+        XCTAssertEqual(LibreWatchHistoryPolicy.rejection(
+            reading: reading, transport: .queuedUserInfo, session: session,
+            calibration: snapshot, ownership: .iphone, receipt: receipt,
+            now: receipt.expiresAt), .missingReceipt)
+        XCTAssertEqual(LibreWatchHistoryPolicy.rejection(
+            reading: reading, transport: .queuedUserInfo, session: session,
+            calibration: snapshot, ownership: .iphone, receipt: receipt,
+            now: receipt.expiresAt.addingTimeInterval(0.001)), .tooOld)
+    }
+
+    func testReleaseReceiptCreationKeepsStrictSixHourCutoffBoundary() throws {
+        let snapshot = calibration(type: .fixedSlope, slope: 1, intercept: 0)
+        let cutoff = receivedAt.addingTimeInterval(600)
+        let expiresAt = cutoff.addingTimeInterval(LibreWatchHistoryPolicy.maximumAge)
+        let receipt = try XCTUnwrap(LibreWatchReleaseReceipt(
+            session: session, calibration: snapshot, cutoff: cutoff,
+            now: expiresAt.addingTimeInterval(-0.001)))
+        XCTAssertEqual(receipt.expiresAt, expiresAt)
+        XCTAssertNil(LibreWatchReleaseReceipt(
+            session: session, calibration: snapshot, cutoff: cutoff, now: expiresAt))
+        XCTAssertNil(LibreWatchReleaseReceipt(
+            session: session, calibration: snapshot, cutoff: cutoff,
+            now: expiresAt.addingTimeInterval(0.001)))
     }
 
     @MainActor
@@ -5642,6 +5854,317 @@ extension LibreWatchValuePipelineTests {
             XCTAssertEqual(LibreWatchLifecyclePolicy.disconnectRecoveryAction(
                 isDeliberate: false, systemIsReconnecting: false, ownership: ownership
             ), .noAdditionalWork)
+        }
+    }
+}
+
+extension LibreWatchValuePipelineTests {
+    private enum OutboxFileTestError: Error { case injectedWriteFailure }
+
+    private func outboxFileFixture() throws -> (fileURL: URL, defaults: UserDefaults) {
+        let identifier = UUID().uuidString
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("LibreWatchOutboxFileTests-\(identifier)", isDirectory: true)
+        let suiteName = "LibreWatchOutboxFileTests.\(identifier)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        addTeardownBlock {
+            defaults.removePersistentDomain(forName: suiteName)
+            if FileManager.default.fileExists(atPath: directory.path) {
+                try FileManager.default.removeItem(at: directory)
+            }
+        }
+        return (directory.appendingPathComponent("queue/outbox-v2.json"), defaults)
+    }
+
+    private func fileOutboxReading(_ index: Int, at date: Date) -> LibreWatchOutboxItem {
+        .reading(payload(id: outboxFixtureID(index), raw: 847, previousRaw: 829,
+            domain: .xDripRawGlucose, sensorTime: UInt16(1_000 + index), at: date))
+    }
+
+    func testFileOutboxRestartsAfterEveryReadingAndDurableAcknowledgement() throws {
+        let fixture = try outboxFileFixture()
+        var expected = LibreWatchConnectivityOutbox()
+        for index in 0..<12 {
+            let now = receivedAt.addingTimeInterval(Double(index) * 60)
+            let store = LibreWatchOutboxFileStore(fileURL: fixture.fileURL, defaults: fixture.defaults)
+            var restored = try store.load(at: now)
+            XCTAssertEqual(restored, expected)
+            let item = fileOutboxReading(index, at: now)
+            XCTAssertTrue(restored.enqueue(item, now: now))
+            restored.markSubmitted(id: item.id, at: now)
+            try store.save(restored)
+            expected = restored
+            XCTAssertEqual(try LibreWatchOutboxFileStore(fileURL: fixture.fileURL,
+                defaults: fixture.defaults).load(at: now), expected,
+                "Every reading is durable before another frame or batching interval")
+        }
+
+        let now = receivedAt.addingTimeInterval(12 * 60)
+        for id in expected.items.map(\.id) {
+            let store = LibreWatchOutboxFileStore(fileURL: fixture.fileURL, defaults: fixture.defaults)
+            var restored = try store.load(at: now)
+            let item = try XCTUnwrap(restored.items.first { $0.id == id })
+            XCTAssertTrue(LibreWatchConnectivityDeliveryPolicy.shouldFinish(item,
+                success: true, outcome: .historicalInserted, durableReceipt: true))
+            restored.remove(id: id)
+            try store.save(restored)
+            expected = restored
+            let restarted = try LibreWatchOutboxFileStore(fileURL: fixture.fileURL,
+                defaults: fixture.defaults).load(at: now)
+            XCTAssertEqual(restarted, expected)
+            XCTAssertNil(restarted.lastSubmittedAt?[id])
+        }
+        XCTAssertTrue(expected.items.isEmpty)
+        XCTAssertNil(expected.didPrioritizeLatestReading)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.fileURL.path),
+            "An acknowledged empty queue remains an authoritative durable snapshot")
+    }
+
+    func testFileOutboxMigratesLegacyOnlyAfterFirstSuccessfulFileCommit() throws {
+        let fixture = try outboxFileFixture()
+        var legacy = LibreWatchConnectivityOutbox()
+        let item = fileOutboxReading(0, at: receivedAt)
+        legacy.enqueue(item, now: receivedAt)
+        legacy.markSubmitted(id: item.id, at: receivedAt)
+        let legacyData = try JSONEncoder().encode(legacy)
+        fixture.defaults.set(legacyData, forKey: LibreWatchMessageKey.persistedOutbox)
+        var writeCount = 0
+        let store = LibreWatchOutboxFileStore(fileURL: fixture.fileURL, defaults: fixture.defaults) { data, url in
+            writeCount += 1
+            XCTAssertEqual(fixture.defaults.data(forKey: LibreWatchMessageKey.persistedOutbox), legacyData,
+                "The migration source survives until the file commit succeeds")
+            try data.write(to: url, options: .atomic)
+        }
+        let loaded = try store.load(at: receivedAt.addingTimeInterval(10))
+        XCTAssertEqual(loaded, legacy)
+        XCTAssertEqual(writeCount, 0)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.fileURL.path))
+        try store.save(loaded)
+        XCTAssertEqual(writeCount, 1)
+        XCTAssertNil(fixture.defaults.data(forKey: LibreWatchMessageKey.persistedOutbox))
+        try store.save(loaded)
+        XCTAssertEqual(writeCount, 1, "An identical successful snapshot needs no second write")
+        let restarted = try LibreWatchOutboxFileStore(fileURL: fixture.fileURL,
+            defaults: fixture.defaults).load(at: receivedAt.addingTimeInterval(10))
+        XCTAssertEqual(restarted, legacy)
+        XCTAssertNil(restarted.nextEligible(at: receivedAt.addingTimeInterval(59)))
+        XCTAssertEqual(restarted.nextEligible(at: receivedAt.addingTimeInterval(60))?.id, item.id)
+    }
+
+    func testFileOutboxMigrationWriteFailureRetainsLegacyAndRetriesIdenticalSnapshot() throws {
+        let fixture = try outboxFileFixture()
+        var legacy = LibreWatchConnectivityOutbox()
+        legacy.enqueue(fileOutboxReading(0, at: receivedAt), now: receivedAt)
+        let legacyData = try JSONEncoder().encode(legacy)
+        fixture.defaults.set(legacyData, forKey: LibreWatchMessageKey.persistedOutbox)
+        var shouldFail = true
+        var writeCount = 0
+        let store = LibreWatchOutboxFileStore(fileURL: fixture.fileURL, defaults: fixture.defaults) { data, url in
+            writeCount += 1
+            if shouldFail { throw OutboxFileTestError.injectedWriteFailure }
+            try data.write(to: url, options: .atomic)
+        }
+        let loaded = try store.load(at: receivedAt)
+        XCTAssertThrowsError(try store.save(loaded))
+        XCTAssertEqual(writeCount, 1)
+        XCTAssertEqual(fixture.defaults.data(forKey: LibreWatchMessageKey.persistedOutbox), legacyData)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.fileURL.path))
+        XCTAssertEqual(try LibreWatchOutboxFileStore(fileURL: fixture.fileURL,
+            defaults: fixture.defaults).load(at: receivedAt), legacy)
+
+        shouldFail = false
+        try store.save(loaded)
+        XCTAssertEqual(writeCount, 2, "The failed snapshot was never cached as durable")
+        XCTAssertNil(fixture.defaults.data(forKey: LibreWatchMessageKey.persistedOutbox))
+        XCTAssertEqual(try LibreWatchOutboxFileStore(fileURL: fixture.fileURL,
+            defaults: fixture.defaults).load(at: receivedAt), legacy)
+    }
+
+    func testFileOutboxFailedReplacementPreservesPreviousFileAndDoesNotAdvanceCache() throws {
+        let fixture = try outboxFileFixture()
+        var shouldFail = false
+        var writeCount = 0
+        let store = LibreWatchOutboxFileStore(fileURL: fixture.fileURL, defaults: fixture.defaults) { data, url in
+            writeCount += 1
+            if shouldFail { throw OutboxFileTestError.injectedWriteFailure }
+            try data.write(to: url, options: .atomic)
+        }
+        var outbox = try store.load(at: receivedAt)
+        outbox.enqueue(fileOutboxReading(0, at: receivedAt), now: receivedAt)
+        try store.save(outbox)
+        let previousFile = try Data(contentsOf: fixture.fileURL)
+        let previousOutbox = outbox
+        try store.save(outbox)
+        XCTAssertEqual(writeCount, 1)
+
+        outbox.enqueue(fileOutboxReading(1, at: receivedAt.addingTimeInterval(60)),
+            now: receivedAt.addingTimeInterval(60))
+        shouldFail = true
+        XCTAssertThrowsError(try store.save(outbox))
+        XCTAssertEqual(writeCount, 2)
+        XCTAssertEqual(try Data(contentsOf: fixture.fileURL), previousFile)
+        XCTAssertEqual(try LibreWatchOutboxFileStore(fileURL: fixture.fileURL,
+            defaults: fixture.defaults).load(at: receivedAt.addingTimeInterval(60)), previousOutbox)
+        XCTAssertEqual(outbox.items.count, 2, "The caller retains the new reading for a persistence retry")
+
+        shouldFail = false
+        try store.save(outbox)
+        try store.save(outbox)
+        XCTAssertEqual(writeCount, 3)
+        XCTAssertEqual(try LibreWatchOutboxFileStore(fileURL: fixture.fileURL,
+            defaults: fixture.defaults).load(at: receivedAt.addingTimeInterval(60)), outbox)
+    }
+
+    func testFileOutboxClearWritesEmptyTombstoneThatWinsOverStaleLegacyData() throws {
+        let fixture = try outboxFileFixture()
+        let store = LibreWatchOutboxFileStore(fileURL: fixture.fileURL, defaults: fixture.defaults)
+        var outbox = try store.load(at: receivedAt)
+        outbox.enqueue(fileOutboxReading(0, at: receivedAt), now: receivedAt)
+        try store.save(outbox)
+        let staleLegacy = try JSONEncoder().encode(outbox)
+        try store.clear()
+        // Model termination after the atomic empty commit but before preferences removal.
+        fixture.defaults.set(staleLegacy, forKey: LibreWatchMessageKey.persistedOutbox)
+        let restarted = LibreWatchOutboxFileStore(fileURL: fixture.fileURL, defaults: fixture.defaults)
+        let empty = try restarted.load(at: receivedAt)
+        XCTAssertTrue(empty.items.isEmpty)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.fileURL.path))
+        try restarted.save(empty)
+        XCTAssertNil(fixture.defaults.data(forKey: LibreWatchMessageKey.persistedOutbox))
+        XCTAssertTrue(try JSONDecoder().decode(LibreWatchConnectivityOutbox.self,
+            from: Data(contentsOf: fixture.fileURL)).items.isEmpty)
+    }
+
+    func testFileOutboxCorruptPrimaryCannotFallBackToLegacyOrAuthorizeOverwrite() throws {
+        let fixture = try outboxFileFixture()
+        try FileManager.default.createDirectory(at: fixture.fileURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true)
+        let corrupt = Data("not an outbox snapshot".utf8)
+        try corrupt.write(to: fixture.fileURL, options: .atomic)
+        var legacy = LibreWatchConnectivityOutbox()
+        legacy.enqueue(fileOutboxReading(0, at: receivedAt), now: receivedAt)
+        let legacyData = try JSONEncoder().encode(legacy)
+        fixture.defaults.set(legacyData, forKey: LibreWatchMessageKey.persistedOutbox)
+        var writeCount = 0
+        let store = LibreWatchOutboxFileStore(fileURL: fixture.fileURL, defaults: fixture.defaults) { _, _ in
+            writeCount += 1
+        }
+        XCTAssertThrowsError(try store.load(at: receivedAt))
+        XCTAssertThrowsError(try store.save(LibreWatchConnectivityOutbox()))
+        XCTAssertThrowsError(try store.clear())
+        XCTAssertEqual(writeCount, 0)
+        XCTAssertEqual(try Data(contentsOf: fixture.fileURL), corrupt)
+        XCTAssertEqual(fixture.defaults.data(forKey: LibreWatchMessageKey.persistedOutbox), legacyData)
+    }
+
+    func testFileOutboxPrunedLoadMustCommitBeforeItsChangedSnapshotCanBeCached() throws {
+        let fixture = try outboxFileFixture()
+        var original = LibreWatchConnectivityOutbox()
+        original.enqueue(fileOutboxReading(0, at: receivedAt), now: receivedAt)
+        original.enqueue(fileOutboxReading(1, at: receivedAt.addingTimeInterval(60)),
+            now: receivedAt.addingTimeInterval(60))
+        let initialStore = LibreWatchOutboxFileStore(fileURL: fixture.fileURL, defaults: fixture.defaults)
+        _ = try initialStore.load(at: receivedAt)
+        try initialStore.save(original)
+        var writeCount = 0
+        let store = LibreWatchOutboxFileStore(fileURL: fixture.fileURL, defaults: fixture.defaults) { data, url in
+            writeCount += 1
+            try data.write(to: url, options: .atomic)
+        }
+        let now = receivedAt.addingTimeInterval(LibreWatchConnectivityOutbox.maximumAge + 0.001)
+        let pruned = try store.load(at: now)
+        XCTAssertEqual(pruned.items.map(\.id), [outboxFixtureID(1)])
+        XCTAssertEqual(try JSONDecoder().decode(LibreWatchConnectivityOutbox.self,
+            from: Data(contentsOf: fixture.fileURL)), original)
+        try store.save(pruned)
+        try store.save(pruned)
+        XCTAssertEqual(writeCount, 1)
+        XCTAssertEqual(try LibreWatchOutboxFileStore(fileURL: fixture.fileURL,
+            defaults: fixture.defaults).load(at: now), pruned)
+    }
+
+    func testFileOutboxRetriesInitialReadFailureWithoutLosingNewRAMReadings() throws {
+        let fixture = try outboxFileFixture()
+        let firstStore = LibreWatchOutboxFileStore(fileURL: fixture.fileURL, defaults: fixture.defaults)
+        var old = try firstStore.load(at: receivedAt)
+        old.enqueue(fileOutboxReading(0, at: receivedAt), now: receivedAt)
+        old.markSubmitted(id: outboxFixtureID(0), at: receivedAt)
+        try firstStore.save(old)
+        let previousFile = try Data(contentsOf: fixture.fileURL)
+        var readFails = true
+        let store = LibreWatchOutboxFileStore(fileURL: fixture.fileURL, defaults: fixture.defaults,
+            reader: { url in
+                if readFails { throw CocoaError(.fileReadNoPermission) }
+                return try Data(contentsOf: url)
+            })
+        XCTAssertThrowsError(try store.load(at: receivedAt))
+        var pending = LibreWatchConnectivityOutbox()
+        pending.enqueue(fileOutboxReading(1, at: receivedAt.addingTimeInterval(1)),
+            now: receivedAt.addingTimeInterval(1))
+        // A late replay of an existing ID must not reset that payload's retry backoff.
+        pending.enqueue(fileOutboxReading(0, at: receivedAt), now: receivedAt.addingTimeInterval(1))
+        XCTAssertThrowsError(try store.prepareForDelivery(&pending, sessionID: session.id,
+            at: receivedAt.addingTimeInterval(2)))
+        XCTAssertEqual(try Data(contentsOf: fixture.fileURL), previousFile)
+        XCTAssertEqual(pending.items.count, 2)
+        readFails = false
+        try store.prepareForDelivery(&pending, sessionID: session.id,
+            at: receivedAt.addingTimeInterval(3))
+        XCTAssertEqual(pending.items.map(\.id), [outboxFixtureID(0), outboxFixtureID(1)])
+        XCTAssertEqual(pending.lastSubmittedAt?[outboxFixtureID(0)], receivedAt)
+        XCTAssertEqual(pending.didPrioritizeLatestReading, true)
+        XCTAssertEqual(try LibreWatchOutboxFileStore(fileURL: fixture.fileURL,
+            defaults: fixture.defaults).load(at: receivedAt.addingTimeInterval(3)), pending)
+    }
+
+    func testFileOutboxLateReadRecoveryDoesNotReintroduceReplacedSensorSession() throws {
+        let fixture = try outboxFileFixture()
+        let firstStore = LibreWatchOutboxFileStore(fileURL: fixture.fileURL, defaults: fixture.defaults)
+        var old = try firstStore.load(at: receivedAt)
+        old.enqueue(fileOutboxReading(0, at: receivedAt), now: receivedAt)
+        try firstStore.save(old)
+        var pending = LibreWatchConnectivityOutbox()
+        let newSession = UUID()
+        let newer = payload(id: outboxFixtureID(1), raw: 847, previousRaw: 829,
+            domain: .xDripRawGlucose, sensorTime: 1_001, at: receivedAt, sessionID: newSession)
+        pending.enqueue(.reading(newer), now: receivedAt)
+        let store = LibreWatchOutboxFileStore(fileURL: fixture.fileURL, defaults: fixture.defaults)
+        try store.prepareForDelivery(&pending, sessionID: newSession, at: receivedAt)
+        XCTAssertEqual(pending.items.map(\.id), [newer.id])
+        XCTAssertEqual(try LibreWatchOutboxFileStore(fileURL: fixture.fileURL,
+            defaults: fixture.defaults).load(at: receivedAt).items.map(\.id), [newer.id])
+    }
+
+    func testFileOutboxSixHour360And400ReadingSnapshotsStayBoundedAcrossRestart() throws {
+        XCTAssertEqual(LibreWatchConnectivityOutbox.maximumAge, 6 * 60 * 60)
+        XCTAssertEqual(LibreWatchReadingAcceptancePolicy.maximumTransportAge, 3 * 60)
+        for readingCount in [360, 400] {
+            let fixture = try outboxFileFixture()
+            let now = receivedAt.addingTimeInterval(6 * 60 * 60)
+            var outbox = LibreWatchConnectivityOutbox()
+            for index in 0..<readingCount {
+                // Include an exact six-hour boundary and a full-capacity reading fixture;
+                // cadence here is a storage input, not a claim about sensor production rate.
+                let date = receivedAt.addingTimeInterval(Double(index) * (6 * 60 * 60) / Double(readingCount - 1))
+                let item = fileOutboxReading(index, at: date)
+                XCTAssertTrue(outbox.enqueue(item, now: now))
+                if index % 10 == 0 { outbox.markSubmitted(id: item.id, at: now) }
+            }
+            XCTAssertEqual(outbox.items.count, readingCount)
+            XCTAssertEqual(outbox.items.first?.createdAt, receivedAt)
+            let store = LibreWatchOutboxFileStore(fileURL: fixture.fileURL, defaults: fixture.defaults)
+            _ = try store.load(at: now)
+            try store.save(outbox)
+            let file = try Data(contentsOf: fixture.fileURL)
+            print("Libre outbox file: \(readingCount) readings, \(file.count) encoded bytes")
+            XCTAssertLessThanOrEqual(file.count, LibreWatchConnectivityOutbox.maximumEncodedBytes)
+            XCTAssertEqual(try LibreWatchOutboxFileStore(fileURL: fixture.fileURL,
+                defaults: fixture.defaults).load(at: now), outbox)
+            let justExpired = try LibreWatchOutboxFileStore(fileURL: fixture.fileURL,
+                defaults: fixture.defaults).load(at: now.addingTimeInterval(0.001))
+            XCTAssertEqual(justExpired.items.count, readingCount - 1)
+            XCTAssertFalse(justExpired.items.contains { $0.id == outboxFixtureID(0) })
+            XCTAssertNil(justExpired.lastSubmittedAt?[outboxFixtureID(0)])
         }
     }
 }

@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import os.log
 
 enum LibreWatchMessageKey {
     static let session = "libreWatchDirectSession"
@@ -599,7 +600,8 @@ struct LibreWatchReleaseReceipt: Codable, Equatable {
 }
 
 struct LibreWatchHistoryPolicy {
-    static let maximumAge: TimeInterval = 60 * 60
+    // Offline retention is independent of the unchanged three-minute live/alert limit.
+    static let maximumAge: TimeInterval = 6 * 60 * 60
 
     static func rejection(
         reading: LibreWatchDirectReadingPayload,
@@ -718,8 +720,10 @@ struct LibreWatchOutboxItem: Codable, Equatable, Identifiable {
 }
 
 struct LibreWatchConnectivityOutbox: Codable, Equatable {
-    static let maximumItems = 256
-    static let maximumAge: TimeInterval = 60 * 60
+    // Six hours at one reading/minute, with room for bounded command/diagnostic traffic.
+    static let maximumItems = 512
+    static let maximumAge = LibreWatchHistoryPolicy.maximumAge
+    static let maximumEncodedBytes = 512 * 1_024
     private(set) var items: [LibreWatchOutboxItem] = []
     // Optional for decoding the persisted v1 queue after an upgrade. Submission is not
     // storage acknowledgement; retain payloads until a receiver reports a terminal result.
@@ -734,6 +738,21 @@ struct LibreWatchConnectivityOutbox: Codable, Equatable {
     private(set) var capacityDroppedDiagnostics: UInt64?
     private(set) var capacityDroppedCommands: UInt64?
     static let retryInterval: TimeInterval = 60
+    // Ephemeral validation cache: unchanged BLE/health opportunities must not repeatedly
+    // serialize a six-hour queue just to prune it. Decoding always starts unchecked.
+    private var capacityIsValidated = false
+    private enum CodingKeys: String, CodingKey {
+        case items, lastSubmittedAt, didPrioritizeLatestReading
+        case capacityDroppedReadings, capacityDroppedDiagnostics, capacityDroppedCommands
+    }
+    init() {}
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.items == rhs.items && lhs.lastSubmittedAt == rhs.lastSubmittedAt &&
+            lhs.didPrioritizeLatestReading == rhs.didPrioritizeLatestReading &&
+            lhs.capacityDroppedReadings == rhs.capacityDroppedReadings &&
+            lhs.capacityDroppedDiagnostics == rhs.capacityDroppedDiagnostics &&
+            lhs.capacityDroppedCommands == rhs.capacityDroppedCommands
+    }
 
     /// Returns whether the stable payload is retained (including an existing duplicate).
     @discardableResult
@@ -746,8 +765,24 @@ struct LibreWatchConnectivityOutbox: Codable, Equatable {
             // A replayed journal event must not displace a submitted diagnostic and erase
             // its retry throttle. Leave this event pending in the journal until room opens.
             recordCapacityDrop(item)
+            sortAndLimitCapacity()
+            removeOrphanedSubmissionMetadata()
             return false
         }
+        if item.command == .reportDiagnostic {
+            var candidate = self
+            candidate.items.append(item)
+            // A byte-full queue has the same no-churn rule as a count-full queue.
+            // Keep room for drop counters; replay must not erase another event's backoff.
+            guard let data = try? JSONEncoder().encode(candidate),
+                  data.count <= Self.maximumEncodedBytes - 1_024 else {
+                recordCapacityDrop(item)
+                sortAndLimitCapacity()
+                removeOrphanedSubmissionMetadata()
+                return false
+            }
+        }
+        capacityIsValidated = false
         items.append(item)
         sortAndLimitCapacity()
         removeOrphanedSubmissionMetadata()
@@ -771,30 +806,38 @@ struct LibreWatchConnectivityOutbox: Codable, Equatable {
     }
 
     mutating func prune(at date: Date = Date()) {
+        let previousCount = items.count
         items.removeAll {
             !$0.isStructurallyValid || date.timeIntervalSince($0.createdAt) > Self.maximumAge
         }
+        if items.count != previousCount { capacityIsValidated = false }
+        removeOrphanedSubmissionMetadata()
         sortAndLimitCapacity()
         removeOrphanedSubmissionMetadata()
     }
 
     private mutating func sortAndLimitCapacity() {
+        guard !capacityIsValidated else { return }
         items.sort {
             if $0.createdAt != $1.createdAt { return $0.createdAt < $1.createdAt }
             return $0.id.uuidString < $1.id.uuidString
         }
-        while items.count > Self.maximumItems {
+        while !items.isEmpty && (items.count > Self.maximumItems ||
+            ((try? JSONEncoder().encode(self).count) ?? Int.max) > Self.maximumEncodedBytes) {
             // Readings win over diagnostics and counter updates. Within a kind preserve
             // the oldest pending payloads; delivery priority must not change retention.
             let index = items.lastIndex { $0.command == .reportDiagnostic }
                 ?? items.lastIndex { $0.kind == .command }
                 ?? items.index(before: items.endIndex)
             let removed = items.remove(at: index)
+            lastSubmittedAt?.removeValue(forKey: removed.id)
             recordCapacityDrop(removed)
         }
+        capacityIsValidated = true
     }
 
     private mutating func recordCapacityDrop(_ item: LibreWatchOutboxItem) {
+        capacityIsValidated = false
         if item.kind == .reading {
             capacityDroppedReadings = (capacityDroppedReadings ?? 0) &+ 1
         } else if item.command == .reportDiagnostic {
@@ -833,7 +876,11 @@ struct LibreWatchConnectivityOutbox: Codable, Equatable {
     /// Persist before initiating transport; eligibility checks alone never reserve it.
     mutating func markSelected(id: UUID) {
         guard items.contains(where: { $0.id == id && $0.kind == .reading }) else { return }
+        guard didPrioritizeLatestReading != true else { return }
         didPrioritizeLatestReading = true
+        capacityIsValidated = false
+        sortAndLimitCapacity()
+        removeOrphanedSubmissionMetadata()
     }
 
     /// Reuse an existing execution opportunity; never create a background polling loop.
@@ -847,10 +894,29 @@ struct LibreWatchConnectivityOutbox: Codable, Equatable {
         markSelected(id: id)
         if lastSubmittedAt == nil { lastSubmittedAt = [:] }
         lastSubmittedAt?[id] = date
+        capacityIsValidated = false
+        sortAndLimitCapacity()
+        removeOrphanedSubmissionMetadata()
     }
 
     mutating func retry(id: UUID) {
         lastSubmittedAt?.removeValue(forKey: id)
+    }
+
+    /// Only used after an initially unreadable store becomes readable. No transport has
+    /// been started from the RAM-only queue; stable IDs also tolerate late OS receipts.
+    mutating func mergePendingAfterReadFailure(_ pending: Self, at date: Date) {
+        for item in pending.items { enqueue(item, now: date) }
+        if pending.didPrioritizeLatestReading == true { didPrioritizeLatestReading = true }
+        for (id, submittedAt) in pending.lastSubmittedAt ?? [:] {
+            if lastSubmittedAt == nil { lastSubmittedAt = [:] }
+            lastSubmittedAt?[id] = max(lastSubmittedAt?[id] ?? .distantPast, submittedAt)
+        }
+        capacityDroppedReadings = (capacityDroppedReadings ?? 0) &+ (pending.capacityDroppedReadings ?? 0)
+        capacityDroppedDiagnostics = (capacityDroppedDiagnostics ?? 0) &+ (pending.capacityDroppedDiagnostics ?? 0)
+        capacityDroppedCommands = (capacityDroppedCommands ?? 0) &+ (pending.capacityDroppedCommands ?? 0)
+        capacityIsValidated = false
+        prune(at: date)
     }
 }
 
@@ -2479,7 +2545,111 @@ struct LibreWatchPersistedDirectReading: Codable, Equatable {
     }
 }
 
+/// Main-context store for the delivery queue, not a second reading/clinical pipeline.
+/// Every changed snapshot is atomically written before transport. No RAM batching window:
+/// a completed write survives process termination; an interrupted replacement leaves the
+/// previous file. Identical *successfully persisted* snapshots do not encode/write again.
+final class LibreWatchOutboxFileStore {
+    enum StoreError: Error { case unavailableLocation, notLoaded, exceedsBounds }
+    typealias Writer = (Data, URL) throws -> Void
+    typealias Reader = (URL) throws -> Data
+    private let fileURL: URL?
+    private let defaults: UserDefaults
+    private let writer: Writer
+    private let reader: Reader
+    private var didLoad = false
+    private var durableSnapshot: LibreWatchConnectivityOutbox?
+
+    init(fileURL: URL? = nil, defaults: UserDefaults = .standard,
+         reader: @escaping Reader = { try Data(contentsOf: $0) },
+         writer: @escaping Writer = { try $0.write(to: $1, options: .atomic) }) {
+        self.fileURL = fileURL ?? FileManager.default.urls(for: .applicationSupportDirectory,
+            in: .userDomainMask).first?.appendingPathComponent("LibreWatch/outbox-v2.json")
+        self.defaults = defaults
+        self.writer = writer
+        self.reader = reader
+    }
+
+    func load(at date: Date = Date()) throws -> LibreWatchConnectivityOutbox {
+        didLoad = false
+        durableSnapshot = nil
+        guard let fileURL else { throw StoreError.unavailableLocation }
+        let data: Data?
+        do {
+            data = try reader(fileURL)
+        } catch let error as NSError where error.domain == NSCocoaErrorDomain &&
+            error.code == CocoaError.fileReadNoSuchFile.rawValue {
+            data = nil
+        }
+        // An unreadable/corrupt existing file must NOT become an empty queue that a
+        // subsequent flush overwrites. Only a successful load authorizes saves.
+        let stored: LibreWatchConnectivityOutbox
+        if let data {
+            stored = try JSONDecoder().decode(LibreWatchConnectivityOutbox.self, from: data)
+            durableSnapshot = stored // cache BEFORE pruning; changes still require a write
+        } else if let legacy = defaults.data(forKey: LibreWatchMessageKey.persistedOutbox) {
+            stored = try JSONDecoder().decode(LibreWatchConnectivityOutbox.self, from: legacy)
+            durableSnapshot = nil // migration is not complete until the first file commit
+        } else {
+            stored = LibreWatchConnectivityOutbox()
+            durableSnapshot = nil
+        }
+        didLoad = true
+        var outbox = stored
+        outbox.prune(at: date)
+        return outbox
+    }
+
+    func save(_ outbox: LibreWatchConnectivityOutbox) throws {
+        guard didLoad else { throw StoreError.notLoaded }
+        guard let fileURL else { throw StoreError.unavailableLocation }
+        if durableSnapshot != outbox {
+            let data = try JSONEncoder().encode(outbox)
+            // Never silently trim a different queue from the one the sender owns.
+            guard outbox.items.count <= LibreWatchConnectivityOutbox.maximumItems,
+                  data.count <= LibreWatchConnectivityOutbox.maximumEncodedBytes
+            else { throw StoreError.exceedsBounds }
+            try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true)
+            try writer(data, fileURL)
+            durableSnapshot = outbox // only a successful write may suppress an identical retry
+        }
+        // File (including an EMPTY snapshot) is authoritative if a process dies here.
+        // Never remove the legacy queue on a failed migration write.
+        defaults.removeObject(forKey: LibreWatchMessageKey.persistedOutbox)
+    }
+
+    func clear() throws {
+        if !didLoad { _ = try load() }
+        try save(LibreWatchConnectivityOutbox()) // durable tombstone, not file deletion
+    }
+
+    func prepareForDelivery(_ pending: inout LibreWatchConnectivityOutbox,
+                            sessionID: UUID?, at date: Date = Date()) throws {
+        if !didLoad {
+            var restored = try load(at: date)
+            restored.mergePendingAfterReadFailure(pending, at: date)
+            restored.retain(sessionID: sessionID)
+            pending = restored
+        }
+        try save(pending)
+    }
+}
+
 enum LibreWatchSessionStore {
+    #if os(watchOS)
+    private static let outboxFileStore = LibreWatchOutboxFileStore()
+    private static var outboxPersistenceFailureLogged = false
+
+    private static func reportOutboxPersistenceFailure(_ error: Error) {
+        guard !outboxPersistenceFailureLogged else { return }
+        outboxPersistenceFailureLogged = true
+        let error = error as NSError
+        // Do not recursively enqueue a diagnostic about an outbox write failure.
+        os_log("Libre outbox storage failed, domain=%{public}@ code=%{public}ld; retaining memory and previous file",
+            log: .default, type: .error, error.domain, error.code)
+    }
+    #endif
     static func loadSession(defaults: UserDefaults = .standard) -> LibreWatchDirectSession? {
         guard let data = defaults.data(forKey: LibreWatchMessageKey.persistedSession),
               let session = try? JSONDecoder().decode(LibreWatchDirectSession.self, from: data),
@@ -2554,6 +2724,18 @@ enum LibreWatchSessionStore {
     }
 
     static func loadOutbox(defaults: UserDefaults = .standard) -> LibreWatchConnectivityOutbox {
+        #if os(watchOS)
+        if defaults === UserDefaults.standard {
+            do {
+                let outbox = try outboxFileStore.load()
+                _ = saveOutbox(outbox, defaults: defaults)
+                return outbox
+            } catch {
+                reportOutboxPersistenceFailure(error)
+                return LibreWatchConnectivityOutbox()
+            }
+        }
+        #endif
         guard let data = defaults.data(forKey: LibreWatchMessageKey.persistedOutbox),
               var outbox = try? JSONDecoder().decode(LibreWatchConnectivityOutbox.self, from: data)
         else { return LibreWatchConnectivityOutbox() }
@@ -2561,12 +2743,44 @@ enum LibreWatchSessionStore {
         return outbox
     }
 
+    @discardableResult
     static func saveOutbox(
         _ outbox: LibreWatchConnectivityOutbox,
         defaults: UserDefaults = .standard
-    ) {
-        guard let data = try? JSONEncoder().encode(outbox) else { return }
+    ) -> Bool {
+        #if os(watchOS)
+        if defaults === UserDefaults.standard {
+            do {
+                try outboxFileStore.save(outbox)
+                outboxPersistenceFailureLogged = false
+                return true
+            } catch {
+                reportOutboxPersistenceFailure(error)
+                return false
+            }
+        }
+        #endif
+        guard let data = try? JSONEncoder().encode(outbox) else { return false }
         defaults.set(data, forKey: LibreWatchMessageKey.persistedOutbox)
+        return true
+    }
+
+    /// Retry a failed initial read only while already executing; never replace newer RAM
+    /// readings with an old file, cross a replaced session, or schedule a background timer.
+    static func prepareOutboxForDelivery(_ outbox: inout LibreWatchConnectivityOutbox,
+                                        sessionID: UUID?, at date: Date = Date()) -> Bool {
+        #if os(watchOS)
+        do {
+            try outboxFileStore.prepareForDelivery(&outbox, sessionID: sessionID, at: date)
+            outboxPersistenceFailureLogged = false
+            return true
+        } catch {
+            reportOutboxPersistenceFailure(error)
+            return false
+        }
+        #else
+        return saveOutbox(outbox)
+        #endif
     }
 
     static func loadDiagnosticReceipts(
@@ -2652,6 +2866,12 @@ enum LibreWatchSessionStore {
     }
 
     static func clear(defaults: UserDefaults = .standard) {
+        #if os(watchOS)
+        if defaults === UserDefaults.standard {
+            do { try outboxFileStore.clear() }
+            catch { reportOutboxPersistenceFailure(error); return }
+        }
+        #endif
         defaults.removeObject(forKey: LibreWatchMessageKey.persistedSession)
         defaults.removeObject(forKey: LibreWatchMessageKey.persistedOwnership)
         defaults.removeObject(forKey: LibreWatchMessageKey.persistedCalibration)
