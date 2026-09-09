@@ -1464,9 +1464,11 @@ struct LibreWatchConnectionTiming {
     mutating func observeLink(
         connected: Bool, connecting: Bool, hasReceptionState: Bool,
         at date: Date, applicationIsActive: Bool, executionIsAvailable: Bool = true,
-        monotonicTime: TimeInterval? = nil
+        monotonicTime: TimeInterval? = nil, legacyDisconnectIsPending: Bool = false
     ) -> Bool {
-        guard !connected, phase != .cancelling else { return false }
+        // The queued delegate owns this transition. A passive observation must not
+        // invalidate its captured generation before the existing fallback can run.
+        guard !legacyDisconnectIsPending, !connected, phase != .cancelling else { return false }
         let staleReception = hasReceptionState || setupInProgress || phase == .receiving
         let missingConnection = connecting && phase != .connection
         guard staleReception || missingConnection else { return false }

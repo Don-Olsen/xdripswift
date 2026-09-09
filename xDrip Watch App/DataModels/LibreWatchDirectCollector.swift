@@ -638,7 +638,8 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
                   at: date,
                   applicationIsActive: applicationIsActive,
                   executionIsAvailable: timedRecoveryIsAllowed,
-                  monotonicTime: monotonicNow
+                  monotonicTime: monotonicNow,
+                  legacyDisconnectIsPending: disconnectGate.pendingToken != nil
               )
         else { return false }
         cancelReconnectFallback()

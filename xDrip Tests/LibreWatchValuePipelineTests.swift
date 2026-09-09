@@ -5468,3 +5468,180 @@ extension LibreWatchValuePipelineTests {
         XCTAssertTrue(LibreWatchConnectivityDeliveryPolicy.shouldFinish(diagnostic, success: false, outcome: .invalidPayload))
     }
 }
+
+extension LibreWatchValuePipelineTests {
+    func testPendingLegacyDisconnectSurvivesBackgroundHealthObservation() throws {
+        for applicationState in [LibreWatchApplicationState.inactive, .background] {
+            var timing = LibreWatchConnectionTiming()
+            timing.receivedPacketOrEnabledNotifications(at: receivedAt)
+            timing.recordReceivingProgress(at: receivedAt, timeout: 120,
+                executionIsAvailable: true, monotonicTime: 100)
+            timing.setExecutionAvailable(false, at: receivedAt.addingTimeInterval(3), monotonicTime: 103)
+            let generation = timing.generation
+            var gate = LibreWatchLegacyDisconnectGate()
+            let token = try XCTUnwrap(gate.scheduleLegacy())
+            let executionIsAvailable = LibreWatchLifecyclePolicy.recoveryIsAllowed(
+                applicationState: applicationState, extendedRuntimeIsRunning: false, ownership: .watch
+            )
+            XCTAssertFalse(executionIsAvailable)
+
+            // The health timer runs during the existing 100 ms legacy fallback delay.
+            XCTAssertFalse(timing.observeLink(
+                connected: false, connecting: false, hasReceptionState: true,
+                at: receivedAt.addingTimeInterval(93), applicationIsActive: false,
+                executionIsAvailable: executionIsAvailable,
+                monotonicTime: 193,
+                legacyDisconnectIsPending: gate.pendingToken != nil
+            ))
+            XCTAssertEqual(timing.generation, generation)
+            XCTAssertEqual(timing.phase, .receiving)
+            XCTAssertNil(timing.deadline)
+            XCTAssertEqual(try XCTUnwrap(timing.remainingExecutionTime(
+                at: receivedAt.addingTimeInterval(93), monotonicTime: 193
+            )), 117, accuracy: 0.001)
+            XCTAssertTrue(gate.legacyIsCurrent(
+                token, scheduledGeneration: generation, currentGeneration: timing.generation,
+                peripheralIsDisconnectedOrDisconnecting: true
+            ))
+            XCTAssertTrue(gate.accept(legacyToken: token))
+            XCTAssertNil(gate.pendingToken, "Acceptance clears the normalization guard before recovery")
+            XCTAssertFalse(gate.accept(legacyToken: token), "The same disconnect still runs only once")
+            XCTAssertEqual(LibreWatchLifecyclePolicy.disconnectRecoveryAction(
+                isDeliberate: false, systemIsReconnecting: false, ownership: .watch
+            ), .reconnectManually)
+
+            XCTAssertTrue(timing.observeLink(
+                connected: false, connecting: false, hasReceptionState: true,
+                at: receivedAt.addingTimeInterval(93.1), applicationIsActive: false,
+                executionIsAvailable: executionIsAvailable,
+                legacyDisconnectIsPending: gate.pendingToken != nil
+            ))
+            XCTAssertNotEqual(timing.generation, generation)
+            XCTAssertNil(timing.phase)
+        }
+    }
+
+    func testPendingLegacyDisconnectPreservesSystemConnectingUntilCallbackAdoptsIt() throws {
+        var timing = LibreWatchConnectionTiming()
+        timing.receivedPacketOrEnabledNotifications(at: receivedAt)
+        let generation = timing.generation
+        var gate = LibreWatchLegacyDisconnectGate()
+        let token = try XCTUnwrap(gate.scheduleLegacy())
+        let disconnectedAt = receivedAt.addingTimeInterval(93)
+
+        XCTAssertFalse(timing.observeLink(
+            connected: false, connecting: true, hasReceptionState: true,
+            at: disconnectedAt, applicationIsActive: false, executionIsAvailable: false,
+            legacyDisconnectIsPending: gate.pendingToken != nil
+        ))
+        XCTAssertEqual(timing.generation, generation)
+        XCTAssertEqual(timing.phase, .receiving)
+        XCTAssertNil(timing.deadline)
+        XCTAssertTrue(gate.legacyIsCurrent(
+            token, scheduledGeneration: generation, currentGeneration: timing.generation,
+            peripheralIsDisconnectedOrDisconnecting: false, peripheralIsConnecting: true
+        ))
+        XCTAssertTrue(gate.accept(legacyToken: token))
+        XCTAssertNil(gate.pendingToken)
+        XCTAssertEqual(LibreWatchLifecyclePolicy.disconnectRecoveryAction(
+            isDeliberate: false, systemIsReconnecting: true, ownership: .watch
+        ), .waitForSystemReconnect)
+    }
+
+    func testObservedDisconnectedWithoutPendingLegacyStillClearsStaleReception() {
+        var timing = LibreWatchConnectionTiming()
+        timing.receivedPacketOrEnabledNotifications(at: receivedAt)
+        let generation = timing.generation
+        let gate = LibreWatchLegacyDisconnectGate()
+
+        XCTAssertTrue(timing.observeLink(
+            connected: false, connecting: false, hasReceptionState: true,
+            at: receivedAt.addingTimeInterval(93), applicationIsActive: false,
+            executionIsAvailable: false, legacyDisconnectIsPending: gate.pendingToken != nil
+        ))
+        XCTAssertNotEqual(timing.generation, generation)
+        XCTAssertNil(timing.phase)
+        XCTAssertNil(timing.deadline)
+    }
+
+    func testModernDisconnectOrDidConnectStillSupersedesPendingLegacyAfterObservation() throws {
+        for didConnectFirst in [false, true] {
+            var timing = LibreWatchConnectionTiming()
+            timing.receivedPacketOrEnabledNotifications(at: receivedAt)
+            let generation = timing.generation
+            var gate = LibreWatchLegacyDisconnectGate()
+            let token = try XCTUnwrap(gate.scheduleLegacy())
+            XCTAssertFalse(timing.observeLink(
+                connected: false, connecting: false, hasReceptionState: true,
+                at: receivedAt.addingTimeInterval(93), applicationIsActive: false,
+                executionIsAvailable: false, legacyDisconnectIsPending: gate.pendingToken != nil
+            ))
+
+            if didConnectFirst {
+                gate.reset()
+                timing.beginSetup(at: receivedAt.addingTimeInterval(93.05), executionIsAvailable: false)
+            } else {
+                XCTAssertTrue(gate.accept())
+            }
+            XCTAssertNil(gate.pendingToken)
+            XCTAssertFalse(gate.legacyIsCurrent(
+                token, scheduledGeneration: generation, currentGeneration: timing.generation,
+                peripheralIsDisconnectedOrDisconnecting: !didConnectFirst
+            ))
+            XCTAssertFalse(gate.accept(legacyToken: token))
+        }
+    }
+
+    func testRealGenerationChangeStillRejectsLegacyAndRejectionUnblocksObservation() throws {
+        var timing = LibreWatchConnectionTiming()
+        timing.receivedPacketOrEnabledNotifications(at: receivedAt)
+        let generation = timing.generation
+        var gate = LibreWatchLegacyDisconnectGate()
+        let token = try XCTUnwrap(gate.scheduleLegacy())
+        timing.invalidate() // A real session/ownership invalidation must still win.
+
+        XCTAssertFalse(gate.legacyIsCurrent(
+            token, scheduledGeneration: generation, currentGeneration: timing.generation,
+            peripheralIsDisconnectedOrDisconnecting: true
+        ))
+        gate.cancelLegacy() // The existing rejected-fallback path.
+        XCTAssertNil(gate.pendingToken)
+        XCTAssertFalse(gate.accept(legacyToken: token))
+        XCTAssertTrue(timing.observeLink(
+            connected: false, connecting: false, hasReceptionState: true,
+            at: receivedAt.addingTimeInterval(93), applicationIsActive: false,
+            executionIsAvailable: false, legacyDisconnectIsPending: gate.pendingToken != nil
+        ))
+    }
+
+    func testCancellationClearsPendingLegacyWithoutGrantingRecoveryForPhoneOwnership() throws {
+        var timing = LibreWatchConnectionTiming()
+        timing.receivedPacketOrEnabledNotifications(at: receivedAt)
+        let generation = timing.generation
+        var gate = LibreWatchLegacyDisconnectGate()
+        let token = try XCTUnwrap(gate.scheduleLegacy())
+        timing.beginCancellation(at: receivedAt.addingTimeInterval(93))
+        gate.reset() // beginCancellation uses prepareForExpectedDisconnectCallback.
+
+        XCTAssertNil(gate.pendingToken)
+        XCTAssertFalse(gate.legacyIsCurrent(
+            token, scheduledGeneration: generation, currentGeneration: timing.generation,
+            peripheralIsDisconnectedOrDisconnecting: true
+        ))
+        XCTAssertFalse(timing.observeLink(
+            connected: false, connecting: false, hasReceptionState: true,
+            at: receivedAt.addingTimeInterval(93.1), applicationIsActive: false,
+            executionIsAvailable: false, legacyDisconnectIsPending: gate.pendingToken != nil
+        ))
+        XCTAssertEqual(timing.phase, .cancelling)
+        XCTAssertEqual(LibreWatchLifecyclePolicy.disconnectRecoveryAction(
+            isDeliberate: true, systemIsReconnecting: false, ownership: .iphone
+        ), .finishDeliberateDisconnect)
+        for ownership in [LibreWatchOwnership.iphone, .releasingToPhone, .releasingToWatch, .recovery] {
+            XCTAssertFalse(LibreWatchLifecyclePolicy.eventDrivenRecoveryIsAllowed(ownership: ownership))
+            XCTAssertEqual(LibreWatchLifecyclePolicy.disconnectRecoveryAction(
+                isDeliberate: false, systemIsReconnecting: false, ownership: ownership
+            ), .noAdditionalWork)
+        }
+    }
+}
