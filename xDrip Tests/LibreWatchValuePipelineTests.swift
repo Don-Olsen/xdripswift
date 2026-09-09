@@ -6117,6 +6117,48 @@ extension LibreWatchValuePipelineTests {
             defaults: fixture.defaults).load(at: receivedAt.addingTimeInterval(3)), pending)
     }
 
+    func testFileOutboxReadRecoveryMergesLatestSubmissionBeforePersistingRetryBackoff() throws {
+        let cases: [(stored: TimeInterval?, pending: TimeInterval)] = [
+            (nil, 20), (10, 20), (20, 10), (20, 20)
+        ]
+        for offsets in cases {
+            let fixture = try outboxFileFixture()
+            let firstStore = LibreWatchOutboxFileStore(fileURL: fixture.fileURL, defaults: fixture.defaults)
+            var stored = try firstStore.load(at: receivedAt)
+            let item = fileOutboxReading(0, at: receivedAt)
+            stored.enqueue(item, now: receivedAt)
+            if let offset = offsets.stored {
+                stored.markSubmitted(id: item.id, at: receivedAt.addingTimeInterval(offset))
+            }
+            try firstStore.save(stored)
+
+            var readFails = true
+            let store = LibreWatchOutboxFileStore(fileURL: fixture.fileURL, defaults: fixture.defaults,
+                reader: { url in
+                    if readFails { throw CocoaError(.fileReadNoPermission) }
+                    return try Data(contentsOf: url)
+                })
+            XCTAssertThrowsError(try store.load(at: receivedAt.addingTimeInterval(30)))
+            var pending = LibreWatchConnectivityOutbox()
+            pending.enqueue(item, now: receivedAt)
+            pending.markSubmitted(id: item.id, at: receivedAt.addingTimeInterval(offsets.pending))
+
+            readFails = false
+            try store.prepareForDelivery(&pending, sessionID: session.id,
+                at: receivedAt.addingTimeInterval(30))
+            let latestSubmission = receivedAt.addingTimeInterval(max(offsets.stored ?? 0, offsets.pending))
+            XCTAssertEqual(pending.items.map(\.id), [item.id], "A replay remains one durable payload")
+            XCTAssertEqual(pending.lastSubmittedAt?[item.id], latestSubmission)
+            XCTAssertEqual(pending.didPrioritizeLatestReading, true)
+
+            let restarted = try LibreWatchOutboxFileStore(fileURL: fixture.fileURL,
+                defaults: fixture.defaults).load(at: receivedAt.addingTimeInterval(30))
+            XCTAssertEqual(restarted, pending)
+            XCTAssertNil(restarted.nextEligible(at: latestSubmission.addingTimeInterval(59)))
+            XCTAssertEqual(restarted.nextEligible(at: latestSubmission.addingTimeInterval(60))?.id, item.id)
+        }
+    }
+
     func testFileOutboxLateReadRecoveryDoesNotReintroduceReplacedSensorSession() throws {
         let fixture = try outboxFileFixture()
         let firstStore = LibreWatchOutboxFileStore(fileURL: fixture.fileURL, defaults: fixture.defaults)

@@ -910,7 +910,8 @@ struct LibreWatchConnectivityOutbox: Codable, Equatable {
         if pending.didPrioritizeLatestReading == true { didPrioritizeLatestReading = true }
         for (id, submittedAt) in pending.lastSubmittedAt ?? [:] {
             if lastSubmittedAt == nil { lastSubmittedAt = [:] }
-            lastSubmittedAt?[id] = max(lastSubmittedAt?[id] ?? .distantPast, submittedAt)
+            let latestSubmission = max(lastSubmittedAt?[id] ?? .distantPast, submittedAt)
+            lastSubmittedAt?[id] = latestSubmission
         }
         capacityDroppedReadings = (capacityDroppedReadings ?? 0) &+ (pending.capacityDroppedReadings ?? 0)
         capacityDroppedDiagnostics = (capacityDroppedDiagnostics ?? 0) &+ (pending.capacityDroppedDiagnostics ?? 0)
