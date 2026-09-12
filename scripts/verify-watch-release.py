@@ -27,7 +27,7 @@ for app, bundle_id in [(main, main_id), (watch, main_id + '.watchkitapp')]:
     assert info['CFBundleIdentifier'] == bundle_id, 'Unexpected bundle ID'
     assert info['XDripSourceCommit'] == sha, 'Archived source stamp differs from tested checkout'
     subprocess.run(['codesign', '--verify', '--deep', '--strict', str(app)], check=True)
-    signed = plistlib.loads(subprocess.check_output(['codesign', '-d', '--entitlements', ':-', str(app)], stderr=subprocess.PIPE))
+    signed = plistlib.loads(subprocess.check_output(['codesign', '--display', '--entitlements', '-', '--xml', str(app)], stderr=subprocess.PIPE))
     assert signed.get('com.apple.developer.team-identifier') == team, 'Unexpected signing team'
     assert signed.get('application-identifier') == team + '.' + bundle_id, 'Unexpected signed App ID'
     assert signed.get('get-task-allow', False) is False, 'Distribution archive permits debugging'
