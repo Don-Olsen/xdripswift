@@ -1700,6 +1700,53 @@ final class LibreWatchValuePipelineTests: XCTestCase {
         ), .discoverServices)
     }
 
+    func testRestorationObjectGraphIsReusableOnlyForAnActuallyConnectedRestore() {
+        let generation = UUID()
+        var connected = LibreWatchRestorationState(
+            sessionID: session.id,
+            sensorIdentity: session.redactedIdentity(),
+            generation: generation,
+            mayReuseRestoredObjectGraph: true
+        )
+        var disconnected = LibreWatchRestorationState(
+            sessionID: session.id,
+            sensorIdentity: session.redactedIdentity(),
+            generation: generation,
+            mayReuseRestoredObjectGraph: false
+        )
+
+        XCTAssertEqual(restorationAction(&connected, generation: generation), .awaitExistingStream)
+        XCTAssertEqual(restorationAction(&disconnected, generation: generation), .discoverServices)
+    }
+
+    func testRestoredPeripheralSelectionRequiresOneObservedExactName() {
+        let expected = session.expectedPeripheralName
+        XCTAssertEqual(
+            LibreWatchRestoredPeripheralSelection.select(
+                observedNames: ["WRONG", expected, nil], expectedSession: session
+            ),
+            .match(index: 1)
+        )
+        XCTAssertEqual(
+            LibreWatchRestoredPeripheralSelection.select(
+                observedNames: [nil], expectedSession: session
+            ),
+            .unresolved
+        )
+        XCTAssertEqual(
+            LibreWatchRestoredPeripheralSelection.select(
+                observedNames: ["WRONG"], expectedSession: session
+            ),
+            .mismatch
+        )
+        XCTAssertEqual(
+            LibreWatchRestoredPeripheralSelection.select(
+                observedNames: [expected, expected], expectedSession: session
+            ),
+            .ambiguous
+        )
+    }
+
     func testRepeatedRestorationCallbacksDoNotRenewInFlightGATTBudget() throws {
         let generation = UUID()
         var restoration = LibreWatchRestorationState(
@@ -2870,6 +2917,36 @@ final class LibreWatchValuePipelineTests: XCTestCase {
             ))
             XCTAssertFalse(gate.accept(legacyToken: token))
         }
+    }
+
+    func testDisconnectCallbackTimestampCannotRetireANewerPhysicalConnection() {
+        let connectedAt = receivedAt.addingTimeInterval(10)
+        XCTAssertFalse(LibreWatchDisconnectTimestampPolicy.belongsToCurrentConnection(
+            disconnectedAt: connectedAt.addingTimeInterval(-0.001),
+            currentConnectionAcceptedAt: connectedAt
+        ))
+        XCTAssertTrue(LibreWatchDisconnectTimestampPolicy.belongsToCurrentConnection(
+            disconnectedAt: connectedAt,
+            currentConnectionAcceptedAt: connectedAt
+        ))
+        XCTAssertTrue(LibreWatchDisconnectTimestampPolicy.belongsToCurrentConnection(
+            disconnectedAt: connectedAt,
+            currentConnectionAcceptedAt: nil
+        ))
+    }
+
+    func testCurrentServiceInvalidationUsesObjectIdentity() {
+        let current = NSObject()
+        let unrelated = NSObject()
+        XCTAssertTrue(LibreWatchRestoredObjectIdentity.containsCurrent(
+            [unrelated, current], expected: current
+        ))
+        XCTAssertFalse(LibreWatchRestoredObjectIdentity.containsCurrent(
+            [unrelated], expected: current
+        ))
+        XCTAssertFalse(LibreWatchRestoredObjectIdentity.containsCurrent(
+            [current], expected: nil
+        ))
     }
 
     func testLegacyDiagnosticEventsStillDecodeWithoutNewContext() throws {
