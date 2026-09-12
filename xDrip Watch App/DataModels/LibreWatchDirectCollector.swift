@@ -6,13 +6,18 @@ import WatchKit
 /// Maintains the direct Libre connection while Watch owns the sensor.
 /// Ownership is explicit and persistent; leaving the view does not stop reception.
 final class LibreWatchDirectCollector: NSObject, ObservableObject {
+    private static let processID = UUID()
+
     @Published private(set) var state = LibreWatchDirectState()
     @Published private(set) var bluetoothStateText = "UNKNOWN"
 
     private weak var watchState: WatchStateModel?
     private var preparedSession: LibreWatchDirectSession?
     private var centralManager: CBCentralManager?
+    private var centralInstanceID: UUID?
     private var sensorPeripheral: CBPeripheral?
+    private var currentConnectionAcceptedAt: Date?
+    private var connectionInstance = LibreWatchConnectionInstanceTracker()
     // A timed-out cancellation is retired from our generation, but retained until Core
     // Bluetooth confirms disconnection. No subsequent connect or phone handoff may race it.
     private var retiredPeripheral: CBPeripheral?
@@ -38,10 +43,11 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
     private var extendedRuntimeSession: WKExtendedRuntimeSession?
     private var extendedRuntimeIsRunning = false
     private var userInitiatedRuntimeStart = false
-    private var pendingLegacyDisconnect: DispatchWorkItem?
-    private var disconnectGate = LibreWatchLegacyDisconnectGate()
+    private var disconnectGate = LibreWatchDisconnectGate()
+    private var serviceDiscoveryFence = LibreWatchServiceDiscoveryFence()
     private var scanAfterReconnectCancellation = false
     private var recoveryAttemptState = LibreWatchSessionStore.loadRecoveryAttempt()
+    private var callbackDiagnosticBuffer = LibreWatchCallbackDiagnosticBuffer()
     private var pendingRecoveryDiagnostic: (trigger: String, startedAt: Date)?
     private var currentReconcileSource: LibreWatchRecoveryReconcileSource = .initialPreparation
     private var lastFrameProgressDiagnosticAt: Date?
@@ -99,6 +105,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         startHealthMonitoring()
 
         if centralManager == nil {
+            centralInstanceID = UUID()
             centralManager = CBCentralManager(
                 delegate: self,
                 queue: .main,
@@ -107,6 +114,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
                     CBCentralManagerOptionShowPowerAlertKey: true
                 ]
             )
+            reportBluetoothAction("centralCreated", reason: "collectorPreparation")
         }
 
         if watchState.libreWatchOwnership == .watch {
@@ -589,8 +597,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         }
     }
 
-    private func connect(_ peripheral: CBPeripheral, using central: CBCentralManager,
-                         resetDisconnectGate: Bool = true) {
+    private func connect(_ peripheral: CBPeripheral, using central: CBCentralManager) {
         guard eventDrivenRecoveryIsAllowed, !deliberatelyDisconnecting,
               !scanAfterReconnectCancellation, identityAndOwnershipAreConfirmed(for: peripheral),
               peripheral.state == .disconnected, releaseRetiredPeripheralIfDisconnected(),
@@ -616,7 +623,6 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
             scheduleReconnectFallback(for: peripheral)
             return
         }
-        if resetDisconnectGate { prepareForExpectedDisconnectCallback() }
         systemAutoReconnectIsActive = false
         scanIsPending = false
         central.stopScan()
@@ -638,8 +644,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
                   at: date,
                   applicationIsActive: applicationIsActive,
                   executionIsAvailable: timedRecoveryIsAllowed,
-                  monotonicTime: monotonicNow,
-                  legacyDisconnectIsPending: disconnectGate.pendingToken != nil
+                  monotonicTime: monotonicNow
               )
         else { return false }
         cancelReconnectFallback()
@@ -682,6 +687,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         frameAssembler.reset()
         frameLiveness = LibreWatchFrameLiveness()
         state.connecting()
+        reportBluetoothAction("discoverServices", reason: "freshConnectionSetup")
         peripheral.discoverServices([CBUUID(string: Libre2WatchDirectConstants.serviceUUIDString)])
         scheduleReconnectFallback(for: peripheral)
     }
@@ -698,6 +704,16 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
                 ownership: watchState?.libreWatchOwnership ?? .iphone
             ) == true
         guard !isSameRestoration else {
+            if observedState(of: peripheral) != .connected {
+                restorationState?.discardRestoredObjectGraph()
+                currentConnectionAcceptedAt = nil
+                connectionInstance.retire()
+                serviceDiscoveryFence.reset()
+                setupGeneration = nil
+                setupService = nil
+                writeCharacteristic = nil
+                receiveCharacteristic = nil
+            }
             bindRestoredGATTObjects(from: peripheral)
             return
         }
@@ -709,8 +725,12 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         restorationState = LibreWatchRestorationState(
             sessionID: session.id,
             sensorIdentity: session.redactedIdentity(),
-            generation: connectionTiming.generation
+            generation: connectionTiming.generation,
+            mayReuseRestoredObjectGraph: observedState(of: peripheral) == .connected
         )
+        currentConnectionAcceptedAt = nil
+        connectionInstance.retire()
+        serviceDiscoveryFence.reset()
         setupService = nil
         setupGeneration = nil
         writeCharacteristic = nil
@@ -722,6 +742,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
 
     private func bindRestoredGATTObjects(from peripheral: CBPeripheral) {
         guard restoredPeripheral === peripheral,
+              restorationState?.mayReuseRestoredObjectGraph == true,
               let service = peripheral.services?.first(where: {
                   $0.uuid == CBUUID(string: Libre2WatchDirectConstants.serviceUUIDString)
               })
@@ -787,6 +808,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
             scheduleReconnectFallback(for: peripheral)
         case .discoverServices:
             beginRestoredSetup(at: .services, for: peripheral)
+            reportBluetoothAction("discoverServices", reason: "restoredMissingService")
             peripheral.discoverServices([
                 CBUUID(string: Libre2WatchDirectConstants.serviceUUIDString)
             ])
@@ -802,11 +824,13 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
             }
             guard !missing.isEmpty else { return }
             beginRestoredSetup(at: .characteristics, for: peripheral)
+            reportBluetoothAction("discoverCharacteristics", reason: "restoredMissingCharacteristics")
             peripheral.discoverCharacteristics(missing, for: setupService)
             scheduleReconnectFallback(for: peripheral)
         case .enableNotifications:
             guard let receiveCharacteristic else { return }
             beginRestoredSetup(at: .notifications, for: peripheral)
+            reportBluetoothAction("setNotifyValue", reason: "restoredNotificationSetup")
             peripheral.setNotifyValue(true, for: receiveCharacteristic)
             scheduleReconnectFallback(for: peripheral)
         case .awaitExistingStream:
@@ -829,6 +853,9 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         cancelReconnectFallback()
         connectionTiming.invalidate()
         setupGeneration = nil
+        setupService = nil
+        writeCharacteristic = nil
+        receiveCharacteristic = nil
         connectionTiming.beginConnection(
             at: Date(),
             applicationIsActive: applicationIsActive,
@@ -952,7 +979,9 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         else { return }
         recordSetupProgress(.characteristics)
 
-        if restorationBelongsToCurrentSession(for: peripheral), receiveCharacteristic.isNotifying {
+        if restorationBelongsToCurrentSession(for: peripheral),
+           restorationState?.mayReuseRestoredObjectGraph == true,
+           receiveCharacteristic.isNotifying {
             if var restorationState {
                 restorationState.beginAwaitingStreamEvidence()
                 self.restorationState = restorationState
@@ -961,6 +990,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
             return
         }
 
+        reportBluetoothAction("setNotifyValue", reason: "characteristicsReady")
         peripheral.setNotifyValue(true, for: receiveCharacteristic)
         scheduleReconnectFallback(for: peripheral)
     }
@@ -1225,8 +1255,6 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
     }
 
     private func prepareForExpectedDisconnectCallback() {
-        pendingLegacyDisconnect?.cancel()
-        pendingLegacyDisconnect = nil
         lastFrameProgressDiagnosticAt = nil
         disconnectGate.reset()
     }
@@ -1236,11 +1264,12 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         systemAutoReconnectIsActive = false
         cancelReconnectFallback()
         invalidateRestoration()
-        pendingLegacyDisconnect?.cancel()
-        pendingLegacyDisconnect = nil
         disconnectGate.reset()
         sensorPeripheral?.delegate = nil
         sensorPeripheral = nil
+        currentConnectionAcceptedAt = nil
+        connectionInstance.retire()
+        serviceDiscoveryFence.reset()
         matchedPeripheralName = nil
         setupService = nil
         setupGeneration = nil
@@ -1308,7 +1337,8 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         peripheral: CBPeripheral,
         isReconnecting: Bool,
         disconnectedAt: Date,
-        error: Error?
+        error: Error?,
+        reconnectObservationSource: LibreWatchReconnectObservationSource
     ) {
         guard peripheral === sensorPeripheral else { return }
         currentReconcileSource = .didDisconnect
@@ -1318,8 +1348,15 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
             .disconnected, trigger: "didDisconnect", at: disconnectedAt,
             isReconnecting: isReconnecting,
             errorDomain: nsError?.domain,
-            errorCode: nsError?.code
+            errorCode: nsError?.code,
+            reconnectObservationSource: reconnectObservationSource
         )
+        // The disconnected event belongs to the observed link that just ended. Later recovery
+        // diagnostics must not inherit that link identity; a fresh didConnect (or a connected
+        // restoration) establishes the next one.
+        currentConnectionAcceptedAt = nil
+        connectionInstance.retire()
+        serviceDiscoveryFence.reset()
 
         if scanAfterReconnectCancellation {
             evaluateCancellation(allowsEventDrivenStart: true)
@@ -1343,7 +1380,8 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         writeCharacteristic = nil
         receiveCharacteristic = nil
         frameAssembler.reset()
-        // Keep an already observed connection deadline when the delayed callback arrives.
+        // Keep an already observed system reconnect deadline when a legacy callback arrives
+        // while Core Bluetooth already reports the peripheral as connecting.
         if connectionTiming.phase != .connection { connectionTiming.invalidate() }
         state.reconnecting(error: bluetoothErrorDescription(error))
 
@@ -1387,7 +1425,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
                 beginRecoveryDiagnosticIfNeeded()
             } else {
                 // A retry keeps the same phase budget, including an observed missing callback.
-                connect(peripheral, using: centralManager, resetDisconnectGate: false)
+                connect(peripheral, using: centralManager)
                 beginRecoveryDiagnosticIfNeeded()
             }
             scheduleReconnectFallback(for: peripheral)
@@ -1421,6 +1459,9 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         runtimeInvalidationReason: Int? = nil,
         runtimeError: String? = nil,
         bluetoothErrorClassification: String? = nil,
+        peripheralStateOverride: LibreWatchObservedPeripheralState? = nil,
+        includeCurrentConnectionInstanceID: Bool = true,
+        reconnectObservationSource: LibreWatchReconnectObservationSource? = nil,
         attempt: LibreWatchRecoveryAttemptContext? = nil,
         reconcileSource: LibreWatchRecoveryReconcileSource? = nil,
         returnContext: (attempt: LibreWatchReturnAttempt, event: LibreWatchReturnDiagnostic)? = nil
@@ -1443,7 +1484,8 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
             trigger: belongsToRecoveryAttempt ? (attempt?.originalTrigger ?? trigger) : trigger,
             applicationIsActive: applicationIsActive,
             extendedRuntimeIsRunning: extendedRuntimeIsRunning,
-            peripheralState: sensorPeripheral.map { String(describing: $0.state) },
+            peripheralState: peripheralStateOverride?.rawValue
+                ?? sensorPeripheral.map { observedState(of: $0).rawValue },
             connectionPhase: connectionTiming.phase?.rawValue ?? "idle",
             deadlinePhase: connectionTiming.deadline?.phase.rawValue,
             deadlineAt: connectionTiming.deadline?.expiresAt,
@@ -1474,10 +1516,30 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
             extendedRuntimeState: extendedRuntimeSession.map { String(describing: $0.state) },
             extendedRuntimeStartRequested: userInitiatedRuntimeStart,
             ownership: watchState?.libreWatchOwnership,
-            unlockCounter: preparedSession?.unlockCount
+            unlockCounter: preparedSession?.unlockCount,
+            processID: Self.processID,
+            centralInstanceID: centralInstanceID,
+            connectionInstanceID: includeCurrentConnectionInstanceID
+                ? connectionInstance.currentID : nil,
+            reconnectObservationSource: reconnectObservationSource
         )
         event.returnAttempt = returnContext?.event
-        watchState?.reportLibreWatchDiagnostic(event)
+        let capturedEvent = event
+        if callbackDiagnosticBuffer.capture(capturedEvent) { return }
+        watchState?.reportLibreWatchDiagnostic(capturedEvent)
+    }
+
+    private func beginCoreBluetoothCallbackDiagnostics() -> Bool {
+        callbackDiagnosticBuffer.begin()
+    }
+
+    private func finishCoreBluetoothCallbackDiagnostics(owner: Bool) {
+        let capturedEvents = callbackDiagnosticBuffer.finish(owner: owner)
+        guard let watchState else { return }
+        // Bluetooth state transitions and issued GATT calls have completed. Persist each entry
+        // snapshot now, before returning from the system callback, so suspension cannot leave
+        // progress dependent on a later main-queue work item.
+        watchState.reportLibreWatchDiagnostics(capturedEvents)
     }
 
     private func reportReturnDiagnostic(
@@ -1496,12 +1558,19 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
             returnContext: (attempt, context))
     }
 
-    private func reportBluetoothAction(_ action: String, reason: String) {
+    private func reportBluetoothAction(
+        _ action: String,
+        reason: String,
+        peripheralStateOverride: LibreWatchObservedPeripheralState? = nil,
+        includeCurrentConnectionInstanceID: Bool = true
+    ) {
         reportDiagnostic(
             .bluetoothAction,
             trigger: reason,
             bluetoothAction: action,
-            actionReason: reason
+            actionReason: reason,
+            peripheralStateOverride: peripheralStateOverride,
+            includeCurrentConnectionInstanceID: includeCurrentConnectionInstanceID
         )
     }
 
@@ -1510,7 +1579,10 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         error: Error? = nil,
         isReconnecting: Bool? = nil,
         classification: String? = nil,
-        source: LibreWatchRecoveryReconcileSource? = nil
+        source: LibreWatchRecoveryReconcileSource? = nil,
+        peripheralStateOverride: LibreWatchObservedPeripheralState? = nil,
+        includeCurrentConnectionInstanceID: Bool = true,
+        reconnectObservationSource: LibreWatchReconnectObservationSource? = nil
     ) {
         let nsError = error.map { $0 as NSError }
         reportDiagnostic(
@@ -1520,6 +1592,9 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
             errorDomain: nsError?.domain,
             errorCode: nsError?.code,
             bluetoothErrorClassification: classification,
+            peripheralStateOverride: peripheralStateOverride,
+            includeCurrentConnectionInstanceID: includeCurrentConnectionInstanceID,
+            reconnectObservationSource: reconnectObservationSource,
             reconcileSource: source
         )
     }
@@ -1534,11 +1609,18 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         reportDiagnostic(.frameProgress, trigger: "validBLEFrame", at: date)
     }
 
-    private func reportRejectedCallback(_ callback: String, reason: String) {
+    private func reportRejectedCallback(
+        _ callback: String,
+        reason: String,
+        peripheralStateOverride: LibreWatchObservedPeripheralState? = nil,
+        includeCurrentConnectionInstanceID: Bool = true
+    ) {
         reportDiagnostic(
             .callbackRejected,
             trigger: callback,
-            actionReason: reason
+            actionReason: reason,
+            peripheralStateOverride: peripheralStateOverride,
+            includeCurrentConnectionInstanceID: includeCurrentConnectionInstanceID
         )
     }
 
@@ -1587,14 +1669,23 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         isReconnecting: Bool,
         disconnectedAt: Date,
         error: Error?,
-        legacyToken: UUID? = nil
+        reconnectObservationSource: LibreWatchReconnectObservationSource
     ) {
-        guard peripheral === sensorPeripheral, disconnectGate.accept(legacyToken: legacyToken) else { return }
+        guard peripheral === sensorPeripheral else { return }
+        guard disconnectGate.accept() else {
+            reportRejectedCallback(
+                reconnectObservationSource == .modernCallback
+                    ? "didDisconnectModern" : "didDisconnectLegacy",
+                reason: "disconnectAlreadyHandled"
+            )
+            return
+        }
         handleDisconnect(
             peripheral: peripheral,
             isReconnecting: isReconnecting,
             disconnectedAt: disconnectedAt,
-            error: error
+            error: error,
+            reconnectObservationSource: reconnectObservationSource
         )
     }
 
@@ -1647,7 +1738,6 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
 
     deinit {
         reconnectFallbackWorkItem?.cancel()
-        pendingLegacyDisconnect?.cancel()
         healthTimer?.invalidate()
         if let extendedRuntimeSession, extendedRuntimeSession.state != .invalid {
             extendedRuntimeSession.invalidate()
@@ -1692,17 +1782,34 @@ extension LibreWatchDirectCollector: WKExtendedRuntimeSessionDelegate {
 
 extension LibreWatchDirectCollector: CBCentralManagerDelegate {
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
+        let ownsDiagnostics = beginCoreBluetoothCallbackDiagnostics()
+        defer { finishCoreBluetoothCallbackDiagnostics(owner: ownsDiagnostics) }
         currentReconcileSource = .centralStateUpdate
+        let diagnosticTrigger: String
         switch central.state {
-        case .poweredOn: bluetoothStateText = "POWERED ON"
-        case .poweredOff: bluetoothStateText = "POWERED OFF"
-        case .unauthorized: bluetoothStateText = "UNAUTHORIZED"
-        case .unsupported: bluetoothStateText = "UNSUPPORTED"
-        case .resetting: bluetoothStateText = "RESETTING"
-        case .unknown: bluetoothStateText = "UNKNOWN"
-        @unknown default: bluetoothStateText = "UNKNOWN"
+        case .poweredOn:
+            bluetoothStateText = "POWERED ON"
+            diagnosticTrigger = "centralPoweredOn"
+        case .poweredOff:
+            bluetoothStateText = "POWERED OFF"
+            diagnosticTrigger = "centralPoweredOff"
+        case .unauthorized:
+            bluetoothStateText = "UNAUTHORIZED"
+            diagnosticTrigger = "centralUnauthorized"
+        case .unsupported:
+            bluetoothStateText = "UNSUPPORTED"
+            diagnosticTrigger = "centralUnsupported"
+        case .resetting:
+            bluetoothStateText = "RESETTING"
+            diagnosticTrigger = "centralResetting"
+        case .unknown:
+            bluetoothStateText = "UNKNOWN"
+            diagnosticTrigger = "centralUnknown"
+        @unknown default:
+            bluetoothStateText = "UNKNOWN"
+            diagnosticTrigger = "centralUnknown"
         }
-        reportCoreBluetoothCallback("centralState:\(bluetoothStateText)")
+        reportCoreBluetoothCallback(diagnosticTrigger)
 
         if central.state == .poweredOn || connectionTiming.phase == .cancelling {
             reconcileRecoveryState(at: Date(), source: .centralStateUpdate)
@@ -1710,6 +1817,8 @@ extension LibreWatchDirectCollector: CBCentralManagerDelegate {
     }
 
     func centralManager(_ central: CBCentralManager, willRestoreState dict: [String: Any]) {
+        let ownsDiagnostics = beginCoreBluetoothCallbackDiagnostics()
+        defer { finishCoreBluetoothCallbackDiagnostics(owner: ownsDiagnostics) }
         currentReconcileSource = .stateRestoration
         reportCoreBluetoothCallback("willRestoreState")
         guard watchState?.libreWatchOwnership == .watch,
@@ -1717,24 +1826,69 @@ extension LibreWatchDirectCollector: CBCentralManagerDelegate {
               let preparedSession
         else { return }
 
-        let exactMatch = peripherals.first(where: {
-            preparedSession.matches(candidateName: $0.name)
-        })
-        let soleUnnamedPeripheral = peripherals.count == 1 && peripherals[0].name == nil
-            ? peripherals[0]
-            : nil
-
-        guard let restored = exactMatch ?? soleUnnamedPeripheral else {
+        let selection = LibreWatchRestoredPeripheralSelection.select(
+            observedNames: peripherals.map(\.name),
+            expectedSession: preparedSession
+        )
+        guard case let .match(index) = selection else {
+            let rejectionReason: String
+            switch selection {
+            case .unresolved: rejectionReason = "restoredIdentityUnresolved"
+            case .mismatch: rejectionReason = "restoredIdentityMismatch"
+            case .ambiguous: rejectionReason = "restoredIdentityAmbiguous"
+            case .match: return
+            }
+            reportRejectedCallback("willRestoreState", reason: rejectionReason)
+            // These objects came from this central's old restoration state but do not carry
+            // enough observed identity to reconnect safely. Cancel any live link and return to
+            // the existing exact-name scan without changing the persisted NFC session.
+            for peripheral in peripherals where peripheral.state != .disconnected {
+                reportBluetoothAction(
+                    "cancel", reason: rejectionReason,
+                    peripheralStateOverride: observedState(of: peripheral),
+                    includeCurrentConnectionInstanceID: false
+                )
+                central.cancelPeripheralConnection(peripheral)
+            }
+            cancelReconnectFallback()
+            connectionTiming.invalidate()
+            invalidateRestoration()
+            setupService = nil
+            writeCharacteristic = nil
+            receiveCharacteristic = nil
+            sensorPeripheral = nil
+            matchedPeripheralName = nil
+            currentConnectionAcceptedAt = nil
+            connectionInstance.retire()
             scanIsPending = true
+            beginScanningIfPossible(allowsEventDrivenStart: true)
             return
+        }
+        let restored = peripherals[index]
+        for otherIndex in LibreWatchRestoredPeripheralSelection.unselectedIndices(
+            count: peripherals.count,
+            selectedIndex: index
+        ) where peripherals[otherIndex].state != .disconnected {
+            reportBluetoothAction(
+                "cancel", reason: "restoredNonSelectedPeripheral",
+                peripheralStateOverride: observedState(of: peripherals[otherIndex]),
+                includeCurrentConnectionInstanceID: false
+            )
+            central.cancelPeripheralConnection(peripherals[otherIndex])
         }
 
         sensorPeripheral = restored
-        matchedPeripheralName = restored.name ?? preparedSession.expectedPeripheralName
+        matchedPeripheralName = restored.name
         restored.delegate = self
         scanIsPending = false
         central.stopScan()
         installRestoredConnection(restored, session: preparedSession)
+        let restoredState = observedState(of: restored)
+        if restoredState == .connected { connectionInstance.acceptConnectedRestoration() }
+        reportCoreBluetoothCallback(
+            "restorationAccepted",
+            peripheralStateOverride: restoredState
+        )
 
         switch restored.state {
         case .connected:
@@ -1755,8 +1909,18 @@ extension LibreWatchDirectCollector: CBCentralManagerDelegate {
             )
             state.reconnecting(error: nil)
         case .disconnecting:
+            systemAutoReconnectIsActive = false
+            prepareRestoredConnectionAttemptIfNeeded(
+                for: restored,
+                systemIsReconnecting: false
+            )
             state.reconnecting(error: nil)
         @unknown default:
+            systemAutoReconnectIsActive = false
+            prepareRestoredConnectionAttemptIfNeeded(
+                for: restored,
+                systemIsReconnecting: false
+            )
             state.reconnecting(error: nil)
         }
         reconcileRecoveryState(at: Date(), source: .stateRestoration)
@@ -1768,6 +1932,8 @@ extension LibreWatchDirectCollector: CBCentralManagerDelegate {
         advertisementData: [String: Any],
         rssi RSSI: NSNumber
     ) {
+        let ownsDiagnostics = beginCoreBluetoothCallbackDiagnostics()
+        defer { finishCoreBluetoothCallbackDiagnostics(owner: ownsDiagnostics) }
         guard releaseRetiredPeripheralIfDisconnected() else { return }
         guard eventDrivenRecoveryIsAllowed,
               watchState?.libreWatchOwnership == .watch,
@@ -1779,7 +1945,11 @@ extension LibreWatchDirectCollector: CBCentralManagerDelegate {
         let candidateName = peripheral.name ?? advertisementData[CBAdvertisementDataLocalNameKey] as? String
         guard preparedSession.matches(candidateName: candidateName) else { return }
 
-        reportCoreBluetoothCallback("didDiscoverConfirmedSensor")
+        reportCoreBluetoothCallback(
+            "didDiscoverConfirmedSensor",
+            peripheralStateOverride: observedState(of: peripheral),
+            includeCurrentConnectionInstanceID: false
+        )
         state.candidate(rssi: RSSI.intValue)
         sensorPeripheral = peripheral
         matchedPeripheralName = candidateName
@@ -1793,11 +1963,30 @@ extension LibreWatchDirectCollector: CBCentralManagerDelegate {
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+        let ownsDiagnostics = beginCoreBluetoothCallbackDiagnostics()
+        defer { finishCoreBluetoothCallbackDiagnostics(owner: ownsDiagnostics) }
+        let connectedAt = Date()
+        let callbackIsCurrent = peripheral === sensorPeripheral
+        if callbackIsCurrent {
+            connectionInstance.acceptDidConnect()
+        }
         currentReconcileSource = .didConnect
-        reportCoreBluetoothCallback("didConnect")
-        guard peripheral === sensorPeripheral else {
-            reportRejectedCallback("didConnect", reason: "notCurrentPeripheral")
-            reportBluetoothAction("cancel", reason: "unexpectedPeripheralConnected")
+        reportCoreBluetoothCallback(
+            "didConnect",
+            peripheralStateOverride: observedState(of: peripheral),
+            includeCurrentConnectionInstanceID: callbackIsCurrent
+        )
+        guard callbackIsCurrent else {
+            reportRejectedCallback(
+                "didConnect", reason: "notCurrentPeripheral",
+                peripheralStateOverride: observedState(of: peripheral),
+                includeCurrentConnectionInstanceID: false
+            )
+            reportBluetoothAction(
+                "cancel", reason: "unexpectedPeripheralConnected",
+                peripheralStateOverride: observedState(of: peripheral),
+                includeCurrentConnectionInstanceID: false
+            )
             central.cancelPeripheralConnection(peripheral)
             return
         }
@@ -1815,7 +2004,31 @@ extension LibreWatchDirectCollector: CBCentralManagerDelegate {
             central.cancelPeripheralConnection(peripheral)
             return
         }
+        currentConnectionAcceptedAt = connectedAt
         guard eventDrivenRecoveryIsAllowed else { return }
+        let wasCurrentRestoration = restorationBelongsToCurrentSession(for: peripheral)
+        let interruptedPhase = connectionTiming.phase
+        let startedUnobservedConnectionGeneration = connectionTiming.acceptDidConnect(
+            at: connectedAt,
+            applicationIsActive: applicationIsActive,
+            executionIsAvailable: timedRecoveryIsAllowed,
+            monotonicTime: monotonicNow
+        )
+        serviceDiscoveryFence.begin(
+            generation: connectionTiming.generation,
+            interruptedServiceDiscovery:
+                startedUnobservedConnectionGeneration && interruptedPhase == .services
+        )
+        if startedUnobservedConnectionGeneration {
+            setupGeneration = nil
+            setupService = nil
+            writeCharacteristic = nil
+            receiveCharacteristic = nil
+            frameAssembler.reset()
+            if wasCurrentRestoration {
+                restorationState?.beginConnectionGeneration(connectionTiming.generation)
+            }
+        }
         // Accept the connection before consulting any old deadline. GATT gets its own clock.
         if restorationBelongsToCurrentSession(for: peripheral) {
             continueRestoredConnectionIfPossible(for: peripheral)
@@ -1832,14 +2045,26 @@ extension LibreWatchDirectCollector: CBCentralManagerDelegate {
         didFailToConnect peripheral: CBPeripheral,
         error: Error?
     ) {
+        let ownsDiagnostics = beginCoreBluetoothCallbackDiagnostics()
+        defer { finishCoreBluetoothCallbackDiagnostics(owner: ownsDiagnostics) }
         currentReconcileSource = .didFailToConnect
-        reportCoreBluetoothCallback("didFailToConnect", error: error)
+        let callbackIsCurrent = peripheral === sensorPeripheral
+        reportCoreBluetoothCallback(
+            "didFailToConnect",
+            error: error,
+            peripheralStateOverride: observedState(of: peripheral),
+            includeCurrentConnectionInstanceID: callbackIsCurrent
+        )
         if peripheral === retiredPeripheral {
             _ = releaseRetiredPeripheralIfDisconnected()
             return
         }
         guard peripheral === sensorPeripheral else {
-            reportRejectedCallback("didFailToConnect", reason: "notCurrentPeripheral")
+            reportRejectedCallback(
+                "didFailToConnect", reason: "notCurrentPeripheral",
+                peripheralStateOverride: observedState(of: peripheral),
+                includeCurrentConnectionInstanceID: false
+            )
             return
         }
         if scanAfterReconnectCancellation || deliberatelyDisconnecting {
@@ -1882,46 +2107,54 @@ extension LibreWatchDirectCollector: CBCentralManagerDelegate {
         didDisconnectPeripheral peripheral: CBPeripheral,
         error: Error?
     ) {
-        reportCoreBluetoothCallback("didDisconnectLegacy", error: error, source: .didDisconnect)
-        // Keep the fallback on every OS version: availability does not guarantee delivery
-        // of the modern callback. Its token is also invalidated by a later didConnect.
+        let ownsDiagnostics = beginCoreBluetoothCallbackDiagnostics()
+        defer { finishCoreBluetoothCallbackDiagnostics(owner: ownsDiagnostics) }
+        let observedState = observedState(of: peripheral)
+        let callbackIsCurrent = peripheral === sensorPeripheral && peripheral !== retiredPeripheral
+        let inferredReconnect = observedState == .connecting
+        reportCoreBluetoothCallback(
+            "didDisconnectLegacy",
+            error: error,
+            isReconnecting: inferredReconnect,
+            source: .didDisconnect,
+            peripheralStateOverride: observedState,
+            includeCurrentConnectionInstanceID: callbackIsCurrent && observedState != .connected,
+            reconnectObservationSource: .peripheralStateObservation
+        )
+        // This delegate callback is the system-provided execution opportunity. Complete the
+        // transition now; a delayed main-queue work item may never run after suspension.
         if peripheral === retiredPeripheral {
-            reportRejectedCallback("didDisconnectLegacy", reason: "retiredPeripheral")
+            reportRejectedCallback(
+                "didDisconnectLegacy", reason: "retiredPeripheral",
+                peripheralStateOverride: observedState,
+                includeCurrentConnectionInstanceID: false
+            )
             _ = releaseRetiredPeripheralIfDisconnected()
             return
         }
-        guard peripheral === sensorPeripheral, pendingLegacyDisconnect == nil,
-              let token = disconnectGate.scheduleLegacy() else {
-            reportRejectedCallback("didDisconnectLegacy", reason: "notCurrentPeripheralOrPendingLegacy")
+        guard peripheral === sensorPeripheral else {
+            reportRejectedCallback(
+                "didDisconnectLegacy", reason: "notCurrentPeripheral",
+                peripheralStateOverride: observedState,
+                includeCurrentConnectionInstanceID: false
+            )
             return
         }
-        let disconnectedAt = Date()
-        let generation = connectionTiming.generation
-        let workItem = DispatchWorkItem { [weak self] in
-            guard let self, self.disconnectGate.pendingToken == token else { return }
-            self.pendingLegacyDisconnect = nil
-            guard self.disconnectGate.legacyIsCurrent(
-                token, scheduledGeneration: generation,
-                currentGeneration: self.connectionTiming.generation,
-                peripheralIsDisconnectedOrDisconnecting: peripheral.state == .disconnected || peripheral.state == .disconnecting,
-                peripheralIsConnecting: peripheral.state == .connecting
-            ) else {
-                self.reportRejectedCallback("didDisconnectLegacy", reason: "staleGenerationOrLinkRecovered")
-                self.disconnectGate.cancelLegacy()
-                return
-            }
-            self.handleDisconnectOnce(
-                peripheral: peripheral,
-                // The link can already be reconnecting before the legacy callback executes.
-                // Adopt that system attempt; do not compete with a manual connect or scan.
-                isReconnecting: peripheral.state == .connecting,
-                disconnectedAt: disconnectedAt,
-                error: error,
-                legacyToken: token
+        guard observedState != .connected else {
+            reportRejectedCallback(
+                "didDisconnectLegacy", reason: "linkAlreadyConnected",
+                peripheralStateOverride: observedState,
+                includeCurrentConnectionInstanceID: false
             )
+            return
         }
-        pendingLegacyDisconnect = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1, execute: workItem)
+        handleDisconnectOnce(
+            peripheral: peripheral,
+            isReconnecting: inferredReconnect,
+            disconnectedAt: Date(),
+            error: error,
+            reconnectObservationSource: .peripheralStateObservation
+        )
     }
 
     @available(watchOS 10.0, *)
@@ -1932,33 +2165,153 @@ extension LibreWatchDirectCollector: CBCentralManagerDelegate {
         isReconnecting: Bool,
         error: Error?
     ) {
-        reportCoreBluetoothCallback("didDisconnectModern", error: error, isReconnecting: isReconnecting, source: .didDisconnect)
+        let ownsDiagnostics = beginCoreBluetoothCallbackDiagnostics()
+        defer { finishCoreBluetoothCallbackDiagnostics(owner: ownsDiagnostics) }
+        let disconnectedAt = Date(timeIntervalSinceReferenceDate: timestamp)
+        let observedState = observedState(of: peripheral)
+        let callbackBelongsToCurrentConnection = peripheral === sensorPeripheral &&
+            peripheral !== retiredPeripheral &&
+            LibreWatchDisconnectTimestampPolicy.belongsToCurrentConnection(
+                disconnectedAt: disconnectedAt,
+                currentConnectionAcceptedAt: currentConnectionAcceptedAt,
+                observedPeripheralState: observedState
+            )
+        reportCoreBluetoothCallback(
+            "didDisconnectModern",
+            error: error,
+            isReconnecting: isReconnecting,
+            source: .didDisconnect,
+            peripheralStateOverride: observedState,
+            includeCurrentConnectionInstanceID: callbackBelongsToCurrentConnection,
+            reconnectObservationSource: .modernCallback
+        )
         if peripheral === retiredPeripheral {
-            reportRejectedCallback("didDisconnectModern", reason: "retiredPeripheral")
+            reportRejectedCallback(
+                "didDisconnectModern", reason: "retiredPeripheral",
+                peripheralStateOverride: observedState,
+                includeCurrentConnectionInstanceID: false
+            )
             _ = releaseRetiredPeripheralIfDisconnected()
             return
         }
         guard peripheral === sensorPeripheral else {
-            reportRejectedCallback("didDisconnectModern", reason: "notCurrentPeripheral")
+            reportRejectedCallback(
+                "didDisconnectModern", reason: "notCurrentPeripheral",
+                peripheralStateOverride: observedState,
+                includeCurrentConnectionInstanceID: false
+            )
             return
         }
-        pendingLegacyDisconnect?.cancel()
-        pendingLegacyDisconnect = nil
+        guard callbackBelongsToCurrentConnection else {
+            reportRejectedCallback(
+                "didDisconnectModern", reason: "disconnectPredatesCurrentConnection",
+                peripheralStateOverride: observedState,
+                includeCurrentConnectionInstanceID: false
+            )
+            return
+        }
         handleDisconnectOnce(
             peripheral: peripheral,
             isReconnecting: isReconnecting,
-            disconnectedAt: Date(timeIntervalSinceReferenceDate: timestamp),
-            error: error
+            disconnectedAt: disconnectedAt,
+            error: error,
+            reconnectObservationSource: .modernCallback
         )
     }
 }
 
 extension LibreWatchDirectCollector: CBPeripheralDelegate {
-    func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
+    func peripheral(_ peripheral: CBPeripheral, didModifyServices invalidatedServices: [CBService]) {
+        let ownsDiagnostics = beginCoreBluetoothCallbackDiagnostics()
+        defer { finishCoreBluetoothCallbackDiagnostics(owner: ownsDiagnostics) }
         currentReconcileSource = .gattCallback
-        reportCoreBluetoothCallback("didDiscoverServices", error: error)
+        reportCoreBluetoothCallback(
+            "didModifyServices",
+            peripheralStateOverride: observedState(of: peripheral),
+            includeCurrentConnectionInstanceID: peripheral === sensorPeripheral
+        )
+        guard peripheral === sensorPeripheral,
+              LibreWatchRestoredObjectIdentity.containsCurrent(
+                  invalidatedServices,
+                  expected: setupService
+              )
+        else {
+            reportRejectedCallback(
+                "didModifyServices", reason: "unrelatedServiceInvalidation",
+                peripheralStateOverride: observedState(of: peripheral),
+                includeCurrentConnectionInstanceID: false
+            )
+            return
+        }
+        guard identityAndOwnershipAreConfirmed(for: peripheral),
+              peripheral.state == .connected,
+              !deliberatelyDisconnecting, !scanAfterReconnectCancellation,
+              connectionTiming.phase != .cancelling
+        else {
+            reportRejectedCallback(
+                "didModifyServices", reason: "serviceInvalidationNotActionable",
+                peripheralStateOverride: observedState(of: peripheral),
+                includeCurrentConnectionInstanceID: false
+            )
+            return
+        }
+
+        cancelReconnectFallback()
+        invalidateRestoration()
+        serviceDiscoveryFence.reset()
+        setupService = nil
+        writeCharacteristic = nil
+        receiveCharacteristic = nil
+        frameAssembler.reset()
+        connectionTiming.beginSetup(
+            at: Date(),
+            startingAt: .services,
+            retiringCurrentGeneration: true,
+            executionIsAvailable: timedRecoveryIsAllowed,
+            monotonicTime: monotonicNow
+        )
+        setupGeneration = connectionTiming.generation
+        state.connecting()
+        reportBluetoothAction("discoverServices", reason: "serviceInvalidated")
+        peripheral.discoverServices([CBUUID(string: Libre2WatchDirectConstants.serviceUUIDString)])
+        beginRecoveryDiagnosticIfNeeded(trigger: "serviceInvalidated")
+        scheduleReconnectFallback(for: peripheral)
+    }
+
+    func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
+        let ownsDiagnostics = beginCoreBluetoothCallbackDiagnostics()
+        defer { finishCoreBluetoothCallbackDiagnostics(owner: ownsDiagnostics) }
+        currentReconcileSource = .gattCallback
+        reportCoreBluetoothCallback(
+            "didDiscoverServices",
+            error: error,
+            peripheralStateOverride: observedState(of: peripheral),
+            includeCurrentConnectionInstanceID: peripheral === sensorPeripheral
+        )
         guard setupCallbackIsCurrent(peripheral, phase: .services) else {
-            reportRejectedCallback("didDiscoverServices", reason: "staleSetupGenerationOrPhase")
+            reportRejectedCallback(
+                "didDiscoverServices", reason: "staleSetupGenerationOrPhase",
+                peripheralStateOverride: observedState(of: peripheral),
+                includeCurrentConnectionInstanceID: false
+            )
+            return
+        }
+        if serviceDiscoveryFence.mustRediscoverBeforeAcceptingCallback(
+            generation: connectionTiming.generation
+        ) {
+            reportRejectedCallback(
+                "didDiscoverServices", reason: "serviceDiscoveryRequiresConfirmation",
+                peripheralStateOverride: observedState(of: peripheral),
+                includeCurrentConnectionInstanceID: false
+            )
+            reportBluetoothAction(
+                "discoverServices", reason: "serviceDiscoveryConfirmation",
+                peripheralStateOverride: observedState(of: peripheral)
+            )
+            peripheral.discoverServices([
+                CBUUID(string: Libre2WatchDirectConstants.serviceUUIDString)
+            ])
+            scheduleReconnectFallback(for: peripheral)
             return
         }
         if let error {
@@ -1984,6 +2337,7 @@ extension LibreWatchDirectCollector: CBPeripheralDelegate {
             continueAfterCharacteristicsAreBound(for: peripheral, service: service)
             return
         }
+        reportBluetoothAction("discoverCharacteristics", reason: "serviceDiscoveryCompleted")
         peripheral.discoverCharacteristics(missing, for: service)
         scheduleReconnectFallback(for: peripheral)
     }
@@ -1993,11 +2347,22 @@ extension LibreWatchDirectCollector: CBPeripheralDelegate {
         didDiscoverCharacteristicsFor service: CBService,
         error: Error?
     ) {
+        let ownsDiagnostics = beginCoreBluetoothCallbackDiagnostics()
+        defer { finishCoreBluetoothCallbackDiagnostics(owner: ownsDiagnostics) }
         currentReconcileSource = .gattCallback
-        reportCoreBluetoothCallback("didDiscoverCharacteristics", error: error)
+        reportCoreBluetoothCallback(
+            "didDiscoverCharacteristics",
+            error: error,
+            peripheralStateOverride: observedState(of: peripheral),
+            includeCurrentConnectionInstanceID: peripheral === sensorPeripheral
+        )
         guard setupCallbackIsCurrent(peripheral, phase: .characteristics),
               LibreWatchRestoredObjectIdentity.isCurrent(service, expected: setupService) else {
-            reportRejectedCallback("didDiscoverCharacteristics", reason: "staleSetupGenerationOrService")
+            reportRejectedCallback(
+                "didDiscoverCharacteristics", reason: "staleSetupGenerationOrService",
+                peripheralStateOverride: observedState(of: peripheral),
+                includeCurrentConnectionInstanceID: false
+            )
             return
         }
         if let error {
@@ -2028,8 +2393,15 @@ extension LibreWatchDirectCollector: CBPeripheralDelegate {
         didUpdateNotificationStateFor characteristic: CBCharacteristic,
         error: Error?
     ) {
+        let ownsDiagnostics = beginCoreBluetoothCallbackDiagnostics()
+        defer { finishCoreBluetoothCallbackDiagnostics(owner: ownsDiagnostics) }
         currentReconcileSource = .gattCallback
-        reportCoreBluetoothCallback("didUpdateNotificationState", error: error)
+        reportCoreBluetoothCallback(
+            "didUpdateNotificationState",
+            error: error,
+            peripheralStateOverride: observedState(of: peripheral),
+            includeCurrentConnectionInstanceID: peripheral === sensorPeripheral
+        )
         guard characteristic.uuid == CBUUID(string: Libre2WatchDirectConstants.receiveCharacteristicUUIDString),
               LibreWatchRestoredObjectIdentity.isCurrent(
                   characteristic,
@@ -2037,7 +2409,11 @@ extension LibreWatchDirectCollector: CBPeripheralDelegate {
               ),
               setupCallbackIsCurrent(peripheral, phase: .notifications)
         else {
-            reportRejectedCallback("didUpdateNotificationState", reason: "staleCharacteristicOrSetupPhase")
+            reportRejectedCallback(
+                "didUpdateNotificationState", reason: "staleCharacteristicOrSetupPhase",
+                peripheralStateOverride: observedState(of: peripheral),
+                includeCurrentConnectionInstanceID: false
+            )
             return
         }
         guard error == nil, characteristic.isNotifying else {
@@ -2061,8 +2437,15 @@ extension LibreWatchDirectCollector: CBPeripheralDelegate {
         didWriteValueFor characteristic: CBCharacteristic,
         error: Error?
     ) {
+        let ownsDiagnostics = beginCoreBluetoothCallbackDiagnostics()
+        defer { finishCoreBluetoothCallbackDiagnostics(owner: ownsDiagnostics) }
         currentReconcileSource = .gattCallback
-        reportCoreBluetoothCallback("didWriteUnlock", error: error)
+        reportCoreBluetoothCallback(
+            "didWriteUnlock",
+            error: error,
+            peripheralStateOverride: observedState(of: peripheral),
+            includeCurrentConnectionInstanceID: peripheral === sensorPeripheral
+        )
         guard characteristic.uuid == CBUUID(string: Libre2WatchDirectConstants.writeCharacteristicUUIDString),
               LibreWatchRestoredObjectIdentity.isCurrent(
                   characteristic,
@@ -2070,7 +2453,11 @@ extension LibreWatchDirectCollector: CBPeripheralDelegate {
               ),
               setupCallbackIsCurrent(peripheral, phase: .unlock)
         else {
-            reportRejectedCallback("didWriteUnlock", reason: "staleCharacteristicOrSetupPhase")
+            reportRejectedCallback(
+                "didWriteUnlock", reason: "staleCharacteristicOrSetupPhase",
+                peripheralStateOverride: observedState(of: peripheral),
+                includeCurrentConnectionInstanceID: false
+            )
             return
         }
         if let error {
@@ -2095,6 +2482,8 @@ extension LibreWatchDirectCollector: CBPeripheralDelegate {
         didUpdateValueFor characteristic: CBCharacteristic,
         error: Error?
     ) {
+        let ownsDiagnostics = beginCoreBluetoothCallbackDiagnostics()
+        defer { finishCoreBluetoothCallbackDiagnostics(owner: ownsDiagnostics) }
         currentReconcileSource = .bleNotification
         guard characteristic.uuid == CBUUID(string: Libre2WatchDirectConstants.receiveCharacteristicUUIDString),
               LibreWatchRestoredObjectIdentity.isCurrent(
@@ -2106,7 +2495,11 @@ extension LibreWatchDirectCollector: CBPeripheralDelegate {
               !deliberatelyDisconnecting, !scanAfterReconnectCancellation
         else {
             if characteristic.uuid == CBUUID(string: Libre2WatchDirectConstants.receiveCharacteristicUUIDString) {
-                reportRejectedCallback("didUpdateValue", reason: "staleCharacteristicGenerationOrOwnership")
+                reportRejectedCallback(
+                    "didUpdateValue", reason: "staleCharacteristicGenerationOrOwnership",
+                    peripheralStateOverride: observedState(of: peripheral),
+                    includeCurrentConnectionInstanceID: false
+                )
             }
             return
         }
@@ -2119,7 +2512,9 @@ extension LibreWatchDirectCollector: CBPeripheralDelegate {
             reportCoreBluetoothCallback(
                 "didUpdateValue",
                 error: error,
-                classification: errorAction.diagnosticName
+                classification: errorAction.diagnosticName,
+                peripheralStateOverride: observedState(of: peripheral),
+                includeCurrentConnectionInstanceID: peripheral === sensorPeripheral
             )
             switch errorAction {
             case .preserveConnectionNearBackgroundLimit:

@@ -1023,36 +1023,46 @@ final class WatchStateModel: NSObject, ObservableObject {
     }
 
     func reportLibreWatchDiagnostic(_ event: LibreWatchDiagnosticEvent) {
-        var event = event
-        let eventSessionID = event.sessionID ?? libreWatchDirectSession?.id
-        if let settings = localAlarms.settings, settings.sessionID == eventSessionID {
-            let at = event.watchTimestamp ?? Date()
-            event.alarmSettingsRevision = settings.revision
-            event.alarmEnabledKinds = LibreWatchAlarmKind.allCases.filter {
-                settings.rule(for: $0, at: at)?.enabled == true
-            }.map(\.rawValue)
-            event.alarmSnoozeAllUntil = settings.snoozeAllUntil
-            event.alarmSnoozes = Dictionary(uniqueKeysWithValues: LibreWatchAlarmKind.allCases.compactMap { kind in
-                let until = localAlarms.state.snoozedUntil(kind, settings: settings)
-                return until > at ? (kind.rawValue, until) : nil
-            })
-            event.alarmNotificationsAuthorized = localAlarms.notificationsAreAuthorized
-            event.alarmDelegatedToWatch = localAlarms.alarmsAreDelegatedToWatch
-        }
-        let result = diagnosticJournal.append(event)
-        LibreWatchSessionStore.saveDiagnosticJournal(diagnosticJournal)
-        guard result.inserted,
-              let encoded = try? JSONEncoder().encode(result.event),
-              let eventSessionID
-        else { return }
+        reportLibreWatchDiagnostics([event])
+    }
 
-        sendLibreWatchCommand(
-            .reportDiagnostic,
-            sessionID: eventSessionID,
-            diagnosticEvent: encoded,
-            queueIfUnreachable: true,
-            completion: nil
+    /// Persists one Core Bluetooth callback's immutable snapshots with one journal write and
+    /// one outbox write. The journal remains first so a process exit between the two stores is
+    /// repaired by `restorePendingDiagnosticJournalToOutbox` on the next execution opportunity.
+    func reportLibreWatchDiagnostics(_ events: [LibreWatchDiagnosticEvent]) {
+        guard !events.isEmpty else { return }
+        var preparedEvents: [LibreWatchDiagnosticEvent] = []
+
+        for sourceEvent in events {
+            var event = sourceEvent
+            let eventSessionID = event.sessionID ?? libreWatchDirectSession?.id
+            if let settings = localAlarms.settings, settings.sessionID == eventSessionID {
+                let at = event.watchTimestamp ?? Date()
+                event.alarmSettingsRevision = settings.revision
+                event.alarmEnabledKinds = LibreWatchAlarmKind.allCases.filter {
+                    settings.rule(for: $0, at: at)?.enabled == true
+                }.map(\.rawValue)
+                event.alarmSnoozeAllUntil = settings.snoozeAllUntil
+                event.alarmSnoozes = Dictionary(uniqueKeysWithValues: LibreWatchAlarmKind.allCases.compactMap { kind in
+                    let until = localAlarms.state.snoozedUntil(kind, settings: settings)
+                    return until > at ? (kind.rawValue, until) : nil
+                })
+                event.alarmNotificationsAuthorized = localAlarms.notificationsAreAuthorized
+                event.alarmDelegatedToWatch = localAlarms.alarmsAreDelegatedToWatch
+            }
+
+            preparedEvents.append(event)
+        }
+
+        _ = LibreWatchDiagnosticBatch.stage(
+            preparedEvents,
+            fallbackSessionID: libreWatchDirectSession?.id,
+            journal: &diagnosticJournal,
+            outbox: &connectivityOutbox
         )
+        LibreWatchSessionStore.saveDiagnosticJournal(diagnosticJournal)
+        LibreWatchSessionStore.saveOutbox(connectivityOutbox)
+        flushWatchConnectivityOutbox()
     }
 
     private func acceptLibreWatchCalibration(_ snapshot: LibreWatchCalibrationSnapshot) {
@@ -1450,28 +1460,11 @@ final class WatchStateModel: NSObject, ObservableObject {
     /// Existing IDs make this idempotent; normal delivery remains the per-event outbox path.
     private func restorePendingDiagnosticJournalToOutbox(at date: Date = Date()) {
         lastDiagnosticReplayAt = date
-        connectivityOutbox.prune(at: date)
-        let pending = diagnosticJournal.pendingEvents()
-        guard !pending.isEmpty else { return }
-
-        for (index, event) in pending.enumerated() {
-            guard let eventID = event.eventID,
-                  let sessionID = event.sessionID,
-                  let encoded = try? JSONEncoder().encode(event)
-            else { continue }
-            if connectivityOutbox.items.contains(where: { $0.id == eventID }) { continue }
-            // A full queue must not churn pending journal events through eviction on every
-            // flush. Leave them in the journal until an acknowledged item frees a slot.
-            guard connectivityOutbox.items.count < LibreWatchConnectivityOutbox.maximumItems else { break }
-            let admitted = connectivityOutbox.enqueue(.command(
-                .reportDiagnostic,
-                sessionID: sessionID,
-                diagnosticEvent: encoded,
-                id: eventID,
-                createdAt: date.addingTimeInterval(-1 + Double(index) / 1_000)
-            ), now: date)
-            if !admitted { break }
-        }
+        _ = LibreWatchDiagnosticBatch.replayPending(
+            journal: diagnosticJournal,
+            outbox: &connectivityOutbox,
+            at: date
+        )
         LibreWatchSessionStore.saveOutbox(connectivityOutbox)
     }
 

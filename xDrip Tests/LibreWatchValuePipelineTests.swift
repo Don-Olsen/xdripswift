@@ -424,17 +424,12 @@ extension LibreWatchValuePipelineTests {
         withExtendedLifetime(subscription) { XCTAssertEqual(events, [.iphone]) }
     }
 
-    func testLegacyConnectingCallbackAdoptsExistingSystemAttemptWithoutManualConnect() throws {
+    func testLegacyConnectingObservationAdoptsExistingSystemAttemptWithoutManualConnect() {
         var timing = LibreWatchConnectionTiming()
         timing.receivedPacketOrEnabledNotifications(at: receivedAt)
         XCTAssertNil(timing.deadline, "Do not fabricate a connection deadline in this fixture")
-        var gate = LibreWatchLegacyDisconnectGate()
-        let generation = timing.generation
-        let token = try XCTUnwrap(gate.scheduleLegacy())
-        XCTAssertTrue(gate.legacyIsCurrent(token, scheduledGeneration: generation,
-            currentGeneration: timing.generation, peripheralIsDisconnectedOrDisconnecting: false,
-            peripheralIsConnecting: true))
-        XCTAssertTrue(gate.accept(legacyToken: token))
+        var gate = LibreWatchDisconnectGate()
+        XCTAssertTrue(gate.accept())
         XCTAssertEqual(LibreWatchLifecyclePolicy.disconnectRecoveryAction(isDeliberate: false,
             systemIsReconnecting: true, ownership: .watch), .waitForSystemReconnect)
         timing.invalidate()
@@ -445,19 +440,6 @@ extension LibreWatchValuePipelineTests {
         XCTAssertEqual(timing.generation, adoptedGeneration)
         XCTAssertEqual(timing.remainingExecutionTime(at: receivedAt.addingTimeInterval(600)), 90)
         XCTAssertFalse(gate.accept(), "A following modern callback cannot create a second recovery")
-    }
-
-    func testLegacyConnectingFallbackStillRejectsOldGenerationAndNewDidConnect() throws {
-        var gate = LibreWatchLegacyDisconnectGate()
-        let generation = UUID()
-        let token = try XCTUnwrap(gate.scheduleLegacy())
-        XCTAssertFalse(gate.legacyIsCurrent(token, scheduledGeneration: generation,
-            currentGeneration: UUID(), peripheralIsDisconnectedOrDisconnecting: false, peripheralIsConnecting: true))
-        gate.reset()
-        XCTAssertFalse(gate.legacyIsCurrent(token, scheduledGeneration: generation,
-            currentGeneration: generation, peripheralIsDisconnectedOrDisconnecting: false, peripheralIsConnecting: true))
-        XCTAssertEqual(LibreWatchLifecyclePolicy.disconnectRecoveryAction(isDeliberate: false,
-            systemIsReconnecting: true, ownership: .iphone), .noAdditionalWork)
     }
 
     func testFinalTransientOutboxItemRetriesOnExistingExecutionOpportunityAfterReturn() throws {
@@ -1719,6 +1701,41 @@ final class LibreWatchValuePipelineTests: XCTestCase {
         XCTAssertEqual(restorationAction(&disconnected, generation: generation), .discoverServices)
     }
 
+    func testDidConnectRetiresStaleRestoredSetupAndReceivingGraphs() {
+        for interruptedPhase in [
+            LibreWatchConnectionTiming.Phase.services,
+            .characteristics,
+            .receiving
+        ] {
+            var timing = LibreWatchConnectionTiming()
+            if interruptedPhase == .receiving {
+                timing.receivedPacketOrEnabledNotifications(at: receivedAt)
+            } else {
+                timing.beginSetup(at: receivedAt, startingAt: interruptedPhase)
+            }
+            let oldGeneration = timing.generation
+            var restoration = LibreWatchRestorationState(
+                sessionID: session.id,
+                sensorIdentity: session.redactedIdentity(),
+                generation: oldGeneration,
+                mayReuseRestoredObjectGraph: true
+            )
+
+            XCTAssertTrue(timing.acceptDidConnect(
+                at: receivedAt.addingTimeInterval(1),
+                applicationIsActive: false
+            ))
+            restoration.beginConnectionGeneration(timing.generation)
+
+            XCTAssertNotEqual(timing.generation, oldGeneration)
+            XCTAssertEqual(restorationAction(
+                &restoration,
+                generation: timing.generation,
+                connectionPhase: timing.phase
+            ), .discoverServices)
+        }
+    }
+
     func testRestoredPeripheralSelectionRequiresOneObservedExactName() {
         let expected = session.expectedPeripheralName
         XCTAssertEqual(
@@ -1726,6 +1743,10 @@ final class LibreWatchValuePipelineTests: XCTestCase {
                 observedNames: ["WRONG", expected, nil], expectedSession: session
             ),
             .match(index: 1)
+        )
+        XCTAssertEqual(
+            LibreWatchRestoredPeripheralSelection.unselectedIndices(count: 3, selectedIndex: 1),
+            [0, 2]
         )
         XCTAssertEqual(
             LibreWatchRestoredPeripheralSelection.select(
@@ -1850,7 +1871,7 @@ final class LibreWatchValuePipelineTests: XCTestCase {
         XCTAssertEqual(restorationAction(
             &restoration,
             generation: newGeneration
-        ), .awaitExistingStream)
+        ), .discoverServices)
     }
 
     func testRestorationRejectsChangedOwnershipSessionGenerationAndStaleObjects() {
@@ -2302,44 +2323,19 @@ final class LibreWatchValuePipelineTests: XCTestCase {
         ))
     }
 
-    func testLegacyDisconnectWithoutModernCallbackIsHandled() throws {
-        var gate = LibreWatchLegacyDisconnectGate()
-        let pending = try XCTUnwrap(gate.scheduleLegacy())
-        XCTAssertTrue(gate.accept(legacyToken: pending))
-        XCTAssertTrue(gate.handled)
-        XCTAssertNil(gate.pendingToken)
-    }
-
-    func testModernDisconnectCancelsPendingLegacyFallback() throws {
-        var gate = LibreWatchLegacyDisconnectGate()
-        let pending = try XCTUnwrap(gate.scheduleLegacy())
+    func testLegacyDisconnectIsAcceptedSynchronouslyAndModernDuplicateIsRejected() {
+        var gate = LibreWatchDisconnectGate()
         XCTAssertTrue(gate.accept())
-        XCTAssertNil(gate.pendingToken)
-        XCTAssertFalse(gate.accept(legacyToken: pending))
+        XCTAssertTrue(gate.handled)
+        XCTAssertFalse(gate.accept(), "the later modern callback remains a duplicate")
     }
 
-    func testBothDisconnectCallbacksProduceOnlyOneRecoveryInEitherOrder() throws {
-        for modernFirst in [true, false] {
-            var gate = LibreWatchLegacyDisconnectGate()
-            let pending = try XCTUnwrap(gate.scheduleLegacy())
-            let deliveries: [UUID?] = modernFirst ? [nil, pending] : [pending, nil]
-            var handledCount = 0
-            for token in deliveries {
-                if gate.accept(legacyToken: token) { handledCount += 1 }
-            }
-            XCTAssertEqual(handledCount, 1)
-            XCTAssertNil(gate.scheduleLegacy())
-        }
-    }
-
-    func testDidConnectCancelsOldLegacyCallbackButAllowsTheNextRealDisconnect() throws {
-        var gate = LibreWatchLegacyDisconnectGate()
-        let old = try XCTUnwrap(gate.scheduleLegacy())
+    func testDidConnectResetAllowsTheNextRealDisconnect() {
+        var gate = LibreWatchDisconnectGate()
+        XCTAssertTrue(gate.accept())
         gate.reset() // Accepted didConnect.
-        let next = try XCTUnwrap(gate.scheduleLegacy())
-        XCTAssertFalse(gate.accept(legacyToken: old))
-        XCTAssertEqual(gate.pendingToken, next)
-        XCTAssertTrue(gate.accept(legacyToken: next))
+        XCTAssertFalse(gate.handled)
+        XCTAssertTrue(gate.accept())
     }
 
     func testReceivingThenObservedConnectingWithoutAnyDisconnectCreatesOneDeadline() throws {
@@ -2855,30 +2851,6 @@ final class LibreWatchValuePipelineTests: XCTestCase {
         XCTAssertEqual(liveness.consecutiveInvalidFrames, 3)
     }
 
-    func testDelayedLegacyDisconnectMustMatchGenerationAndDisconnectedState() throws {
-        var timing = LibreWatchConnectionTiming()
-        timing.receivedPacketOrEnabledNotifications(at: receivedAt)
-        let oldGeneration = timing.generation
-        var gate = LibreWatchLegacyDisconnectGate()
-        let token = try XCTUnwrap(gate.scheduleLegacy())
-        XCTAssertTrue(gate.legacyIsCurrent(
-            token, scheduledGeneration: oldGeneration, currentGeneration: timing.generation,
-            peripheralIsDisconnectedOrDisconnecting: true
-        ))
-        XCTAssertFalse(gate.legacyIsCurrent(
-            token, scheduledGeneration: oldGeneration, currentGeneration: timing.generation,
-            peripheralIsDisconnectedOrDisconnecting: false
-        ))
-        timing.invalidate()
-        timing.beginConnection(at: receivedAt.addingTimeInterval(1), applicationIsActive: true)
-        XCTAssertFalse(gate.legacyIsCurrent(
-            token, scheduledGeneration: oldGeneration, currentGeneration: timing.generation,
-            peripheralIsDisconnectedOrDisconnecting: true
-        ))
-        gate.cancelLegacy()
-        XCTAssertFalse(gate.accept(legacyToken: token))
-    }
-
     func testNewPhysicalConnectionRotatesAStaleSetupGeneration() {
         for interruptedPhase in [
             LibreWatchConnectionTiming.Phase.services,
@@ -2888,50 +2860,124 @@ final class LibreWatchValuePipelineTests: XCTestCase {
             .receiving
         ] {
             var timing = LibreWatchConnectionTiming()
-            timing.beginSetup(at: receivedAt, startingAt: interruptedPhase)
+            if interruptedPhase == .receiving {
+                timing.receivedPacketOrEnabledNotifications(at: receivedAt)
+            } else {
+                timing.beginSetup(at: receivedAt, startingAt: interruptedPhase)
+            }
             let disconnectedGeneration = timing.generation
 
-            // This is the production beginSetup path reached by a new didConnect when the
-            // delayed legacy disconnect did not get to retire the old setup first.
+            XCTAssertTrue(timing.acceptDidConnect(
+                at: receivedAt.addingTimeInterval(1),
+                applicationIsActive: false
+            ))
             timing.beginSetup(at: receivedAt.addingTimeInterval(1), startingAt: .services)
 
             XCTAssertNotEqual(timing.generation, disconnectedGeneration,
-                "A new physical connection must not accept callbacks from the old \(interruptedPhase.rawValue) phase")
+                "A new observed connection must not accept callbacks from the old \(interruptedPhase.rawValue) phase")
             XCTAssertTrue(timing.acceptsSetup(.services))
         }
     }
 
-    func testModernCallbackAndDidConnectInvalidateDelayedLegacyWork() throws {
-        for didConnectFirst in [true, false] {
-            var gate = LibreWatchLegacyDisconnectGate()
-            let token = try XCTUnwrap(gate.scheduleLegacy())
-            let generation = UUID()
-            if didConnectFirst {
-                gate.reset()
-            } else {
-                XCTAssertTrue(gate.accept())
-            }
-            XCTAssertFalse(gate.legacyIsCurrent(
-                token, scheduledGeneration: generation, currentGeneration: generation,
-                peripheralIsDisconnectedOrDisconnecting: true
-            ))
-            XCTAssertFalse(gate.accept(legacyToken: token))
-        }
+    func testBackToBackReconnectsRetireServicesAndCharacteristicsGenerations() throws {
+        var timing = LibreWatchConnectionTiming()
+        timing.beginSetup(at: receivedAt, startingAt: .services)
+        let servicesGeneration = timing.generation
+        let servicesDeadline = try XCTUnwrap(timing.deadline)
+
+        XCTAssertTrue(timing.acceptDidConnect(
+            at: receivedAt.addingTimeInterval(1),
+            applicationIsActive: false
+        ))
+        timing.beginSetup(
+            at: receivedAt.addingTimeInterval(1),
+            startingAt: .services
+        )
+        XCTAssertTrue(timing.setupProgress(
+            .services,
+            at: receivedAt.addingTimeInterval(2)
+        ))
+        let characteristicsGeneration = timing.generation
+        let characteristicsDeadline = try XCTUnwrap(timing.deadline)
+        XCTAssertTrue(timing.acceptsSetup(.characteristics))
+
+        XCTAssertTrue(timing.acceptDidConnect(
+            at: receivedAt.addingTimeInterval(3),
+            applicationIsActive: false
+        ))
+        let finalGeneration = timing.generation
+        timing.beginSetup(
+            at: receivedAt.addingTimeInterval(3),
+            startingAt: .services
+        )
+
+        XCTAssertNotEqual(servicesGeneration, characteristicsGeneration)
+        XCTAssertNotEqual(characteristicsGeneration, finalGeneration)
+        XCTAssertNotEqual(servicesGeneration, finalGeneration)
+        XCTAssertFalse(timing.timeoutIsCurrent(
+            servicesDeadline,
+            ownership: .watch,
+            cancelling: false,
+            at: servicesDeadline.expiresAt
+        ))
+        XCTAssertFalse(timing.timeoutIsCurrent(
+            characteristicsDeadline,
+            ownership: .watch,
+            cancelling: false,
+            at: characteristicsDeadline.expiresAt
+        ))
+        XCTAssertTrue(timing.acceptsSetup(.services))
     }
 
-    func testDisconnectCallbackTimestampCannotRetireANewerPhysicalConnection() {
+    func testCompletedConnectionKeepsItsAlreadyFreshGenerationWhenSetupBegins() {
+        var timing = LibreWatchConnectionTiming()
+        timing.beginConnection(at: receivedAt, applicationIsActive: false)
+        let connectionGeneration = timing.generation
+        XCTAssertFalse(timing.acceptDidConnect(
+            at: receivedAt.addingTimeInterval(1),
+            applicationIsActive: false
+        ))
+        timing.beginSetup(at: receivedAt.addingTimeInterval(1), startingAt: .services)
+
+        XCTAssertEqual(timing.generation, connectionGeneration)
+        XCTAssertTrue(timing.acceptsSetup(.services))
+    }
+
+    func testServiceInvalidationRetiresOnlyTheGATTGeneration() {
+        var timing = LibreWatchConnectionTiming()
+        timing.receivedPacketOrEnabledNotifications(at: receivedAt)
+        let oldGeneration = timing.generation
+        timing.beginSetup(
+            at: receivedAt.addingTimeInterval(1),
+            startingAt: .services,
+            retiringCurrentGeneration: true
+        )
+
+        XCTAssertNotEqual(timing.generation, oldGeneration)
+        XCTAssertTrue(timing.acceptsSetup(.services))
+    }
+
+    func testDisconnectTimestampRejectsOlderCallbackOnlyWhileCurrentLinkIsConnected() {
         let connectedAt = receivedAt.addingTimeInterval(10)
         XCTAssertFalse(LibreWatchDisconnectTimestampPolicy.belongsToCurrentConnection(
             disconnectedAt: connectedAt.addingTimeInterval(-0.001),
-            currentConnectionAcceptedAt: connectedAt
+            currentConnectionAcceptedAt: connectedAt,
+            observedPeripheralState: .connected
         ))
         XCTAssertTrue(LibreWatchDisconnectTimestampPolicy.belongsToCurrentConnection(
             disconnectedAt: connectedAt,
-            currentConnectionAcceptedAt: connectedAt
+            currentConnectionAcceptedAt: connectedAt,
+            observedPeripheralState: .connected
         ))
         XCTAssertTrue(LibreWatchDisconnectTimestampPolicy.belongsToCurrentConnection(
             disconnectedAt: connectedAt,
-            currentConnectionAcceptedAt: nil
+            currentConnectionAcceptedAt: nil,
+            observedPeripheralState: .connected
+        ))
+        XCTAssertTrue(LibreWatchDisconnectTimestampPolicy.belongsToCurrentConnection(
+            disconnectedAt: connectedAt.addingTimeInterval(-0.001),
+            currentConnectionAcceptedAt: connectedAt,
+            observedPeripheralState: .disconnected
         ))
     }
 
@@ -2973,7 +3019,107 @@ final class LibreWatchValuePipelineTests: XCTestCase {
         XCTAssertNil(event.bluetoothErrorClassification)
         XCTAssertNil(event.extendedRuntimeState)
         XCTAssertNil(event.extendedRuntimeStartRequested)
+        XCTAssertNil(event.processID)
+        XCTAssertNil(event.centralInstanceID)
+        XCTAssertNil(event.connectionInstanceID)
+        XCTAssertNil(event.reconnectObservationSource)
         XCTAssertNil(event.returnAttempt)
+    }
+
+    func testCoreBluetoothDiagnosticSnapshotsStayBufferedUntilCallbackWorkCompletes() {
+        let connectionID = UUID()
+        let entered = LibreWatchDiagnosticEvent(
+            eventID: UUID(), kind: .coreBluetoothCallback, trigger: "didConnect",
+            connectionPhase: "connection", connectionInstanceID: connectionID
+        )
+        let issued = LibreWatchDiagnosticEvent(
+            eventID: UUID(), kind: .bluetoothAction,
+            trigger: "freshConnectionSetup", connectionPhase: "services",
+            bluetoothAction: "discoverServices", connectionInstanceID: connectionID
+        )
+        var buffer = LibreWatchCallbackDiagnosticBuffer()
+
+        XCTAssertTrue(buffer.begin())
+        XCTAssertFalse(buffer.begin(), "nested work must share the owning callback batch")
+        XCTAssertTrue(buffer.capture(entered))
+        XCTAssertEqual(buffer.finish(owner: false), [])
+        XCTAssertTrue(buffer.capture(issued))
+        let persisted = buffer.finish(owner: true)
+        XCTAssertEqual(persisted, [entered, issued])
+        XCTAssertEqual(persisted.map(\.connectionPhase), ["connection", "services"])
+        XCTAssertEqual(Set(persisted.compactMap(\.connectionInstanceID)), Set([connectionID]))
+        XCTAssertFalse(buffer.capture(entered), "outside a callback diagnostics persist immediately")
+    }
+
+    func testProcessLocalConnectionObservationStaysStableAcrossGATTAndChangesAtNextConnect() {
+        let firstConnection = UUID()
+        let secondConnection = UUID()
+        let ignoredRepeatedRestorationID = UUID()
+        var tracker = LibreWatchConnectionInstanceTracker()
+        XCTAssertTrue(tracker.acceptConnectedRestoration(id: firstConnection))
+        XCTAssertFalse(tracker.acceptConnectedRestoration(id: ignoredRepeatedRestorationID))
+        XCTAssertEqual(tracker.currentID, firstConnection)
+
+        let firstLinkEvents = ["didConnect", "didDiscoverServices", "didDiscoverCharacteristics", "didWriteUnlock"]
+            .map {
+                LibreWatchDiagnosticEvent(
+                    kind: .coreBluetoothCallback, trigger: $0,
+                    connectionInstanceID: tracker.currentID
+                )
+            }
+        tracker.retire()
+        XCTAssertNil(tracker.currentID)
+        tracker.acceptDidConnect(id: secondConnection)
+        let nextLinkEvent = LibreWatchDiagnosticEvent(
+            kind: .coreBluetoothCallback, trigger: "didConnect",
+            connectionInstanceID: tracker.currentID
+        )
+
+        XCTAssertEqual(Set(firstLinkEvents.compactMap(\.connectionInstanceID)), Set([firstConnection]))
+        XCTAssertNotEqual(firstLinkEvents.last?.connectionInstanceID, nextLinkEvent.connectionInstanceID)
+    }
+
+    func testInterruptedServiceDiscoveryFencesExactlyOneAmbiguousCallback() {
+        var timing = LibreWatchConnectionTiming()
+        timing.beginSetup(at: receivedAt, startingAt: .services)
+        let oldGeneration = timing.generation
+        let interruptedPhase = timing.phase
+        XCTAssertTrue(timing.acceptDidConnect(
+            at: receivedAt.addingTimeInterval(1),
+            applicationIsActive: false
+        ))
+        let newGeneration = timing.generation
+        timing.beginSetup(at: receivedAt.addingTimeInterval(1), startingAt: .services)
+        var fence = LibreWatchServiceDiscoveryFence()
+
+        fence.begin(
+            generation: newGeneration,
+            interruptedServiceDiscovery: interruptedPhase == .services
+        )
+        XCTAssertFalse(fence.mustRediscoverBeforeAcceptingCallback(generation: oldGeneration))
+        XCTAssertTrue(fence.mustRediscoverBeforeAcceptingCallback(generation: newGeneration))
+        XCTAssertEqual(timing.phase, .services,
+            "the ambiguous callback must not advance the new setup")
+        XCTAssertFalse(fence.mustRediscoverBeforeAcceptingCallback(generation: newGeneration),
+            "the bounded confirmation must not create a discovery loop")
+        XCTAssertTrue(timing.setupProgress(
+            .services,
+            at: receivedAt.addingTimeInterval(2)
+        ))
+        XCTAssertEqual(timing.phase, .characteristics)
+
+        fence.reset()
+        XCTAssertNil(fence.generation)
+    }
+
+    func testConnectedRestorationWithoutDidConnectTimeAcceptsModernDisconnectTimestamp() {
+        // A restored link predates this process. willRestoreState receipt time is not the link's
+        // acceptance time and cannot be invented as a lower bound for Apple's callback timestamp.
+        XCTAssertTrue(LibreWatchDisconnectTimestampPolicy.belongsToCurrentConnection(
+            disconnectedAt: receivedAt,
+            currentConnectionAcceptedAt: nil,
+            observedPeripheralState: .connected
+        ))
     }
 
     func testReturnPreflightRecordsIntentBeforePermittedDisconnect() {
@@ -5803,170 +5949,30 @@ extension LibreWatchValuePipelineTests {
 }
 
 extension LibreWatchValuePipelineTests {
-    func testPendingLegacyDisconnectSurvivesBackgroundHealthObservation() throws {
-        for applicationState in [LibreWatchApplicationState.inactive, .background] {
-            var timing = LibreWatchConnectionTiming()
-            timing.receivedPacketOrEnabledNotifications(at: receivedAt)
-            timing.recordReceivingProgress(at: receivedAt, timeout: 120,
-                executionIsAvailable: true, monotonicTime: 100)
-            timing.setExecutionAvailable(false, at: receivedAt.addingTimeInterval(3), monotonicTime: 103)
-            let generation = timing.generation
-            var gate = LibreWatchLegacyDisconnectGate()
-            let token = try XCTUnwrap(gate.scheduleLegacy())
-            let executionIsAvailable = LibreWatchLifecyclePolicy.recoveryIsAllowed(
-                applicationState: applicationState, extendedRuntimeIsRunning: false, ownership: .watch
-            )
-            XCTAssertFalse(executionIsAvailable)
-
-            // The health timer runs during the existing 100 ms legacy fallback delay.
-            XCTAssertFalse(timing.observeLink(
-                connected: false, connecting: false, hasReceptionState: true,
-                at: receivedAt.addingTimeInterval(93), applicationIsActive: false,
-                executionIsAvailable: executionIsAvailable,
-                monotonicTime: 193,
-                legacyDisconnectIsPending: gate.pendingToken != nil
-            ))
-            XCTAssertEqual(timing.generation, generation)
-            XCTAssertEqual(timing.phase, .receiving)
-            XCTAssertNil(timing.deadline)
-            XCTAssertEqual(try XCTUnwrap(timing.remainingExecutionTime(
-                at: receivedAt.addingTimeInterval(93), monotonicTime: 193
-            )), 117, accuracy: 0.001)
-            XCTAssertTrue(gate.legacyIsCurrent(
-                token, scheduledGeneration: generation, currentGeneration: timing.generation,
-                peripheralIsDisconnectedOrDisconnecting: true
-            ))
-            XCTAssertTrue(gate.accept(legacyToken: token))
-            XCTAssertNil(gate.pendingToken, "Acceptance clears the normalization guard before recovery")
-            XCTAssertFalse(gate.accept(legacyToken: token), "The same disconnect still runs only once")
-            XCTAssertEqual(LibreWatchLifecyclePolicy.disconnectRecoveryAction(
-                isDeliberate: false, systemIsReconnecting: false, ownership: .watch
-            ), .reconnectManually)
-
-            XCTAssertTrue(timing.observeLink(
-                connected: false, connecting: false, hasReceptionState: true,
-                at: receivedAt.addingTimeInterval(93.1), applicationIsActive: false,
-                executionIsAvailable: executionIsAvailable,
-                legacyDisconnectIsPending: gate.pendingToken != nil
-            ))
-            XCTAssertNotEqual(timing.generation, generation)
-            XCTAssertNil(timing.phase)
-        }
-    }
-
-    func testPendingLegacyDisconnectPreservesSystemConnectingUntilCallbackAdoptsIt() throws {
+    func testObservedDisconnectedClearsStaleReceptionWithoutContinuousExecution() {
         var timing = LibreWatchConnectionTiming()
         timing.receivedPacketOrEnabledNotifications(at: receivedAt)
         let generation = timing.generation
-        var gate = LibreWatchLegacyDisconnectGate()
-        let token = try XCTUnwrap(gate.scheduleLegacy())
-        let disconnectedAt = receivedAt.addingTimeInterval(93)
-
-        XCTAssertFalse(timing.observeLink(
-            connected: false, connecting: true, hasReceptionState: true,
-            at: disconnectedAt, applicationIsActive: false, executionIsAvailable: false,
-            legacyDisconnectIsPending: gate.pendingToken != nil
-        ))
-        XCTAssertEqual(timing.generation, generation)
-        XCTAssertEqual(timing.phase, .receiving)
-        XCTAssertNil(timing.deadline)
-        XCTAssertTrue(gate.legacyIsCurrent(
-            token, scheduledGeneration: generation, currentGeneration: timing.generation,
-            peripheralIsDisconnectedOrDisconnecting: false, peripheralIsConnecting: true
-        ))
-        XCTAssertTrue(gate.accept(legacyToken: token))
-        XCTAssertNil(gate.pendingToken)
-        XCTAssertEqual(LibreWatchLifecyclePolicy.disconnectRecoveryAction(
-            isDeliberate: false, systemIsReconnecting: true, ownership: .watch
-        ), .waitForSystemReconnect)
-    }
-
-    func testObservedDisconnectedWithoutPendingLegacyStillClearsStaleReception() {
-        var timing = LibreWatchConnectionTiming()
-        timing.receivedPacketOrEnabledNotifications(at: receivedAt)
-        let generation = timing.generation
-        let gate = LibreWatchLegacyDisconnectGate()
 
         XCTAssertTrue(timing.observeLink(
             connected: false, connecting: false, hasReceptionState: true,
             at: receivedAt.addingTimeInterval(93), applicationIsActive: false,
-            executionIsAvailable: false, legacyDisconnectIsPending: gate.pendingToken != nil
+            executionIsAvailable: false
         ))
         XCTAssertNotEqual(timing.generation, generation)
         XCTAssertNil(timing.phase)
         XCTAssertNil(timing.deadline)
     }
 
-    func testModernDisconnectOrDidConnectStillSupersedesPendingLegacyAfterObservation() throws {
-        for didConnectFirst in [false, true] {
-            var timing = LibreWatchConnectionTiming()
-            timing.receivedPacketOrEnabledNotifications(at: receivedAt)
-            let generation = timing.generation
-            var gate = LibreWatchLegacyDisconnectGate()
-            let token = try XCTUnwrap(gate.scheduleLegacy())
-            XCTAssertFalse(timing.observeLink(
-                connected: false, connecting: false, hasReceptionState: true,
-                at: receivedAt.addingTimeInterval(93), applicationIsActive: false,
-                executionIsAvailable: false, legacyDisconnectIsPending: gate.pendingToken != nil
-            ))
-
-            if didConnectFirst {
-                gate.reset()
-                timing.beginSetup(at: receivedAt.addingTimeInterval(93.05), executionIsAvailable: false)
-                XCTAssertNotEqual(timing.generation, generation,
-                    "didConnect must retire the generation whose disconnect callback was pending")
-            } else {
-                XCTAssertTrue(gate.accept())
-            }
-            XCTAssertNil(gate.pendingToken)
-            XCTAssertFalse(gate.legacyIsCurrent(
-                token, scheduledGeneration: generation, currentGeneration: timing.generation,
-                peripheralIsDisconnectedOrDisconnecting: !didConnectFirst
-            ))
-            XCTAssertFalse(gate.accept(legacyToken: token))
-        }
-    }
-
-    func testRealGenerationChangeStillRejectsLegacyAndRejectionUnblocksObservation() throws {
+    func testCancellationDoesNotGrantRecoveryForPhoneOwnership() {
         var timing = LibreWatchConnectionTiming()
         timing.receivedPacketOrEnabledNotifications(at: receivedAt)
-        let generation = timing.generation
-        var gate = LibreWatchLegacyDisconnectGate()
-        let token = try XCTUnwrap(gate.scheduleLegacy())
-        timing.invalidate() // A real session/ownership invalidation must still win.
-
-        XCTAssertFalse(gate.legacyIsCurrent(
-            token, scheduledGeneration: generation, currentGeneration: timing.generation,
-            peripheralIsDisconnectedOrDisconnecting: true
-        ))
-        gate.cancelLegacy() // The existing rejected-fallback path.
-        XCTAssertNil(gate.pendingToken)
-        XCTAssertFalse(gate.accept(legacyToken: token))
-        XCTAssertTrue(timing.observeLink(
-            connected: false, connecting: false, hasReceptionState: true,
-            at: receivedAt.addingTimeInterval(93), applicationIsActive: false,
-            executionIsAvailable: false, legacyDisconnectIsPending: gate.pendingToken != nil
-        ))
-    }
-
-    func testCancellationClearsPendingLegacyWithoutGrantingRecoveryForPhoneOwnership() throws {
-        var timing = LibreWatchConnectionTiming()
-        timing.receivedPacketOrEnabledNotifications(at: receivedAt)
-        let generation = timing.generation
-        var gate = LibreWatchLegacyDisconnectGate()
-        let token = try XCTUnwrap(gate.scheduleLegacy())
         timing.beginCancellation(at: receivedAt.addingTimeInterval(93))
-        gate.reset() // beginCancellation uses prepareForExpectedDisconnectCallback.
 
-        XCTAssertNil(gate.pendingToken)
-        XCTAssertFalse(gate.legacyIsCurrent(
-            token, scheduledGeneration: generation, currentGeneration: timing.generation,
-            peripheralIsDisconnectedOrDisconnecting: true
-        ))
         XCTAssertFalse(timing.observeLink(
             connected: false, connecting: false, hasReceptionState: true,
             at: receivedAt.addingTimeInterval(93.1), applicationIsActive: false,
-            executionIsAvailable: false, legacyDisconnectIsPending: gate.pendingToken != nil
+            executionIsAvailable: false
         ))
         XCTAssertEqual(timing.phase, .cancelling)
         XCTAssertEqual(LibreWatchLifecyclePolicy.disconnectRecoveryAction(
@@ -6101,6 +6107,70 @@ extension LibreWatchValuePipelineTests {
         XCTAssertNil(fixture.defaults.data(forKey: LibreWatchMessageKey.persistedOutbox))
         XCTAssertEqual(try LibreWatchOutboxFileStore(fileURL: fixture.fileURL,
             defaults: fixture.defaults).load(at: receivedAt), legacy)
+    }
+
+    func testDiagnosticCallbackBatchSurvivesOutboxWriteFailureAndReplaysOnceInOrder() throws {
+        let fixture = try outboxFileFixture()
+        let firstID = UUID()
+        let secondID = UUID()
+        let events = [
+            LibreWatchDiagnosticEvent(
+                eventID: firstID, kind: .coreBluetoothCallback,
+                watchTimestamp: receivedAt, trigger: "didConnect"
+            ),
+            LibreWatchDiagnosticEvent(
+                eventID: secondID, kind: .bluetoothAction,
+                watchTimestamp: receivedAt, trigger: "freshConnectionSetup",
+                bluetoothAction: "discoverServices"
+            )
+        ]
+        var journal = LibreWatchDiagnosticJournal()
+        var outbox = LibreWatchConnectivityOutbox()
+        XCTAssertEqual(LibreWatchDiagnosticBatch.stage(
+            events,
+            fallbackSessionID: session.id,
+            journal: &journal,
+            outbox: &outbox,
+            at: receivedAt
+        ), [firstID, secondID])
+        XCTAssertEqual(journal.entries.compactMap { $0.event.eventID }, [firstID, secondID])
+        XCTAssertEqual(outbox.items.map(\.id), [firstID, secondID])
+        XCTAssertEqual(LibreWatchDiagnosticBatch.stage(
+            events,
+            fallbackSessionID: session.id,
+            journal: &journal,
+            outbox: &outbox,
+            at: receivedAt
+        ), [])
+        XCTAssertEqual(outbox.items.map(\.id), [firstID, secondID])
+
+        LibreWatchSessionStore.saveDiagnosticJournal(
+            journal, defaults: fixture.defaults, at: receivedAt
+        )
+        let failingStore = LibreWatchOutboxFileStore(
+            fileURL: fixture.fileURL,
+            defaults: fixture.defaults,
+            writer: { _, _ in throw OutboxFileTestError.injectedWriteFailure }
+        )
+        _ = try failingStore.load(at: receivedAt)
+        XCTAssertThrowsError(try failingStore.save(outbox))
+
+        let restoredJournal = LibreWatchSessionStore.loadDiagnosticJournal(
+            defaults: fixture.defaults, at: receivedAt
+        )
+        var restartedOutbox = LibreWatchConnectivityOutbox()
+        XCTAssertEqual(LibreWatchDiagnosticBatch.replayPending(
+            journal: restoredJournal,
+            outbox: &restartedOutbox,
+            at: receivedAt.addingTimeInterval(1)
+        ), [firstID, secondID])
+        XCTAssertEqual(restartedOutbox.items.map(\.id), [firstID, secondID])
+        XCTAssertEqual(LibreWatchDiagnosticBatch.replayPending(
+            journal: restoredJournal,
+            outbox: &restartedOutbox,
+            at: receivedAt.addingTimeInterval(1)
+        ), [])
+        XCTAssertEqual(restartedOutbox.items.map(\.id), [firstID, secondID])
     }
 
     func testFileOutboxFailedReplacementPreservesPreviousFileAndDoesNotAdvanceCache() throws {

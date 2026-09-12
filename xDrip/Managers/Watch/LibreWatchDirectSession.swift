@@ -263,6 +263,13 @@ enum LibreWatchRecoveryReconcileSource: String, Codable, Equatable {
     }
 }
 
+/// Records whether reconnect state came from Apple's modern callback or from the legacy
+/// delegate's observation of `CBPeripheral.state`.
+enum LibreWatchReconnectObservationSource: String, Codable, Equatable {
+    case modernCallback
+    case peripheralStateObservation
+}
+
 struct LibreWatchRecoveryAttemptContext: Codable, Equatable {
     let attemptID: UUID
     let originalTrigger: String
@@ -338,7 +345,7 @@ struct LibreWatchDiagnosticEvent: Codable, Equatable {
     let generation: UUID?
     let attemptID: UUID?
     let attemptStartedAt: Date?
-    let sessionID: UUID?
+    var sessionID: UUID?
     let sensorIdentity: String?
     let reconcileSource: LibreWatchRecoveryReconcileSource?
     let remainingExecutionBudget: TimeInterval?
@@ -363,6 +370,10 @@ struct LibreWatchDiagnosticEvent: Codable, Equatable {
     let installationID: UUID?
     let ownership: LibreWatchOwnership?
     let unlockCounter: UInt16?
+    let processID: UUID?
+    let centralInstanceID: UUID?
+    let connectionInstanceID: UUID?
+    let reconnectObservationSource: LibreWatchReconnectObservationSource?
     var journalUnacknowledgedDropCount: UInt64?
     var alarmSettingsRevision: UInt64?
     var alarmEnabledKinds: [Int]?
@@ -413,6 +424,10 @@ struct LibreWatchDiagnosticEvent: Codable, Equatable {
         installationID: UUID? = LibreWatchSessionStore.installationID(),
         ownership: LibreWatchOwnership? = nil,
         unlockCounter: UInt16? = nil,
+        processID: UUID? = nil,
+        centralInstanceID: UUID? = nil,
+        connectionInstanceID: UUID? = nil,
+        reconnectObservationSource: LibreWatchReconnectObservationSource? = nil,
         journalUnacknowledgedDropCount: UInt64? = nil
     ) {
         self.eventID = eventID
@@ -455,6 +470,10 @@ struct LibreWatchDiagnosticEvent: Codable, Equatable {
         self.installationID = installationID
         self.ownership = ownership
         self.unlockCounter = unlockCounter
+        self.processID = processID
+        self.centralInstanceID = centralInstanceID
+        self.connectionInstanceID = connectionInstanceID
+        self.reconnectObservationSource = reconnectObservationSource
         self.journalUnacknowledgedDropCount = journalUnacknowledgedDropCount
     }
 
@@ -1189,6 +1208,69 @@ struct LibreWatchDiagnosticJournal: Codable, Equatable {
     }
 }
 
+/// Shared transition used by the Watch callback integration and deterministic tests. It stages
+/// stable diagnostic IDs into the local journal and transport outbox without performing I/O;
+/// the caller persists journal first, then outbox, and can replay the crash/write-failure gap.
+struct LibreWatchDiagnosticBatch {
+    @discardableResult
+    static func stage(
+        _ sourceEvents: [LibreWatchDiagnosticEvent],
+        fallbackSessionID: UUID?,
+        journal: inout LibreWatchDiagnosticJournal,
+        outbox: inout LibreWatchConnectivityOutbox,
+        at date: Date = Date()
+    ) -> [UUID] {
+        var stagedIDs: [UUID] = []
+        for (index, sourceEvent) in sourceEvents.enumerated() {
+            var event = sourceEvent
+            if event.sessionID == nil { event.sessionID = fallbackSessionID }
+            let result = journal.append(event, at: date)
+            guard result.inserted,
+                  let eventID = result.event.eventID,
+                  let sessionID = result.event.sessionID,
+                  let encoded = try? JSONEncoder().encode(result.event)
+            else { continue }
+            let item = LibreWatchOutboxItem.command(
+                .reportDiagnostic,
+                sessionID: sessionID,
+                diagnosticEvent: encoded,
+                id: eventID,
+                createdAt: date.addingTimeInterval(Double(index) / 1_000)
+            )
+            if outbox.enqueue(item, now: date) { stagedIDs.append(eventID) }
+        }
+        return stagedIDs
+    }
+
+    @discardableResult
+    static func replayPending(
+        journal: LibreWatchDiagnosticJournal,
+        outbox: inout LibreWatchConnectivityOutbox,
+        at date: Date = Date()
+    ) -> [UUID] {
+        outbox.prune(at: date)
+        var replayedIDs: [UUID] = []
+        for (index, event) in journal.pendingEvents().enumerated() {
+            guard let eventID = event.eventID,
+                  let sessionID = event.sessionID,
+                  let encoded = try? JSONEncoder().encode(event)
+            else { continue }
+            if outbox.items.contains(where: { $0.id == eventID }) { continue }
+            guard outbox.items.count < LibreWatchConnectivityOutbox.maximumItems else { break }
+            let admitted = outbox.enqueue(.command(
+                .reportDiagnostic,
+                sessionID: sessionID,
+                diagnosticEvent: encoded,
+                id: eventID,
+                createdAt: date.addingTimeInterval(-1 + Double(index) / 1_000)
+            ), now: date)
+            if !admitted { break }
+            replayedIDs.append(eventID)
+        }
+        return replayedIDs
+    }
+}
+
 enum LibreWatchNotificationErrorAction: Equatable {
     case preserveConnectionNearBackgroundLimit
     case preserveConnectionExceededBackgroundLimit
@@ -1233,39 +1315,107 @@ enum LibreWatchReconnectFallbackAction: Equatable {
     case noAdditionalWork
 }
 
-/// One disconnect per connection, with a cancellable legacy fallback on every OS version.
-struct LibreWatchLegacyDisconnectGate {
-    private(set) var pendingToken: UUID?
-    private(set) var handled = false
+/// Collects immutable snapshots during one Core Bluetooth delegate callback. The collector
+/// performs state/GATT work first, then durably submits the snapshots before returning.
+struct LibreWatchCallbackDiagnosticBuffer {
+    private var events: [LibreWatchDiagnosticEvent]?
 
-    mutating func scheduleLegacy() -> UUID? {
-        guard !handled else { return nil }
-        if pendingToken == nil { pendingToken = UUID() }
-        return pendingToken
+    mutating func begin() -> Bool {
+        guard events == nil else { return false }
+        events = []
+        return true
     }
 
-    mutating func accept(legacyToken: UUID? = nil) -> Bool {
-        if let legacyToken, legacyToken != pendingToken { return false }
-        pendingToken = nil
+    /// Returns true when the caller must defer persistence until the owning callback ends.
+    mutating func capture(_ event: LibreWatchDiagnosticEvent) -> Bool {
+        guard events != nil else { return false }
+        events?.append(event)
+        return true
+    }
+
+    mutating func finish(owner: Bool) -> [LibreWatchDiagnosticEvent] {
+        guard owner, let events else { return [] }
+        self.events = nil
+        return events
+    }
+}
+
+/// Gives every observed link one process-local identity while keeping the recovery
+/// attempt and the rotating GATT generation independent. A repeated restoration callback for
+/// the same still-connected link must not make that link look new.
+struct LibreWatchConnectionInstanceTracker {
+    private(set) var currentID: UUID?
+
+    mutating func acceptDidConnect(id: UUID = UUID()) {
+        currentID = id
+    }
+
+    @discardableResult
+    mutating func acceptConnectedRestoration(id: UUID = UUID()) -> Bool {
+        guard currentID == nil else { return false }
+        currentID = id
+        return true
+    }
+
+    mutating func retire() {
+        currentID = nil
+    }
+}
+
+/// A `didDiscoverServices` callback carries no request or connection token. If `didConnect`
+/// interrupts an in-flight service discovery on the same CBPeripheral object, one old callback
+/// can otherwise advance the new setup generation. Fence exactly the first callback in that
+/// narrow case and issue one fresh discovery; all ordinary setup paths remain single-shot.
+struct LibreWatchServiceDiscoveryFence {
+    private(set) var generation: UUID?
+    private(set) var mustConfirmFirstCallback = false
+
+    mutating func begin(generation: UUID, interruptedServiceDiscovery: Bool) {
+        self.generation = generation
+        mustConfirmFirstCallback = interruptedServiceDiscovery
+    }
+
+    mutating func mustRediscoverBeforeAcceptingCallback(generation: UUID) -> Bool {
+        guard self.generation == generation, mustConfirmFirstCallback else { return false }
+        mustConfirmFirstCallback = false
+        return true
+    }
+
+    mutating func reset() {
+        generation = nil
+        mustConfirmFirstCallback = false
+    }
+}
+
+/// The modern disconnect timestamp belongs to the same Core Bluetooth clock as the
+/// callback. It must not retire a connected link accepted after that timestamp.
+struct LibreWatchDisconnectTimestampPolicy {
+    static func belongsToCurrentConnection(
+        disconnectedAt: Date,
+        currentConnectionAcceptedAt: Date?,
+        observedPeripheralState: LibreWatchObservedPeripheralState
+    ) -> Bool {
+        guard let currentConnectionAcceptedAt else { return true }
+        // Only reject a provably stale callback while the newly accepted link is still live.
+        // If Core Bluetooth already reports it disconnected/connecting, handling recovery is
+        // safer than suppressing the only callback for a very short-lived current connection.
+        return disconnectedAt >= currentConnectionAcceptedAt || observedPeripheralState != .connected
+    }
+}
+
+/// Accepts one disconnect transition per observed connection. Both legacy and modern
+/// callbacks use the same gate; `reset` starts the next connect/cancel cycle.
+struct LibreWatchDisconnectGate {
+    private(set) var handled = false
+
+    mutating func accept() -> Bool {
         guard !handled else { return false }
         handled = true
         return true
     }
 
     mutating func reset() {
-        pendingToken = nil
         handled = false
-    }
-
-    func legacyIsCurrent(_ token: UUID, scheduledGeneration: UUID, currentGeneration: UUID,
-                         peripheralIsDisconnectedOrDisconnecting: Bool,
-                         peripheralIsConnecting: Bool = false) -> Bool {
-        !handled && pendingToken == token && scheduledGeneration == currentGeneration &&
-            (peripheralIsDisconnectedOrDisconnecting || peripheralIsConnecting)
-    }
-
-    mutating func cancelLegacy() {
-        pendingToken = nil
     }
 }
 
@@ -1413,9 +1563,31 @@ struct LibreWatchConnectionTiming {
         )
     }
 
+    /// Marks a delivered didConnect as an observed connection boundary unless it completes the
+    /// already tracked `.connection` attempt. This retires stale setup/stream callbacks even when
+    /// a disconnect transition was never delivered or never got execution time.
+    @discardableResult
+    mutating func acceptDidConnect(
+        at date: Date,
+        applicationIsActive: Bool,
+        executionIsAvailable: Bool = true,
+        monotonicTime: TimeInterval? = nil
+    ) -> Bool {
+        guard phase != .cancelling, phase != .connection else { return false }
+        invalidate()
+        beginConnection(
+            at: date,
+            applicationIsActive: applicationIsActive,
+            executionIsAvailable: executionIsAvailable,
+            monotonicTime: monotonicTime
+        )
+        return true
+    }
+
     mutating func beginSetup(
         at date: Date,
         startingAt setupPhase: Phase = .services,
+        retiringCurrentGeneration: Bool = false,
         executionIsAvailable: Bool = true,
         monotonicTime: TimeInterval? = nil
     ) {
@@ -1426,6 +1598,7 @@ struct LibreWatchConnectionTiming {
         case .connection, .receiving, .cancelling:
             return
         }
+        if retiringCurrentGeneration { invalidate() }
         executionBudget = nil
         cancellationDeadline = nil
         dataExpectedSince = nil
@@ -1531,11 +1704,9 @@ struct LibreWatchConnectionTiming {
     mutating func observeLink(
         connected: Bool, connecting: Bool, hasReceptionState: Bool,
         at date: Date, applicationIsActive: Bool, executionIsAvailable: Bool = true,
-        monotonicTime: TimeInterval? = nil, legacyDisconnectIsPending: Bool = false
+        monotonicTime: TimeInterval? = nil
     ) -> Bool {
-        // The queued delegate owns this transition. A passive observation must not
-        // invalidate its captured generation before the existing fallback can run.
-        guard !legacyDisconnectIsPending, !connected, phase != .cancelling else { return false }
+        guard !connected, phase != .cancelling else { return false }
         let staleReception = hasReceptionState || setupInProgress || phase == .receiving
         let missingConnection = connecting && phase != .connection
         guard staleReception || missingConnection else { return false }
@@ -1668,17 +1839,20 @@ struct LibreWatchRestorationState: Equatable {
     private(set) var awaitingStreamEvidence = false
     private(set) var unlockWasRequested = false
     private(set) var streamEvidenceWasReceived = false
+    private(set) var mayReuseRestoredObjectGraph: Bool
 
     init(
         token: UUID = UUID(),
         sessionID: UUID,
         sensorIdentity: String,
-        generation: UUID
+        generation: UUID,
+        mayReuseRestoredObjectGraph: Bool = true
     ) {
         self.token = token
         self.sessionID = sessionID
         self.sensorIdentity = sensorIdentity
         self.generation = generation
+        self.mayReuseRestoredObjectGraph = mayReuseRestoredObjectGraph
     }
 
     mutating func bind(to generation: UUID) {
@@ -1687,9 +1861,15 @@ struct LibreWatchRestorationState: Equatable {
 
     mutating func beginConnectionGeneration(_ generation: UUID) {
         self.generation = generation
+        discardRestoredObjectGraph()
+    }
+
+    mutating func discardRestoredObjectGraph() {
         awaitingStreamEvidence = false
         unlockWasRequested = false
         streamEvidenceWasReceived = false
+        // Services, characteristics and descriptors from the disconnected link are invalid.
+        mayReuseRestoredObjectGraph = false
     }
 
     func belongsTo(
@@ -1739,7 +1919,7 @@ struct LibreWatchRestorationState: Equatable {
             return .preserveActiveStream
         }
 
-        guard hasService else { return .discoverServices }
+        guard mayReuseRestoredObjectGraph, hasService else { return .discoverServices }
         guard hasWriteCharacteristic, hasReceiveCharacteristic else {
             return .discoverCharacteristics
         }
@@ -1791,10 +1971,45 @@ struct LibreWatchRestorationState: Equatable {
     }
 }
 
+/// Restoration may contain peripherals whose names are unavailable or no longer belong to the
+/// NFC-confirmed session. Never turn the expected name into an observed identity.
+struct LibreWatchRestoredPeripheralSelection {
+    enum Result: Equatable {
+        case match(index: Int)
+        case unresolved
+        case mismatch
+        case ambiguous
+    }
+
+    static func select(
+        observedNames: [String?],
+        expectedSession: LibreWatchDirectSession
+    ) -> Result {
+        let matches = observedNames.enumerated().compactMap { index, name in
+            expectedSession.matches(candidateName: name) ? index : nil
+        }
+        if matches.count == 1, let index = matches.first {
+            return .match(index: index)
+        }
+        if matches.count > 1 { return .ambiguous }
+        return observedNames.contains(where: { $0 == nil }) ? .unresolved : .mismatch
+    }
+
+    static func unselectedIndices(count: Int, selectedIndex: Int) -> [Int] {
+        guard count > 0, (0 ..< count).contains(selectedIndex) else { return [] }
+        return (0 ..< count).filter { $0 != selectedIndex }
+    }
+}
+
 /// Object identity, rather than a matching characteristic UUID, defines the current GATT graph.
 struct LibreWatchRestoredObjectIdentity {
     static func isCurrent(_ candidate: AnyObject, expected: AnyObject?) -> Bool {
         candidate === expected
+    }
+
+    static func containsCurrent<T: AnyObject>(_ candidates: [T], expected: AnyObject?) -> Bool {
+        guard let expected else { return false }
+        return candidates.contains { $0 === expected }
     }
 }
 
