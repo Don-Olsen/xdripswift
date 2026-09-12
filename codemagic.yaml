@@ -361,7 +361,8 @@ workflows:
             if test -d "$CM_BUILD_DIR/build/verification/Verification.xcresult"; then
               python3 scripts/record-watch-test-results.py \
                 "$CM_BUILD_DIR/build/verification/Verification.xcresult" \
-                "$CM_BUILD_DIR/build/verification/stability-summary.json" || test_status=1
+                "$CM_BUILD_DIR/build/verification/stability-summary.json" \
+                --include-verify-only || test_status=1
             fi
             exit "$test_status"
           }

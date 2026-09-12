@@ -10,8 +10,10 @@ import subprocess
 import sys
 from urllib.parse import unquote
 
-SUITES = ('WatchRefreshCoordinatorTests', 'WatchPhoneRefreshServiceTests',
+SUITES = ('LibreWatchValuePipelineTests', 'TroubleshootingLogTests',
+          'WatchRefreshCoordinatorTests', 'WatchPhoneRefreshServiceTests',
           'WatchSnapshotSemanticsTests', 'WatchDeliveryEvidenceTests')
+VERIFY_ONLY_SUITES = ('RootHomeInteractionTests',)
 
 
 def require(condition, message):
@@ -19,9 +21,9 @@ def require(condition, message):
         raise ValueError(message)
 
 
-def declared_tests(root):
+def declared_tests(root, suites=SUITES):
     expected = {}
-    for suite in SUITES:
+    for suite in suites:
         source = (root / 'xDrip Tests' / (suite + '.swift')).read_text(encoding='utf-8')
         methods = set(re.findall(r'\bfunc\s+(test\w+)\s*\(', source))
         require(bool(methods), 'No declared tests for ' + suite)
@@ -76,10 +78,16 @@ def analyze(summary, tree, expected):
         require(len(found[suite]) > 0, 'Required XCTest suite executed zero tests: ' + suite)
         suites[suite] = {'declaredMethods': len(methods), 'uniquePassedMethods': len(found[suite]),
                          'caseResultNodes': sum(found[suite].values()), 'failed': 0, 'skipped': 0}
+    required_count = sum(len(methods) for methods in expected.values())
+    require(total >= required_count, 'xcresult summary contains fewer tests than the required methods')
+    require(summary['passedTests'] >= required_count,
+            'xcresult summary contains fewer passes than the required methods')
+    require(total == summary['passedTests'] + summary['failedTests'] + summary['skippedTests'],
+            'xcresult summary counts are internally inconsistent')
     return suites
 
 
-def main(result, destination):
+def main(result, destination, include_verify_only=False):
     base = ['xcrun', 'xcresulttool', 'get', 'test-results']
     summary = json.loads(subprocess.check_output(base + ['summary', '--path', str(result)], text=True))
     tree = json.loads(subprocess.check_output(base + ['tests', '--path', str(result)], text=True))
@@ -88,7 +96,8 @@ def main(result, destination):
         json.dumps(summary, indent=2), encoding='utf-8')
     tree_path = destination.with_name(destination.stem + '-test-tree.json')
     tree_path.write_text(json.dumps(tree, separators=(',', ':')), encoding='utf-8')
-    expected = declared_tests(Path(__file__).resolve().parents[1])
+    selected_suites = SUITES + VERIFY_ONLY_SUITES if include_verify_only else SUITES
+    expected = declared_tests(Path(__file__).resolve().parents[1], selected_suites)
     manifest = {'sourceCommit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
                 'xcode': subprocess.check_output(['xcodebuild', '-version'], text=True).strip(),
                 'resultBundle': str(result), 'testTreeArtifact': tree_path.name,
@@ -106,8 +115,10 @@ def main(result, destination):
 
 
 def self_test():
-    expected = {suite: {'testOne', 'testTwo'} for suite in SUITES}
-    summary = {'totalTestCount': 8, 'passedTests': 8, 'failedTests': 0, 'skippedTests': 0}
+    expected = {suite: {'testOne', 'testTwo'} for suite in SUITES + VERIFY_ONLY_SUITES}
+    test_count = sum(len(methods) for methods in expected.values())
+    summary = {'totalTestCount': test_count, 'passedTests': test_count,
+               'failedTests': 0, 'skippedTests': 0}
     tree = {'testNodes': [{'name': suite, 'nodeType': 'Test Suite', 'children': [
         {'name': method + '()', 'nodeType': 'Test Case', 'result': 'Passed',
          'nodeIdentifier': suite + '/' + method + '()'} for method in sorted(methods)]}
@@ -143,5 +154,7 @@ if __name__ == '__main__':
     if sys.argv[1:] == ['--self-test']:
         self_test()
     else:
-        require(len(sys.argv) == 3, 'Usage: record-watch-test-results.py XCRESULT MANIFEST or --self-test')
-        main(Path(sys.argv[1]), Path(sys.argv[2]))
+        include_verify_only = len(sys.argv) == 4 and sys.argv[3] == '--include-verify-only'
+        require(len(sys.argv) == 3 or include_verify_only,
+                'Usage: record-watch-test-results.py XCRESULT MANIFEST [--include-verify-only] or --self-test')
+        main(Path(sys.argv[1]), Path(sys.argv[2]), include_verify_only)
