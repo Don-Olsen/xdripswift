@@ -39,6 +39,10 @@ workflows:
             -destination "platform=iOS Simulator,id=$simulator_id" \
             -only-testing:xdripTests/LibreWatchValuePipelineTests \
             -only-testing:xdripTests/TroubleshootingLogTests \
+            -only-testing:xdripTests/WatchRefreshCoordinatorTests \
+            -only-testing:xdripTests/WatchPhoneRefreshServiceTests \
+            -only-testing:xdripTests/WatchSnapshotSemanticsTests \
+            -only-testing:xdripTests/WatchDeliveryEvidenceTests \
             -resultBundlePath "$CM_BUILD_DIR/build/test-results/LibreWatchValuePipelineTests.xcresult" \
             CODE_SIGNING_ALLOWED=NO
 
@@ -51,6 +55,13 @@ workflows:
             -configuration Debug \
             -destination "generic/platform=iOS Simulator" \
             CODE_SIGNING_ALLOWED=NO
+
+      - name: Record executed stability test results
+        script: |
+          set -euo pipefail
+          python3 scripts/record-watch-test-results.py \
+            "$CM_BUILD_DIR/build/test-results/LibreWatchValuePipelineTests.xcresult" \
+            "$CM_BUILD_DIR/build/test-results/stability-summary.json"
 
       - name: Compile Watch app target
         script: |
@@ -285,6 +296,10 @@ workflows:
             *) echo "Archived Watch app has the wrong signing team"; exit 1 ;;
           esac
 
+          python3 scripts/verify-watch-release.py \
+            "$CM_BUILD_DIR/build/ios/xcarchive/xdrip.xcarchive" \
+            "$CM_BUILD_DIR/build/test-results/release-manifest.json"
+
           mkdir -p "$CM_BUILD_DIR/build/ios/ipa"
           xcodebuild \
             -exportArchive \
@@ -295,6 +310,7 @@ workflows:
     artifacts:
       - build/ios/ipa/*.ipa
       - build/test-results/*.xcresult
+      - build/test-results/*.json
       - /tmp/xcodebuild_logs/*.log
       - $HOME/Library/Developer/Xcode/DerivedData/**/Build/**/*.dSYM
 
@@ -336,6 +352,10 @@ workflows:
             -only-testing:xdripTests/RootHomeInteractionTests \
             -only-testing:xdripTests/LibreWatchValuePipelineTests \
             -only-testing:xdripTests/TroubleshootingLogTests \
+            -only-testing:xdripTests/WatchRefreshCoordinatorTests \
+            -only-testing:xdripTests/WatchPhoneRefreshServiceTests \
+            -only-testing:xdripTests/WatchSnapshotSemanticsTests \
+            -only-testing:xdripTests/WatchDeliveryEvidenceTests \
             -resultBundlePath "$CM_BUILD_DIR/build/verification/Verification.xcresult" \
             CODE_SIGNING_ALLOWED=NO \
             2>&1 | tee "$CM_BUILD_DIR/build/verification/xctest.log"
@@ -350,6 +370,13 @@ workflows:
             -destination "generic/platform=iOS Simulator" \
             CODE_SIGNING_ALLOWED=NO \
             2>&1 | tee "$CM_BUILD_DIR/build/verification/iphone-build.log"
+
+      - name: Record executed stability verification tests
+        script: |
+          set -euo pipefail
+          python3 scripts/record-watch-test-results.py \
+            "$CM_BUILD_DIR/build/verification/Verification.xcresult" \
+            "$CM_BUILD_DIR/build/verification/stability-summary.json"
 
       - name: Compile Watch app target without signing
         script: |
@@ -366,3 +393,4 @@ workflows:
       - build/verification/*.txt
       - build/verification/*.log
       - build/verification/*.xcresult
+      - build/verification/*.json
