@@ -1949,6 +1949,24 @@ extension TroubleshootingLogTests {
         XCTAssertEqual(restored.timestamp, referenceDate.addingTimeInterval(600))
     }
 
+    func testWatchDiagnosticNormalizesKnownRawCoreBluetoothPeripheralStates() {
+        let expected = [
+            0: "disconnected",
+            1: "connecting",
+            2: "connected",
+            3: "disconnecting"
+        ]
+        for (rawValue, state) in expected {
+            let event = LibreWatchDiagnosticEvent(kind: .coreBluetoothCallback,
+                peripheralState: "CBPeripheralState(rawValue: \(rawValue))",
+                connectionPhase: "services", trigger: "didDiscoverServices")
+            XCTAssertEqual(TroubleshootingWatchDiagnostic(event).peripheral, state)
+        }
+        XCTAssertNil(TroubleshootingWatchDiagnostic(LibreWatchDiagnosticEvent(
+            kind: .coreBluetoothCallback, peripheralState: "CBPeripheralState(rawValue: 99)"
+        )).peripheral)
+    }
+
     func testWatchDiagnosticExportExcludesArbitraryErrorsAndSecretText() {
         let secret = "secret=https://user:password@example.invalid"
         let event = LibreWatchDiagnosticEvent(kind: .recoveryFailed,

@@ -1678,6 +1678,28 @@ final class LibreWatchValuePipelineTests: XCTestCase {
                        .awaitExistingStream)
     }
 
+    func testDisconnectedRestorationDiscardsStaleGATTGraphBeforeReconnect() {
+        let restoredGeneration = UUID()
+        let reconnectedGeneration = UUID()
+        var restoration = LibreWatchRestorationState(
+            sessionID: session.id,
+            sensorIdentity: session.redactedIdentity(),
+            generation: restoredGeneration
+        )
+
+        // CoreBluetooth service/characteristic objects restored for the old link are invalid
+        // after a real disconnect, even if their UUIDs and isNotifying flags still look usable.
+        restoration.beginConnectionGeneration(reconnectedGeneration)
+        XCTAssertEqual(restorationAction(
+            &restoration,
+            generation: reconnectedGeneration,
+            hasService: true,
+            hasWriteCharacteristic: true,
+            hasReceiveCharacteristic: true,
+            receiveIsNotifying: true
+        ), .discoverServices)
+    }
+
     func testRepeatedRestorationCallbacksDoNotRenewInFlightGATTBudget() throws {
         let generation = UUID()
         var restoration = LibreWatchRestorationState(
@@ -2808,6 +2830,28 @@ final class LibreWatchValuePipelineTests: XCTestCase {
         ))
         gate.cancelLegacy()
         XCTAssertFalse(gate.accept(legacyToken: token))
+    }
+
+    func testNewPhysicalConnectionRotatesAStaleSetupGeneration() {
+        for interruptedPhase in [
+            LibreWatchConnectionTiming.Phase.services,
+            .characteristics,
+            .notifications,
+            .unlock,
+            .receiving
+        ] {
+            var timing = LibreWatchConnectionTiming()
+            timing.beginSetup(at: receivedAt, startingAt: interruptedPhase)
+            let disconnectedGeneration = timing.generation
+
+            // This is the production beginSetup path reached by a new didConnect when the
+            // delayed legacy disconnect did not get to retire the old setup first.
+            timing.beginSetup(at: receivedAt.addingTimeInterval(1), startingAt: .services)
+
+            XCTAssertNotEqual(timing.generation, disconnectedGeneration,
+                "A new physical connection must not accept callbacks from the old \(interruptedPhase.rawValue) phase")
+            XCTAssertTrue(timing.acceptsSetup(.services))
+        }
     }
 
     func testModernCallbackAndDidConnectInvalidateDelayedLegacyWork() throws {
@@ -5792,6 +5836,8 @@ extension LibreWatchValuePipelineTests {
             if didConnectFirst {
                 gate.reset()
                 timing.beginSetup(at: receivedAt.addingTimeInterval(93.05), executionIsAvailable: false)
+                XCTAssertNotEqual(timing.generation, generation,
+                    "didConnect must retire the generation whose disconnect callback was pending")
             } else {
                 XCTAssertTrue(gate.accept())
             }
