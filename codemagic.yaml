@@ -32,6 +32,17 @@ workflows:
           simulator_id="$(xcrun simctl list devices available -j | jq -r '[.devices[][] | select(.name | startswith("iPhone"))][0].udid // empty')"
           test -n "$simulator_id"
           mkdir -p "$CM_BUILD_DIR/build/test-results"
+          record_test_evidence() {
+            test_status=$?
+            trap - EXIT
+            if test -d "$CM_BUILD_DIR/build/test-results/LibreWatchValuePipelineTests.xcresult"; then
+              python3 scripts/record-watch-test-results.py \
+                "$CM_BUILD_DIR/build/test-results/LibreWatchValuePipelineTests.xcresult" \
+                "$CM_BUILD_DIR/build/test-results/stability-summary.json" || test_status=1
+            fi
+            exit "$test_status"
+          }
+          trap record_test_evidence EXIT
           xcodebuild test \
             -workspace "$CM_BUILD_DIR/xdrip.xcworkspace" \
             -scheme "xdrip" \
@@ -55,13 +66,6 @@ workflows:
             -configuration Debug \
             -destination "generic/platform=iOS Simulator" \
             CODE_SIGNING_ALLOWED=NO
-
-      - name: Record executed stability test results
-        script: |
-          set -euo pipefail
-          python3 scripts/record-watch-test-results.py \
-            "$CM_BUILD_DIR/build/test-results/LibreWatchValuePipelineTests.xcresult" \
-            "$CM_BUILD_DIR/build/test-results/stability-summary.json"
 
       - name: Compile Watch app target
         script: |
@@ -317,6 +321,13 @@ workflows:
     publishing:
       app_store_connect:
         auth: integration
+      scripts:
+        - name: Observe exact uploaded Apple build (read only)
+          script: |
+            set -eu
+            python3 "$CM_BUILD_DIR/scripts/check-apple-processing.py" \
+              "$CM_BUILD_DIR/build/test-results/release-manifest.json" \
+              "$CM_BUILD_DIR/build/test-results/apple-processing-observation.json"
 
   xdrip-verify:
     name: xDrip verification only (no publishing)
@@ -344,6 +355,17 @@ workflows:
           simulator_id="$(xcrun simctl list devices available -j | jq -r '[.devices[][] | select(.name | startswith("iPhone"))][0].udid // empty')"
           test -n "$simulator_id"
           printf '%s\n' "$simulator_id" > "$CM_BUILD_DIR/build/verification/simulator-id.txt"
+          record_test_evidence() {
+            test_status=$?
+            trap - EXIT
+            if test -d "$CM_BUILD_DIR/build/verification/Verification.xcresult"; then
+              python3 scripts/record-watch-test-results.py \
+                "$CM_BUILD_DIR/build/verification/Verification.xcresult" \
+                "$CM_BUILD_DIR/build/verification/stability-summary.json" || test_status=1
+            fi
+            exit "$test_status"
+          }
+          trap record_test_evidence EXIT
           xcodebuild test \
             -workspace "$CM_BUILD_DIR/xdrip.xcworkspace" \
             -scheme "xdrip" \
@@ -370,13 +392,6 @@ workflows:
             -destination "generic/platform=iOS Simulator" \
             CODE_SIGNING_ALLOWED=NO \
             2>&1 | tee "$CM_BUILD_DIR/build/verification/iphone-build.log"
-
-      - name: Record executed stability verification tests
-        script: |
-          set -euo pipefail
-          python3 scripts/record-watch-test-results.py \
-            "$CM_BUILD_DIR/build/verification/Verification.xcresult" \
-            "$CM_BUILD_DIR/build/verification/stability-summary.json"
 
       - name: Compile Watch app target without signing
         script: |

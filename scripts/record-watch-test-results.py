@@ -84,6 +84,8 @@ def main(result, destination):
     summary = json.loads(subprocess.check_output(base + ['summary', '--path', str(result)], text=True))
     tree = json.loads(subprocess.check_output(base + ['tests', '--path', str(result)], text=True))
     destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.with_name(destination.stem + '-xcode-summary.json').write_text(
+        json.dumps(summary, indent=2), encoding='utf-8')
     tree_path = destination.with_name(destination.stem + '-test-tree.json')
     tree_path.write_text(json.dumps(tree, separators=(',', ':')), encoding='utf-8')
     expected = declared_tests(Path(__file__).resolve().parents[1])
