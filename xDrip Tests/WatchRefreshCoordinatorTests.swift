@@ -407,6 +407,8 @@ final class WatchRefreshCoordinatorTests: XCTestCase {
         pair.phone.changed(["status", "bgReadings"])
         pair.suspendBuilder = false
         pair.pendingBuild?(first); pair.pendingBuild = nil
+        XCTAssertEqual(pair.replies.count, 1)
+        XCTAssertEqual((pair.replies.first?["status"] as? [String: Any])?["lowLimitInMgDl"] as? Double, 80)
         pair.watch.advance(0.5)
         XCTAssertEqual(pair.builds.count, 2)
         XCTAssertEqual(pair.watch.appliedStatusLimit, 90)

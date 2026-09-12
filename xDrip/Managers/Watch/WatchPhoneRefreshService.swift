@@ -311,8 +311,14 @@ final class WatchPhoneRefreshService {
 
     private func sendPendingPush() {
         guard pushID == nil, now() >= nextPush else { return }
-        let streams = pushWanted.filter { cache[$0] != nil && lastPushed[$0] != cache[$0]?.contentID }
-        pushWanted.subtract(pushWanted.filter { cache[$0] != nil && lastPushed[$0] == cache[$0]?.contentID })
+        // A reply can acknowledge the cache built before a concurrent mutation. Its
+        // content ID is not proof that the newer dirty generation has been delivered.
+        // Keep that demand until the database builder captures the current version.
+        let current = pushWanted.filter {
+            cache[$0] != nil && builtVersions[$0] == versions[$0, default: 0]
+        }
+        let streams = current.filter { lastPushed[$0] != cache[$0]?.contentID }
+        pushWanted.subtract(current.filter { lastPushed[$0] == cache[$0]?.contentID })
         guard !streams.isEmpty || legacyAGPResponse != nil else { return }
         let id = UUID(); pushID = id; pushDeadline = now() + 8
         var payload = body(for: streams)

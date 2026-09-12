@@ -179,6 +179,25 @@ final class WatchPhoneRefreshServiceTests: XCTestCase {
         XCTAssertEqual(h.replies[1]["success"] as? Bool, true)
     }
 
+    func testReplyForOldBuildCannotRemoveNewerPendingDataChange() throws {
+        let h = Harness(); h.automaticBuild = false
+        h.request(["bgReadings"]); h.advance(0.25)
+        let oldBody = h.payload(["bgReadings"])
+        h.value = 125; h.service.changed(["bgReadings"])
+        h.builds[0].completion(oldBody)
+        XCTAssertEqual((h.replies.first?["bgReadings"] as? [String: Any])?["bgReadingValues"] as? [Double], [120])
+        XCTAssertTrue(h.pushes.isEmpty, "The old solicited reply is not a new-data push")
+        h.advance(0.25)
+        XCTAssertEqual(h.builds.count, 2, "Acknowledging old cache content must retain the dirty version")
+        let next = try XCTUnwrap(h.builds.dropFirst().first)
+        next.completion(h.payload(next.streams))
+        let push = try XCTUnwrap(h.pushes.first)
+        XCTAssertEqual((push.payload["bgReadings"] as? [String: Any])?["bgReadingValues"] as? [Double], [125])
+        h.advance(60)
+        XCTAssertEqual(h.builds.count, 2)
+        XCTAssertEqual(h.pushes.count, 1)
+    }
+
     func testMissingBuildBodyFailsOnceWithoutRepeatedDatabaseWork() {
         let h = Harness(); h.automaticBuild = false
         h.request(["status"]); h.advance(0.25)
