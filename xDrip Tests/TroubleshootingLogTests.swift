@@ -1925,6 +1925,9 @@ extension TroubleshootingLogTests {
     }
 
     func testWatchDiagnosticExportKeepsOriginalBuildAndSeparateEventReceiptClocks() throws {
+        let processID = UUID()
+        let centralInstanceID = UUID()
+        let connectionInstanceID = UUID()
         let event = LibreWatchDiagnosticEvent(kind: .bluetoothAction,
             watchTimestamp: referenceDate, trigger: "notificationSubscriptionReady",
             peripheralState: "connected", connectionPhase: "unlock",
@@ -1932,7 +1935,9 @@ extension TroubleshootingLogTests {
             applicationState: .inactive, appBuild: "4252",
             bluetoothAction: "unlockRequested",
             appCommit: "a001908a9b752d909ff3cb8b1efe2e844de4c90f", ownership: .watch,
-            unlockCounter: 42)
+            unlockCounter: 42, processID: processID, centralInstanceID: centralInstanceID,
+            connectionInstanceID: connectionInstanceID,
+            reconnectObservationSource: .peripheralStateObservation)
         let projection = TroubleshootingWatchDiagnostic(event)
         let entry = TroubleshootingLogEntry.detailed(.watchDiagnostic(projection),
             timestamp: referenceDate.addingTimeInterval(600))
@@ -1945,6 +1950,19 @@ extension TroubleshootingLogTests {
         XCTAssertTrue(report.contains("receiptTime="))
         XCTAssertTrue(report.contains("action=unlockRequested"))
         XCTAssertTrue(report.contains("unlockCounter=42"))
+        XCTAssertTrue(report.contains("process=\(processID.uuidString)"))
+        XCTAssertTrue(report.contains("central=\(centralInstanceID.uuidString)"))
+        XCTAssertTrue(report.contains("connection=\(connectionInstanceID.uuidString)"))
+        XCTAssertTrue(report.contains("reconnectSource=peripheralStateObservation"))
+        let modernProjection = TroubleshootingWatchDiagnostic(LibreWatchDiagnosticEvent(
+            kind: .coreBluetoothCallback,
+            trigger: "didDisconnectModern",
+            reconnectObservationSource: .modernCallback
+        ))
+        XCTAssertEqual(modernProjection.reconnectObservationSource, .modernCallback)
+        XCTAssertTrue(makeReport(entries: [
+            .detailed(.watchDiagnostic(modernProjection), timestamp: referenceDate)
+        ]).reportText.contains("reconnectSource=modernCallback"))
         XCTAssertEqual(projection.watchTime, referenceDate)
         XCTAssertEqual(restored.timestamp, referenceDate.addingTimeInterval(600))
     }

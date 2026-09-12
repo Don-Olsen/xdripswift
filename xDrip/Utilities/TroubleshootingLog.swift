@@ -810,6 +810,9 @@ struct TroubleshootingWatchDiagnostic: Codable, Equatable {
     let commit: String?
     let watchOS: String?
     let installationID: UUID?
+    let processID: UUID?
+    let centralInstanceID: UUID?
+    let connectionInstanceID: UUID?
     let sessionID: UUID?
     let owner: LibreWatchOwnership?
     let sequence: UInt64?
@@ -818,6 +821,7 @@ struct TroubleshootingWatchDiagnostic: Codable, Equatable {
     let runtimeInvalidationReason: Int?
     let bluetoothErrorClassification: String?
     let source: LibreWatchRecoveryReconcileSource?
+    let reconnectObservationSource: LibreWatchReconnectObservationSource?
     let peripheral: String?
     let phase: String?
     let action: String?
@@ -857,6 +861,9 @@ struct TroubleshootingWatchDiagnostic: Codable, Equatable {
             $0.range(of: "^Version [0-9]{1,3}\\.[0-9]{1,3}(\\.[0-9]{1,3})? \\(Build [0-9A-Za-z]{1,16}\\)$", options: .regularExpression) != nil ? $0 : nil
         }
         installationID = event.installationID
+        processID = event.processID
+        centralInstanceID = event.centralInstanceID
+        connectionInstanceID = event.connectionInstanceID
         sessionID = event.sessionID
         owner = event.ownership
         sequence = event.sequenceNumber
@@ -866,10 +873,11 @@ struct TroubleshootingWatchDiagnostic: Codable, Equatable {
         bluetoothErrorClassification = Self.allow(event.bluetoothErrorClassification,
             in: ["backgroundBudgetNear", "backgroundBudgetExceeded", "recoverBluetoothLink"])
         source = event.reconcileSource
-        peripheral = Self.allow(event.peripheralState, in: ["connected", "connecting", "disconnected", "disconnecting"])
+        reconnectObservationSource = event.reconnectObservationSource
+        peripheral = Self.normalizedPeripheralState(event.peripheralState)
         phase = Self.allow(event.connectionPhase, in: ["idle", "connection", "services", "characteristics", "notifications", "unlock", "receiving", "cancelling"])
-        action = Self.allow(event.bluetoothAction, in: ["scan", "connect", "cancel", "discoverServices", "discoverCharacteristics", "setNotifyValue", "unlockRequested", "unlockCompleted"])
-        let causes: Set<String> = ["observedLinkState", "didFailToConnect", "didConnect", "didDisconnect", "didDisconnectLegacy", "didDisconnectModern", "didDiscoverServices", "didDiscoverCharacteristics", "didUpdateNotificationState", "didWriteUnlock", "didUpdateValue", "validBLEFrame", "invalidFrames", "noData", "setupOrBluetoothError", "returnAwaitingDisconnection", "extendedRuntimeWillExpire", "extendedRuntimeInvalidated", "exactNFCConfirmedSensor", "confirmedPeripheral", "notificationSubscriptionReady", "writeAcknowledged", "controlledRecovery", "returnToPhone", "ownershipStopped", "unexpectedPeripheralConnected", "connectionArrivedDuringCancellation", "connectionIdentityOrOwnershipMismatch", "notCurrentPeripheral", "retiredPeripheral", "notCurrentPeripheralOrPendingLegacy", "staleGenerationOrLinkRecovered", "staleSetupGenerationOrPhase", "staleSetupGenerationOrService", "staleCharacteristicOrSetupPhase", "staleCharacteristicGenerationOrOwnership", "willRestoreState", "disconnect", "connectionTimeout", "setupTimeout"]
+        action = Self.allow(event.bluetoothAction, in: ["centralCreated", "scan", "connect", "cancel", "discoverServices", "discoverCharacteristics", "setNotifyValue", "unlockRequested", "unlockCompleted"])
+        let causes: Set<String> = ["observedLinkState", "didFailToConnect", "didConnect", "didDisconnect", "didDisconnectLegacy", "didDisconnectModern", "didDiscoverServices", "didDiscoverCharacteristics", "didModifyServices", "didUpdateNotificationState", "didWriteUnlock", "didUpdateValue", "didDiscoverConfirmedSensor", "restorationAccepted", "centralPoweredOn", "centralPoweredOff", "centralUnauthorized", "centralUnsupported", "centralResetting", "centralUnknown", "validBLEFrame", "invalidFrames", "noData", "setupOrBluetoothError", "returnAwaitingDisconnection", "extendedRuntimeWillExpire", "extendedRuntimeInvalidated", "exactNFCConfirmedSensor", "confirmedPeripheral", "collectorPreparation", "freshConnectionSetup", "restoredMissingService", "restoredMissingCharacteristics", "restoredNotificationSetup", "restoredNonSelectedPeripheral", "serviceDiscoveryCompleted", "serviceDiscoveryRequiresConfirmation", "serviceDiscoveryConfirmation", "characteristicsReady", "notificationSubscriptionReady", "writeAcknowledged", "controlledRecovery", "serviceInvalidated", "returnToPhone", "ownershipStopped", "unexpectedPeripheralConnected", "connectionArrivedDuringCancellation", "connectionIdentityOrOwnershipMismatch", "notCurrentPeripheral", "retiredPeripheral", "linkAlreadyConnected", "disconnectPredatesCurrentConnection", "disconnectAlreadyHandled", "restoredIdentityUnresolved", "restoredIdentityMismatch", "restoredIdentityAmbiguous", "unrelatedServiceInvalidation", "serviceInvalidationNotActionable", "staleSetupGenerationOrPhase", "staleSetupGenerationOrService", "staleCharacteristicOrSetupPhase", "staleCharacteristicGenerationOrOwnership", "willRestoreState", "disconnect", "connectionTimeout", "setupTimeout"]
         trigger = Self.allow(event.trigger, in: causes)
         reason = Self.allow(event.actionReason, in: causes)
         generation = event.generation
@@ -896,6 +904,17 @@ struct TroubleshootingWatchDiagnostic: Codable, Equatable {
 
     private static func allow(_ value: String?, in choices: Set<String>) -> String? {
         value.flatMap { choices.contains($0) ? $0 : nil }
+    }
+
+    private static func normalizedPeripheralState(_ value: String?) -> String? {
+        let states = ["disconnected", "connecting", "connected", "disconnecting"]
+        if let direct = allow(value, in: Set(states)) { return direct }
+        guard let value,
+              value.hasPrefix("CBPeripheralState(rawValue: "), value.hasSuffix(")"),
+              let rawValue = Int(value.dropFirst(28).dropLast()),
+              states.indices.contains(rawValue)
+        else { return nil }
+        return states[rawValue]
     }
 }
 
@@ -1957,12 +1976,18 @@ struct TroubleshootingLogReportBuilder {
                 "watchTime=\(time(event.watchTime))", "receiptTime=\(time(entry.timestamp))",
                 "build=\(event.build.map(String.init) ?? "unknown")", "SHA=\(event.commit ?? "unknown")",
                 "installation=\(event.installationID?.uuidString ?? "unknown")",
+                "process=\(event.processID?.uuidString ?? "unknown")",
+                "central=\(event.centralInstanceID?.uuidString ?? "unknown")",
+                "connection=\(event.connectionInstanceID?.uuidString ?? "unknown")",
                 "session=\(event.sessionID?.uuidString ?? "unknown")", "owner=\(event.owner?.rawValue ?? "unknown")",
                 "sequence=\(event.sequence.map(String.init) ?? "unknown")",
                 "scene=\(event.scene?.rawValue ?? "unknown")", "runtime=\(event.runtime.map(String.init) ?? "unknown")",
                 "source=\(event.source?.rawValue ?? "unknown")", "peripheral=\(event.peripheral ?? "unknown")",
                 "phase=\(event.phase ?? "unknown")", "trigger=\(event.trigger ?? "unknown")"
             ]
+            if let reconnectSource = event.reconnectObservationSource {
+                fields.append("reconnectSource=\(reconnectSource.rawValue)")
+            }
             if let returnAttempt = event.returnAttempt {
                 fields.append(returnAttempt.summary { time($0) })
             }
