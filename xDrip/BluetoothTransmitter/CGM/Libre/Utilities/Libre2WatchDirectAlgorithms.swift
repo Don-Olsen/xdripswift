@@ -48,11 +48,13 @@ struct Libre2WatchDirectReading: Equatable {
     }
 
     func payload(
+        id: UUID = UUID(),
         sessionID: UUID,
         valueDomain: LibreWatchValueDomain,
         calibrationRevision: UInt64
     ) -> LibreWatchDirectReadingPayload {
         LibreWatchDirectReadingPayload(
+            id: id,
             sessionID: sessionID,
             valueDomain: valueDomain,
             nativeGlucoseMGDL: nativeGlucoseMGDL,
