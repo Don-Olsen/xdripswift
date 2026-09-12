@@ -1976,8 +1976,9 @@ extension TroubleshootingLogTests {
         ]
         for (rawValue, state) in expected {
             let event = LibreWatchDiagnosticEvent(kind: .coreBluetoothCallback,
+                trigger: "didDiscoverServices",
                 peripheralState: "CBPeripheralState(rawValue: \(rawValue))",
-                connectionPhase: "services", trigger: "didDiscoverServices")
+                connectionPhase: "services")
             XCTAssertEqual(TroubleshootingWatchDiagnostic(event).peripheral, state)
         }
         XCTAssertNil(TroubleshootingWatchDiagnostic(LibreWatchDiagnosticEvent(
