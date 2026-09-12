@@ -39,6 +39,8 @@ En 4259-telefon afviser den nye overload med `success=false` uden protokolversio
 
 Telefonens `AGPCalculationGate` tillader desuden kun én faktisk statistikberegning ad gangen. Den eksisterende OperationQueue-beregning kan ikke afbrydes blot ved en transporttimeout. Porten frigives derfor først ved beregningens rigtige callback; nye requests kan få deres status/graf og et genprøvbart AGP-resultat uden at starte flere beregninger eller opbygge en ny ventekø.
 
+Et delvist svar med gyldig status/graf og manglende AGP anvendes straks; alene AGP får sin egen stigende retry-frist, som ikke udskyder status/grafens cachefrist eller en manuel opdatering.
+
 `snapshotValidatedAt` angiver genkontrol af et ellers uændret snapshot. Den erstatter ikke `generatedAt` eller målingernes tidsstempler. `WatchPhoneSnapshotStore` bevarer eksisterende målingsgrænser; urets direkte værdi og historik er fortsat autoritative, når uret ejer sensoren. Telefonens graf kan da valideres og caches uden at erstatte direkte Watch-data. Appens og komplikationens eksisterende kliniske friskhedsmarkeringer er ikke udvidet.
 
 `updateApplicationContext` bevares. Delvise opdateringer flettes på hovedkøen med den eksisterende context, herunder indholds-ID'er, så status ikke fjerner sessions-, kalibrerings- eller alarmfelter. En mislykket status/context-opdatering beholdes til en senere mulighed.

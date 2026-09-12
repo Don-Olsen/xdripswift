@@ -97,13 +97,20 @@ final class WatchRefreshCoordinatorTests: XCTestCase {
         var lowLimit = 80.0
         var graphTime: TimeInterval = 0
         var controlRequests = 0
+        var replies: [[String: Any]] = []
+        var useAGPCalculationGate = false
+        let agpCalculationGate = WatchManager.AGPCalculationGate()
+        var finishAGPCalculation: (([String: Any]?) -> Void)?
         lazy var phone = WatchPhoneRefreshService(
             now: { [unowned self] in watch.uptime },
             wall: { [unowned self] in watch.wall.addingTimeInterval(watch.uptime) },
             schedule: { [unowned self] delay, action in watch.jobs.append((watch.uptime + delay, action)) },
             build: { [unowned self] streams, _, completion in
                 builds.append(streams)
-                if suspendBuilder { pendingBuild = completion }
+                if useAGPCalculationGate, streams.contains("agp") {
+                    _ = agpCalculationGate.start(base: makePayload(streams.subtracting(["agp"])),
+                        calculate: { [unowned self] in finishAGPCalculation = $0 }, complete: completion)
+                } else if suspendBuilder { pendingBuild = completion }
                 else { completion(makePayload(streams)) }
             },
             generation: { [unowned self] in WatchPhoneSnapshotStore.nextGeneration(sessionID: nil,
@@ -116,7 +123,9 @@ final class WatchRefreshCoordinatorTests: XCTestCase {
         init() {
             watch.onSend = { [unowned self] sent in
                 guard let reply = sent.reply else { return }
-                XCTAssertTrue(phone.receive(sent.message, reply: reply))
+                XCTAssertTrue(phone.receive(sent.message) { [unowned self] payload in
+                    replies.append(payload); reply(payload)
+                })
             }
         }
         func makePayload(_ streams: Set<String>) -> [String: Any] {
@@ -460,5 +469,40 @@ final class WatchRefreshCoordinatorTests: XCTestCase {
         XCTAssertNil(h.client.inFlightRequestID)
         XCTAssertTrue(h.events.contains { $0.1 == "failed" && $0.2 == "timeout" })
         XCTAssertEqual(h.sent.count, 1)
+    }
+
+    func testPairedBusyActualAGPCalculationStillDeliversPartialStatusAndGraph() {
+        let pair = PairedHarness(); pair.useAGPCalculationGate = true
+        _ = pair.agpCalculationGate.start(base: [:], calculate: { _ in }, complete: { _ in })
+        pair.watch.client.setAGPRange(start: pair.watch.wall.addingTimeInterval(-3600), end: pair.watch.wall)
+        pair.watch.client.setVisibleStreams([.status, .bgReadings, .agp])
+        pair.start()
+        XCTAssertEqual(pair.replies.first?["success"] as? Bool, false)
+        XCTAssertEqual(pair.watch.appliedStatusLimit, 80)
+        XCTAssertEqual(pair.watch.displayedReadingDate, pair.watch.wall)
+        XCTAssertGreaterThan(pair.watch.client.agpNextAllowedAttemptAt, pair.watch.uptime)
+        XCTAssertLessThanOrEqual(pair.watch.client.nextAllowedAttemptAt, pair.watch.uptime)
+        XCTAssertFalse(pair.watch.events.contains { $0.1 == "failed" && $0.0 != .agp })
+        pair.watch.client.request(force: true); pair.watch.advance(0.5)
+        XCTAssertEqual(pair.watch.sent.count, 2)
+        XCTAssertEqual(pair.watch.sent[1].message["streams"] as? [String], ["bgReadings", "status"])
+        XCTAssertNil(pair.watch.client.inFlightRequestID)
+    }
+
+    func testPairedAGPBackoffDoesNotPostponeStatusGraphCacheExpiry() {
+        let pair = PairedHarness(); pair.useAGPCalculationGate = true
+        _ = pair.agpCalculationGate.start(base: [:], calculate: { _ in }, complete: { _ in })
+        pair.watch.client.setAGPRange(start: pair.watch.wall.addingTimeInterval(-3600), end: pair.watch.wall)
+        pair.watch.client.setVisibleStreams([.status, .bgReadings, .agp])
+        pair.start(); pair.watch.advance(60.5)
+        let statusRequests = pair.watch.sent.filter {
+            ($0.message["streams"] as? [String] ?? []).contains("status")
+        }
+        XCTAssertEqual(statusRequests.count, 2, "Status expires after 60 seconds even while AGP's backoff is longer")
+        XCTAssertEqual(statusRequests.last?.message["streams"] as? [String], ["bgReadings", "status"])
+        XCTAssertGreaterThan(pair.watch.client.agpNextAllowedAttemptAt, pair.watch.uptime)
+        XCTAssertLessThan(pair.watch.sent.count, 10, "The missing AGP profile remains bounded")
+        XCTAssertEqual(pair.watch.displayedReadingDate, pair.watch.wall)
+        XCTAssertFalse(pair.watch.events.contains { $0.1 == "failed" && $0.0 != .agp })
     }
 }

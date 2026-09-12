@@ -42,6 +42,7 @@ final class WatchRefreshCoordinator {
     private var attempt: Attempt?
     private var scheduledToken = UUID()
     private var failureCount = 0
+    private var agpFailureCount = 0
     private var contentIDs: [String: String] = [:]
     private var lastReceived: [Stream: TimeInterval] = [:]
     private var agpRange: (start: Date, end: Date)?
@@ -50,6 +51,7 @@ final class WatchRefreshCoordinator {
 
     private(set) var lastAttemptAt: TimeInterval?
     private(set) var nextAllowedAttemptAt: TimeInterval = 0
+    private(set) var agpNextAllowedAttemptAt: TimeInterval = 0
     var inFlightRequestID: String? { attempt?.id }
     var usesLegacyCompatibility: Bool { peer == .legacy }
     var latestAGPRequestID: Double { agpSequence }
@@ -153,6 +155,10 @@ final class WatchRefreshCoordinator {
         forced.contains(stream) || lastReceived[stream].map { clock() - $0 >= lifetime(stream) } != false
     }
 
+    private func allowedAt(_ stream: Stream) -> TimeInterval {
+        stream == .agp ? max(nextAllowedAttemptAt, agpNextAllowedAttemptAt) : nextAllowedAttemptAt
+    }
+
     private func enqueue() {
         guard active else { return }
         let token = UUID()
@@ -160,13 +166,16 @@ final class WatchRefreshCoordinator {
         let delay: TimeInterval
         if let attempt {
             delay = max(0, attempt.startedAt + configuration.timeout - clock())
-        } else if !requested.filter({ due($0) && ($0 != .agp || agpRange != nil) }).isEmpty {
-            guard isReachable() else { return }
-            delay = max(configuration.coalescingDelay, nextAllowedAttemptAt - clock())
         } else {
-            let expiry = visibleStreams.compactMap { stream in lastReceived[stream].map { $0 + lifetime(stream) } }.min()
-            guard let expiry else { return }
-            delay = max(configuration.coalescingDelay, expiry - clock())
+            let pending = requested.filter { due($0) && ($0 != .agp || agpRange != nil) }
+            if !pending.isEmpty, !isReachable() { return }
+            let retry = pending.map { allowedAt($0) }.min()
+            let expiry = visibleStreams.filter { !due($0) }.compactMap { stream in
+                lastReceived[stream].map { $0 + lifetime(stream) }
+            }.min()
+            // An AGP-only retry cannot postpone the next status/graph cache expiry.
+            guard let next = [retry, expiry].compactMap({ $0 }).min() else { return }
+            delay = max(configuration.coalescingDelay, next - clock())
         }
         schedule(delay) { [weak self] in
             guard let self, self.active, self.scheduledToken == token else { return }
@@ -181,8 +190,8 @@ final class WatchRefreshCoordinator {
 
     private func startIfPossible() {
         guard active, attempt == nil, isReachable(), clock() >= nextAllowedAttemptAt else { enqueue(); return }
-        var streams = requested.filter { due($0) }
-        for stream in requested.subtracting(streams) { event(stream, "suppressed", "fresh") }
+        var streams = requested.filter { due($0) && clock() >= allowedAt($0) }
+        for stream in requested where !due(stream) { event(stream, "suppressed", "fresh") }
         if agpRange == nil { streams.remove(.agp) }
         requested.subtract(streams)
         guard !streams.isEmpty else { enqueue(); return }
@@ -252,8 +261,9 @@ final class WatchRefreshCoordinator {
             return receivedAt >= current.startedAt && contentIDs[stream.rawValue] != current.contentIDs[stream.rawValue]
         }
         accepted.formUnion(newerPush)
+        if accepted.contains(.agp) { agpFailureCount = 0; agpNextAllowedAttemptAt = clock() }
         if current.streams.isSubset(of: accepted) { finish(id: id) }
-        else { fail(id: id, reason: "incompleteReply") }
+        else { fail(id: id, reason: "incompleteReply", retrying: current.streams.subtracting(accepted)) }
     }
 
     private func sendLegacy(_ current: Attempt) {
@@ -295,15 +305,25 @@ final class WatchRefreshCoordinator {
         enqueue()
     }
 
-    private func fail(id: String, reason: String) {
+    private func fail(id: String, reason: String, retrying missing: Set<Stream>? = nil) {
         guard let current = attempt, current.id == id else { return }
         attempt = nil
-        requested.formUnion(current.streams.intersection(visibleStreams))
-        failureCount = min(failureCount + 1, 10)
-        let delay = min(configuration.maximumRetry, configuration.initialRetry * pow(2, Double(failureCount - 1)))
-        nextAllowedAttemptAt = max(nextAllowedAttemptAt, clock() + delay)
-        if peer == .legacy { nextAllowedAttemptAt = max(nextAllowedAttemptAt, (lastLegacyAttempt ?? clock()) + configuration.legacyMinimumInterval) }
-        for stream in current.streams { event(stream, "failed", reason) }
+        let failed = missing ?? current.streams
+        requested.formUnion(failed.intersection(visibleStreams))
+        if failed == [.agp], peer != .legacy {
+            agpFailureCount = min(agpFailureCount + 1, 10)
+            let delay = min(configuration.maximumRetry, configuration.initialRetry * pow(2, Double(agpFailureCount - 1)))
+            agpNextAllowedAttemptAt = clock() + delay
+            // A valid partial reply proves status/graph transport succeeded. Their next
+            // expiry/manual refresh remains independent of a busy statistics calculation.
+            if missing != nil { failureCount = 0; nextAllowedAttemptAt = clock() }
+        } else {
+            failureCount = min(failureCount + 1, 10)
+            let delay = min(configuration.maximumRetry, configuration.initialRetry * pow(2, Double(failureCount - 1)))
+            nextAllowedAttemptAt = max(nextAllowedAttemptAt, clock() + delay)
+            if peer == .legacy { nextAllowedAttemptAt = max(nextAllowedAttemptAt, (lastLegacyAttempt ?? clock()) + configuration.legacyMinimumInterval) }
+        }
+        for stream in failed { event(stream, "failed", reason) }
         enqueue()
     }
 
