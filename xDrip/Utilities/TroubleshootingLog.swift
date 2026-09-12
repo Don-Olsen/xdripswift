@@ -1002,6 +1002,7 @@ final class TroubleshootingLogStore {
     private let maximumFileSize: Int
     private let now: () -> Date
     private let queue = DispatchQueue(label: "com.faifly.xdrip.troubleshooting-log", qos: .utility)
+    private let acknowledgementQueue = DispatchQueue(label: "com.faifly.xdrip.troubleshooting-log.acknowledgement", qos: .utility)
 
     /// Tracks whether an operational subsystem has an unresolved problem while replaying history.
     /// It is local to the filtering pass and is never persisted as a second source of truth.
@@ -1066,11 +1067,14 @@ final class TroubleshootingLogStore {
 
     /// The Watch keeps its journal item until this asynchronous persistence acknowledgement.
     /// Stable event IDs also cover the crash window before the phone receipt ledger is saved.
+    /// Completion runs on a separate serial queue after storage finishes, independently of UI work.
+    /// It may call `snapshot()` safely. Consumers must dispatch UI/owner-confined state themselves.
     func recordWatchDiagnostic(_ diagnostic: TroubleshootingWatchDiagnostic, receivedAt: Date,
                                completion: @escaping (Bool) -> Void) {
-        queue.async { [weak self] in
+        let acknowledgementQueue = self.acknowledgementQueue
+        queue.async { [weak self, acknowledgementQueue] in
             guard let self else {
-                DispatchQueue.main.async { completion(false) }
+                acknowledgementQueue.async { completion(false) }
                 return
             }
             self.prepareCacheOnQueue()
@@ -1088,7 +1092,7 @@ final class TroubleshootingLogStore {
                 if case let .watchDiagnostic(value) = $0.kind { return value.eventID == diagnostic.eventID }
                 return false
             } ?? false)
-            DispatchQueue.main.async { completion(stored) }
+            acknowledgementQueue.async { completion(stored) }
         }
     }
 

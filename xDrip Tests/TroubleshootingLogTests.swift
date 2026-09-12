@@ -2077,4 +2077,36 @@ extension TroubleshootingLogTests {
         XCTAssertEqual(exported.commit, event.appCommit)
         XCTAssertEqual(entry.timestamp, referenceDate)
     }
+
+    @MainActor
+    func testWatchDiagnosticStorageAcknowledgementDoesNotWaitForMainQueue() {
+        let fixture = makeStore()
+        defer { removeFixture(fixture.directory) }
+        let event = TroubleshootingWatchDiagnostic(LibreWatchDiagnosticEvent(
+            kind: .recoveryStarted, watchTimestamp: referenceDate.addingTimeInterval(-600),
+            appBuild: "4252"))
+        let receiptTime = referenceDate
+        let acknowledged = DispatchSemaphore(value: 0)
+
+        fixture.store.recordWatchDiagnostic(event, receivedAt: receiptTime) { stored in
+            XCTAssertFalse(Thread.isMainThread, "Durable acknowledgements must not wait for UI processing")
+            XCTAssertTrue(stored)
+            // A completion must also be independent of the storage queue: consumers may request
+            // an export snapshot here without deadlocking or seeing an unfinished write.
+            XCTAssertEqual(fixture.store.snapshot().count, 1)
+            let reloaded = TroubleshootingLogStore(fileURL: fixture.fileURL, now: { receiptTime })
+            let restored = reloaded.snapshot()
+            XCTAssertEqual(restored.count, 1)
+            if case let .watchDiagnostic(value)? = restored.first?.kind {
+                XCTAssertEqual(value.eventID, event.eventID)
+            } else {
+                XCTFail("Acknowledged Watch event must already be reloadable from disk")
+            }
+            acknowledged.signal()
+        }
+
+        // Deliberately keep main occupied as during expensive UI work. The old main-queue
+        // completion cannot run here; increasing the timeout would not fix that dependency.
+        XCTAssertEqual(acknowledged.wait(timeout: .now() + 5), .success)
+    }
 }

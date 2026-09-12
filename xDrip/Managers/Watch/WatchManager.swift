@@ -1106,10 +1106,14 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
         TroubleshootingLogStore.shared.recordWatchDiagnostic(
             TroubleshootingWatchDiagnostic(event), receivedAt: receiptTime
         ) { [weak self] stored in
-            guard let self else { return }
             if stored {
-                _ = self.libreWatchDiagnosticReceipts.accept(event.eventID)
-                LibreWatchSessionStore.saveDiagnosticReceipts(self.libreWatchDiagnosticReceipts)
+                // This compatibility ledger is not the durable receipt authority.
+                // Keep its main-thread ownership without delaying the storage reply on UI work.
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    _ = self.libreWatchDiagnosticReceipts.accept(event.eventID)
+                    LibreWatchSessionStore.saveDiagnosticReceipts(self.libreWatchDiagnosticReceipts)
+                }
             }
             var response: [String: Any] = [
                 LibreWatchMessageKey.success: stored,
