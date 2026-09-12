@@ -154,8 +154,11 @@ enum WatchPhoneSnapshotStore {
     static func isValid(_ payload: [String: Any], stream: Stream, sessionID: UUID?,
                         allowUnscopedPhoneSession: Bool = false, at now: Date = Date()) -> Bool {
         guard let generatedAt = number(payload["generatedAt"]),
-              generatedAt > now.addingTimeInterval(-60 * 60).timeIntervalSince1970,
-              generatedAt <= now.addingTimeInterval(20).timeIntervalSince1970
+              generatedAt > 0,
+              let validatedAt = number(payload["snapshotValidatedAt"] ?? payload["generatedAt"]),
+              validatedAt >= generatedAt,
+              validatedAt > now.addingTimeInterval(-60 * 60).timeIntervalSince1970,
+              validatedAt <= now.addingTimeInterval(20).timeIntervalSince1970
         else { return false }
         if let rawGeneration = payload[generationKey] {
             guard let dictionary = rawGeneration as? [String: Any],
@@ -220,7 +223,15 @@ enum WatchPhoneSnapshotStore {
         if let previous = saved[stream.rawValue] as? [String: Any] {
             let oldGeneration = (previous[generationKey] as? [String: Any]).flatMap(Generation.init)
             if let generation, let oldGeneration, generation.installationID == oldGeneration.installationID {
-                guard generation.revision > oldGeneration.revision else { return false }
+                if generation.revision == oldGeneration.revision {
+                    // Revalidation of exactly the same content is not a new generation.
+                    // It never advances the actual glucose timestamp or changes authority.
+                    guard let contentID = payload["snapshotContentID"] as? String,
+                          contentID == previous["snapshotContentID"] as? String,
+                          let checked = number(payload["snapshotValidatedAt"]),
+                          checked > (number(previous["snapshotValidatedAt"]) ?? 0),
+                          sameSnapshotContent(payload, previous) else { return false }
+                } else if generation.revision < oldGeneration.revision { return false }
             } else {
                 guard generatedAt > (previous["generatedAt"] as? Double ?? 0) else { return false }
             }
@@ -236,5 +247,29 @@ enum WatchPhoneSnapshotStore {
         guard let data = try? JSONSerialization.data(withJSONObject: saved) else { return false }
         defaults.set(data, forKey: receivedKey)
         return true
+    }
+
+    /// A context may arrive before its matching push/reply. Acknowledge that already
+    /// validated content without writing it again or treating receipt as a new reading.
+    static func isCurrent(_ payload: [String: Any], stream: Stream, sessionID: UUID?,
+                          allowUnscopedPhoneSession: Bool = false, at now: Date = Date(),
+                          defaults: UserDefaults = .standard) -> Bool {
+        guard isValid(payload, stream: stream, sessionID: sessionID,
+                      allowUnscopedPhoneSession: allowUnscopedPhoneSession, at: now),
+              let saved = stored(stream, defaults: defaults) else { return false }
+        return sameSnapshotContent(payload, saved)
+    }
+
+    private static func sameSnapshotContent(_ lhs: [String: Any], _ rhs: [String: Any]) -> Bool {
+        func content(_ value: Any) -> Any {
+            if let dictionary = value as? [String: Any] {
+                return dictionary.filter { !["generatedAt", "snapshotValidatedAt", "sensorAgeInMinutes"].contains($0.key) }
+                    .mapValues(content)
+            }
+            if let array = value as? [Any] { return array.map(content) }
+            return value
+        }
+        guard let left = content(lhs) as? [String: Any], let right = content(rhs) as? [String: Any] else { return false }
+        return NSDictionary(dictionary: left).isEqual(to: right)
     }
 }

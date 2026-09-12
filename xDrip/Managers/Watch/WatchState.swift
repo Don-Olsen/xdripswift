@@ -29,6 +29,8 @@ struct WatchStatus: WatchPayload {
     var urgentHighLimitInMgDl: Double = 250
     var activeSensorDescription: String?
     var sensorAgeInMinutes: Double = 0
+    /// Absolute origin lets the Watch render age/countdown without polling the phone.
+    var sensorStartedAt: Double?
     var sensorMaxAgeInMinutes: Double = 0
     var preferSensorCountdown: Bool = false
     var sensorNoiseStateRawValue: Int?
