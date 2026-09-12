@@ -129,7 +129,9 @@ final class WatchPhoneRefreshService {
 
     func reachable() {
         // A genuine link return is a new opportunity, not proof of a previous delivery.
-        nextPush = now()
+        // Legacy has no correlated acknowledgement; a flapping link must not bypass
+        // its minimum interval and turn compatibility into a second request storm.
+        if !legacyPeer { nextPush = now() }
         nextContext = now()
         pushWanted.formUnion(["status", "bgReadings"])
         enqueue()
@@ -327,6 +329,12 @@ final class WatchPhoneRefreshService {
         record(sentStreams, "pushAttempt")
         sendPush(payload) { [weak self] success, unsupported in
             guard let self, self.pushID == id else { return }
+            guard self.now() < self.pushDeadline else {
+                self.pushID = nil
+                if self.legacyAGPResponse == nil { self.legacyAGPResponse = sentLegacyAGP }
+                self.failPush("pushTimeout", streams: sentStreams)
+                return
+            }
             self.pushID = nil
             if unsupported { self.legacyPeer = true }
             if success {
@@ -349,7 +357,8 @@ final class WatchPhoneRefreshService {
 
     private func failPush(_ outcome: String, streams: Set<String>) {
         pushFailures = min(pushFailures + 1, 6)
-        nextPush = now() + min(120, 5 * pow(2, Double(pushFailures - 1)))
+        let delay = min(120, 5 * pow(2, Double(pushFailures - 1)))
+        nextPush = now() + (legacyPeer ? max(60, delay) : delay)
         record(streams, outcome)
         // No background wake timer: a later data/activation/reachability opportunity retries.
     }

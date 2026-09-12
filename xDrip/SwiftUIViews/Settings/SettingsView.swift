@@ -404,7 +404,14 @@ private struct SettingsTraceMailView: UIViewControllerRepresentable {
             )
         }
 
-        // Snapshot only already-received local history. Export never requests a Watch journal sync.
+        // Export is local. A manual request in Activity Log can first fetch the Watch's own
+        // offline evidence; this attachment identifies missing/stale snapshots explicitly.
+        mailViewController.addAttachmentData(
+            WatchDeliveryEvidenceTransfer.shared.supportData(),
+            mimeType: "application/json",
+            fileName: "WatchDeliveryEvidence.json"
+        )
+
         let troubleshootingReport = TroubleshootingLogReportBuilder(
             entries: TroubleshootingLogStore.shared.snapshot(),
             usesMgDl: UserDefaults.standard.bloodGlucoseUnitIsMgDl,

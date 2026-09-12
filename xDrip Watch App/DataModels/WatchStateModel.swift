@@ -74,8 +74,7 @@ final class WatchStateModel: NSObject, ObservableObject {
     /// the Watch Connectivity session
     var session: WCSession
 
-    // set timer to automatically refresh the view
-    // https://www.hackingwithswift.com/quick-start/swiftui/how-to-use-a-timer-with-swiftui
+    // Local rendering only. This timer never polls WatchConnectivity or wakes watchOS.
     let timer = Timer.publish(every: 2, tolerance: 0.5, on: .main, in: .common).autoconnect()
     @Published var timerControlDate = Date()
 
@@ -90,12 +89,47 @@ final class WatchStateModel: NSObject, ObservableObject {
     // this lets the Watch remap AGP instantly when the chart hours change
     private var agpProfilePoints: [WatchAGPProfilePoint] = []
 
-    // make sure late AGP replies from older requests don't replace newer chart data
-    private var latestAGPRequestID: Double = 0
-
-    // keep the latest AGP request if WatchConnectivity is not ready yet
-    // this fixes first-load cases where the AGP page appears before the session is reachable
-    private var pendingAGPRequestRange: (startDate: Date, endDate: Date)?
+    @Published private(set) var lastPhoneStatusReceivedAt: Date?
+    @Published private(set) var lastPhoneGraphReceivedAt: Date?
+    private var phoneSensorStartedAt: Date?
+    private var sensorAgeReferenceDate: Date?
+    private var mappedAGPRange: (start: Date, end: Date)?
+    private var mappedAGPPoints: [GlucoseChartAGPPoint] = []
+    private lazy var phoneRefresh = WatchRefreshCoordinator(
+        schedule: { delay, work in DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work) },
+        isReachable: { [weak self] in self?.phoneIsReachable == true },
+        send: { [weak self] message, reply, failure in
+            guard let self else { return }
+            self.requestingDataIconColor = ConstantsAppleWatch.requestingDataIconColorPending
+            let replyHandler: (([String: Any]) -> Void)? = reply.map { callback in
+                { payload in DispatchQueue.main.async { callback(payload) } }
+            }
+            self.session.sendMessage(message, replyHandler: replyHandler) { error in
+                DispatchQueue.main.async { failure(error) }
+            }
+        },
+        consume: { [weak self] payload in
+            guard let self else { return [] }
+            self.processLibreWatchPayload(payload)
+            return self.processWatchPayloadFromDictionary(dictionary: payload)
+        },
+        event: { [weak self] stream, action, outcome in
+            let evidenceStream: WatchDeliveryEvidenceStream
+            switch stream {
+            case .status: evidenceStream = .status
+            case .bgReadings: evidenceStream = .graph
+            case .agp: evidenceStream = .agp
+            }
+            WatchDeliveryEvidenceStore.shared.recordTransport(stream: evidenceStream, action: action, outcome: outcome)
+            if action == "failed" {
+                self?.log.error("Watch refresh \(stream.rawValue, privacy: .public) failed: \(outcome ?? "unknown", privacy: .public)")
+                self?.requestingDataIconColor = ConstantsAppleWatch.requestingDataIconColorInactive
+            } else if action == "received" {
+                self?.requestingDataIconColor = ConstantsAppleWatch.requestingDataIconColorInactive
+                if stream == .status { self?.lastPhoneStatusReceivedAt = Date() }
+                if stream == .bgReadings { self?.lastPhoneGraphReceivedAt = Date() }
+            }
+        })
 
     @Published var isMgDl: Bool = true
     @Published var slopeOrdinal: Int = 2
@@ -104,7 +138,7 @@ final class WatchStateModel: NSObject, ObservableObject {
     @Published var lowLimitInMgDl: Double = 80
     @Published var highLimitInMgDl: Double = 170
     @Published var urgentHighLimitInMgDl: Double = 250
-    @Published var updatedDate: Date = .now
+    @Published var updatedDate: Date = .distantPast
     @Published var activeSensorDescription: String = ""
     @Published var sensorAgeInMinutes: Double = 0
     @Published var sensorMaxAgeInMinutes: Double = 14400
@@ -142,6 +176,7 @@ final class WatchStateModel: NSObject, ObservableObject {
     private var latestDirectSourceDelta: Double?
     private var directReadingAcceptance = LibreWatchReadingAcceptancePolicy()
     private var connectivityOutbox = LibreWatchSessionStore.loadOutbox()
+    private var evidenceConfirmedOutboxIDs = Set<UUID>()
     private var diagnosticJournal = LibreWatchSessionStore.loadDiagnosticJournal()
     private var outboxSendGate = LibreWatchConnectivitySendAttemptGate()
     private var pendingPhoneReturn = LibreWatchSessionStore.loadPhoneReturn()
@@ -153,6 +188,9 @@ final class WatchStateModel: NSObject, ObservableObject {
     private var activationWasRequested = false
     private var lastAlarmAcknowledgementAttemptAt: Date?
     private var acceptedHandoffRevision = LibreWatchSessionStore.loadHandoffRevision()
+    private let acceptedHandoffSnapshotKey = "libreWatchAcceptedHandoffContent.v1"
+    private var acceptedHandoffSnapshot = UserDefaults.standard.data(forKey: "libreWatchAcceptedHandoffContent.v1")
+        .flatMap { try? JSONDecoder().decode(LibreWatchHandoffSnapshot.self, from: $0) }
 
     @Published var aidStatus: AIDStatus?
 
@@ -374,6 +412,7 @@ final class WatchStateModel: NSObject, ObservableObject {
     /// function to calculate the sensor progress value and return a text color to be used by the view
     /// - Returns: progress: the % progress between 0 and 1, textColor:
     func activeSensorProgress() -> (progress: Float, textColor: Color) {
+        let sensorAgeInMinutes = currentSensorAgeInMinutes()
         if sensorAgeInMinutes > 0, sensorMaxAgeInMinutes > 0 {
             let sensorTimeLeftInMinutes = sensorMaxAgeInMinutes - sensorAgeInMinutes
             let progress = Float(min(max(preferSensorCountdown ? sensorTimeLeftInMinutes / sensorMaxAgeInMinutes : sensorAgeInMinutes / sensorMaxAgeInMinutes, 0), 1))
@@ -396,8 +435,17 @@ final class WatchStateModel: NSObject, ObservableObject {
     /// returns either the elapsed or remaining sensor lifetime based upon the user's preference
     /// - Returns: string representation of the sensor lifetime as days and hours
     func activeSensorLifetimeText() -> String {
+        let sensorAgeInMinutes = currentSensorAgeInMinutes()
         let lifetimeInMinutes = preferSensorCountdown ? max(sensorMaxAgeInMinutes - sensorAgeInMinutes, 0) : sensorAgeInMinutes
         return lifetimeInMinutes.minutesToDaysAndHours()
+    }
+
+    private func currentSensorAgeInMinutes(at now: Date = Date()) -> Double {
+        if isShowingDirectLibreReading, let measured = bgReadingDate() {
+            return sensorAgeInMinutes + max(0, now.timeIntervalSince(measured)) / 60
+        }
+        if let started = phoneSensorStartedAt { return max(0, now.timeIntervalSince(started)) / 60 }
+        return sensorAgeInMinutes + max(0, now.timeIntervalSince(sensorAgeReferenceDate ?? now)) / 60
     }
 
     /// returns the sensor noise indicator color supplied by the paired iPhone
@@ -553,19 +601,17 @@ final class WatchStateModel: NSObject, ObservableObject {
 
     /// request a state update from the iOS companion app
     func requestWatchStateUpdate() {
-        guard session.activationState == .activated else {
-            requestSessionActivationIfNeeded()
-            return
-        }
-        // change the text, this must be done in the main thread but only do it if the watch app is reachable
-        if session.isReachable {
-            DispatchQueue.main.async {
-                self.requestingDataIconColor = ConstantsAppleWatch.requestingDataIconColorPending
-            }
+        if session.activationState != .activated { requestSessionActivationIfNeeded() }
+        phoneRefresh.request(force: true)
+    }
 
-            requestWatchUpdate(updateType: "status")
-            requestWatchUpdate(updateType: "bgReadings")
-        }
+    /// RootView owns execution/selection. Hidden TabView pages cannot start pollers.
+    func phoneRefreshVisibilityDidChange(active: Bool, showsAGP: Bool, hours: Double) {
+        let end = Date().addingTimeInterval(5 * 60)
+        phoneRefresh.setAGPRange(start: end.addingTimeInterval(-(hours * 60 * 60 + 5 * 60)), end: end)
+        phoneRefresh.setVisibleStreams(showsAGP ? [.status, .bgReadings, .agp] : [.status, .bgReadings])
+        phoneRefresh.setExecutionAvailable(active)
+        if active, session.activationState != .activated { requestSessionActivationIfNeeded() }
     }
 
     var phoneIsReachable: Bool {
@@ -721,27 +767,44 @@ final class WatchStateModel: NSObject, ObservableObject {
     }
 
     @discardableResult
-    func submitLibreWatchReading(_ directReading: Libre2WatchDirectReading) -> Bool {
+    func submitLibreWatchReading(_ directReading: Libre2WatchDirectReading, payloadID: UUID = UUID()) -> Bool {
         guard let directSession = libreWatchDirectSession,
               let snapshot = libreWatchCalibrationSnapshot,
               snapshot.matches(session: directSession),
               libreWatchOwnership == .watch
-        else { return false }
+        else {
+            let reason = libreWatchDirectSession == nil ? "missingSession" :
+                libreWatchCalibrationSnapshot == nil ? "missingCalibration" :
+                libreWatchOwnership != .watch ? "notWatchOwner" : "calibrationSessionMismatch"
+            WatchDeliveryEvidenceStore.shared.record(stage: .rejected, payloadID: payloadID,
+                sessionID: libreWatchDirectSession?.id, measuredAt: directReading.receivedAt,
+                sensorElapsedMinutes: directReading.sensorTimeInMinutes, outcome: reason)
+            return false
+        }
 
         let reading = directReading.payload(
+            id: payloadID,
             sessionID: directSession.id,
             valueDomain: snapshot.requiredValueDomain,
             calibrationRevision: snapshot.revision
         )
         guard reading.isValid(for: snapshot),
               snapshot.displayedGlucose(for: reading) != nil
-        else { return false }
+        else {
+            WatchDeliveryEvidenceStore.shared.recordReading(.rejected, reading: reading, outcome: "invalidValueOrCalibration")
+            return false
+        }
 
         guard directReadingAcceptance.accept(
             reading,
             for: directSession.id,
             now: Date()
-        ) else { return false }
+        ) else {
+            WatchDeliveryEvidenceStore.shared.recordReading(.rejected, reading: reading,
+                outcome: WatchDeliveryEvidencePipeline.rejection(of: reading, policy: directReadingAcceptance, at: Date()))
+            return false
+        }
+        WatchDeliveryEvidenceStore.shared.recordReading(.accepted, reading: reading)
 
         applyLibreWatchReadingLocally(reading)
         if let glucose = snapshot.displayedGlucose(for: reading) {
@@ -1079,43 +1142,16 @@ final class WatchStateModel: NSObject, ObservableObject {
 
     /// request the compact AGP profile used by the Watch main chart background
     func requestAGPBackground(startDate: Date, endDate: Date) {
-        // always save the latest requested range first
-        // if the session isn't ready, we'll retry when activation/reachability changes
-        pendingAGPRequestRange = (startDate: startDate, endDate: endDate)
-
-        sendPendingAGPRequestIfPossible()
-    }
-
-    private func sendPendingAGPRequestIfPossible() {
-        guard let pendingAGPRequestRange else { return }
-
-        // the Watch app can appear before WCSession has finished activating
-        // keep the pending range and try again when activation completes
-        guard session.activationState == .activated else {
-            requestSessionActivationIfNeeded()
-            return
-        }
-
-        // if the phone isn't reachable yet, keep the pending range and retry on reachability change
-        guard session.isReachable else { return }
-
-        // tag each request so old phone replies can be ignored
-        latestAGPRequestID += 1
-
-        session.sendMessage([
-            "requestWatchUpdate": "agp",
-            "requestID": latestAGPRequestID,
-            "visibleStartDate": pendingAGPRequestRange.startDate.timeIntervalSince1970,
-            "visibleEndDate": pendingAGPRequestRange.endDate.timeIntervalSince1970
-        ], replyHandler: nil) { [log] error in
-            log.error("Error requesting agp: \(error.localizedDescription, privacy: .public)")
-        }
+        phoneRefresh.setAGPRange(start: startDate, end: endDate)
     }
 
     /// Maps the stored daily AGP profile onto the dates currently visible on the Watch chart.
     func agpBackgroundPointsMatching(startDate: Date, endDate: Date) -> [GlucoseChartAGPPoint] {
-        // convert the stored minute-of-day profile into real chart dates for this render pass
-        mapAGPProfileToVisibleRange(startDate: startDate, endDate: endDate)
+        if mappedAGPRange?.start != startDate || mappedAGPRange?.end != endDate {
+            mappedAGPPoints = mapAGPProfileToVisibleRange(startDate: startDate, endDate: endDate)
+            mappedAGPRange = (startDate, endDate)
+        }
+        return mappedAGPPoints
     }
 
     private func mapAGPProfileToVisibleRange(startDate: Date, endDate: Date) -> [GlucoseChartAGPPoint] {
@@ -1195,11 +1231,6 @@ final class WatchStateModel: NSObject, ObservableObject {
         lowerValue + (upperValue - lowerValue) * progress
     }
 
-    private func requestWatchUpdate(updateType: String) {
-        session.sendMessage(["requestWatchUpdate": updateType], replyHandler: nil) { [log] error in
-            log.error("Error requesting \(updateType, privacy: .public): \(error.localizedDescription, privacy: .public)")
-        }
-    }
 
     private func setLibreWatchOwnership(_ ownership: LibreWatchOwnership) {
         let ownershipChanged = ownership != libreWatchOwnership
@@ -1226,13 +1257,17 @@ final class WatchStateModel: NSObject, ObservableObject {
     private func processLibreWatchPayload(_ incomingPayload: [String: Any]) -> Bool {
         var payload = incomingPayload
         var handoffRevision: UInt64?
+        var applyingSnapshot: LibreWatchHandoffSnapshot?
         if let snapshotData = payload[LibreWatchMessageKey.handoffSnapshot] as? Data {
             guard let snapshot = try? JSONDecoder().decode(LibreWatchHandoffSnapshot.self, from: snapshotData),
                   snapshot.isValid
             else { return false }
             if snapshot.revision == acceptedHandoffRevision {
-                return snapshot.session.id == libreWatchDirectSession?.id &&
-                    snapshot.ownership == libreWatchOwnership
+                // An unchanged authoritative snapshot is idempotent. Matching only ID
+                // and owner would also accept conflicting calibration/alarm/unlock data.
+                // A pre-upgrade installation has no such evidence and waits for the
+                // next real authoritative revision rather than inventing acceptance.
+                return acceptedHandoffSnapshot == snapshot
             }
             guard snapshot.canApply(after: acceptedHandoffRevision) else { return false }
             payload[LibreWatchMessageKey.session] = try? JSONEncoder().encode(snapshot.session)
@@ -1242,6 +1277,7 @@ final class WatchStateModel: NSObject, ObservableObject {
             payload[LibreWatchMessageKey.alarmDelegation] = snapshot.alarmDelegation.flatMap { try? JSONEncoder().encode($0) }
             payload[LibreWatchMessageKey.alarmsReady] = snapshot.alarmDelegation != nil
             handoffRevision = snapshot.revision
+            applyingSnapshot = snapshot
         } else if acceptedHandoffRevision > 0 {
             // Already-queued contexts from before the atomic snapshot must not roll back
             // a completed takeover or return. Updated phones always include the snapshot.
@@ -1311,6 +1347,10 @@ final class WatchStateModel: NSObject, ObservableObject {
         // Keep an interrupted old return recoverable until the replacement session and
         // its authoritative owner have both been persisted.
         if sessionChanged { LibreWatchSessionStore.savePhoneReturn(nil) }
+        if let applyingSnapshot, let data = try? JSONEncoder().encode(applyingSnapshot) {
+            acceptedHandoffSnapshot = applyingSnapshot
+            UserDefaults.standard.set(data, forKey: acceptedHandoffSnapshotKey)
+        }
         sendLibreWatchCommand(
             .acknowledgeSession,
             sessionID: preparedSession.id,
@@ -1348,9 +1388,26 @@ final class WatchStateModel: NSObject, ObservableObject {
     }
 
     private func enqueueForWatchConnectivity(_ item: LibreWatchOutboxItem) {
-        connectivityOutbox.enqueue(item)
-        LibreWatchSessionStore.saveOutbox(connectivityOutbox)
+        let admitted = connectivityOutbox.enqueue(item)
+        let saved = LibreWatchSessionStore.saveOutbox(connectivityOutbox)
+        if item.reading != nil {
+            let retained = admitted && connectivityOutbox.items.contains(where: { $0.id == item.id })
+            WatchDeliveryEvidencePipeline.localWrite(saved && retained, item: item,
+                failureReason: retained ? "atomicOutboxWriteFailed" : "notRetainedByOutbox")
+            if saved && retained { evidenceConfirmedOutboxIDs.insert(item.id) }
+        }
         flushWatchConnectivityOutbox()
+    }
+
+    /// Called only after the production atomic file store confirms the current outbox.
+    /// Captures restart/retry confirmation once per retained payload, not at every BLE fragment.
+    private func recordConfirmedOutboxWrites() {
+        let queuedIDs = Set(connectivityOutbox.items.map(\.id))
+        evidenceConfirmedOutboxIDs.formIntersection(queuedIDs)
+        for item in connectivityOutbox.items where item.reading != nil && !evidenceConfirmedOutboxIDs.contains(item.id) {
+            WatchDeliveryEvidencePipeline.localWrite(true, item: item)
+            evidenceConfirmedOutboxIDs.insert(item.id)
+        }
     }
 
     /// Called by the collector's existing health/activation opportunity, even after return.
@@ -1379,6 +1436,7 @@ final class WatchStateModel: NSObject, ObservableObject {
         guard opportunity.allowsDelivery,
               LibreWatchSessionStore.prepareOutboxForDelivery(&connectivityOutbox,
                   sessionID: libreWatchDirectSession?.id, at: date) else { return }
+        recordConfirmedOutboxWrites()
         LibreWatchConnectivityDeliveryPolicy.retryPendingDelivery(
             outbox: connectivityOutbox, at: date, opportunity: opportunity,
             sessionIsActivated: session.activationState == .activated,
@@ -1440,6 +1498,11 @@ final class WatchStateModel: NSObject, ObservableObject {
             return
         }
         session.transferUserInfo(message)
+        if let reading = item.reading {
+            WatchDeliveryEvidenceStore.shared.recordReading(.sendAttempt, reading: reading, outcome: "transferUserInfo")
+        }
+        WatchDeliveryEvidenceStore.shared.recordTransport(stream: WatchDeliveryEvidencePipeline.stream(for: item),
+            action: "attempt", outcome: "transferUserInfo")
         connectivityOutbox.markSubmitted(id: item.id)
         if item.command == .reportDiagnostic {
             diagnosticJournal.markHandedToWatchConnectivity(eventID: item.id)
@@ -1459,6 +1522,7 @@ final class WatchStateModel: NSObject, ObservableObject {
             outboxSendGate.finish(attempt)
             return nil
         }
+        recordConfirmedOutboxWrites()
         return attempt
     }
 
@@ -1472,6 +1536,7 @@ final class WatchStateModel: NSObject, ObservableObject {
         // opportunity; do not send/reload an older snapshot or create a retry timer.
         guard LibreWatchSessionStore.prepareOutboxForDelivery(&connectivityOutbox,
             sessionID: libreWatchDirectSession?.id) else { return }
+        recordConfirmedOutboxWrites()
         guard let item = connectivityOutbox.nextEligible() else { return }
         if session.activationState == .activated,
            session.outstandingUserInfoTransfers.contains(where: {
@@ -1506,17 +1571,26 @@ final class WatchStateModel: NSObject, ObservableObject {
             transferOutboxItemIfActivated(item, message: message, attempt: attempt)
         case .sendMessage:
             guard let attempt = beginOutboxAttempt(for: item) else { return }
+            if let reading = item.reading {
+                WatchDeliveryEvidenceStore.shared.recordReading(.sendAttempt, reading: reading, outcome: "sendMessage")
+            }
+            WatchDeliveryEvidenceStore.shared.recordTransport(stream: WatchDeliveryEvidencePipeline.stream(for: item),
+                action: "attempt", outcome: "sendMessage")
             if item.command == .reportDiagnostic {
                 diagnosticJournal.markHandedToWatchConnectivity(eventID: item.id)
                 LibreWatchSessionStore.saveDiagnosticJournal(diagnosticJournal)
             }
             session.sendMessage(message, replyHandler: { [weak self] reply in
                 DispatchQueue.main.async {
-                    guard let self, self.outboxSendGate.matches(attempt) else { return }
                     let success = reply[LibreWatchMessageKey.success] as? Bool ?? false
                     let outcome = (reply[LibreWatchMessageKey.deliveryOutcome] as? String)
                         .flatMap { LibreWatchDeliveryOutcome(rawValue: $0) }
                     let durableReceipt = reply[LibreWatchMessageKey.durableReceipt] as? Bool == true
+                    if let reading = item.reading {
+                        WatchDeliveryEvidencePipeline.acknowledgement(reading: reading, success: success,
+                            durable: durableReceipt, outcome: outcome?.rawValue)
+                    }
+                    guard let self, self.outboxSendGate.matches(attempt) else { return }
                     if success, LibreWatchConnectivityDeliveryPolicy.shouldFinish(item, success: success, outcome: outcome, durableReceipt: durableReceipt) {
                         self.finishOutboxItem(item.id)
                     } else if !success, item.kind == .reading,
@@ -1539,8 +1613,14 @@ final class WatchStateModel: NSObject, ObservableObject {
                         }
                     }
                 }
-            }, errorHandler: { [weak self] _ in
+            }, errorHandler: { [weak self] error in
                 DispatchQueue.main.async {
+                    let errorClass = WatchDeliveryEvidenceStore.errorClass(error)
+                    WatchDeliveryEvidenceStore.shared.recordTransport(stream: WatchDeliveryEvidencePipeline.stream(for: item),
+                        action: "failed", outcome: errorClass)
+                    if let reading = item.reading {
+                        WatchDeliveryEvidenceStore.shared.recordReading(.transportFailed, reading: reading, outcome: errorClass)
+                    }
                     guard let self, self.outboxSendGate.matches(attempt) else { return }
                     switch LibreWatchConnectivityDeliveryPolicy.actionAfterSendError(
                         sessionIsActivated: self.session.activationState == .activated
@@ -1627,8 +1707,13 @@ final class WatchStateModel: NSObject, ObservableObject {
 
         returnDiagnostic?(.releaseSent, nil, nil)
         returnWillSend?()
+        let evidenceStream: WatchDeliveryEvidenceStream = command == .reportDiagnostic ? .diagnostic : .session
+        WatchDeliveryEvidenceStore.shared.recordTransport(stream: evidenceStream,
+            action: "commandAttempt", outcome: command.rawValue)
         session.sendMessage(message, replyHandler: { reply in
             DispatchQueue.main.async {
+                WatchDeliveryEvidenceStore.shared.recordTransport(stream: evidenceStream,
+                    action: "commandReply", outcome: reply[LibreWatchMessageKey.success] as? Bool == true ? "accepted" : "rejected")
                 guard returnReplyIsCurrent?() != false else { return }
                 let success = reply[LibreWatchMessageKey.success] as? Bool ?? false
                 let error = reply[LibreWatchMessageKey.error] as? String
@@ -1656,6 +1741,8 @@ final class WatchStateModel: NSObject, ObservableObject {
             }
         }, errorHandler: { error in
             DispatchQueue.main.async {
+                WatchDeliveryEvidenceStore.shared.recordTransport(stream: evidenceStream,
+                    action: "commandFailed", outcome: WatchDeliveryEvidenceStore.errorClass(error))
                 guard returnReplyIsCurrent?() != false else { return }
                 returnDiagnostic?(.transportFailed, .transportError, error as NSError)
                 returnResponse?(.unknown, error.localizedDescription)
@@ -1701,13 +1788,24 @@ final class WatchStateModel: NSObject, ObservableObject {
         guard let value = message[LibreWatchMessageKey.deliveryReceiptID] as? String,
               let id = UUID(uuidString: value)
         else { return false }
+        WatchDeliveryEvidenceStore.shared.recordTransport(stream: .receipt, action: "receivedEnvelope",
+            outcome: message[LibreWatchMessageKey.deliveryOutcome] as? String)
         guard let item = connectivityOutbox.items.first(where: { $0.id == id }),
               message[LibreWatchMessageKey.sessionID] as? String == item.sessionID.uuidString
-        else { return true }
+        else {
+            WatchDeliveryEvidenceStore.shared.record(stage: .acknowledgement, payloadID: id,
+                sessionID: (message[LibreWatchMessageKey.sessionID] as? String).flatMap(UUID.init(uuidString:)),
+                outcome: "unmatchedOrDuplicateReceipt:\(message[LibreWatchMessageKey.deliveryOutcome] as? String ?? "unknown")", stream: .receipt)
+            return true
+        }
         let success = message[LibreWatchMessageKey.success] as? Bool ?? false
         let outcome = (message[LibreWatchMessageKey.deliveryOutcome] as? String)
             .flatMap(LibreWatchDeliveryOutcome.init(rawValue:))
         let durableReceipt = message[LibreWatchMessageKey.durableReceipt] as? Bool == true
+        if let reading = item.reading {
+            WatchDeliveryEvidencePipeline.acknowledgement(reading: reading, success: success,
+                durable: durableReceipt, outcome: outcome?.rawValue)
+        }
         if LibreWatchConnectivityDeliveryPolicy.shouldFinish(item, success: success, outcome: outcome, durableReceipt: durableReceipt) {
             if !success {
                 log.error("Queued Libre delivery permanently rejected: \(outcome?.rawValue ?? "unknown", privacy: .public)")
@@ -1720,26 +1818,40 @@ final class WatchStateModel: NSObject, ObservableObject {
         return true
     }
 
-    private func processWatchPayloadFromDictionary(dictionary: [String: Any]) {
+    @discardableResult
+    private func processWatchPayloadFromDictionary(dictionary: [String: Any]) -> Set<WatchRefreshCoordinator.Stream> {
         var processedUpdate = false
+        var received: Set<WatchRefreshCoordinator.Stream> = []
 
         if let statusDictionary = dictionary["status"] as? [String: Any] {
             processedUpdate = processStatusFromDictionary(dictionary: statusDictionary)
+            if processedUpdate || WatchPhoneSnapshotStore.isCurrent(statusDictionary, stream: .status,
+                sessionID: libreWatchDirectSession?.id, allowUnscopedPhoneSession: libreWatchOwnership == .iphone) {
+                received.insert(.status)
+            }
         }
 
         if let bgReadingsDictionary = dictionary["bgReadings"] as? [String: Any] {
-            processedUpdate = processBgReadingsFromDictionary(dictionary: bgReadingsDictionary) || processedUpdate
+            let applied = processBgReadingsFromDictionary(dictionary: bgReadingsDictionary)
+            if applied || (libreWatchOwnership == .watch && isShowingDirectLibreReading &&
+                WatchPhoneSnapshotStore.accept(bgReadingsDictionary, stream: .bgReadings, sessionID: libreWatchDirectSession?.id)) ||
+                WatchPhoneSnapshotStore.isCurrent(bgReadingsDictionary, stream: .bgReadings, sessionID: libreWatchDirectSession?.id,
+                    allowUnscopedPhoneSession: libreWatchOwnership == .iphone) {
+                received.insert(.bgReadings)
+                lastPhoneGraphReceivedAt = Date()
+            }
+            processedUpdate = applied || processedUpdate
         }
 
         if let agpDictionary = dictionary["agp"] as? [String: Any] {
-            processAGPFromDictionary(dictionary: agpDictionary)
-            processedUpdate = true
+            if processAGPFromDictionary(dictionary: agpDictionary) { received.insert(.agp) }
         }
 
         if processedUpdate {
             // now process the shared user defaults to get data for the WidgetKit complications
             updateComplicationData()
         }
+        return received
     }
 
     private func processBgReadingsFromDictionary(dictionary: [String: Any], restoring: Bool = false) -> Bool {
@@ -1755,7 +1867,6 @@ final class WatchStateModel: NSObject, ObservableObject {
               latest >= (bgReadingDate()?.timeIntervalSince1970 ?? 0),
               let slope = dictionary["slopeOrdinal"] as? Int,
               let delta = dictionary["deltaValueInUserUnit"] as? Double,
-              let generatedAt = dictionary["generatedAt"] as? Double,
               restoring || WatchPhoneSnapshotStore.accept(dictionary, stream: .bgReadings,
                   sessionID: libreWatchDirectSession?.id, displayedReadingDate: bgReadingDate(),
                   allowUnscopedPhoneSession: libreWatchOwnership == .iphone)
@@ -1766,7 +1877,9 @@ final class WatchStateModel: NSObject, ObservableObject {
         bgReadingValues = values
         slopeOrdinal = slope
         deltaValueInUserUnit = delta
-        updatedDate = max(updatedDate, Date(timeIntervalSince1970: generatedAt))
+        // This is measurement freshness. A regenerated status envelope cannot update it.
+        updatedDate = Date(timeIntervalSince1970: latest)
+        if !restoring { lastPhoneGraphReceivedAt = Date() }
         // Only a validated replacement changes measurement provenance, never an ownership reply.
         isShowingDirectLibreReading = false
         directLibreReadingIsStale = false
@@ -1782,7 +1895,6 @@ final class WatchStateModel: NSObject, ObservableObject {
         // updates so reopening the app does not replay days of state changes one by one.
         guard WatchPhoneSnapshotStore.isValid(dictionary, stream: .status, sessionID: libreWatchDirectSession?.id,
                   allowUnscopedPhoneSession: libreWatchOwnership == .iphone),
-              let generatedAt = dictionary["generatedAt"] as? Double,
               restoring || WatchPhoneSnapshotStore.accept(dictionary, stream: .status,
                   sessionID: libreWatchDirectSession?.id,
                   allowUnscopedPhoneSession: libreWatchOwnership == .iphone) else {
@@ -1794,9 +1906,15 @@ final class WatchStateModel: NSObject, ObservableObject {
         lowLimitInMgDl = dictionary["lowLimitInMgDl"] as? Double ?? 70
         highLimitInMgDl = dictionary["highLimitInMgDl"] as? Double ?? 180
         urgentHighLimitInMgDl = dictionary["urgentHighLimitInMgDl"] as? Double ?? 250
-        updatedDate = max(updatedDate, Date(timeIntervalSince1970: generatedAt))
+        if !restoring { lastPhoneStatusReceivedAt = Date() }
         activeSensorDescription = dictionary["activeSensorDescription"] as? String ?? ""
-        sensorAgeInMinutes = dictionary["sensorAgeInMinutes"] as? Double ?? 0
+        if !isShowingDirectLibreReading || libreWatchOwnership != .watch {
+            sensorAgeInMinutes = dictionary["sensorAgeInMinutes"] as? Double ?? 0
+        }
+        if let started = dictionary["sensorStartedAt"] as? Double, started.isFinite, started > 0 {
+            phoneSensorStartedAt = Date(timeIntervalSince1970: started)
+        } else { phoneSensorStartedAt = nil }
+        sensorAgeReferenceDate = (dictionary["generatedAt"] as? Double).map(Date.init(timeIntervalSince1970:))
         sensorMaxAgeInMinutes = dictionary["sensorMaxAgeInMinutes"] as? Double ?? 0
         preferSensorCountdown = dictionary["preferSensorCountdown"] as? Bool ?? false
         sensorNoiseStateRawValue = dictionary["sensorNoiseStateRawValue"] as? Int
@@ -1827,7 +1945,8 @@ final class WatchStateModel: NSObject, ObservableObject {
         return true
     }
 
-    private func processAGPFromDictionary(dictionary: [String: Any]) {
+    @discardableResult
+    private func processAGPFromDictionary(dictionary: [String: Any]) -> Bool {
         // the payload is column-based because it's smaller and cheaper to decode on watchOS
         // than sending raw glucose history or nested report objects
         let requestID = dictionary["requestID"] as? Double ?? 0
@@ -1847,17 +1966,16 @@ final class WatchStateModel: NSObject, ObservableObject {
         ].min() ?? 0
 
         // ignore stale replies if the user has already requested a newer AGP profile
-        guard requestID == latestAGPRequestID else {
-            return
+        guard requestID == phoneRefresh.latestAGPRequestID else {
+            return false
         }
 
-        // this request has now been answered, even if the profile itself is empty
-        pendingAGPRequestRange = nil
+        mappedAGPRange = nil
 
         guard pointCount > 0 else {
             agpProfilePoints = []
             agpBackgroundPoints = []
-            return
+            return true
         }
 
         // validate the percentile ordering before storing the profile
@@ -1893,6 +2011,7 @@ final class WatchStateModel: NSObject, ObservableObject {
             startDate: bgReadingDates.last ?? fallbackStartDate,
             endDate: bgReadingDates.first ?? fallbackEndDate
         )
+        return true
     }
 
     /// once we've process the state update, then save this data to the shared app group so that the complication can read it
@@ -1950,11 +2069,9 @@ extension WatchStateModel: WCSessionDelegate {
                 return
             }
 
-            self.requestWatchStateUpdate()
+            self.phoneRefresh.reachabilityDidChange()
             self.retryPendingPhoneReturn()
             self.synchronizeLocalAlarmState()
-            // if the AGP tab requested data while activation was pending, send it now
-            self.sendPendingAGPRequestIfPossible()
             self.flushWatchConnectivityOutbox()
         }
     }
@@ -1963,19 +2080,18 @@ extension WatchStateModel: WCSessionDelegate {
         DispatchQueue.main.async {
             self.retryPendingPhoneReturn()
             self.synchronizeLocalAlarmState()
-            // retry AGP requests that were made before the phone became reachable
-            self.sendPendingAGPRequestIfPossible()
+            self.phoneRefresh.reachabilityDidChange()
             self.flushWatchConnectivityOutbox()
         }
     }
 
     func session(_: WCSession, didReceiveMessageData _: Data) {}
 
-    func session(_: WCSession, didReceiveMessage message: [String: Any]) {
+    func session(_ session: WCSession, didReceiveMessage message: [String: Any]) {
         DispatchQueue.main.async {
+            if WatchDeliveryEvidenceTransfer.shared.handleRequest(message, session: session, reply: nil) { return }
             if self.processLibreWatchDeliveryReceipt(message) { return }
-            self.processLibreWatchPayload(message)
-            self.processWatchPayloadFromDictionary(dictionary: message)
+            self.phoneRefresh.receivePush(message)
             self.requestingDataIconColor = ConstantsAppleWatch.requestingDataIconColorActive
 
             // change the requesting icon color back after a small delay to prevent it
@@ -1986,11 +2102,29 @@ extension WatchStateModel: WCSessionDelegate {
         }
     }
 
+    func session(_ session: WCSession, didReceiveMessage message: [String: Any], replyHandler: @escaping ([String: Any]) -> Void) {
+        DispatchQueue.main.async {
+            if WatchDeliveryEvidenceTransfer.shared.handleRequest(message, session: session, reply: replyHandler) { return }
+            guard message["watchSnapshotPush"] as? Int == 1,
+                  let id = message["pushID"] as? String else {
+                replyHandler([LibreWatchMessageKey.success: false])
+                return
+            }
+            // Reply after the synchronous main-queue validation/persistence, rather than
+            // treating the dispatch itself as completion. Measurement receipts are separate.
+            let accepted = self.phoneRefresh.receivePush(message)
+            let requested = Set(WatchRefreshCoordinator.Stream.allCases.filter { message[$0.rawValue] != nil })
+            let success = !requested.isEmpty && requested.isSubset(of: accepted)
+            replyHandler(["watchSnapshotPush": 1, "pushID": id, LibreWatchMessageKey.success: success,
+                "acceptedStreams": accepted.map(\.rawValue).sorted(),
+                "rejectedOrSupersededStreams": requested.subtracting(accepted).map(\.rawValue).sorted()])
+        }
+    }
+
     func session(_: WCSession, didReceiveUserInfo userInfo: [String: Any] = [:]) {
         DispatchQueue.main.async {
             if self.processLibreWatchDeliveryReceipt(userInfo) { return }
-            self.processLibreWatchPayload(userInfo)
-            self.processWatchPayloadFromDictionary(dictionary: userInfo)
+            self.phoneRefresh.receivePush(userInfo)
         }
     }
 
@@ -1999,13 +2133,18 @@ extension WatchStateModel: WCSessionDelegate {
         didReceiveApplicationContext applicationContext: [String: Any]
     ) {
         DispatchQueue.main.async {
-            self.processLibreWatchPayload(applicationContext)
-            self.processWatchPayloadFromDictionary(dictionary: applicationContext)
+            self.phoneRefresh.receivePush(applicationContext)
         }
     }
 
     func session(_: WCSession, didFinish userInfoTransfer: WCSessionUserInfoTransfer, error: Error?) {
         DispatchQueue.main.async {
+            let command = userInfoTransfer.userInfo[LibreWatchMessageKey.command] as? String
+            let stream: WatchDeliveryEvidenceStream = command == LibreWatchCommand.submitReading.rawValue ? .reading :
+                command == LibreWatchCommand.reportDiagnostic.rawValue ? .diagnostic : .session
+            WatchDeliveryEvidenceStore.shared.recordTransport(stream: stream,
+                action: error == nil ? "OStransferCompleted" : "OStransferFailed",
+                outcome: error.map(WatchDeliveryEvidenceStore.errorClass))
             guard let value = userInfoTransfer.userInfo[LibreWatchMessageKey.deliveryItemID] as? String,
                   let id = UUID(uuidString: value),
                   self.connectivityOutbox.items.contains(where: { $0.id == id })
@@ -2018,6 +2157,10 @@ extension WatchStateModel: WCSessionDelegate {
             self.connectivityOutbox.markSubmitted(id: id)
             LibreWatchSessionStore.saveOutbox(self.connectivityOutbox)
         }
+    }
+
+    func session(_: WCSession, didFinish fileTransfer: WCSessionFileTransfer, error: Error?) {
+        WatchDeliveryEvidenceTransfer.shared.finished(fileTransfer, error: error)
     }
 
     #if os(iOS)

@@ -803,6 +803,18 @@
 		F8FDD6CB2553385000625B49 /* Array.swift in Sources */ = {isa = PBXBuildFile; fileRef = F8FDD6CA2553385000625B49 /* Array.swift */; };
 		F8FDFEA9260DE1A70047597D /* DTCustomColoredAccessory.m in Sources */ = {isa = PBXBuildFile; fileRef = F8FDFEA8260DE1A70047597D /* DTCustomColoredAccessory.m */; };
 		F8FDFEAD260DE1B90047597D /* ConstantsUI.swift in Sources */ = {isa = PBXBuildFile; fileRef = F8FDFEAC260DE1B90047597D /* ConstantsUI.swift */; };
+		68CBD7FC97BD4C6D6E1F812C /* WatchRefreshCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = FBC4DB662736FDDDED496FC6 /* WatchRefreshCoordinator.swift */; };
+		0B3F97748B10F387ED5211AC /* WatchRefreshCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = FBC4DB662736FDDDED496FC6 /* WatchRefreshCoordinator.swift */; };
+		B108DF78E1292783BE98FF48 /* WatchPhoneRefreshService.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2BF56397061EE014A3D7B21 /* WatchPhoneRefreshService.swift */; };
+		0B40FB601DD4180ED8F18005 /* LibreWatchHandoffSnapshotCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = CE5BFE84F5CAD6ACB1ECC640 /* LibreWatchHandoffSnapshotCache.swift */; };
+		47BE8F8F444122CDE4AAE7D7 /* WatchDeliveryEvidence.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8E4083F0F21E53575A5558A2 /* WatchDeliveryEvidence.swift */; };
+		497F116BE619239F1324C655 /* WatchDeliveryEvidence.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8E4083F0F21E53575A5558A2 /* WatchDeliveryEvidence.swift */; };
+		F66773D91CB87BB2A9DD2D2C /* WatchDeliveryEvidenceTransfer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7E3763F4BD194FD72ABB4F3E /* WatchDeliveryEvidenceTransfer.swift */; };
+		1E6DF2E22D45569E7BA60103 /* WatchDeliveryEvidenceTransfer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7E3763F4BD194FD72ABB4F3E /* WatchDeliveryEvidenceTransfer.swift */; };
+		F6AE625266BC22C222B1BCD3 /* WatchRefreshCoordinatorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0613C57EF2220762CB1E164 /* WatchRefreshCoordinatorTests.swift */; };
+		CF10A6C64147896888B547DE /* WatchPhoneRefreshServiceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 43B25D54B33624DC31566FD0 /* WatchPhoneRefreshServiceTests.swift */; };
+		04641C00B9DCC88AA2DF4F8F /* WatchSnapshotSemanticsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 025967A60C120D86CE28EBBC /* WatchSnapshotSemanticsTests.swift */; };
+		BF7243F81F77D4FAAC7507FA /* WatchDeliveryEvidenceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E0669690CC8CFD9CFF1DFE7F /* WatchDeliveryEvidenceTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -1968,6 +1980,15 @@
 		F8FDFEA7260DE1A70047597D /* DTCustomColoredAccessory.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = DTCustomColoredAccessory.h; sourceTree = "<group>"; };
 		F8FDFEA8260DE1A70047597D /* DTCustomColoredAccessory.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; path = DTCustomColoredAccessory.m; sourceTree = "<group>"; };
 		F8FDFEAC260DE1B90047597D /* ConstantsUI.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = ConstantsUI.swift; sourceTree = "<group>"; };
+		FBC4DB662736FDDDED496FC6 /* WatchRefreshCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchRefreshCoordinator.swift; sourceTree = "<group>"; };
+		F2BF56397061EE014A3D7B21 /* WatchPhoneRefreshService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchPhoneRefreshService.swift; sourceTree = "<group>"; };
+		CE5BFE84F5CAD6ACB1ECC640 /* LibreWatchHandoffSnapshotCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LibreWatchHandoffSnapshotCache.swift; sourceTree = "<group>"; };
+		8E4083F0F21E53575A5558A2 /* WatchDeliveryEvidence.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchDeliveryEvidence.swift; sourceTree = "<group>"; };
+		7E3763F4BD194FD72ABB4F3E /* WatchDeliveryEvidenceTransfer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchDeliveryEvidenceTransfer.swift; sourceTree = "<group>"; };
+		A0613C57EF2220762CB1E164 /* WatchRefreshCoordinatorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchRefreshCoordinatorTests.swift; sourceTree = "<group>"; };
+		43B25D54B33624DC31566FD0 /* WatchPhoneRefreshServiceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchPhoneRefreshServiceTests.swift; sourceTree = "<group>"; };
+		025967A60C120D86CE28EBBC /* WatchSnapshotSemanticsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchSnapshotSemanticsTests.swift; sourceTree = "<group>"; };
+		E0669690CC8CFD9CFF1DFE7F /* WatchDeliveryEvidenceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchDeliveryEvidenceTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -2098,6 +2119,11 @@
 		472596032B76300800459D12 /* Watch */ = {
 			isa = PBXGroup;
 			children = (
+				FBC4DB662736FDDDED496FC6 /* WatchRefreshCoordinator.swift */,
+				F2BF56397061EE014A3D7B21 /* WatchPhoneRefreshService.swift */,
+				CE5BFE84F5CAD6ACB1ECC640 /* LibreWatchHandoffSnapshotCache.swift */,
+				8E4083F0F21E53575A5558A2 /* WatchDeliveryEvidence.swift */,
+				7E3763F4BD194FD72ABB4F3E /* WatchDeliveryEvidenceTransfer.swift */,
 				D1B710012026090100000001 /* LibreWatchDirectSession.swift */,
 				472596042B76301F00459D12 /* WatchManager.swift */,
 				47DE41AC2B863D370041DA19 /* WatchState.swift */,
@@ -2547,6 +2573,10 @@
 		4F2600213002000200000001 /* xDrip Tests */ = {
 			isa = PBXGroup;
 			children = (
+				A0613C57EF2220762CB1E164 /* WatchRefreshCoordinatorTests.swift */,
+				43B25D54B33624DC31566FD0 /* WatchPhoneRefreshServiceTests.swift */,
+				025967A60C120D86CE28EBBC /* WatchSnapshotSemanticsTests.swift */,
+				E0669690CC8CFD9CFF1DFE7F /* WatchDeliveryEvidenceTests.swift */,
 				D1B720012026090200000001 /* LibreWatchValuePipelineTests.swift */,
 				4D7D00013016000200000001 /* BluetoothPeripheralDisplayStatusTests.swift */,
 				4D7C00013015000100000001 /* CalibrationReadinessTests.swift */,
@@ -4236,6 +4266,9 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				0B3F97748B10F387ED5211AC /* WatchRefreshCoordinator.swift in Sources */,
+				497F116BE619239F1324C655 /* WatchDeliveryEvidence.swift in Sources */,
+				1E6DF2E22D45569E7BA60103 /* WatchDeliveryEvidenceTransfer.swift in Sources */,
 				D1B700012026090100000002 /* LibreWatchDirectSession.swift in Sources */,
 				D1B700012026090100000004 /* Libre2WatchDirectAlgorithms.swift in Sources */,
 				D1B700012026090100000005 /* LibreWatchDirectState.swift in Sources */,
@@ -4314,6 +4347,10 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				F6AE625266BC22C222B1BCD3 /* WatchRefreshCoordinatorTests.swift in Sources */,
+				CF10A6C64147896888B547DE /* WatchPhoneRefreshServiceTests.swift in Sources */,
+				04641C00B9DCC88AA2DF4F8F /* WatchSnapshotSemanticsTests.swift in Sources */,
+				BF7243F81F77D4FAAC7507FA /* WatchDeliveryEvidenceTests.swift in Sources */,
 				D1B720022026090200000001 /* LibreWatchValuePipelineTests.swift in Sources */,
 				4D7D00023016000200000001 /* BluetoothPeripheralDisplayStatusTests.swift in Sources */,
 				4D7C00023015000100000001 /* CalibrationReadinessTests.swift in Sources */,
@@ -4337,6 +4374,11 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				68CBD7FC97BD4C6D6E1F812C /* WatchRefreshCoordinator.swift in Sources */,
+				B108DF78E1292783BE98FF48 /* WatchPhoneRefreshService.swift in Sources */,
+				0B40FB601DD4180ED8F18005 /* LibreWatchHandoffSnapshotCache.swift in Sources */,
+				47BE8F8F444122CDE4AAE7D7 /* WatchDeliveryEvidence.swift in Sources */,
+				F66773D91CB87BB2A9DD2D2C /* WatchDeliveryEvidenceTransfer.swift in Sources */,
 				D1B700012026090100000001 /* LibreWatchDirectSession.swift in Sources */,
 				D1B700012026090100000003 /* Libre2WatchDirectAlgorithms.swift in Sources */,
 				4D7A00023014000100000001 /* TroubleshootingLog.swift in Sources */,

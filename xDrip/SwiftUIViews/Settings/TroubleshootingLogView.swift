@@ -11,10 +11,12 @@ final class TroubleshootingLogViewModel: ObservableObject {
     @Published private(set) var entries = [TroubleshootingLogEntry]()
     @Published private(set) var appInfo: TroubleshootingLogAppInfo
     @Published private(set) var refreshedAt = Date()
+    @Published private(set) var deliveryStatus = WatchDeliveryEvidenceTransfer.shared.status
 
     private let store: TroubleshootingLogStore
     private let appInfoProvider: () -> TroubleshootingLogAppInfo
     private var changeObserver: NSObjectProtocol?
+    private var deliveryObserver: NSObjectProtocol?
 
     init(
         store: TroubleshootingLogStore = .shared,
@@ -38,12 +40,19 @@ final class TroubleshootingLogViewModel: ObservableObject {
                 self?.reload()
             }
         }
+        deliveryObserver = NotificationCenter.default.addObserver(forName: .watchDeliveryEvidenceChanged,
+            object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    self?.deliveryStatus = WatchDeliveryEvidenceTransfer.shared.status
+                }
+            }
     }
 
     deinit {
         if let changeObserver {
             NotificationCenter.default.removeObserver(changeObserver)
         }
+        if let deliveryObserver { NotificationCenter.default.removeObserver(deliveryObserver) }
     }
 
     func reload() {
@@ -71,6 +80,9 @@ struct TroubleshootingLogView: View {
     @State private var filterText = ""
     @State private var appliedFilterText = ""
     @FocusState private var filterFieldIsFocused: Bool
+    @State private var evidenceURL: URL?
+    @State private var sharingEvidence = false
+    @State private var evidenceExportFailed = false
 
     init(
         store: TroubleshootingLogStore = .shared,
@@ -115,6 +127,7 @@ struct TroubleshootingLogView: View {
 
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 16) {
+                    deliveryEvidenceSection
                     if report.entries.isEmpty {
                         emptyState
                     } else if visibleDayGroups.isEmpty {
@@ -153,6 +166,36 @@ struct TroubleshootingLogView: View {
             }
         }
         .onAppear(perform: viewModel.reload)
+        .sheet(isPresented: $sharingEvidence) {
+            if let evidenceURL { WatchDeliveryEvidenceShareSheet(url: evidenceURL) }
+        }
+    }
+
+    private var deliveryEvidenceSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Button("Hent lokal Watch-log") {
+                WatchDeliveryEvidenceTransfer.shared.requestFromWatch()
+            }
+            Text(viewModel.deliveryStatus)
+                .font(.caption)
+                .foregroundStyle(Color(.colorSecondary))
+            Button("Del leveringslog") {
+                let url = FileManager.default.temporaryDirectory.appendingPathComponent("WatchDeliveryEvidence.json")
+                do {
+                    try WatchDeliveryEvidenceTransfer.shared.supportData().write(to: url, options: .atomic)
+                    evidenceURL = url
+                    evidenceExportFailed = false
+                    sharingEvidence = true
+                } catch { evidenceExportFailed = true }
+            }
+            if evidenceExportFailed {
+                Text("Leveringsloggen kunne ikke klargøres til deling.").font(.caption).foregroundStyle(.orange)
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(.secondarySystemGroupedBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
     }
 
     /// Lives outside the `ScrollView` so the user can always refine or clear the query, including
@@ -446,4 +489,12 @@ private struct TroubleshootingLogDayGroup: Identifiable {
     var entries: [TroubleshootingLogEntry]
 
     var id: Date { day }
+}
+
+private struct WatchDeliveryEvidenceShareSheet: UIViewControllerRepresentable {
+    let url: URL
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: [url], applicationActivities: nil)
+    }
+    func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
 }

@@ -23,11 +23,11 @@ struct RootView: View {
     var body: some View {
         TabView(selection: $selectedPage) {
             // normal main page
-            MainView(hoursToShowIndex: $hoursToShowIndex)
+            MainView(isVisible: selectedPage == WatchAppPage.main.rawValue, hoursToShowIndex: $hoursToShowIndex)
                 .tag(WatchAppPage.main.rawValue)
 
             // same main page layout, but with the AGP background enabled in the chart
-            MainView(showsAGPBackground: true, hoursToShowIndex: $hoursToShowIndex)
+            MainView(showsAGPBackground: true, isVisible: selectedPage == WatchAppPage.agp.rawValue, hoursToShowIndex: $hoursToShowIndex)
                 .tag(WatchAppPage.agp.rawValue)
 
             // large number page
@@ -48,6 +48,7 @@ struct RootView: View {
                 selectedPage = WatchAppPage.main.rawValue
             }
             libreDirectCollector.applicationActivityDidChange(scenePhase.libreWatchApplicationState)
+            updatePhoneRefreshVisibility()
         }
         .onChange(of: scenePhase) { newPhase in
             libreDirectCollector.applicationActivityDidChange(newPhase.libreWatchApplicationState)
@@ -55,12 +56,25 @@ struct RootView: View {
             if newPhase == .active, watchState.libreWatchOwnership == .watch {
                 selectedPage = WatchAppPage.bigNumber.rawValue
             }
+            updatePhoneRefreshVisibility()
         }
         .onChange(of: watchState.libreWatchOwnership) { ownership in
             if ownership == .watch {
                 selectedPage = WatchAppPage.bigNumber.rawValue
             }
         }
+        .onChange(of: selectedPage) { _ in updatePhoneRefreshVisibility() }
+        .onChange(of: hoursToShowIndex) { _ in updatePhoneRefreshVisibility() }
+        .onDisappear {
+            watchState.phoneRefreshVisibilityDidChange(active: false, showsAGP: false,
+                hours: ConstantsAppleWatch.hoursToShow[hoursToShowIndex])
+        }
+    }
+
+    private func updatePhoneRefreshVisibility() {
+        watchState.phoneRefreshVisibilityDidChange(active: scenePhase == .active,
+            showsAGP: selectedPage == WatchAppPage.agp.rawValue,
+            hours: ConstantsAppleWatch.hoursToShow[hoursToShowIndex])
     }
 }
 

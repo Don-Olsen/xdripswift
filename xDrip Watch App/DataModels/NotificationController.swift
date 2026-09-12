@@ -96,6 +96,8 @@ final class LibreWatchAlarmController: NSObject, UNUserNotificationCenterDelegat
     private var delegation: LibreWatchAlarmDelegation? { configuration.delegation }
     private var watchOwnsSensor = false
     private var notificationsAuthorized = false
+    private var permissionEvidence = "authorization=unknown:alert=unknown:sound=unknown"
+    private var previousReadinessEvidence: [String: String] = [:]
     private var pendingGlucoseAlarm = false
     var onStatusChange: ((String) -> Void)?
     var onReadinessChange: (() -> Void)?
@@ -188,6 +190,7 @@ final class LibreWatchAlarmController: NSObject, UNUserNotificationCenterDelegat
             DispatchQueue.main.async {
                 guard let self else { return }
                 let previous = self.readinessRevision
+                self.permissionEvidence = "authorization=\(permissions.authorizationStatus.rawValue):alert=\(permissions.alertSetting.rawValue):sound=\(permissions.soundSetting.rawValue)"
                 self.notificationsAuthorized = permissions.authorizationStatus == .authorized || permissions.authorizationStatus == .provisional
                 if !self.notificationsAuthorized { self.cancelScheduledAlarms() }
                 else { self.reconcileScheduledMissedAlarm() }
@@ -223,6 +226,8 @@ final class LibreWatchAlarmController: NSObject, UNUserNotificationCenterDelegat
                     return
                 }
                 if let error {
+                    WatchDeliveryEvidenceStore.shared.record(stage: .alarmReadiness, payloadID: reading.id,
+                        sessionID: reading.sessionID, outcome: "glucoseNotificationAddFailed:\(WatchDeliveryEvidenceStore.errorClass(error))", stream: .diagnostic)
                     self.onStatusChange?("Watch-alarm kunne ikke oprettes: \((error as NSError).domain) \((error as NSError).code)")
                     return
                 }
@@ -290,6 +295,8 @@ final class LibreWatchAlarmController: NSObject, UNUserNotificationCenterDelegat
                 if !self.watchOwnsSensor || self.state.scheduledMissedID != identifier {
                     self.center.removePendingNotificationRequests(withIdentifiers: [identifier])
                 } else if let error {
+                    WatchDeliveryEvidenceStore.shared.record(stage: .alarmReadiness, sessionID: self.settings?.sessionID,
+                        outcome: "missedNotificationAddFailed:\(WatchDeliveryEvidenceStore.errorClass(error))", stream: .diagnostic)
                     self.state.scheduledMissedID = nil
                     LibreWatchAlarmStore.save(self.state)
                     self.onStatusChange?("Watch-alarm kunne ikke planlægges: \((error as NSError).domain) \((error as NSError).code)")
@@ -327,6 +334,7 @@ final class LibreWatchAlarmController: NSObject, UNUserNotificationCenterDelegat
     }
 
     private func publishStatus() {
+        recordReadinessEvidence()
         guard let settings else { onStatusChange?("Watch-alarmer: venter på iPhone-indstillinger"); return }
         if !settings.rules.contains(where: \.enabled) {
             onStatusChange?("Watch-alarmer er slået fra i dine indstillinger")
@@ -341,6 +349,24 @@ final class LibreWatchAlarmController: NSObject, UNUserNotificationCenterDelegat
         } else {
             onStatusChange?("Alarmansvaret er hos iPhone")
         }
+    }
+
+    /// Permissions and delegated responsibility are evidence, not proof that sound was heard.
+    /// Record only semantic changes; presentation ticks do not create journal writes.
+    private func recordReadinessEvidence() {
+        var evidence = ["permissions": permissionEvidence,
+            "authority": "ownerWatch=\(watchOwnsSensor):delegated=\(alarmsAreDelegatedToWatch):readiness=\(readinessRevision.map { String($0) } ?? "none")",
+            "snoozeAll": "until=\(settings?.snoozeAllUntil.map { String($0.timeIntervalSince1970) } ?? "none")"]
+        if let settings {
+            evidence["snoozes"] = LibreWatchAlarmKind.allCases.map {
+                "\($0.rawValue)=\(state.snoozedUntil($0, settings: settings).timeIntervalSince1970)"
+            }.joined(separator: ":")
+        }
+        for key in evidence.keys.sorted() where previousReadinessEvidence[key] != evidence[key] {
+            WatchDeliveryEvidenceStore.shared.record(stage: .alarmReadiness, sessionID: settings?.sessionID,
+                outcome: "\(key):\(evidence[key] ?? "unknown")", stream: .diagnostic)
+        }
+        previousReadinessEvidence = evidence
     }
 
     func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,

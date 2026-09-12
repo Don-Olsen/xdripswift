@@ -14,6 +14,7 @@ struct MainView: View {
     // the AGP page intentionally reuses this exact view. Only the chart background changes so the
     // layout does not move when swiping between the normal and AGP pages
     let showsAGPBackground: Bool
+    let isVisible: Bool
 
     // get the array of different hour ranges from the constants file
     // we'll move through this array as the user swipes left/right on the chart
@@ -47,8 +48,9 @@ struct MainView: View {
     // map AGP across the same span so the background reaches the chart edge too
     private let chartTrailingAGPExtension: TimeInterval = 5 * 60
 
-    init(showsAGPBackground: Bool = false, hoursToShowIndex: Binding<Int> = .constant(ConstantsAppleWatch.hoursToShowDefaultIndex)) {
+    init(showsAGPBackground: Bool = false, isVisible: Bool = true, hoursToShowIndex: Binding<Int> = .constant(ConstantsAppleWatch.hoursToShowDefaultIndex)) {
         self.showsAGPBackground = showsAGPBackground
+        self.isVisible = isVisible
         _hoursToShowIndex = hoursToShowIndex
     }
 
@@ -63,7 +65,7 @@ struct MainView: View {
 
             // only the AGP page asks for AGP points. The normal page passes nil so the chart is
             // rendered exactly as a normal glucose chart.
-            let agpBackgroundPoints = showsAGPBackground ? watchState.agpBackgroundPointsMatching(startDate: chartStartDate, endDate: agpEndDate) : nil
+            let agpBackgroundPoints = showsAGPBackground && isVisible ? watchState.agpBackgroundPointsMatching(startDate: chartStartDate, endDate: agpEndDate) : nil
 
             VStack(spacing: rowSpacing) {
                 MainViewHeaderView()
@@ -120,19 +122,24 @@ struct MainView: View {
             // update the chart height as soon as SwiftUI has measured the fixed rows
             .onPreferenceChange(MainViewFixedRowHeightPreferenceKey.self) { fixedRowHeights = $0 }
             .onReceive(watchState.timer) { date in
-                if watchState.updatedDate.timeIntervalSinceNow < -5 {
-                    chartRangeEndDate = date
-                    watchState.timerControlDate = date
-                    watchState.requestWatchStateUpdate()
-                    refreshView.toggle()
-                }
+                guard isVisible else { return }
+                // Only local presentation changes here. Keep missing measurements
+                // visibly behind the chart edge; remap its range at most once a minute.
+                if date.timeIntervalSince(chartRangeEndDate) >= 60 { chartRangeEndDate = date }
+                watchState.timerControlDate = date
+                watchState.refreshDirectLibreReadingFreshness(at: date)
+                refreshView.toggle()
             }
             .onAppear {
+                guard isVisible else { return }
                 chartRangeEndDate = Date()
-                // if the Watch session is not reachable yet, the model will keep this request and retry it
-                requestAGPBackgroundIfNeeded(endDate: chartRangeEndDate)
-                watchState.requestWatchStateUpdate()
                 refreshView.toggle()
+            }
+            .onChange(of: isVisible) { visible in
+                if visible { chartRangeEndDate = Date(); refreshView.toggle() }
+            }
+            .onChange(of: watchState.bgReadingDates.first) { _ in
+                if isVisible { chartRangeEndDate = Date() }
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -148,15 +155,6 @@ struct MainView: View {
         return max(containerHeight - fixedHeight - spacingHeight, minimumChartHeight)
     }
 
-    private func requestAGPBackgroundIfNeeded(endDate: Date) {
-        guard showsAGPBackground else { return }
-
-        let startDate = endDate.addingTimeInterval(-hoursToShow[hoursToShowIndex] * 60 * 60)
-        let agpEndDate = endDate.addingTimeInterval(chartTrailingAGPExtension)
-
-        // request the compact AGP profile from the iOS app. The Watch maps it onto this date range locally.
-        watchState.requestAGPBackground(startDate: startDate, endDate: agpEndDate)
-    }
 }
 
 private enum MainViewFixedRow: Hashable {

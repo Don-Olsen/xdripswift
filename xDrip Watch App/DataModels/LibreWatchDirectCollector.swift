@@ -2150,6 +2150,10 @@ extension LibreWatchDirectCollector: CBPeripheralDelegate {
                 parameters: preparedSession.algorithmParameters,
                 receivedAt: now
             )
+            let payloadID = UUID()
+            WatchDeliveryEvidenceStore.shared.record(stage: .decoded, payloadID: payloadID,
+                sessionID: preparedSession.id, measuredAt: reading.receivedAt,
+                sensorElapsedMinutes: reading.sensorTimeInMinutes, outcome: "validDecryptedFrame")
             // BLE liveness is a property of the technically valid Libre frame, not of later
             // clinical ordering/deduplication. Refresh it before the payload acceptance gate.
             frameLiveness.validFrame(at: now)
@@ -2166,12 +2170,18 @@ extension LibreWatchDirectCollector: CBPeripheralDelegate {
             state.notificationsActive()
             reportRecoverySuccessIfNeeded()
             reportFrameProgress(at: now)
-            let wasAccepted = watchState?.submitLibreWatchReading(reading) == true
+            let wasAccepted = watchState?.submitLibreWatchReading(reading, payloadID: payloadID) == true
             scheduleReconnectFallback(for: peripheral)
             if wasAccepted {
                 state.recordDirectReading(reading)
+            } else if watchState == nil {
+                WatchDeliveryEvidenceStore.shared.record(stage: .rejected, payloadID: payloadID,
+                    sessionID: preparedSession.id, measuredAt: reading.receivedAt,
+                    sensorElapsedMinutes: reading.sensorTimeInMinutes, outcome: "missingWatchState")
             }
         } catch {
+            WatchDeliveryEvidenceStore.shared.record(stage: .rejected, sessionID: preparedSession?.id,
+                outcome: "frameDecodeFailed:\(WatchDeliveryEvidenceStore.errorClass(error))")
             frameAssembler.reset()
             state.fail(.invalidFrame, error: error.localizedDescription)
             if frameLiveness.invalidFrame() {

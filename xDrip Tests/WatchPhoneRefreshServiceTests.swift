@@ -26,6 +26,7 @@ final class WatchPhoneRefreshServiceTests: XCTestCase {
         var controls: Payload = ["testControlRevision": 7, "testOwner": "watch"]
         var events: [(String, String)] = []
         var automaticBuild = true
+        var agpGate: WatchManager.AGPCalculationGate?
         var automaticPush = true
         var contextFailures = 0
         var scope = "phone"
@@ -38,8 +39,17 @@ final class WatchPhoneRefreshServiceTests: XCTestCase {
             wall: { [unowned self] in origin.addingTimeInterval(uptime) },
             schedule: { [unowned self] delay, work in jobs.append((uptime + delay, work)) },
             build: { [unowned self] streams, raw, completion in
-                builds.append(Build(streams: streams, raw: raw, completion: completion))
-                if automaticBuild { completion(payload(streams)) }
+                if let gate = agpGate, streams.contains("agp") {
+                    gate.start(base: payload(streams.subtracting(["agp"])), calculate: { finished in
+                        builds.append(Build(streams: streams, raw: raw, completion: { body in
+                            finished(body["agp"] as? Payload)
+                        }))
+                        if automaticBuild { finished(payload(["agp"])["agp"] as? Payload) }
+                    }, complete: completion)
+                } else {
+                    builds.append(Build(streams: streams, raw: raw, completion: completion))
+                    if automaticBuild { completion(payload(streams)) }
+                }
             },
             generation: { [unowned self] in
                 generations += 1
@@ -336,6 +346,62 @@ final class WatchPhoneRefreshServiceTests: XCTestCase {
         XCTAssertEqual(h.replies[0]["error"] as? String, "invalidAGPRange")
     }
 
+    func testPhysicalAGPCalculationSurvivesTransportTimeoutWithoutAdditionalQueuedWork() {
+        let h = Harness(); h.agpGate = WatchManager.AGPCalculationGate(); h.automaticBuild = false
+        h.request(["agp", "status"]); h.advance(5.25)
+        XCTAssertEqual(h.replies[0]["error"] as? String, "buildTimeout")
+        for _ in 0..<20 { h.request(["agp", "status"]); h.advance(0.25) }
+        XCTAssertEqual(h.builds.count, 1, "Transport retries must not enqueue further statistics operations")
+        XCTAssertTrue(h.replies.dropFirst().allSatisfy { $0["status"] != nil || $0["unchangedStreams"] != nil })
+        XCTAssertTrue(h.replies.dropFirst().allSatisfy { $0["success"] as? Bool == false })
+        h.request(["status"]); h.advance(0.25)
+        XCTAssertEqual(h.replies.last?["success"] as? Bool, true)
+    }
+
+    func testPhysicalAGPCompletionReleasesGateButCannotApplyTimedOutResult() {
+        let h = Harness(); h.agpGate = WatchManager.AGPCalculationGate(); h.automaticBuild = false
+        h.request(["agp"]); h.advance(5.25)
+        h.completeBuild(0)
+        XCTAssertEqual(h.replies.count, 1)
+        XCTAssertTrue(h.contextAttempts.isEmpty)
+        h.request(["agp"]); h.advance(0.25)
+        XCTAssertEqual(h.builds.count, 2)
+        h.completeBuild(0) // Duplicate completion cannot release the newer physical calculation.
+        h.request(["status"])
+        h.completeBuild(1); h.advance(0.25)
+        XCTAssertEqual(h.replies[1]["success"] as? Bool, true)
+        XCTAssertEqual(h.replies[1]["agp"] is [String: Any], true)
+    }
+
+    func testAGPGateFailureReleasesWithoutInventingProfile() {
+        let gate = WatchManager.AGPCalculationGate()
+        var callback: (([String: Any]?) -> Void)?
+        var result: [String: Any]?
+        XCTAssertTrue(gate.start(base: ["status": ["v": 1]], calculate: { callback = $0 }, complete: { result = $0 }))
+        callback?(nil)
+        XCTAssertNotNil(result?["status"])
+        XCTAssertNil(result?["agp"])
+        XCTAssertTrue(gate.start(base: [:], calculate: { $0(["medianValues": [120.0]]) }, complete: { result = $0 }))
+        XCTAssertNotNil(result?["agp"])
+    }
+
+    func testAGPGateDuplicateCallbackCannotReleaseNewerCalculation() {
+        let gate = WatchManager.AGPCalculationGate()
+        var callbacks: [([String: Any]?) -> Void] = []
+        var completed = 0
+        XCTAssertTrue(gate.start(base: [:], calculate: { callbacks.append($0) }, complete: { _ in completed += 1 }))
+        callbacks[0](["dayCount": 7])
+        XCTAssertTrue(gate.start(base: [:], calculate: { callbacks.append($0) }, complete: { _ in completed += 1 }))
+        callbacks[0](nil)
+        var busyBase: [String: Any]?
+        XCTAssertFalse(gate.start(base: ["status": ["v": 2]], calculate: { _ in XCTFail("Second calculation started") },
+            complete: { busyBase = $0 }))
+        XCTAssertNotNil(busyBase?["status"])
+        XCTAssertEqual(completed, 1)
+        callbacks[1](nil)
+        XCTAssertEqual(completed, 2)
+    }
+
     func testContextContentIDsMergeAlongsideControlFields() {
         let merged = WatchPhoneRefreshService.merging(
             ["bgReadings": ["v": 2], "contentIDs": ["bgReadings": "new-graph"]],
@@ -345,5 +411,33 @@ final class WatchPhoneRefreshServiceTests: XCTestCase {
             ["status": "old-status", "bgReadings": "new-graph"])
         XCTAssertEqual(merged["libreHandoff"] as? Data, Data([4]))
         XCTAssertEqual(merged["libreCalibration"] as? Data, Data([5]))
+    }
+
+    func testLegacyReachabilityFlapsRespectMinimumIntervalAfterSuccessAndFailure() {
+        for succeeded in [true, false] {
+            let h = Harness(); h.automaticPush = false
+            h.service.refreshLegacy(["status"]); h.advance(0.25)
+            XCTAssertEqual(h.pushes.count, 1)
+            h.pushes[0].completion(succeeded, false)
+            h.value = 140; h.service.changed(["bgReadings"])
+            for _ in 0..<10 { h.service.reachable(); h.advance(1) }
+            XCTAssertEqual(h.pushes.count, 1, "Reachability cannot reset the legacy minimum interval")
+            h.advance(50); h.service.reachable(); h.advance(0.25)
+            XCTAssertEqual(h.pushes.count, 2)
+        }
+    }
+
+    func testLatePushCallbackCannotAcknowledgeAfterSuspendedTimeoutScheduler() {
+        let h = Harness(); h.automaticPush = false
+        h.service.changed(["status", "bgReadings"]); h.advance(0.25)
+        XCTAssertEqual(h.pushes.count, 1)
+        // Simulate suspension: monotonic time advances before scheduled work resumes.
+        h.uptime += 9
+        h.pushes[0].completion(true, false)
+        XCTAssertTrue(h.events.contains { $0.1 == "pushTimeout" })
+        XCTAssertFalse(h.events.contains { $0.1 == "pushAcknowledged" })
+        h.jobs.removeAll()
+        h.service.reachable(); h.advance(0.25)
+        XCTAssertEqual(h.pushes.count, 2, "A late ACK must not mark the old content as delivered")
     }
 }
