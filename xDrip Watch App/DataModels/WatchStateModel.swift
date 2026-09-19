@@ -2098,19 +2098,9 @@ extension WatchStateModel: WCSessionDelegate {
     func session(_ session: WCSession, didReceiveMessage message: [String: Any], replyHandler: @escaping ([String: Any]) -> Void) {
         DispatchQueue.main.async {
             if WatchDeliveryEvidenceTransfer.shared.handleRequest(message, session: session, reply: replyHandler) { return }
-            guard message["watchSnapshotPush"] as? Int == 1,
-                  let id = message["pushID"] as? String else {
-                replyHandler([LibreWatchMessageKey.success: false])
-                return
-            }
             // Reply after the synchronous main-queue validation/persistence, rather than
             // treating the dispatch itself as completion. Measurement receipts are separate.
-            let accepted = self.phoneRefresh.receivePush(message)
-            let requested = Set(WatchRefreshCoordinator.Stream.allCases.filter { message[$0.rawValue] != nil })
-            let success = !requested.isEmpty && requested.isSubset(of: accepted)
-            replyHandler(["watchSnapshotPush": 1, "pushID": id, LibreWatchMessageKey.success: success,
-                "acceptedStreams": accepted.map(\.rawValue).sorted(),
-                "rejectedOrSupersededStreams": requested.subtracting(accepted).map(\.rawValue).sorted()])
+            replyHandler(WatchSnapshotPushContract.reply(to: message) { self.phoneRefresh.receivePush($0) })
         }
     }
 

@@ -527,10 +527,8 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
         } else {
             session.sendMessage(payload, replyHandler: { reply in
                 DispatchQueue.main.async {
-                    let matched = reply["watchSnapshotPush"] as? Int == 1 &&
-                        reply["pushID"] as? String == payload["pushID"] as? String &&
-                        reply["success"] as? Bool == true
-                    completion(matched, reply["watchSnapshotPush"] == nil && reply["success"] as? Bool == false)
+                    let outcome = WatchSnapshotPushContract.outcome(for: reply, sent: payload)
+                    completion(outcome.acknowledged, outcome.unsupported)
                 }
             }, errorHandler: failure)
         }

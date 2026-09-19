@@ -1,5 +1,67 @@
 import Foundation
 
+/// The status/graph push acknowledgement used by both WCSession adapters. This is
+/// separate from glucose-storage receipts. Protocol 1 accepts the 4260/4261 Watch's
+/// success field and emits both names so a 4261 phone can understand a newer Watch.
+/// Compatibility never bypasses the protocol/UUID/stream checks for a positive ACK.
+enum WatchSnapshotPushContract {
+    typealias Payload = [String: Any]
+    struct Outcome {
+        let acknowledged: Bool
+        let unsupported: Bool
+    }
+
+    static func reply(to message: Payload, consume: WatchRefreshCoordinator.Consumer) -> Payload {
+        var reply: Payload = ["success": false, LibreWatchMessageKey.success: false]
+        if let version = message["watchSnapshotPush"] { reply["watchSnapshotPush"] = version }
+        if let id = message["pushID"] as? String { reply["pushID"] = id }
+        guard message["watchSnapshotPush"] as? Int == 1,
+              let id = message["pushID"] as? String, UUID(uuidString: id) != nil else { return reply }
+        let requested = streams(in: message)
+        guard !requested.isEmpty else { return reply }
+        // The consumer validates/persists synchronously before we acknowledge it.
+        let accepted = consume(message).intersection(requested)
+        let success = requested.isSubset(of: accepted)
+        reply["success"] = success
+        reply[LibreWatchMessageKey.success] = success
+        reply["acceptedStreams"] = accepted.map(\.rawValue).sorted()
+        reply["rejectedOrSupersededStreams"] = requested.subtracting(accepted).map(\.rawValue).sorted()
+        return reply
+    }
+
+    static func outcome(for reply: Payload, sent message: Payload) -> Outcome {
+        let rejected = Outcome(acknowledged: false, unsupported: false)
+        guard message["watchSnapshotPush"] as? Int == 1,
+              let id = message["pushID"] as? String, UUID(uuidString: id) != nil,
+              !streams(in: message).isEmpty else { return rejected }
+        // Older Watches explicitly reject the unsupported reply-handler overload.
+        // Only that uncorrelated negative response enables the service's existing
+        // rate-limited legacy mode; malformed modern replies must not downgrade it.
+        if reply["watchSnapshotPush"] == nil, reply["pushID"] == nil, success(in: reply) == false {
+            return Outcome(acknowledged: false, unsupported: true)
+        }
+        guard reply["watchSnapshotPush"] as? Int == 1, reply["pushID"] as? String == id,
+              success(in: reply) == true,
+              let accepted = reply["acceptedStreams"] as? [String],
+              streams(in: message).map(\.rawValue).allSatisfy(accepted.contains),
+              Set(accepted).isSubset(of: Set(WatchRefreshCoordinator.Stream.allCases.map(\.rawValue))) else { return rejected }
+        return Outcome(acknowledged: true, unsupported: false)
+    }
+
+    private static func streams(in message: Payload) -> Set<WatchRefreshCoordinator.Stream> {
+        Set(WatchRefreshCoordinator.Stream.allCases.filter { message[$0.rawValue] != nil })
+    }
+
+    private static func success(in reply: Payload) -> Bool? {
+        let current = reply["success"] as? Bool
+        let previous = reply[LibreWatchMessageKey.success] as? Bool
+        if reply["success"] != nil && current == nil { return nil }
+        if reply[LibreWatchMessageKey.success] != nil && previous == nil { return nil }
+        if let current, let previous, current != previous { return nil }
+        return current ?? previous
+    }
+}
+
 /// The production request/reply boundary shared by every Watch page. All methods and
 /// callbacks run on the owner's serial queue (the main queue in WatchStateModel).
 /// Scheduled work only runs during an existing foreground execution opportunity;

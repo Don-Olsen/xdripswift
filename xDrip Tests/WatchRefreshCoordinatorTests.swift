@@ -88,6 +88,11 @@ final class WatchRefreshCoordinatorTests: XCTestCase {
     }
 
     private final class PairedHarness {
+        struct Push {
+            let payload: [String: Any]
+            let reply: [String: Any]
+            let completion: (Bool, Bool) -> Void
+        }
         let watch = Harness()
         var builds: [Set<String>] = []
         var published: [[String: Any]] = []
@@ -98,6 +103,10 @@ final class WatchRefreshCoordinatorTests: XCTestCase {
         var graphTime: TimeInterval = 0
         var controlRequests = 0
         var replies: [[String: Any]] = []
+        var pushes: [Push] = []
+        var automaticPushReply = true
+        var legacyWatch = false
+        var phoneEvents: [(String, String)] = []
         var useAGPCalculationGate = false
         let agpCalculationGate = WatchManager.AGPCalculationGate()
         var finishAGPCalculation: (([String: Any]?) -> Void)?
@@ -118,7 +127,25 @@ final class WatchRefreshCoordinatorTests: XCTestCase {
             sessionScope: { "paired-test-scope" },
             controlSnapshot: { [unowned self] in controlRequests += 1; return ["testControlRevision": 7] },
             publishContext: { [unowned self] payload in published.append(payload); watch.client.receivePush(payload); return true },
-            sendPush: { [unowned self] payload, completed in watch.client.receivePush(payload); completed(true, false) })
+            sendPush: { [unowned self] payload, completed in
+                if payload["legacySnapshot"] as? Bool == true {
+                    watch.client.receivePush(payload)
+                    pushes.append(Push(payload: payload, reply: [:], completion: completed))
+                    completed(true, false) // Matches the no-reply WC adapter: submission only.
+                } else {
+                    let reply: [String: Any] = legacyWatch ? [LibreWatchMessageKey.success: false] :
+                        WatchSnapshotPushContract.reply(to: payload) { watch.client.receivePush($0) }
+                    pushes.append(Push(payload: payload, reply: reply, completion: completed))
+                    if automaticPushReply { replyToPush(pushes.count - 1) }
+                }
+            },
+            event: { [unowned self] stream, action in phoneEvents.append((stream, action)) })
+
+        func replyToPush(_ index: Int, with reply: [String: Any]? = nil) {
+            let push = pushes[index]
+            let outcome = WatchSnapshotPushContract.outcome(for: reply ?? push.reply, sent: push.payload)
+            push.completion(outcome.acknowledged, outcome.unsupported)
+        }
 
         init() {
             watch.onSend = { [unowned self] sent in
@@ -506,5 +533,142 @@ final class WatchRefreshCoordinatorTests: XCTestCase {
         XCTAssertLessThan(pair.watch.sent.count, 10, "The missing AGP profile remains bounded")
         XCTAssertEqual(pair.watch.displayedReadingDate, pair.watch.wall)
         XCTAssertFalse(pair.watch.events.contains { $0.1 == "failed" && $0.0 != .agp })
+    }
+
+    func testProductionPushAcknowledgementRoundTripStopsUnchangedRetries() throws {
+        let pair = PairedHarness()
+        pair.phone.changed(["status", "bgReadings"]); pair.watch.advance(0.25)
+        let push = try XCTUnwrap(pair.pushes.first)
+        XCTAssertEqual(push.reply["success"] as? Bool, true, "4261 phone compatibility")
+        XCTAssertEqual(push.reply[LibreWatchMessageKey.success] as? Bool, true)
+        XCTAssertEqual(push.reply["pushID"] as? String, push.payload["pushID"] as? String)
+        XCTAssertEqual(push.reply["acceptedStreams"] as? [String], ["bgReadings", "status"])
+        XCTAssertEqual(pair.watch.displayedReadingDate, pair.watch.wall)
+        XCTAssertNotNil(WatchPhoneSnapshotStore.stored(.bgReadings, defaults: pair.watch.defaults))
+        for _ in 0..<10 { pair.phone.reachable(); pair.watch.advance(1) }
+        XCTAssertEqual(pair.pushes.count, 1)
+        XCTAssertEqual(pair.phoneEvents.filter { $0.1 == "pushAcknowledged" }.count, 2)
+        XCTAssertFalse(pair.phoneEvents.contains { $0.1 == "pushFailed" || $0.1 == "pushTimeout" })
+    }
+
+    func testProductionPushParserAccepts4261WatchReplyWithoutCanonicalField() throws {
+        let pair = PairedHarness(); pair.automaticPushReply = false
+        pair.phone.changed(["status", "bgReadings"]); pair.watch.advance(0.25)
+        var reply = try XCTUnwrap(pair.pushes.first?.reply)
+        reply.removeValue(forKey: "success") // Exact 4260/4261 Watch wire contract.
+        pair.replyToPush(0, with: reply); pair.watch.advance(8)
+        XCTAssertEqual(pair.phoneEvents.filter { $0.1 == "pushAcknowledged" }.count, 2)
+        XCTAssertFalse(pair.phoneEvents.contains { $0.1 == "pushFailed" || $0.1 == "pushTimeout" })
+    }
+
+    func testProductionPushEncoderRejectsMalformedIdentityBeforeConsumption() {
+        let valid: [String: Any] = ["watchSnapshotPush": 1, "pushID": UUID().uuidString, "status": [:]]
+        var invalidMessages: [[String: Any]] = []
+        var message = valid; message.removeValue(forKey: "pushID"); invalidMessages.append(message)
+        message = valid; message["pushID"] = "not-a-uuid"; invalidMessages.append(message)
+        message = valid; message["watchSnapshotPush"] = 2; invalidMessages.append(message)
+        message = valid; message.removeValue(forKey: "status"); invalidMessages.append(message)
+        for invalid in invalidMessages {
+            var consumed = false
+            let reply = WatchSnapshotPushContract.reply(to: invalid) { _ in consumed = true; return [.status] }
+            XCTAssertFalse(consumed)
+            XCTAssertEqual(reply["success"] as? Bool, false)
+            XCTAssertFalse(WatchSnapshotPushContract.outcome(for: reply, sent: valid).acknowledged)
+            XCTAssertFalse(WatchSnapshotPushContract.outcome(for: reply, sent: valid).unsupported)
+        }
+    }
+
+    func testProductionPushPartialPersistenceCannotAcknowledgeBothStreams() {
+        let h = Harness()
+        var message = h.payload()
+        message["watchSnapshotPush"] = 1; message["pushID"] = UUID().uuidString
+        var graph = message["bgReadings"] as! [String: Any]
+        graph["bgReadingValues"] = [Double.nan]; message["bgReadings"] = graph
+        let reply = WatchSnapshotPushContract.reply(to: message) { h.client.receivePush($0) }
+        XCTAssertEqual(reply["success"] as? Bool, false)
+        XCTAssertEqual(reply["acceptedStreams"] as? [String], ["status"])
+        XCTAssertEqual(reply["rejectedOrSupersededStreams"] as? [String], ["bgReadings"])
+        XCTAssertNil(h.displayedReadingDate)
+        let outcome = WatchSnapshotPushContract.outcome(for: reply, sent: message)
+        XCTAssertFalse(outcome.acknowledged); XCTAssertFalse(outcome.unsupported)
+    }
+
+    func testProductionPushParserRequiresMatchingProtocolIdentityAndAcceptedStreams() {
+        let message: [String: Any] = ["watchSnapshotPush": 1, "pushID": UUID().uuidString, "status": [:]]
+        let valid = WatchSnapshotPushContract.reply(to: message) { _ in [.status] }
+        var invalidReplies: [[String: Any]] = []
+        var reply = valid; reply["pushID"] = UUID().uuidString; invalidReplies.append(reply)
+        reply = valid; reply.removeValue(forKey: "pushID"); invalidReplies.append(reply)
+        reply = valid; reply["watchSnapshotPush"] = 2; invalidReplies.append(reply)
+        reply = valid; reply.removeValue(forKey: "watchSnapshotPush"); invalidReplies.append(reply)
+        reply = valid; reply["success"] = "true"; invalidReplies.append(reply)
+        reply = valid; reply[LibreWatchMessageKey.success] = false; invalidReplies.append(reply)
+        reply = valid; reply["acceptedStreams"] = ["bgReadings"]; invalidReplies.append(reply)
+        reply = valid; reply["acceptedStreams"] = ["status", "unknown"]; invalidReplies.append(reply)
+        reply = valid; reply.removeValue(forKey: "acceptedStreams"); invalidReplies.append(reply)
+        for invalid in invalidReplies {
+            let outcome = WatchSnapshotPushContract.outcome(for: invalid, sent: message)
+            XCTAssertFalse(outcome.acknowledged); XCTAssertFalse(outcome.unsupported)
+        }
+        reply = valid; reply.removeValue(forKey: LibreWatchMessageKey.success)
+        XCTAssertTrue(WatchSnapshotPushContract.outcome(for: reply, sent: message).acknowledged)
+    }
+
+    func testProductionPushOnlyExplicitVersionlessNegativeEnablesLegacy() {
+        let message: [String: Any] = ["watchSnapshotPush": 1, "pushID": UUID().uuidString, "status": [:]]
+        for key in ["success", LibreWatchMessageKey.success] {
+            let oldNegative = WatchSnapshotPushContract.outcome(for: [key: false], sent: message)
+            XCTAssertTrue(oldNegative.unsupported); XCTAssertFalse(oldNegative.acknowledged)
+            let uncorrelatedPositive = WatchSnapshotPushContract.outcome(for: [key: true], sent: message)
+            XCTAssertFalse(uncorrelatedPositive.unsupported); XCTAssertFalse(uncorrelatedPositive.acknowledged)
+        }
+        let contradictory = WatchSnapshotPushContract.outcome(
+            for: ["success": false, LibreWatchMessageKey.success: true], sent: message)
+        XCTAssertFalse(contradictory.unsupported); XCTAssertFalse(contradictory.acknowledged)
+    }
+
+    func testProductionPushChangedDuringFlightSurvivesLateDuplicateAcknowledgement() {
+        let pair = PairedHarness(); pair.automaticPushReply = false
+        pair.phone.changed(["status", "bgReadings"]); pair.watch.advance(0.25)
+        pair.lowLimit = 90; pair.graphTime = 0.25
+        pair.phone.changed(["status", "bgReadings"]); pair.watch.advance(0.25)
+        XCTAssertEqual(pair.pushes.count, 1)
+        pair.replyToPush(0); pair.watch.advance(0.25)
+        XCTAssertEqual(pair.pushes.count, 2)
+        pair.replyToPush(0); pair.replyToPush(1); pair.replyToPush(1)
+        pair.watch.advance(8)
+        XCTAssertEqual(pair.watch.appliedStatusLimit, 90)
+        XCTAssertEqual(pair.watch.displayedReadingDate, pair.watch.wall.addingTimeInterval(0.25))
+        XCTAssertEqual(pair.phoneEvents.filter { $0.1 == "pushAcknowledged" }.count, 4)
+        XCTAssertFalse(pair.phoneEvents.contains { $0.1 == "pushTimeout" })
+    }
+
+    func testProductionPushLateWireAcknowledgementCannotCompleteResumedAttempt() {
+        let pair = PairedHarness(); pair.automaticPushReply = false
+        pair.phone.changed(["status", "bgReadings"]); pair.watch.advance(0.25)
+        pair.watch.uptime += 9 // No assumption that background timers ran.
+        pair.replyToPush(0)
+        XCTAssertFalse(pair.phoneEvents.contains { $0.1 == "pushAcknowledged" })
+        XCTAssertTrue(pair.phoneEvents.contains { $0.1 == "pushTimeout" })
+        pair.watch.jobs.removeAll()
+        pair.phone.reachable(); pair.watch.advance(0.25)
+        XCTAssertEqual(pair.pushes.count, 2)
+        pair.replyToPush(0)
+        XCTAssertFalse(pair.phoneEvents.contains { $0.1 == "pushAcknowledged" })
+        pair.replyToPush(1)
+        XCTAssertEqual(pair.phoneEvents.filter { $0.1 == "pushAcknowledged" }.count, 2)
+    }
+
+    func testProductionPushLegacyRejectionUsesBoundedUnconfirmedSubmission() {
+        let pair = PairedHarness(); pair.legacyWatch = true
+        pair.phone.changed(["status", "bgReadings"]); pair.watch.advance(0.25)
+        XCTAssertTrue(pair.phoneEvents.contains { $0.1 == "peerUnsupported" })
+        for _ in 0..<59 { pair.phone.reachable(); pair.watch.advance(1) }
+        XCTAssertEqual(pair.pushes.count, 1)
+        pair.watch.advance(1); pair.phone.reachable(); pair.watch.advance(0.25)
+        XCTAssertEqual(pair.pushes.count, 2)
+        XCTAssertEqual(pair.pushes.last?.payload["legacySnapshot"] as? Bool, true)
+        XCTAssertTrue(pair.phoneEvents.contains { $0.1 == "legacySubmittedUnconfirmed" })
+        XCTAssertFalse(pair.phoneEvents.contains { $0.1 == "pushAcknowledged" })
     }
 }
