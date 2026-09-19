@@ -1031,6 +1031,257 @@ extension LibreWatchValuePipelineTests {
     }
 }
 
+private final class LibreWatchDiscoveryTestPeripheral {
+    var isDisconnected = true
+}
+
+private final class LibreWatchDiscoveryTestClock {
+    var uptime: TimeInterval = 1_000
+}
+
+// This fixture invokes the same production transitions as the collector. Only the native
+// peripheral-state read and the actual connect side effect are replaced with test doubles.
+private final class LibreWatchDiscoveryTestDriver {
+    typealias Handoff = LibreWatchDiscoveryHandoff<LibreWatchDiscoveryTestPeripheral>
+    let clock = LibreWatchDiscoveryTestClock()
+    lazy var handoff = Handoff(now: { [clock] in clock.uptime })
+    var session: LibreWatchDirectSession
+    var centralInstanceID = UUID()
+    var generation = UUID()
+    var ownership: LibreWatchOwnership = .watch
+    var poweredOn = true
+    var selectionIsAllowed = true
+    var retirementIsPending = true
+    private(set) var connectRequests: [Handoff.Candidate] = []
+
+    init(session: LibreWatchDirectSession) { self.session = session }
+
+    var context: Handoff.Context {
+        .init(session: session, centralInstanceID: centralInstanceID, generation: generation,
+              ownership: ownership, bluetoothIsPoweredOn: poweredOn,
+              selectionIsAllowed: selectionIsAllowed)
+    }
+
+    @discardableResult
+    func discover(_ peripheral: LibreWatchDiscoveryTestPeripheral,
+                  name: String?, advertisedName: String? = nil) -> Handoff.Outcome {
+        handoff.didDiscover(peripheral, peripheralName: name, advertisedName: advertisedName,
+            rssi: -60, context: context, retiredPeripheralIsReleased: !retirementIsPending,
+            isDisconnected: { $0.isDisconnected }, connect: { self.connectRequests.append($0) })
+    }
+
+    @discardableResult
+    func release() -> Handoff.Outcome {
+        retirementIsPending = false
+        return handoff.retiredPeripheralWasReleased(context: context,
+            isDisconnected: { $0.isDisconnected }, connect: { self.connectRequests.append($0) })
+    }
+}
+
+extension LibreWatchValuePipelineTests {
+    func testDiscoveryBeforeRetiredDisconnectConnectsWithoutSecondAdvertisement() throws {
+        let driver = LibreWatchDiscoveryTestDriver(session: session)
+        let peripheral = LibreWatchDiscoveryTestPeripheral()
+        // Reach the production retirement state via its existing cancellation watchdog.
+        var timing = LibreWatchConnectionTiming()
+        timing.beginCancellation(at: receivedAt)
+        let deadline = try XCTUnwrap(timing.deadline)
+        XCTAssertEqual(timing.finishCancellation(deadline, ownership: .watch,
+            returningToPhone: false, peripheralIsDisconnected: false, at: deadline.expiresAt), .retireForScan)
+        driver.generation = timing.generation
+        XCTAssertEqual(driver.discover(peripheral, name: session.expectedPeripheralName), .deferred)
+        XCTAssertTrue(driver.connectRequests.isEmpty)
+        XCTAssertNotNil(driver.handoff.pending)
+
+        XCTAssertEqual(driver.release(), .connectRequested)
+        XCTAssertNil(driver.handoff.pending)
+        XCTAssertEqual(driver.connectRequests.count, 1)
+        XCTAssertTrue(driver.connectRequests.first?.peripheral === peripheral)
+        // The delivered candidate still enters normal connection timing; retirement cannot
+        // itself bypass the native proof needed by canConnect or imply a received frame.
+        timing.beginConnection(at: deadline.expiresAt, applicationIsActive: false,
+            executionIsAvailable: false, monotonicTime: driver.clock.uptime)
+        XCTAssertTrue(timing.canConnect(at: deadline.expiresAt, peripheralIsDisconnected: true,
+            retiredPeripheralIsReleased: true, monotonicTime: driver.clock.uptime))
+        XCTAssertFalse(timing.canConnect(at: deadline.expiresAt, peripheralIsDisconnected: true,
+            retiredPeripheralIsReleased: false, monotonicTime: driver.clock.uptime))
+        XCTAssertEqual(timing.phase, .connection)
+    }
+
+    func testDuplicateLegacyAndModernRetirementObservationsConsumeDiscoveryOnce() {
+        let driver = LibreWatchDiscoveryTestDriver(session: session)
+        let peripheral = LibreWatchDiscoveryTestPeripheral()
+        XCTAssertEqual(driver.discover(peripheral, name: session.expectedPeripheralName), .deferred)
+        XCTAssertEqual(driver.discover(peripheral, name: session.expectedPeripheralName), .duplicate)
+        XCTAssertEqual(driver.release(), .connectRequested) // legacy callback or native-state observation
+        XCTAssertEqual(driver.release(), .ignored) // duplicate modern callback
+        XCTAssertEqual(driver.release(), .ignored)
+        XCTAssertEqual(driver.connectRequests.count, 1)
+    }
+
+    func testPendingDiscoveryCanReuseRetiredNativeObjectOnlyOnceItIsDisconnected() {
+        let driver = LibreWatchDiscoveryTestDriver(session: session)
+        let peripheral = LibreWatchDiscoveryTestPeripheral()
+        peripheral.isDisconnected = false
+        XCTAssertEqual(driver.discover(peripheral, name: session.expectedPeripheralName), .deferred)
+        XCTAssertTrue(driver.connectRequests.isEmpty)
+        peripheral.isDisconnected = true
+        XCTAssertEqual(driver.release(), .connectRequested)
+        // Collector marks this old disconnect handled before reusing the object. didConnect,
+        // not connect submission, is the existing reset boundary for the duplicate gate.
+        var disconnectGate = LibreWatchDisconnectGate()
+        XCTAssertTrue(disconnectGate.accept())
+        XCTAssertFalse(disconnectGate.accept())
+        disconnectGate.reset()
+        XCTAssertTrue(disconnectGate.accept())
+        XCTAssertEqual(driver.connectRequests.count, 1)
+    }
+
+    func testDiscoveryRetainsObservedAdvertisementNameWithoutInventingIdentity() {
+        let driver = LibreWatchDiscoveryTestDriver(session: session)
+        let peripheral = LibreWatchDiscoveryTestPeripheral()
+        XCTAssertEqual(driver.discover(peripheral, name: nil), .ignored)
+        XCTAssertNil(driver.handoff.pending)
+        XCTAssertEqual(driver.discover(peripheral, name: nil,
+            advertisedName: session.expectedPeripheralName.lowercased()), .deferred)
+        XCTAssertEqual(driver.release(), .connectRequested)
+        XCTAssertEqual(driver.connectRequests.first?.observedName, session.expectedPeripheralName.lowercased())
+    }
+
+    func testWrongObservedSensorCannotHideBehindMatchingAdvertisedNameOrReplacePending() {
+        let driver = LibreWatchDiscoveryTestDriver(session: session)
+        let correct = LibreWatchDiscoveryTestPeripheral()
+        XCTAssertEqual(driver.discover(correct, name: session.expectedPeripheralName), .deferred)
+        XCTAssertEqual(driver.discover(LibreWatchDiscoveryTestPeripheral(), name: "001122334455",
+            advertisedName: session.expectedPeripheralName), .ignored)
+        XCTAssertEqual(driver.release(), .connectRequested)
+        XCTAssertTrue(driver.connectRequests.first?.peripheral === correct)
+    }
+
+    func testOnlyLatestVerifiedNativeCandidateIsRetainedDuringRetirement() {
+        let driver = LibreWatchDiscoveryTestDriver(session: session)
+        let first = LibreWatchDiscoveryTestPeripheral()
+        let latest = LibreWatchDiscoveryTestPeripheral()
+        XCTAssertEqual(driver.discover(first, name: session.expectedPeripheralName), .deferred)
+        XCTAssertEqual(driver.discover(latest, name: session.expectedPeripheralName), .deferred)
+        XCTAssertTrue(driver.connectRequests.isEmpty)
+        XCTAssertEqual(driver.release(), .connectRequested)
+        XCTAssertEqual(driver.connectRequests.count, 1)
+        XCTAssertTrue(driver.connectRequests.first?.peripheral === latest)
+    }
+
+    func testPendingDiscoveryCannotCrossOwnershipChangeOrPhoneReturn() {
+        for owner in [LibreWatchOwnership.iphone, .releasingToPhone, .releasingToWatch, .recovery] {
+            let driver = LibreWatchDiscoveryTestDriver(session: session)
+            driver.discover(LibreWatchDiscoveryTestPeripheral(), name: session.expectedPeripheralName)
+            driver.ownership = owner
+            XCTAssertEqual(driver.release(), .ignored)
+            XCTAssertNil(driver.handoff.pending)
+            driver.ownership = .watch
+            XCTAssertEqual(driver.release(), .ignored)
+            XCTAssertTrue(driver.connectRequests.isEmpty)
+        }
+    }
+
+    func testPendingDiscoveryCannotCrossCentralOrConnectionGeneration() {
+        for changesCentral in [false, true] {
+            let driver = LibreWatchDiscoveryTestDriver(session: session)
+            driver.discover(LibreWatchDiscoveryTestPeripheral(), name: session.expectedPeripheralName)
+            if changesCentral { driver.centralInstanceID = UUID() } else { driver.generation = UUID() }
+            XCTAssertEqual(driver.release(), .ignored)
+            XCTAssertNil(driver.handoff.pending)
+            XCTAssertTrue(driver.connectRequests.isEmpty)
+        }
+    }
+
+    func testPendingDiscoveryCannotCrossSessionOrSensorChange() {
+        for changesSession in [false, true] {
+            let driver = LibreWatchDiscoveryTestDriver(session: session)
+            driver.discover(LibreWatchDiscoveryTestPeripheral(), name: session.expectedPeripheralName)
+            driver.session = LibreWatchDirectSession(
+                id: changesSession ? UUID() : session.id, createdAt: session.createdAt,
+                sensorUID: changesSession ? session.sensorUID : Data(repeating: 9, count: 8),
+                patchInfo: session.patchInfo, sensorSerialNumber: session.sensorSerialNumber,
+                sensorTypeRawValue: session.sensorTypeRawValue,
+                expectedPeripheralName: session.expectedPeripheralName, unlockCode: session.unlockCode,
+                unlockCount: session.unlockCount, algorithmParameters: session.algorithmParameters)
+            XCTAssertEqual(driver.release(), .ignored)
+            XCTAssertNil(driver.handoff.pending)
+            XCTAssertTrue(driver.connectRequests.isEmpty)
+        }
+    }
+
+    func testUnlockCounterRefreshDoesNotDiscardTheSameSensorDiscovery() {
+        let driver = LibreWatchDiscoveryTestDriver(session: session)
+        driver.discover(LibreWatchDiscoveryTestPeripheral(), name: session.expectedPeripheralName)
+        driver.session.unlockCount += 1
+        XCTAssertEqual(driver.release(), .connectRequested)
+        XCTAssertEqual(driver.session.unlockCount, session.unlockCount + 1)
+    }
+
+    func testPendingDiscoveryRequiresPoweredOnAndAnAvailableSelectionPath() {
+        for losesPower in [false, true] {
+            let driver = LibreWatchDiscoveryTestDriver(session: session)
+            driver.discover(LibreWatchDiscoveryTestPeripheral(), name: session.expectedPeripheralName)
+            if losesPower { driver.poweredOn = false } else { driver.selectionIsAllowed = false }
+            XCTAssertEqual(driver.release(), .ignored)
+            driver.poweredOn = true
+            driver.selectionIsAllowed = true
+            XCTAssertEqual(driver.release(), .ignored)
+            XCTAssertTrue(driver.connectRequests.isEmpty)
+        }
+    }
+
+    func testStopOrPowerResetInvalidatesPendingBeforeAnyLaterCallback() {
+        let driver = LibreWatchDiscoveryTestDriver(session: session)
+        driver.discover(LibreWatchDiscoveryTestPeripheral(), name: session.expectedPeripheralName)
+        driver.handoff.invalidate() // same production call used by stop/session/power-reset paths
+        XCTAssertEqual(driver.release(), .ignored)
+        XCTAssertTrue(driver.connectRequests.isEmpty)
+    }
+
+    func testPendingDiscoveryRejectsCandidateAlreadyConnectedOrConnectingElsewhere() {
+        let driver = LibreWatchDiscoveryTestDriver(session: session)
+        let peripheral = LibreWatchDiscoveryTestPeripheral()
+        driver.discover(peripheral, name: session.expectedPeripheralName)
+        peripheral.isDisconnected = false
+        XCTAssertEqual(driver.release(), .ignored)
+        XCTAssertNil(driver.handoff.pending)
+        XCTAssertTrue(driver.connectRequests.isEmpty)
+    }
+
+    func testPendingAdvertisementExpiryUsesInjectedMonotonicClockWithoutTimer() {
+        let driver = LibreWatchDiscoveryTestDriver(session: session)
+        let peripheral = LibreWatchDiscoveryTestPeripheral()
+        driver.discover(peripheral, name: session.expectedPeripheralName)
+        driver.clock.uptime += 121
+        // No background timer ran or changed Bluetooth state during this simulated suspension.
+        XCTAssertNotNil(driver.handoff.pending)
+        XCTAssertTrue(driver.connectRequests.isEmpty)
+        XCTAssertEqual(driver.release(), .ignored)
+        XCTAssertNil(driver.handoff.pending)
+        XCTAssertEqual(driver.discover(peripheral, name: session.expectedPeripheralName), .connectRequested)
+        XCTAssertEqual(driver.connectRequests.count, 1)
+    }
+
+    func testPendingDiscoveryIsRemovedBeforeReentrantReleaseAndImmediateDiscoveryStillWorks() {
+        let driver = LibreWatchDiscoveryTestDriver(session: session)
+        let peripheral = LibreWatchDiscoveryTestPeripheral()
+        driver.discover(peripheral, name: session.expectedPeripheralName)
+        var connections = 0
+        XCTAssertEqual(driver.handoff.retiredPeripheralWasReleased(context: driver.context,
+            isDisconnected: { $0.isDisconnected }, connect: { _ in
+                connections += 1
+                XCTAssertEqual(driver.handoff.retiredPeripheralWasReleased(context: driver.context,
+                    isDisconnected: { $0.isDisconnected }, connect: { _ in connections += 1 }), .ignored)
+            }), .connectRequested)
+        XCTAssertEqual(connections, 1)
+        driver.retirementIsPending = false
+        XCTAssertEqual(driver.discover(peripheral, name: session.expectedPeripheralName), .connectRequested)
+        XCTAssertEqual(driver.connectRequests.count, 1)
+    }
+}
+
 final class LibreWatchValuePipelineTests: XCTestCase {
     private let receivedAt = Date(timeIntervalSince1970: 1_788_333_200)
 

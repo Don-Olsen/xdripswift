@@ -1967,6 +1967,35 @@ extension TroubleshootingLogTests {
         XCTAssertEqual(restored.timestamp, referenceDate.addingTimeInterval(600))
     }
 
+    func testDeferredDiscoveryDiagnosticsSurviveExportWithoutAllowingSensorSecrets() throws {
+        let secret = "secret=https://user:password@example.invalid"
+        for trigger in ["didDiscoverDeferredSensor", "didDiscoverResumedSensor", "pendingDiscovery"] {
+            let event = LibreWatchDiagnosticEvent(
+                kind: trigger == "pendingDiscovery" ? .callbackRejected : .coreBluetoothCallback,
+                watchTimestamp: referenceDate, trigger: trigger,
+                peripheralState: "disconnected", connectionPhase: "idle",
+                sensorIdentity: secret, runtimeError: secret,
+                actionReason: trigger == "pendingDiscovery" ? "scopeStateOrAgeChanged" : nil)
+            let projection = TroubleshootingWatchDiagnostic(event)
+            XCTAssertEqual(projection.trigger, trigger)
+            XCTAssertEqual(projection.reason, trigger == "pendingDiscovery" ? "scopeStateOrAgeChanged" : nil)
+            let entry = TroubleshootingLogEntry.detailed(.watchDiagnostic(projection), timestamp: referenceDate)
+            let decoded = try JSONDecoder().decode(TroubleshootingLogEntry.self,
+                from: JSONEncoder().encode(entry))
+            XCTAssertEqual(decoded, entry)
+            let report = makeReport(entries: [decoded]).reportText
+            XCTAssertTrue(report.contains(trigger))
+            if trigger == "pendingDiscovery" { XCTAssertTrue(report.contains("scopeStateOrAgeChanged")) }
+            XCTAssertFalse(report.contains("password"))
+            XCTAssertFalse(report.contains("example.invalid"))
+        }
+        let untrusted = TroubleshootingWatchDiagnostic(LibreWatchDiagnosticEvent(
+            kind: .callbackRejected, trigger: "pendingDiscovery-" + secret,
+            actionReason: "scopeStateOrAgeChanged-" + secret))
+        XCTAssertNil(untrusted.trigger)
+        XCTAssertNil(untrusted.reason)
+    }
+
     func testWatchDiagnosticNormalizesKnownRawCoreBluetoothPeripheralStates() {
         let expected = [
             0: "disconnected",

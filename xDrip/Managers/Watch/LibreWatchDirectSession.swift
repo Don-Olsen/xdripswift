@@ -1419,6 +1419,110 @@ struct LibreWatchDisconnectGate {
     }
 }
 
+/// Hands one observed sensor advertisement across a pending native disconnection. The collector
+/// uses these same transitions for discovery and retirement callbacks; no timer or second
+/// advertisement is required. Only the supplied connect closure performs a Bluetooth operation.
+final class LibreWatchDiscoveryHandoff<Peripheral: AnyObject> {
+    struct Context {
+        let session: LibreWatchDirectSession
+        let centralInstanceID: UUID
+        let generation: UUID
+        let ownership: LibreWatchOwnership
+        let bluetoothIsPoweredOn: Bool
+        let selectionIsAllowed: Bool
+
+        fileprivate var isEligible: Bool {
+            ownership == .watch && bluetoothIsPoweredOn && selectionIsAllowed && session.isValid
+        }
+    }
+
+    struct Candidate {
+        let peripheral: Peripheral
+        let observedName: String
+        let rssi: Int
+        fileprivate let context: Context
+        fileprivate let discoveredAtMonotonic: TimeInterval
+    }
+
+    enum Outcome: Equatable {
+        case ignored, deferred, duplicate, connectRequested
+    }
+
+    private(set) var pending: Candidate?
+    private let now: () -> TimeInterval
+    // A retained advertisement is not an indefinite identity lease. This is checked only in
+    // an actual callback/execution opportunity, never by scheduling background work.
+    private let maximumCandidateAge: TimeInterval
+
+    init(maximumCandidateAge: TimeInterval = 120,
+         now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
+        self.maximumCandidateAge = maximumCandidateAge
+        self.now = now
+    }
+
+    @discardableResult
+    func didDiscover(
+        _ peripheral: Peripheral,
+        peripheralName: String?,
+        advertisedName: String?,
+        rssi: Int,
+        context: Context?,
+        retiredPeripheralIsReleased: Bool,
+        isDisconnected: (Peripheral) -> Bool,
+        connect: (Candidate) -> Void
+    ) -> Outcome {
+        guard let context, context.isEligible else { invalidate(); return .ignored }
+        if let pending, !belongsToContext(pending, context) { invalidate() }
+        // Preserve the existing precedence: advertisement identity is used only if the
+        // peripheral has no observed name. Never substitute the expected sensor name.
+        guard let name = peripheralName ?? advertisedName,
+              context.session.matches(candidateName: name) else { return .ignored }
+        let candidate = Candidate(peripheral: peripheral, observedName: name, rssi: rssi,
+            context: context, discoveredAtMonotonic: now())
+        if !retiredPeripheralIsReleased {
+            if let pending, pending.peripheral === peripheral, isFresh(pending) { return .duplicate }
+            pending = candidate
+            return .deferred
+        }
+        invalidate()
+        guard isDisconnected(peripheral) else { return .ignored }
+        connect(candidate)
+        return .connectRequested
+    }
+
+    @discardableResult
+    func retiredPeripheralWasReleased(
+        context: Context?,
+        isDisconnected: (Peripheral) -> Bool,
+        connect: (Candidate) -> Void
+    ) -> Outcome {
+        // Remove before invoking the collector: connect rechecks native retirement and may
+        // re-enter that path. Legacy/modern duplicate callbacks cannot consume this twice.
+        let candidate = pending
+        invalidate()
+        guard let candidate, let context, context.isEligible,
+              belongsToContext(candidate, context), isFresh(candidate),
+              context.session.matches(candidateName: candidate.observedName),
+              isDisconnected(candidate.peripheral) else { return .ignored }
+        connect(candidate)
+        return .connectRequested
+    }
+
+    func invalidate() { pending = nil }
+
+    private func belongsToContext(_ candidate: Candidate, _ context: Context) -> Bool {
+        candidate.context.centralInstanceID == context.centralInstanceID &&
+            candidate.context.generation == context.generation &&
+            candidate.context.session.id == context.session.id &&
+            candidate.context.session.representsSameSensor(as: context.session)
+    }
+
+    private func isFresh(_ candidate: Candidate) -> Bool {
+        let age = now() - candidate.discoveredAtMonotonic
+        return age >= 0 && age <= maximumCandidateAge
+    }
+}
+
 /// Connection/setup/technical-liveness timing; Bluetooth operations remain in the collector.
 struct LibreWatchConnectionTiming {
     enum Phase: String, Equatable {

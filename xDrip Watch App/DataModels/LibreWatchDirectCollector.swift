@@ -21,6 +21,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
     // A timed-out cancellation is retired from our generation, but retained until Core
     // Bluetooth confirms disconnection. No subsequent connect or phone handoff may race it.
     private var retiredPeripheral: CBPeripheral?
+    private let discoveryHandoff = LibreWatchDiscoveryHandoff<CBPeripheral>()
     private var matchedPeripheralName: String?
     private var writeCharacteristic: CBCharacteristic?
     private var receiveCharacteristic: CBCharacteristic?
@@ -141,6 +142,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
 
         preparedSession = resolvedSession
         if previousSessionID != resolvedSession?.id || previousSensorUID != resolvedSession?.sensorUID {
+            discoveryHandoff.invalidate()
             cancelReconnectFallback()
             connectionTiming.invalidate()
             invalidateRestoration()
@@ -185,6 +187,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
     }
 
     func ownershipDidChange(_ ownership: LibreWatchOwnership) {
+        if ownership != .watch { discoveryHandoff.invalidate() }
         switch ownership {
         case .watch:
             reconcileRecoveryState(at: Date(), source: .initialPreparation)
@@ -300,6 +303,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
     }
 
     private func beginReturnToPhone(attempt: LibreWatchReturnAttempt) {
+        discoveryHandoff.invalidate()
         pendingReturnDiagnosticAttempt = attempt
         state.beginReturn()
         deliberatelyDisconnecting = true
@@ -598,9 +602,15 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
     }
 
     private func connect(_ peripheral: CBPeripheral, using central: CBCentralManager) {
+        let selectionGeneration = connectionTiming.generation
+        // Releasing a retired link may synchronously select its saved advertisement. Do not
+        // issue a second connect from the operation which happened to observe that release.
+        guard releaseRetiredPeripheralIfDisconnected(),
+              selectionGeneration == connectionTiming.generation else { return }
         guard eventDrivenRecoveryIsAllowed, !deliberatelyDisconnecting,
               !scanAfterReconnectCancellation, identityAndOwnershipAreConfirmed(for: peripheral),
-              peripheral.state == .disconnected, releaseRetiredPeripheralIfDisconnected(),
+              central === centralManager, central.state == .poweredOn,
+              peripheral.state == .disconnected,
               !systemAutoReconnectIsActive,
               connectionTiming.phase == nil || connectionTiming.phase == .connection
         else { return }
@@ -1151,7 +1161,59 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         guard retiredPeripheral.state == .disconnected else { return false }
         retiredPeripheral.delegate = nil
         self.retiredPeripheral = nil
+        if let centralManager {
+            let hadPendingDiscovery = discoveryHandoff.pending != nil
+            let outcome = discoveryHandoff.retiredPeripheralWasReleased(
+                context: discoveryContext(using: centralManager),
+                isDisconnected: { $0.state == .disconnected },
+                connect: {
+                    if $0.peripheral === retiredPeripheral {
+                        // The saved advertisement can refer to the very same native object.
+                        // Suppress the second legacy/modern old-disconnect callback until a
+                        // new didConnect resets the existing per-connection gate.
+                        _ = self.disconnectGate.accept()
+                    }
+                    self.reportCoreBluetoothCallback("didDiscoverResumedSensor",
+                        peripheralStateOverride: self.observedState(of: $0.peripheral),
+                        includeCurrentConnectionInstanceID: false)
+                    self.connectDiscoveredSensor($0, using: centralManager)
+                }
+            )
+            if hadPendingDiscovery, outcome == .ignored {
+                reportRejectedCallback("pendingDiscovery", reason: "scopeStateOrAgeChanged",
+                    includeCurrentConnectionInstanceID: false)
+            }
+        } else {
+            discoveryHandoff.invalidate()
+        }
         return true
+    }
+
+    private func discoveryContext(using central: CBCentralManager)
+        -> LibreWatchDiscoveryHandoff<CBPeripheral>.Context? {
+        guard central === centralManager, let preparedSession, let centralInstanceID else { return nil }
+        return .init(session: preparedSession, centralInstanceID: centralInstanceID,
+                     generation: connectionTiming.generation,
+                     ownership: watchState?.libreWatchOwnership ?? .iphone,
+                     bluetoothIsPoweredOn: central.state == .poweredOn,
+                     selectionIsAllowed: eventDrivenRecoveryIsAllowed && !deliberatelyDisconnecting &&
+                         !scanAfterReconnectCancellation && !systemAutoReconnectIsActive &&
+                         connectionTiming.canStartBluetoothOperation &&
+                         (sensorPeripheral == nil || sensorPeripheral?.state == .disconnected))
+    }
+
+    private func connectDiscoveredSensor(
+        _ candidate: LibreWatchDiscoveryHandoff<CBPeripheral>.Candidate,
+        using central: CBCentralManager
+    ) {
+        // Both immediate and deferred discovery use the normal identity, ownership, timing,
+        // auto-reconnect and native-disconnection gates in connect(). No GATT objects are reused.
+        guard candidate.peripheral.state == .disconnected else { return }
+        state.candidate(rssi: candidate.rssi)
+        sensorPeripheral = candidate.peripheral
+        matchedPeripheralName = candidate.observedName
+        candidate.peripheral.delegate = self
+        connect(candidate.peripheral, using: central)
     }
 
     /// A retirement removes obsolete callbacks, not proof that the radio has disconnected.
@@ -1166,6 +1228,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
 
     private func beginCancellation(of peripheral: CBPeripheral) {
         guard peripheral === sensorPeripheral else { return }
+        discoveryHandoff.invalidate()
         cancelReconnectFallback()
         invalidateRestoration()
         connectionTiming.beginCancellation(at: Date())
@@ -1260,6 +1323,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
     }
 
     private func clearTransientBluetoothState() {
+        discoveryHandoff.invalidate()
         scanAfterReconnectCancellation = false
         systemAutoReconnectIsActive = false
         cancelReconnectFallback()
@@ -1785,6 +1849,7 @@ extension LibreWatchDirectCollector: CBCentralManagerDelegate {
         let ownsDiagnostics = beginCoreBluetoothCallbackDiagnostics()
         defer { finishCoreBluetoothCallbackDiagnostics(owner: ownsDiagnostics) }
         currentReconcileSource = .centralStateUpdate
+        if central === centralManager, central.state != .poweredOn { discoveryHandoff.invalidate() }
         let diagnosticTrigger: String
         switch central.state {
         case .poweredOn:
@@ -1820,6 +1885,7 @@ extension LibreWatchDirectCollector: CBCentralManagerDelegate {
         let ownsDiagnostics = beginCoreBluetoothCallbackDiagnostics()
         defer { finishCoreBluetoothCallbackDiagnostics(owner: ownsDiagnostics) }
         currentReconcileSource = .stateRestoration
+        discoveryHandoff.invalidate()
         reportCoreBluetoothCallback("willRestoreState")
         guard watchState?.libreWatchOwnership == .watch,
               let peripherals = dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral],
@@ -1934,32 +2000,31 @@ extension LibreWatchDirectCollector: CBCentralManagerDelegate {
     ) {
         let ownsDiagnostics = beginCoreBluetoothCallbackDiagnostics()
         defer { finishCoreBluetoothCallbackDiagnostics(owner: ownsDiagnostics) }
-        guard releaseRetiredPeripheralIfDisconnected() else { return }
-        guard eventDrivenRecoveryIsAllowed,
-              watchState?.libreWatchOwnership == .watch,
-              !deliberatelyDisconnecting, !scanAfterReconnectCancellation,
-              connectionTiming.canStartBluetoothOperation,
-              sensorPeripheral == nil || sensorPeripheral?.state == .disconnected,
-              let preparedSession
-        else { return }
-        let candidateName = peripheral.name ?? advertisementData[CBAdvertisementDataLocalNameKey] as? String
-        guard preparedSession.matches(candidateName: candidateName) else { return }
-
-        reportCoreBluetoothCallback(
-            "didDiscoverConfirmedSensor",
-            peripheralStateOverride: observedState(of: peripheral),
-            includeCurrentConnectionInstanceID: false
+        guard central === centralManager else { return }
+        let retiredIsReleased = releaseRetiredPeripheralIfDisconnected()
+        let outcome = discoveryHandoff.didDiscover(
+            peripheral,
+            peripheralName: peripheral.name,
+            advertisedName: advertisementData[CBAdvertisementDataLocalNameKey] as? String,
+            rssi: RSSI.intValue,
+            context: discoveryContext(using: central),
+            retiredPeripheralIsReleased: retiredIsReleased,
+            isDisconnected: { $0.state == .disconnected },
+            connect: {
+                self.reportCoreBluetoothCallback("didDiscoverConfirmedSensor",
+                    peripheralStateOverride: self.observedState(of: $0.peripheral),
+                    includeCurrentConnectionInstanceID: false)
+                self.connectDiscoveredSensor($0, using: central)
+            }
         )
-        state.candidate(rssi: RSSI.intValue)
-        sensorPeripheral = peripheral
-        matchedPeripheralName = candidateName
-        peripheral.delegate = self
-        central.stopScan()
-        guard identityAndOwnershipAreConfirmed(for: peripheral) else {
-            scheduleRescan(allowsEventDrivenStart: true)
-            return
+        // Duplicated advertisements do not write another diagnostic record.
+        if outcome == .deferred {
+            reportCoreBluetoothCallback(
+                "didDiscoverDeferredSensor",
+                peripheralStateOverride: observedState(of: peripheral),
+                includeCurrentConnectionInstanceID: false
+            )
         }
-        connect(peripheral, using: central)
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
