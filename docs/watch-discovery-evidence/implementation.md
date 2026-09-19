@@ -22,6 +22,8 @@ Regressioner ligger i de eksisterende `WatchDeliveryEvidenceTests`, `WatchRefres
 
 Kør `xdrip-verify` og derefter højst én `xdrip-testflight`-udgivelse fra uændret testet SHA. Release-workflowet henter næste buildnummer fra Apple og kontrollerer Release-arkiv, indlejret Watch-app, signering, bundle-ID'er og indbygget SHA. Faktiske SHA'er, testantal, CI-ID'er, artefakter og Apple-status registreres i den særskilte udgivelsesrapport efter udførelse. Denne fil er ikke i sig selv bevis for en bestået test eller upload.
 
+En særskilt lille rettelse i udgivelsens læsekontrol erstatter ugyldige CLI-retrytal `0` med `1` og klassificerer argumentfejl før autentifikationsfejl. [Codemagics v0.69.0-kilde](https://raw.githubusercontent.com/codemagic-ci-cd/cli-tools/v0.69.0/src/codemagic/tools/app_store_connect/arguments.py) kræver positive tal. Tolv deterministiske Python-tests køres i begge workflows; de tælles separat fra XCTest. De eksisterende tidsfrister bevares. Dette ændrer ingen signering, credentials, grupper eller uploadhandlinger, og gør ikke den historiske ukendte Apple-status til en verificeret succes.
+
 ## Fysisk kontrol
 
 Bevar eksisterende eksport og hent den lokale Watch-evidens før ny test, hvis den stadig findes. Brug samme sensor, udstyr og indstillinger, og registrér build/SHA, OS, batteri, opladning, strømbesparelse, ejer og telefontransport.

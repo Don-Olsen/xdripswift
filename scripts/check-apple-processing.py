@@ -68,8 +68,10 @@ def cli_read(arguments, deadline):
     try:
         result = subprocess.run(
             ['app-store-connect', *arguments, '--json', '--no-color',
-             '--log-stream', 'stderr', '--api-unauthorized-retries', '0',
-             '--api-server-error-retries', '0'],
+             # Codemagic CLI requires strictly positive retry values, including in
+             # v0.69.0 used by 4260/4261. The outer command/deadline still bounds work.
+             '--log-stream', 'stderr', '--api-unauthorized-retries', '1',
+             '--api-server-error-retries', '1'],
             capture_output=True, text=True, timeout=min(CALL_SECONDS, remaining))
     except FileNotFoundError:
         raise ObservationError('cli_unavailable') from None
@@ -78,7 +80,12 @@ def cli_read(arguments, deadline):
     if result.returncode:
         # Inspect locally for a fixed classification; never print CLI error bodies.
         diagnostic = (result.stderr + result.stdout).lower()
-        if re.search(r'\b(401|403)\b|unauthorized|forbidden|private.key|issuer.id|key.identifier', diagnostic):
+        # argparse usage includes authentication option names even when no HTTP
+        # request happened. Reject syntax/configuration errors before auth matching.
+        if re.search(r'(?m)^usage:|\bunrecognized arguments\b|\binvalid choice\b|'
+                     r'argument [^\n]+: (?:invalid|provided|expected)', diagnostic):
+            raise ObservationError('cli_argument_invalid')
+        if re.search(r'\b(401|403)\b|(?<![\w-])(?:unauthorized|forbidden)(?![\w-])', diagnostic):
             raise ObservationError('access_unavailable')
         if re.search(r'\b404\b|not found', diagnostic):
             raise ObservationError('resource_not_visible')
@@ -169,7 +176,7 @@ def poll(report, read=cli_read, now=time.monotonic, sleep=time.sleep, deadline=N
         except ObservationError as error:
             report['lastReadIssue'] = str(error)
             if str(error) in ('access_unavailable', 'cli_unavailable', 'invalid_cli_json',
-                              'identity_or_response_mismatch'):
+                              'identity_or_response_mismatch', 'cli_argument_invalid'):
                 report['outcome'] = 'observation_unavailable'
                 break
         except (KeyError, TypeError, ValueError):

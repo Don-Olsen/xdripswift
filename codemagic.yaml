@@ -23,6 +23,7 @@ workflows:
       - name: Initialize repository dependencies
         script: |
           set -euo pipefail
+          python3 -B scripts/test-check-apple-processing.py
           git submodule sync --recursive
           git submodule update --init --recursive
 
@@ -342,6 +343,7 @@ workflows:
       - name: Record verification source and initialize dependencies
         script: |
           set -euo pipefail
+          python3 -B scripts/test-check-apple-processing.py
           mkdir -p "$CM_BUILD_DIR/build/verification"
           git rev-parse HEAD | tee "$CM_BUILD_DIR/build/verification/source-commit.txt"
           xcodebuild -version | tee "$CM_BUILD_DIR/build/verification/xcode-version.txt"
