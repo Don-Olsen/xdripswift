@@ -98,6 +98,224 @@ final class WatchDeliveryEvidenceTests: XCTestCase {
         XCTAssertTrue(journal.snapshot().events.isEmpty)
     }
 
+    private var journalFile: URL { directory.appendingPathComponent("journal/delivery-events-v1.jsonl") }
+    private var repairSourceFile: URL { directory.appendingPathComponent("journal/delivery-events-v1.pre-repair.jsonl") }
+
+    /// Intentionally uses the released iPhone overload to reproduce the on-device format.
+    private func legacyJournal(_ events: [WatchDeliveryEvidenceEvent]) throws -> Data {
+        var data = Data()
+        for event in events {
+            data.append(try JSONEncoder().encode(event))
+            data.append(0x0a)
+        }
+        return data
+    }
+
+    func testProductionJournalRetainsMultipleEventsAcrossTwoRestarts() throws {
+        let payload = reading(), first = store(origin: origin(device: "phone"))
+        for stage in [WatchDeliveryEvidenceStage.phoneReceived, .phoneStored, .sendAttempt] {
+            XCTAssertTrue(first.recordReading(stage, reading: payload))
+        }
+        let second = store(origin: origin(device: "phone"))
+        XCTAssertEqual(second.snapshot().events.map(\.stage), [.phoneReceived, .phoneStored, .sendAttempt])
+        XCTAssertTrue(second.recordReading(.acknowledgement, reading: payload, stream: .receipt))
+        let third = store(origin: origin(device: "phone")), snapshot = third.snapshot()
+        XCTAssertEqual(snapshot.events.map(\.sequence), [1, 2, 3, 4])
+        XCTAssertEqual(snapshot.events.map(\.payloadID), [payload.id, payload.id, payload.id, payload.id])
+        XCTAssertEqual(snapshot.unreadableLines, 0)
+        XCTAssertEqual(snapshot.rotatedEvents, 0)
+        XCTAssertEqual(snapshot.recoveredLegacyEvents, 0)
+        let data = try Data(contentsOf: journalFile)
+        XCTAssertFalse(data.contains(0))
+        XCTAssertEqual(data.filter { $0 == 0x0a }.count, 4)
+        XCTAssertEqual(data.last, UInt8(0x0a))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: repairSourceFile.path))
+    }
+
+    func testKnownLegacyPaddingMigratesOnceAndPreservesRawSourceAndOriginalProvenance() throws {
+        let oldOrigin = origin(device: "phone", build: "4261"), initial = store(origin: oldOrigin)
+        for stage in [WatchDeliveryEvidenceStage.phoneReceived, .phoneStored, .acknowledgement] {
+            XCTAssertTrue(initial.recordReading(stage, reading: reading()))
+        }
+        let originalEvents = initial.snapshot().events
+        let legacy = try legacyJournal(originalEvents)
+        XCTAssertEqual(legacy.suffix(7), Data(repeating: 0, count: 7))
+        try legacy.write(to: journalFile)
+
+        // Simulate the existing v1 metadata, preserving prior error and rotation evidence.
+        let metadataFile = directory.appendingPathComponent("journal/delivery-metadata-v1.json")
+        var metadata = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: metadataFile)) as? [String: Any])
+        metadata.removeValue(forKey: "recoveredLegacyEvents")
+        metadata.removeValue(forKey: "preservedRepairSourceBytes")
+        metadata["unreadable"] = 828
+        metadata["rotated"] = 12
+        try JSONSerialization.data(withJSONObject: metadata).write(to: metadataFile)
+
+        let migrated = store(origin: origin(device: "phone", build: "new-test-build"))
+        let snapshot = migrated.snapshot()
+        XCTAssertEqual(snapshot.events, originalEvents)
+        XCTAssertEqual(snapshot.events.map(\.origin), [oldOrigin, oldOrigin, oldOrigin])
+        XCTAssertEqual(snapshot.recoveredLegacyEvents, 2) // First row was already readable.
+        XCTAssertEqual(snapshot.unreadableLines, 828)
+        XCTAssertEqual(snapshot.rotatedEvents, 12)
+        XCTAssertEqual(snapshot.preservedRepairSourceBytes, legacy.count)
+        XCTAssertEqual(try Data(contentsOf: repairSourceFile), legacy)
+        XCTAssertFalse(try Data(contentsOf: journalFile).contains(0))
+
+        XCTAssertTrue(migrated.recordReading(.sendAttempt, reading: reading()))
+        let restarted = store(), again = restarted.snapshot()
+        XCTAssertEqual(again.events.map(\.sequence), [1, 2, 3, 4])
+        XCTAssertEqual(again.recoveredLegacyEvents, 2)
+        XCTAssertEqual(again.unreadableLines, 828)
+        XCTAssertEqual(again.rotatedEvents, 12)
+        XCTAssertEqual(try Data(contentsOf: repairSourceFile), legacy)
+        XCTAssertTrue(again.coverageNote.contains("not included in this export"))
+    }
+
+    func testLegacyPaddingDoesNotMakeMalformedOrArbitraryNullPaddedJSONValid() throws {
+        let initial = store()
+        XCTAssertTrue(initial.recordReading(.decoded, reading: reading()))
+        let event = try XCTUnwrap(initial.snapshot().events.first)
+        let json = try JSONEncoder().encode(event)
+        var raw = json
+        raw.append(UInt8(0x0a))
+        raw.append(Data(repeating: 0, count: 3)) // Not the released seven-byte padding.
+        raw.append(json)
+        raw.append(UInt8(0x0a))
+        raw.append(Data(repeating: 0, count: 7))
+        raw.append(Data("{broken".utf8))
+        raw.append(UInt8(0x0a))
+        raw.append(Data(repeating: 0, count: 8)) // Do not strip an arbitrary number of NULs.
+        raw.append(json)
+        raw.append(UInt8(0x0a))
+        try raw.write(to: journalFile)
+
+        let repaired = store(), snapshot = repaired.snapshot()
+        XCTAssertEqual(snapshot.events, [event])
+        XCTAssertEqual(snapshot.unreadableLines, 3)
+        XCTAssertEqual(snapshot.recoveredLegacyEvents, 0)
+        XCTAssertEqual(snapshot.rotatedEvents, 0)
+        XCTAssertEqual(try Data(contentsOf: repairSourceFile), raw)
+        XCTAssertEqual(store().snapshot().unreadableLines, 3)
+    }
+
+    func testLegacyRecoveryRequiresAnObservedNewlineBeforePadding() throws {
+        let initial = store()
+        XCTAssertTrue(initial.recordReading(.decoded, reading: reading()))
+        let event = try XCTUnwrap(initial.snapshot().events.first)
+        var raw = Data(repeating: 0, count: 7)
+        raw.append(try JSONEncoder().encode(event))
+        raw.append(UInt8(0x0a))
+        try raw.write(to: journalFile)
+        let snapshot = store().snapshot()
+        XCTAssertTrue(snapshot.events.isEmpty)
+        XCTAssertEqual(snapshot.unreadableLines, 1)
+        XCTAssertEqual(snapshot.recoveredLegacyEvents, 0)
+        XCTAssertEqual(try Data(contentsOf: repairSourceFile), raw)
+    }
+
+    func testRepairDoesNotOverwriteFirstRawSourceOnLaterCorruption() throws {
+        let initial = store()
+        XCTAssertTrue(initial.recordReading(.decoded, reading: reading()))
+        let legacy = try legacyJournal(initial.snapshot().events)
+        try legacy.write(to: journalFile)
+        let migrated = store()
+        XCTAssertEqual(migrated.snapshot().events.count, 1)
+        var damaged = try Data(contentsOf: journalFile)
+        damaged.append(Data("bad later line\n".utf8))
+        try damaged.write(to: journalFile)
+        let snapshot = store().snapshot()
+        XCTAssertEqual(snapshot.events.count, 1)
+        XCTAssertEqual(snapshot.unreadableLines, 1)
+        XCTAssertEqual(try Data(contentsOf: repairSourceFile), legacy)
+        XCTAssertTrue(snapshot.coverageNote.contains("Later damaged raw sources are not archived"))
+    }
+
+    func testFailedRawPreservationPreventsDestructiveRepairAndAppend() throws {
+        let initial = store()
+        XCTAssertTrue(initial.recordReading(.decoded, reading: reading()))
+        let legacy = try legacyJournal(initial.snapshot().events)
+        try legacy.write(to: journalFile)
+        var failPreservation = true
+        let migrated = store(replace: { data, url in
+            if failPreservation && url.lastPathComponent == "delivery-events-v1.pre-repair.jsonl" {
+                throw CocoaError(.fileWriteOutOfSpace)
+            }
+            try data.write(to: url, options: .atomic)
+        })
+        XCTAssertFalse(migrated.recordReading(.accepted, reading: reading()))
+        XCTAssertEqual(try Data(contentsOf: journalFile), legacy)
+        XCTAssertGreaterThan(migrated.snapshot().writeFailures, 0)
+        XCTAssertNil(migrated.snapshot().preservedRepairSourceBytes)
+        failPreservation = false
+        XCTAssertTrue(migrated.recordReading(.accepted, reading: reading()))
+        XCTAssertEqual(try Data(contentsOf: repairSourceFile), legacy)
+        XCTAssertEqual(store().snapshot().events.map(\.sequence), [1, 2])
+    }
+
+    func testOversizedSourceIsNotDestroyedOrCopiedByRepair() throws {
+        _ = store(limits: .init(age: 3600, events: 4, bytes: 1000))
+        let oversized = Data(repeating: 0x20, count: 16_385)
+        try oversized.write(to: journalFile)
+        let journal = store(limits: .init(age: 3600, events: 4, bytes: 1000))
+        XCTAssertFalse(journal.recordReading(.decoded, reading: reading()))
+        XCTAssertEqual(try Data(contentsOf: journalFile), oversized)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: repairSourceFile.path))
+        XCTAssertGreaterThan(journal.snapshot().writeFailures, 0)
+    }
+
+    func testFailedMigrationDoesNotPersistSuccessfulRecoveryCountBeforeRewrite() throws {
+        let initial = store()
+        XCTAssertTrue(initial.recordReading(.decoded, reading: reading()))
+        XCTAssertTrue(initial.recordReading(.accepted, reading: reading()))
+        let legacy = try legacyJournal(initial.snapshot().events)
+        try legacy.write(to: journalFile)
+        let failed = store(replace: { data, url in
+            if url.lastPathComponent == "delivery-events-v1.jsonl" { throw CocoaError(.fileWriteOutOfSpace) }
+            try data.write(to: url, options: .atomic)
+        })
+        XCTAssertEqual(failed.snapshot().events.count, 2)
+        XCTAssertEqual(failed.snapshot().recoveredLegacyEvents, 0)
+        XCTAssertEqual(try Data(contentsOf: journalFile), legacy)
+        XCTAssertEqual(store().snapshot().recoveredLegacyEvents, 1)
+        XCTAssertEqual(store().snapshot().recoveredLegacyEvents, 1)
+    }
+
+    func testMigrationThenCapacityRotationKeepsCoverageAcrossTwoRestarts() throws {
+        let limits = WatchDeliveryEvidenceStore.Limits(age: 3600, events: 4, bytes: 50_000)
+        let initial = store(limits: limits)
+        for _ in 0..<4 {
+            XCTAssertTrue(initial.recordReading(.decoded, reading: reading()))
+            now += 1; uptime += 1
+        }
+        let legacy = try legacyJournal(initial.snapshot().events)
+        try legacy.write(to: journalFile)
+        let migrated = store(limits: limits)
+        XCTAssertTrue(migrated.recordReading(.accepted, reading: reading()))
+        let first = migrated.snapshot(), restarted = store(limits: limits).snapshot()
+        XCTAssertEqual(first.events.map(\.sequence), [2, 3, 4, 5])
+        XCTAssertEqual(restarted.events, first.events)
+        XCTAssertEqual(restarted.rotatedEvents, 1)
+        XCTAssertEqual(restarted.recoveredLegacyEvents, 3)
+        XCTAssertEqual(restarted.unreadableLines, 0)
+        XCTAssertEqual(restarted.firstRetainedAt, restarted.events.first?.at)
+        XCTAssertEqual(restarted.lastRetainedAt, restarted.events.last?.at)
+        XCTAssertEqual(try Data(contentsOf: repairSourceFile), legacy)
+    }
+
+    func testOlderSnapshotWithoutRepairFieldsStillDecodes() throws {
+        let journal = store()
+        XCTAssertTrue(journal.recordReading(.decoded, reading: reading()))
+        var json = try XCTUnwrap(JSONSerialization.jsonObject(with: journal.snapshotData()) as? [String: Any])
+        json.removeValue(forKey: "recoveredLegacyEvents")
+        json.removeValue(forKey: "preservedRepairSourceBytes")
+        let decoded = try JSONDecoder().decode(WatchDeliveryEvidenceSnapshot.self,
+            from: JSONSerialization.data(withJSONObject: json))
+        XCTAssertEqual(decoded.events.count, 1)
+        XCTAssertNil(decoded.recoveredLegacyEvents)
+        XCTAssertNil(decoded.preservedRepairSourceBytes)
+    }
+
     func testTruncatedFailedAppendIsRepairedBeforeNextEventAndRestart() throws {
         var fail = true
         let journal = store(append: { data, url in

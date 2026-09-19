@@ -62,6 +62,9 @@ struct WatchDeliveryEvidenceSnapshot: Codable {
     let rotatedEvents: UInt64
     let writeFailures: UInt64
     let unreadableLines: UInt64
+    /// Optional so snapshots exported by earlier phone/Watch versions remain decodable.
+    let recoveredLegacyEvents: UInt64?
+    let preservedRepairSourceBytes: Int?
     let counterWindowStartedAt: Date
     let transportCounters: [String: UInt64]
     let lastAlarmReadinessEvidence: [String: String]?
@@ -90,6 +93,8 @@ final class WatchDeliveryEvidenceStore {
         var rotated: UInt64 = 0
         var writeFailures: UInt64 = 0
         var unreadable: UInt64 = 0
+        var recoveredLegacyEvents: UInt64?
+        var preservedRepairSourceBytes: Int?
         var counterWindowStartedAt = Date()
         var counters: [String: UInt64] = [:]
         var alarmReadiness: [String: String]?
@@ -109,7 +114,9 @@ final class WatchDeliveryEvidenceStore {
     private var lastCheckpoint: TimeInterval = -.infinity
     private var lastPrune: Date = .distantPast
     private var journalNeedsRepair = false
+    private var pendingLegacyRecoveredEvents: UInt64 = 0
     private var journalURL: URL { directory.appendingPathComponent("delivery-events-v1.jsonl") }
+    private var repairSourceURL: URL { directory.appendingPathComponent("delivery-events-v1.pre-repair.jsonl") }
     private var metadataURL: URL { directory.appendingPathComponent("delivery-metadata-v1.json") }
 
     init(directory: URL? = nil, origin: WatchDeliveryEvidenceOrigin = .current(),
@@ -170,7 +177,9 @@ final class WatchDeliveryEvidenceStore {
                 metadata.alarmReadiness = readiness
             }
             guard var line = try? JSONEncoder().encode(event) else { metadata.writeFailures &+= 1; return false }
-            line.append(0x0a)
+            // The iPhone Data extension has a generic integer overload: an untyped literal
+            // writes an eight-byte Int (LF followed by seven NULs), not one delimiter byte.
+            line.append(UInt8(0x0a))
             guard line.count <= limits.bytes else { metadata.writeFailures &+= 1; return false }
             // Remove a quarter when full: bounded amortized compaction, not a full rewrite per event.
             if records.count >= limits.events || byteCount + line.count > limits.bytes {
@@ -225,10 +234,12 @@ final class WatchDeliveryEvidenceStore {
                 firstRetainedAt: visible.first?.event.at, lastRetainedAt: visible.last?.event.at,
                 maximumAge: limits.age, maximumEvents: limits.events, maximumBytes: limits.bytes,
                 rotatedEvents: metadata.rotated, writeFailures: metadata.writeFailures,
-                unreadableLines: metadata.unreadable, counterWindowStartedAt: metadata.counterWindowStartedAt,
+                unreadableLines: metadata.unreadable, recoveredLegacyEvents: metadata.recoveredLegacyEvents ?? 0,
+                preservedRepairSourceBytes: metadata.preservedRepairSourceBytes,
+                counterWindowStartedAt: metadata.counterWindowStartedAt,
                 transportCounters: metadata.counters, lastAlarmReadinessEvidence: metadata.alarmReadiness, events: visible.map(\.event),
                 clockNote: "at is origin device wall clock; uptime is monotonic within origin.process only. Cross-device clock offset is unknown. watchReceivedAt is the existing Watch reception timestamp. sensorTime is unknown when absent; elapsed sensor minutes are not a wall-clock timestamp.",
-                coverageNote: "Only retained successfully appended events are included. Rotation is diagnostic retention, not lost glucose. Counters may omit the final 60 seconds after abrupt termination. No events from before this instrumentation are reconstructed. An event's localWriteConfirmed refers to the existing atomic outbox save, not this journal.")
+                coverageNote: "Only retained successfully appended events are included. Rotation is diagnostic retention, not lost glucose. Counters may omit the final 60 seconds after abrupt termination. No events from before this instrumentation are reconstructed. An event's localWriteConfirmed refers to the existing atomic outbox save, not this journal. recoveredLegacyEvents counts valid existing JSON events successfully rewritten without the known old delimiter padding; historical unreadableLines is not reduced. Before repair, the first bounded raw source is retained locally as delivery-events-v1.pre-repair.jsonl, not included in this export. Later damaged raw sources are not archived; unreadable lines remain counted.")
         }
     }
 
@@ -265,11 +276,25 @@ final class WatchDeliveryEvidenceStore {
             metadata.unreadable &+= 1; journalNeedsRepair = true
             return
         }
-        for part in data.split(separator: 0x0a, omittingEmptySubsequences: true) {
-            guard let event = try? JSONDecoder().decode(WatchDeliveryEvidenceEvent.self, from: Data(part)) else {
+        let parts = data.split(separator: 0x0a, omittingEmptySubsequences: false)
+        // The released iPhone writer encoded Int(10) in little endian. Recover only its
+        // exact seven NUL bytes after an observed LF, never arbitrary embedded corruption.
+        let legacyPadding = Data(repeating: 0, count: 7)
+        for (index, part) in parts.enumerated() where !part.isEmpty {
+            let hasLegacyPadding = index > 0 && part.starts(with: legacyPadding)
+            let cleaned = hasLegacyPadding ? Data(part.dropFirst(7)) : Data(part)
+            if hasLegacyPadding {
+                journalNeedsRepair = true
+                // A complete old final delimiter leaves a seven-byte trailing fragment.
+                if cleaned.isEmpty && index == parts.count - 1 { continue }
+            }
+            guard let event = try? JSONDecoder().decode(WatchDeliveryEvidenceEvent.self, from: cleaned) else {
                 metadata.unreadable &+= 1; journalNeedsRepair = true; continue
             }
-            var line = Data(part); line.append(0x0a)
+            if hasLegacyPadding {
+                pendingLegacyRecoveredEvents &+= 1
+            }
+            var line = cleaned; line.append(UInt8(0x0a))
             records.append((event, line)); byteCount += line.count
             metadata.sequence = max(metadata.sequence, event.sequence)
         }
@@ -299,13 +324,31 @@ final class WatchDeliveryEvidenceStore {
     @discardableResult
     private func rewrite(_ retained: [(event: WatchDeliveryEvidenceEvent, line: Data)]) -> Bool {
         do {
+            if journalNeedsRepair { try preserveFirstRepairSource() }
             let data = retained.reduce(into: Data()) { $0.append($1.line) }
             try replace(data, journalURL)
+            // Do not persist a successful migration count while source preservation or
+            // replacement is still failing; another process may need to retry that source.
+            metadata.recoveredLegacyEvents = (metadata.recoveredLegacyEvents ?? 0) &+ pendingLegacyRecoveredEvents
+            pendingLegacyRecoveredEvents = 0
             metadata.rotated &+= UInt64(records.count - retained.count)
             records = retained; byteCount = data.count
+            journalNeedsRepair = false
             checkpoint(force: true)
             return true
         } catch { metadata.writeFailures &+= 1; return false }
+    }
+
+    /// One bounded original, not another journal. If preservation fails, do not destroy
+    /// the damaged source or append to it. This failure never touches the clinical outbox.
+    private func preserveFirstRepairSource() throws {
+        guard FileManager.default.fileExists(atPath: journalURL.path) else { return }
+        let size = try journalURL.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+        guard size <= max(limits.bytes * 2, 16_384) else { throw CocoaError(.fileReadTooLarge) }
+        if !FileManager.default.fileExists(atPath: repairSourceURL.path) {
+            try replace(Data(contentsOf: journalURL), repairSourceURL)
+        }
+        metadata.preservedRepairSourceBytes = try repairSourceURL.resourceValues(forKeys: [.fileSizeKey]).fileSize
     }
 
     private func checkpointIfDue() { checkpoint(force: uptime() - lastCheckpoint >= 60) }
