@@ -112,6 +112,7 @@ public class NightscoutSyncManager: NSObject, ObservableObject {
     /// requests. Managed objects may change or fault during that delay, so the queued work receives
     /// the exact timestamp and Nightscout dictionary captured at scheduling time.
     private struct BgReadingReplacementPayload {
+        let id: String
         let timeStamp: Date
         let dictionaryRepresentationForNightscoutUpload: [String: Any]
     }
@@ -206,6 +207,7 @@ public class NightscoutSyncManager: NSObject, ObservableObject {
     private var pendingDirectBgUploadAfterReplacement = false
     private var pendingDirectBgUploadLastConnectionStatusChangeTimeStamp: Date?
     private var directBgUploadInFlight = false
+    private var directBgUploadWaiters: [CheckedContinuation<Void, Never>] = []
     private var historicalBgUploadInFlight = false
     private var historicalBgUploadWaiters: [CheckedContinuation<Void, Never>] = []
     private var historicalBgRetry: DispatchWorkItem?
@@ -433,9 +435,9 @@ public class NightscoutSyncManager: NSObject, ObservableObject {
             UserDefaults.standard.nightscoutSyncRequired = true
         }
         
-        // Manual historical replacement deletes an explicit Nightscout window,
-        // so direct live upload must wait until that full-window rewrite is
-        // finished. Automatic smoothing tail replacement does not own the newest
+        // Explicit historical replacement can include the newest reading,
+        // so direct live upload waits for that revision. Automatic smoothing
+        // tail replacement does not own the newest
         // live reading and must not stall the normal live upload path in the
         // background.
         if bgReadingsReplacementTaskIdentifier != nil && bgReadingsReplacementBlocksDirectLiveUpload {
@@ -583,9 +585,28 @@ public class NightscoutSyncManager: NSObject, ObservableObject {
     }
 
     @MainActor
-    private func waitForHistoricalBgUpload() async {
+    func waitForHistoricalBgUpload() async {
         guard historicalBgUploadInFlight else { return }
         await withCheckedContinuation { historicalBgUploadWaiters.append($0) }
+    }
+
+    @MainActor func waitForDirectBgUpload() async {
+        guard directBgUploadInFlight else { return }
+        await withCheckedContinuation { directBgUploadWaiters.append($0) }
+    }
+
+    /// Keep a queued backfill revision current while retaining its durable local identity.
+    /// Otherwise a failed old upload could overwrite a newer, successful smoothing update.
+    @MainActor private func revisePendingHistoricalReadings(_ replacements: [BgReadingReplacementPayload]) {
+        guard var queue = loadHistoricalQueue(), !queue.entries.isEmpty else { return }
+        let pendingIDs = Set(queue.entries.map(\.id))
+        for reading in replacements where pendingIDs.contains(reading.id) {
+            guard let payload = try? JSONSerialization.data(
+                withJSONObject: reading.dictionaryRepresentationForNightscoutUpload, options: .sortedKeys)
+            else { continue }
+            queue.enqueue(.init(id: reading.id, measuredAt: reading.timeStamp, payload: payload), now: Date())
+        }
+        saveHistoricalQueue(queue)
     }
 
     public func replaceBgReadingsInNightscout(bgReadings: [BgReading], timeStampsToDelete: [Date] = [], blocksDirectLiveUpload: Bool = false) {
@@ -609,7 +630,7 @@ public class NightscoutSyncManager: NSObject, ObservableObject {
             // Official 7.1.0 / 10e86580: Nightscout upserts by sysTime + type.
             // Omit the local ID so an existing server ID is preserved, with no DELETE first.
             payload.removeValue(forKey: "_id")
-            return BgReadingReplacementPayload(timeStamp: $0.timeStamp, dictionaryRepresentationForNightscoutUpload: payload)
+            return BgReadingReplacementPayload(id: $0.id, timeStamp: $0.timeStamp, dictionaryRepresentationForNightscoutUpload: payload)
         }
         let retainedTimeStamps = Set(bgReadingsToReplace.map(\.timeStamp))
         let exactTimeStampsToDelete = Array(Set(timeStampsToDelete).subtracting(retainedTimeStamps)).sorted()
@@ -631,6 +652,7 @@ public class NightscoutSyncManager: NSObject, ObservableObject {
             // A later revision must not race a historical insertion whose receipt is pending.
             // Registering this replacement already prevents another historical upload starting.
             await self.waitForHistoricalBgUpload()
+            await self.waitForDirectBgUpload()
             // The user can turn off master Nightscout BG upload while a replacement task is queued.
             // Re-check the write permission after waiting so the delayed task
             // does not continue deleting and re-uploading BG values anyway.
@@ -645,12 +667,23 @@ public class NightscoutSyncManager: NSObject, ObservableObject {
                 return
             }
 
+            self.revisePendingHistoricalReadings(bgReadingsToReplace)
+            let pendingDeletions = self.loadHistoricalQueue()?.entries.filter {
+                exactTimeStampsToDelete.contains($0.measuredAt)
+            } ?? []
+
             // Automatic smoothing supplies no deletions. Explicit cadence changes supply only
             // exact suppressed SGV timestamps; never infer deletions from a surrounding window.
             let deletionSucceeded = await self.deleteBgReadingEntriesAtNightscout(
                 timeStamps: exactTimeStampsToDelete, expectedSite: expectedSite, expectedPort: expectedPort)
             var uploadSucceeded = false
             if deletionSucceeded {
+                // Do not let an older durable backfill reinsert a successfully suppressed SGV.
+                // Equality protects any new queue revision received while DELETE was in flight.
+                if !pendingDeletions.isEmpty, var queue = self.loadHistoricalQueue() {
+                    queue.confirm(pendingDeletions)
+                    self.saveHistoricalQueue(queue)
+                }
                 uploadSucceeded = await self.uploadBgReadingsReplacementChunksToNightscout(
                     bgReadings: bgReadingsToReplace, expectedSite: expectedSite, expectedPort: expectedPort)
             }
@@ -1680,6 +1713,9 @@ public class NightscoutSyncManager: NSObject, ObservableObject {
             uploadDataAndGetResponse(dataToUpload: bgReadingsDictionaryRepresentation, httpMethod: nil, path: nightscoutEntriesPath) { _, result in
                 DispatchQueue.main.async {
                     self.directBgUploadInFlight = false
+                    let waiters = self.directBgUploadWaiters
+                    self.directBgUploadWaiters.removeAll()
+                    waiters.forEach { $0.resume() }
                     self.drainHistoricalBgReadings()
                     guard result.successFull() else { return }
                     if let timeStampLastReadingToUpload = timeStampLastReadingToUpload {
@@ -1759,7 +1795,21 @@ public class NightscoutSyncManager: NSObject, ObservableObject {
         let operation = uploadOperation(for: path, payload: dataToUpload)
         do {
             // transform dataToUpload to json
-            let dataToUploadAsJSON = try JSONSerialization.data(withJSONObject: dataToUpload, options: [])
+            // All SGV writers must use the same server identity as replacements. Otherwise
+            // a later live/backfill retry can conflict with the ID assigned by an earlier
+            // upsert. Local reading/outbox IDs and durable queue acknowledgements are unchanged.
+            let wirePayload: Any
+            if path == nightscoutEntriesPath, let readings = dataToUpload as? [[String: Any]],
+               !readings.isEmpty, readings.allSatisfy({ $0["type"] as? String == "sgv" }) {
+                wirePayload = readings.map { reading -> [String: Any] in
+                    var entry = reading
+                    entry.removeValue(forKey: "_id")
+                    return entry
+                }
+            } else {
+                wirePayload = dataToUpload
+            }
+            let dataToUploadAsJSON = try JSONSerialization.data(withJSONObject: wirePayload, options: [])
             
             // trace size of data
             trace("in uploadDataAndGetResponse, size of data to upload : %{public}@", log: oslog, category: ConstantsLog.categoryNightscoutSyncManager, type: .debug, dataToUploadAsJSON.count.description)

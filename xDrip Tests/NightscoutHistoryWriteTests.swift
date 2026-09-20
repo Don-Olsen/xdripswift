@@ -27,6 +27,9 @@ final class NightscoutHistoryWriteTests: XCTestCase {
             defaults.nightscoutAPIKey = "synthetic-test-secret"
             defaults.nightscoutToken = nil
             defaults.nightscoutEnabled = true
+            defaults.nightscoutUseSchedule = false
+            defaults.uploadSensorStartTimeToNS = false
+            defaults.transmitterBatteryInfo = nil
             defaults.isMaster = true
             defaults.masterUploadDataToNightscout = true
             defaults.storeFrequentReadingsInNightscout = true
@@ -52,6 +55,8 @@ final class NightscoutHistoryWriteTests: XCTestCase {
 
         func finish() async {
             await manager.waitForBgReplacements()
+            await manager.waitForHistoricalBgUpload()
+            await manager.waitForDirectBgUpload()
             session.invalidateAndCancel()
             NightscoutHistoryURLProtocol.unregister(server)
             UserDefaults.standard.setPersistentDomain(savedDefaults, forName: Bundle.main.bundleIdentifier!)
@@ -288,6 +293,121 @@ final class NightscoutHistoryWriteTests: XCTestCase {
         XCTAssertTrue(h.server.requests.allSatisfy { $0.method == "POST" })
         await h.finish()
     }
+
+    @MainActor func testQueuedBackfillCannotUndoNewerReplacementOrConflictWithServerID() async throws {
+        let h = Harness()
+        let reading = h.reading(), blocker = h.reading(20)
+        XCTAssertTrue(h.stack.saveChanges())
+        let started = expectation(description: "replacement blocks backfill")
+        h.server.holdNextRequest { started.fulfill() }
+        h.manager.replaceBgReadingsInNightscout(bgReadings: [blocker])
+        await fulfillment(of: [started], timeout: 5)
+        h.manager.storeHistoricalBgReadingsInNightscout(bgReadings: [reading])
+        let queuedData = try XCTUnwrap(UserDefaults.standard.data(forKey: "nightscoutHistoricalReadings.v1"))
+        let queued = try JSONDecoder().decode(NightscoutHistoricalQueue.self, from: queuedData)
+        XCTAssertEqual(queued.entries.map(\.id), [reading.id])
+        reading.calculatedValue = 140
+        h.manager.replaceBgReadingsInNightscout(bgReadings: [reading])
+        h.server.releaseHeld()
+        await h.manager.waitForBgReplacements()
+        await h.manager.waitForHistoricalBgUpload()
+        let matching = h.server.requests.compactMap(\.entries).flatMap { $0 }.filter {
+            ($0["date"] as? NSNumber)?.int64Value == reading.timeStamp.toMillisecondsAsInt64()
+        }
+        XCTAssertEqual(matching.compactMap { $0["sgv"] as? Int }, [140, 140])
+        XCTAssertTrue(matching.allSatisfy { $0["_id"] == nil })
+        XCTAssertEqual(h.server.entries.count, 2)
+        XCTAssertEqual(h.server.entry(at: reading.timeStamp.toMillisecondsAsInt64(), type: "sgv")?["sgv"] as? Int, 140)
+        let remaining = try JSONDecoder().decode(NightscoutHistoricalQueue.self,
+            from: XCTUnwrap(UserDefaults.standard.data(forKey: "nightscoutHistoricalReadings.v1")))
+        XCTAssertTrue(remaining.entries.isEmpty)
+        await h.finish()
+    }
+
+    @MainActor func testLiveUploadAfterReplacementPreservesServerIDAndOnlyOneEntry() async {
+        let h = Harness()
+        let reading = h.reading()
+        XCTAssertTrue(h.stack.saveChanges())
+        h.manager.replaceBgReadingsInNightscout(bgReadings: [reading])
+        await h.manager.waitForBgReplacements()
+        let serverID = h.server.entries.first?["_id"] as? String
+        // A live handoff/retry must coexist with a server-created historical upsert.
+        UserDefaults.standard.timeStampLatestNightscoutUploadedBgReading = .distantPast
+        h.manager.uploadLatestBgReadings(lastConnectionStatusChangeTimeStamp: nil)
+        await h.manager.waitForDirectBgUpload()
+        XCTAssertEqual(h.server.requests.count, 2)
+        XCTAssertEqual(h.server.entries.count, 1)
+        XCTAssertEqual(h.server.entries.first?["_id"] as? String, serverID)
+        XCTAssertEqual(UserDefaults.standard.timeStampLatestNightscoutUploadedBgReading, reading.timeStamp)
+        XCTAssertEqual(reading.id.count, 24) // The local stable ID was never changed.
+        await h.finish()
+    }
+
+    @MainActor func testReplacementWaitsForInFlightLiveValueBeforeWritingNewRevision() async {
+        let h = Harness()
+        let reading = h.reading()
+        XCTAssertTrue(h.stack.saveChanges())
+        let started = expectation(description: "live request")
+        h.server.holdNextRequest { started.fulfill() }
+        h.manager.uploadLatestBgReadings(lastConnectionStatusChangeTimeStamp: nil)
+        await fulfillment(of: [started], timeout: 5)
+        reading.calculatedValue = 140
+        h.manager.replaceBgReadingsInNightscout(bgReadings: [reading])
+        XCTAssertEqual(h.server.requests.count, 1)
+        h.server.releaseHeld()
+        await h.manager.waitForBgReplacements()
+        XCTAssertEqual(h.server.requests.compactMap { $0.entries?.first?["sgv"] as? Int }, [110, 140])
+        XCTAssertEqual(h.server.entries.first?["sgv"] as? Int, 140)
+        await h.finish()
+    }
+
+    @MainActor func testSuppressedPendingBackfillIsNotReinsertedAfterExactDeletion() async throws {
+        let h = Harness()
+        let removed = h.reading(), retained = h.reading(10)
+        XCTAssertTrue(h.stack.saveChanges())
+        let started = expectation(description: "hold initial replacement")
+        h.server.holdNextRequest { started.fulfill() }
+        h.manager.replaceBgReadingsInNightscout(bgReadings: [retained])
+        await fulfillment(of: [started], timeout: 5)
+        h.manager.storeHistoricalBgReadingsInNightscout(bgReadings: [removed])
+        h.manager.replaceBgReadingsInNightscout(bgReadings: [retained], timeStampsToDelete: [removed.timeStamp])
+        h.server.releaseHeld()
+        await h.manager.waitForBgReplacements()
+        await h.manager.waitForHistoricalBgUpload()
+        XCTAssertEqual(h.server.requests.map(\.method), ["POST", "DELETE", "POST"])
+        XCTAssertNil(h.server.entry(at: removed.timeStamp.toMillisecondsAsInt64(), type: "sgv"))
+        let remaining = try JSONDecoder().decode(NightscoutHistoricalQueue.self,
+            from: XCTUnwrap(UserDefaults.standard.data(forKey: "nightscoutHistoricalReadings.v1")))
+        XCTAssertTrue(remaining.entries.isEmpty)
+        await h.finish()
+    }
+
+    @MainActor func testRestartReplaysLegacyQueueAfterLostReplyWithoutIDConflict() async throws {
+        let h = Harness()
+        let reading = h.reading()
+        XCTAssertTrue(h.stack.saveChanges())
+        h.server.failNextUploadAfterStoring = true
+        h.manager.storeHistoricalBgReadingsInNightscout(bgReadings: [reading])
+        await h.manager.waitForHistoricalBgUpload()
+        let queued = try JSONDecoder().decode(NightscoutHistoricalQueue.self,
+            from: XCTUnwrap(UserDefaults.standard.data(forKey: "nightscoutHistoricalReadings.v1")))
+        XCTAssertEqual(queued.entries.map(\.id), [reading.id])
+        let legacyPayload = try JSONSerialization.jsonObject(with: XCTUnwrap(queued.entries.first?.payload)) as? [String: Any]
+        XCTAssertEqual(legacyPayload?["_id"] as? String, reading.id)
+        let serverID = h.server.entries.first?["_id"] as? String
+        let restarted = NightscoutSyncManager(coreDataManager: h.stack, messageHandler: nil,
+            urlSession: h.session, observesSettings: false)
+        restarted.uploadLatestBgReadings(lastConnectionStatusChangeTimeStamp: nil)
+        await restarted.waitForHistoricalBgUpload()
+        XCTAssertEqual(h.server.requests.count, 2)
+        XCTAssertEqual(h.server.entries.count, 1)
+        XCTAssertEqual(h.server.entries.first?["_id"] as? String, serverID)
+        let confirmed = try JSONDecoder().decode(NightscoutHistoricalQueue.self,
+            from: XCTUnwrap(UserDefaults.standard.data(forKey: "nightscoutHistoricalReadings.v1")))
+        XCTAssertTrue(confirmed.entries.isEmpty)
+        XCTAssertEqual(UserDefaults.standard.timeStampLatestNightscoutUploadedBgReading, .distantPast)
+        await h.finish()
+    }
 }
 
 private final class NightscoutHistoryServer {
@@ -320,7 +440,7 @@ private final class NightscoutHistoryServer {
         let row = Request(method: request.httpMethod ?? "GET", query: URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?.queryItems ?? [], entries: entries)
         lock.lock()
         recorded.append(row)
-        let status = nextStatus ?? 200
+        var status = nextStatus ?? 200
         nextStatus = nil
         var data = Data("[]".utf8)
         var failure: Error?
@@ -329,6 +449,11 @@ private final class NightscoutHistoryServer {
             // $set without _id preserves an existing server ID and unrelated entry types.
             for entry in payload {
                 if let index = stored.firstIndex(where: { $0["sysTime"] as? String == entry["sysTime"] as? String && $0["type"] as? String == entry["type"] as? String }) {
+                    if let suppliedID = entry["_id"] as? String, suppliedID != stored[index]["_id"] as? String {
+                        status = 500
+                        data = Data("{\"description\":{\"code\":66}}".utf8)
+                        break // MongoDB immutable _id conflict; never silently replace it.
+                    }
                     stored[index].merge(entry) { _, new in new }
                 } else {
                     var new = entry
@@ -337,6 +462,10 @@ private final class NightscoutHistoryServer {
                 }
             }
             if failNextUploadAfterStoring { failNextUploadAfterStoring = false; failure = URLError(.timedOut) }
+        }
+        if status == 200 && row.method == "GET" {
+            let id = row.query.first { $0.name == "find[_id]" }?.value
+            data = (try? JSONSerialization.data(withJSONObject: stored.filter { $0["_id"] as? String == id })) ?? Data("[]".utf8)
         }
         if status == 200 && row.method == "DELETE" {
             let type = row.query.first { $0.name == "find[type]" }?.value

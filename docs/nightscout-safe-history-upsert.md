@@ -23,6 +23,15 @@ This change adapts the Nightscout portion of official upstream commit
 - Existing replacement ordering, historical upload waiters, durable Watch
   history queue and live upload handoff remain. Every chunk rechecks enabled
   state and the original destination; queued data cannot follow a changed site.
+- The fork's live/backfill writers also omit `_id` on SGV HTTP payloads, including
+  old persisted queue payloads. Mixing a server-assigned replacement ID with a
+  subsequent local-ID replay would otherwise produce MongoDB error 66 on older
+  Nightscout servers. The local reading ID and durable queue ID do not change.
+  Queue acknowledgement still follows an actual successful server response.
+- A replacement waits for an in-flight live upload and revises matching pending
+  backfill payloads before writing, preventing an older retry from undoing the
+  revised value. Successfully deleted exact SGV timestamps are removed from the
+  matching old queue entries; newer queue revisions retain equality protection.
 - The existing URLSession is injectable, so XCTest exercises real manager,
   request construction and callback handling against an isolated URLProtocol.
 
@@ -46,6 +55,10 @@ entry preservation, repeated and changed upserts, overlapping snapshots, a lost
 reply, failed chunks, upload disable, destination change, exact typed deletion,
 50-timestamp chunking, count formats, failed deletion, and the production
 post-processing caller for automatic and explicit cadence paths.
+It also exercises live upload after an upsert, an in-flight live upload followed
+by a revision, queued backfill followed by a newer revision, exact suppression
+with pending backfill, and manager restart after a lost historical-upload reply.
+The server fixture rejects an attempt to mutate an existing `_id` with error 66.
 
 Both Codemagic workflows explicitly select this suite. The xcresult evidence
 script requires every declared test method to have run and passed; missing,
