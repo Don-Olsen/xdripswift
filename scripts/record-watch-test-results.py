@@ -12,7 +12,8 @@ from urllib.parse import unquote
 
 SUITES = ('LibreWatchValuePipelineTests', 'TroubleshootingLogTests',
           'WatchRefreshCoordinatorTests', 'WatchPhoneRefreshServiceTests',
-          'WatchSnapshotSemanticsTests', 'WatchDeliveryEvidenceTests')
+          'WatchSnapshotSemanticsTests', 'WatchDeliveryEvidenceTests',
+          'NightscoutHistoryWriteTests')
 VERIFY_ONLY_SUITES = ('RootHomeInteractionTests',)
 
 

@@ -55,6 +55,7 @@ workflows:
             -only-testing:xdripTests/WatchPhoneRefreshServiceTests \
             -only-testing:xdripTests/WatchSnapshotSemanticsTests \
             -only-testing:xdripTests/WatchDeliveryEvidenceTests \
+            -only-testing:xdripTests/NightscoutHistoryWriteTests \
             -resultBundlePath "$CM_BUILD_DIR/build/test-results/LibreWatchValuePipelineTests.xcresult" \
             CODE_SIGNING_ALLOWED=NO
 
@@ -381,6 +382,7 @@ workflows:
             -only-testing:xdripTests/WatchPhoneRefreshServiceTests \
             -only-testing:xdripTests/WatchSnapshotSemanticsTests \
             -only-testing:xdripTests/WatchDeliveryEvidenceTests \
+            -only-testing:xdripTests/NightscoutHistoryWriteTests \
             -resultBundlePath "$CM_BUILD_DIR/build/verification/Verification.xcresult" \
             CODE_SIGNING_ALLOWED=NO \
             2>&1 | tee "$CM_BUILD_DIR/build/verification/xctest.log"

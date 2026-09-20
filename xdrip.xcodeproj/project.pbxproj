@@ -364,6 +364,7 @@
 		BA0000010000000000000007 /* NightscoutImportService.swift in Sources */ = {isa = PBXBuildFile; fileRef = BA0000010000000000000017 /* NightscoutImportService.swift */; };
 		BA0000020000000000000001 /* NightscoutFollowerGapFillService.swift in Sources */ = {isa = PBXBuildFile; fileRef = BA0000020000000000000011 /* NightscoutFollowerGapFillService.swift */; };
 		BA0000020000000000000002 /* NightscoutFollowerGapFillTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BA0000020000000000000012 /* NightscoutFollowerGapFillTests.swift */; };
+		B42630000000000000000001 /* NightscoutHistoryWriteTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B42630000000000000000002 /* NightscoutHistoryWriteTests.swift */; };
 		BA0000010000000000000008 /* NightscoutImportView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BA0000010000000000000018 /* NightscoutImportView.swift */; };
 		BA0000010000000000000009 /* ManageDataView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BA0000010000000000000019 /* ManageDataView.swift */; };
 		BA000001000000000000000A /* ImportDataView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BA000001000000000000001A /* ImportDataView.swift */; };
@@ -1265,6 +1266,7 @@
 		BA0000010000000000000017 /* NightscoutImportService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NightscoutImportService.swift; sourceTree = "<group>"; };
 		BA0000020000000000000011 /* NightscoutFollowerGapFillService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NightscoutFollowerGapFillService.swift; sourceTree = "<group>"; };
 		BA0000020000000000000012 /* NightscoutFollowerGapFillTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NightscoutFollowerGapFillTests.swift; sourceTree = "<group>"; };
+		B42630000000000000000002 /* NightscoutHistoryWriteTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NightscoutHistoryWriteTests.swift; sourceTree = "<group>"; };
 		BA0000010000000000000018 /* NightscoutImportView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NightscoutImportView.swift; sourceTree = "<group>"; };
 		BA0000010000000000000019 /* ManageDataView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ManageDataView.swift; sourceTree = "<group>"; };
 		BA000001000000000000001A /* ImportDataView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ImportDataView.swift; sourceTree = "<group>"; };
@@ -2587,6 +2589,7 @@
 				A50000040000000000000001 /* OnlineHelpTests.swift */,
 				FBA100030000000000000001 /* FollowerBackgroundKeepAliveManagerTests.swift */,
 				BA0000020000000000000012 /* NightscoutFollowerGapFillTests.swift */,
+				B42630000000000000000002 /* NightscoutHistoryWriteTests.swift */,
 				A40000020000000000000001 /* FollowerSettingsTests.swift */,
 				4F2800123004000100000001 /* GlucoseChartYAxisRetentionTests.swift */,
 				4F2800113004000100000001 /* RootHomeInteractionTests.swift */,
@@ -4361,6 +4364,7 @@
 				A50000030000000000000001 /* OnlineHelpTests.swift in Sources */,
 				FBA100040000000000000001 /* FollowerBackgroundKeepAliveManagerTests.swift in Sources */,
 				BA0000020000000000000002 /* NightscoutFollowerGapFillTests.swift in Sources */,
+				B42630000000000000000001 /* NightscoutHistoryWriteTests.swift in Sources */,
 				4F2600023002000200000001 /* SensorHealthIssueManagerTests.swift in Sources */,
 				4F2800023004000100000001 /* GlucoseChartYAxisRetentionTests.swift in Sources */,
 				4F2800013004000100000001 /* RootHomeInteractionTests.swift in Sources */,

@@ -244,12 +244,16 @@ class BgPostProcessingManager {
         }
         let downstreamReadingsToReplace = bgReadingsToReplaceDownstream.filter(\.isValidForDownstream)
 
-        if downstreamReadingsToReplace.count > 0 {
-            if shouldRewriteFullDownstreamWindow, let earliestBgReading = bgReadings.first, let latestBgReading = bgReadings.last {
-                nightscoutSyncManager?.replaceBgReadingsInNightscout(bgReadings: downstreamReadingsToReplace, deleteFromTimeStamp: earliestBgReading.timeStamp, deleteToTimeStamp: latestBgReading.timeStamp)
-            } else {
-                nightscoutSyncManager?.replaceBgReadingsInNightscout(bgReadings: downstreamReadingsToReplace)
-            }
+        // Only an explicit cadence rebuild removes remote points. Automatic smoothing and
+        // Watch backfill never infer deletion from a gap or touch surrounding phone history.
+        let timeStampsToDelete = fiveMinuteReadingsStartTimeStampOverride != nil &&
+            UserDefaults.standard.useFiveMinuteReadings && onlyNewHistoricalReadingIDs == nil
+            ? bgReadings.filter { $0.isSuppressedByFiveMinuteCadence }.map(\.timeStamp) : []
+        if !downstreamReadingsToReplace.isEmpty || !timeStampsToDelete.isEmpty {
+            nightscoutSyncManager?.replaceBgReadingsInNightscout(
+                bgReadings: downstreamReadingsToReplace,
+                timeStampsToDelete: timeStampsToDelete,
+                blocksDirectLiveUpload: shouldRewriteFullDownstreamWindow)
             healthKitManager?.replaceBgReadingsInHealthKit(bgReadings: downstreamReadingsToReplace)
             return true
         }
