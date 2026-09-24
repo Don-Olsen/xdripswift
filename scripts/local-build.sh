@@ -13,6 +13,7 @@ output_root="${XDRIP_OUTPUT_ROOT:-$repo_root/build/local/$run_stamp}"
 logs_dir="$output_root/logs"
 results_dir="$output_root/results"
 derived_data="$output_root/DerivedData"
+xcode_auth_args=(-allowProvisioningUpdates)
 
 mkdir -p "$logs_dir" "$results_dir" "$derived_data"
 
@@ -251,8 +252,24 @@ print("Verified local automatic signing settings for all five existing bundle ID
 PY
 }
 
+configure_xcode_auth() {
+  local key_path="${XDRIP_XCODE_AUTH_KEY_PATH:-}"
+  local key_id="${XDRIP_XCODE_AUTH_KEY_ID:-}"
+  local issuer_id="${XDRIP_XCODE_AUTH_KEY_ISSUER_ID:-}"
+  xcode_auth_args=(-allowProvisioningUpdates)
+  if [ -n "$key_path$key_id$issuer_id" ]; then
+    [ -f "$key_path" ] || die "Xcode team API private key is missing"
+    [[ "$key_id" =~ ^[A-Za-z0-9]{10}$ ]] || die "Xcode team API key ID is invalid"
+    [ -n "$issuer_id" ] || die "Xcode team API issuer ID is missing"
+    xcode_auth_args+=(-authenticationKeyPath "$key_path"
+                      -authenticationKeyID "$key_id"
+                      -authenticationKeyIssuerID "$issuer_id")
+  fi
+}
+
 release_preflight() {
   local account_count blocked=0
+  configure_xcode_auth
   verify_local_release_settings
   account_count="$(python3 - <<'PY'
 import plistlib
@@ -270,12 +287,15 @@ PY
 )"
 
   echo "Configured Xcode Apple ID account records: $account_count"
-  if [ "$account_count" -lt 1 ]; then
-    echo "Sign in to the existing Apple Developer account in Xcode first."
+  if [ "$account_count" -lt 1 ] && [ "${#xcode_auth_args[@]}" -eq 1 ]; then
+    echo "No Xcode account or team API key is available for signing."
     blocked=1
   fi
 
   echo "Signing mode: Xcode Automatic + cloud-managed local export"
+  if [ "${#xcode_auth_args[@]}" -gt 1 ]; then
+    echo "Authentication: external App Store Connect team API key"
+  fi
   echo "Developer Team: $team_id"
 
   if [ -z "${XDRIP_BUILD_NUMBER:-}" ]; then
@@ -613,7 +633,7 @@ PY
     -destination "generic/platform=iOS" \
     -archivePath "$archive_path" \
     -derivedDataPath "$derived_data/archive" \
-    -allowProvisioningUpdates \
+    "${xcode_auth_args[@]}" \
     CODE_SIGN_STYLE=Automatic \
     CODE_SIGN_IDENTITY="Apple Development" \
     DEVELOPMENT_TEAM="$team_id" \
@@ -650,7 +670,7 @@ PY
     -archivePath "$archive_path" \
     -exportPath "$export_path" \
     -exportOptionsPlist "$export_options" \
-    -allowProvisioningUpdates \
+    "${xcode_auth_args[@]}" \
     2>&1 | tee "$logs_dir/export.log"
 
   ipa_count="$(find "$export_path" -maxdepth 1 -type f -name '*.ipa' | wc -l | tr -d ' ')"

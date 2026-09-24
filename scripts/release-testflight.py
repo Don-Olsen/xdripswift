@@ -435,6 +435,13 @@ def build(root, path, state):
     env.update(XDRIP_OUTPUT_ROOT=str(output), XDRIP_RELEASE_TAG=state["tag"],
                XDRIP_RELEASE_STATE_PATH=str(path), XDRIP_BUILD_NUMBER=state["build"],
                XDRIP_ASC_ALLOCATION_PATH=state["allocationPath"])
+    client = apple_client()
+    if client.issuer_id:
+        # Xcode supports team API-key authentication for automatic provisioning
+        # and cloud-managed distribution. Pass only the external key path/IDs.
+        env.update(XDRIP_XCODE_AUTH_KEY_PATH=str(client.private_key_path),
+                   XDRIP_XCODE_AUTH_KEY_ID=client.key_id,
+                   XDRIP_XCODE_AUTH_KEY_ISSUER_ID=client.issuer_id)
     if sha256_file(Path(state["allocationPath"])) != state["allocationSha256"]:
         fail("Apple allocation receipt changed since checkpoint")
     run([str(ROOT / "scripts/local-build.sh"), "archive"], env=env)

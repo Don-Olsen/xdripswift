@@ -87,7 +87,12 @@ baseline, ikke release-kvittering for en senere ændret versionsfil.
 `testflight-<version>-<build>`-tag; begge fjernrefs verificeres. `build` kræver
 rent working tree, matching testkvittering og Apple-allokering. Kilden udtrækkes
 fra tagget med `git archive`. Xcode genbruger team GFZ896KN66 og automatisk
-signering; eksisterende signeringsaktiver bevares. Alle fem bundles kontrolleres,
+signering. Ved headless arkiv/eksport sender release-scriptet den konfigurerede
+eksterne **Admin-teamnøgles sti, Key ID og Issuer ID** til Xcodes understøttede
+`-authenticationKeyPath`, `-authenticationKeyID` og
+`-authenticationKeyIssuerID` sammen med `-allowProvisioningUpdates`.
+Nøgleindholdet sendes ikke via argumenter eller logs. Eksisterende
+signeringsaktiver bevares. Alle fem bundles kontrolleres,
 inklusive entitlements, profiler, version/build og indbygget source commit.
 `verify` pakker den faktiske IPA ud igen og verificerer den, inden IPA- og
 arkivhashes gemmes.
@@ -117,9 +122,15 @@ og laver/pusher en separat dokumentationscommit uden at flytte release-tagget.
 
 ## App Store Connect API-adgang
 
-Xcodes eksisterende Apple-login bruges fortsat til signering. Apples offentlige
-REST API kræver en Apple-udstedt ES256 `.p8`-nøgle; der findes ikke en understøttet
+Apples offentlige REST API kræver en Apple-udstedt ES256 `.p8`-nøgle; der findes ikke en understøttet
 konvertering fra et almindeligt Xcode-login til denne API-adgang.
+På denne Mac kan Xcode-CLI ikke bruge det synlige Xcode-login til eksport.
+Den bekræftede automatiske metode er en separat Admin-teamnøgle til både
+API-opslag og Xcodes cloud-managed distributionseksport. En App Manager-teamnøgle
+kunne læse buildstatus, men Apple afviste dens cloud-signeringstilladelse;
+Admin-teamnøglen gennemførte en lokal distributionseksport. Den private nøgle
+ligger uden for Git med ejeradgang alene. Fremtidige releases bruger samme
+konfiguration automatisk; normal `local-build.sh build` uploader stadig aldrig.
 `scripts/apple_release.py` bruger Python-standardbiblioteket og macOS' eksisterende
 OpenSSL. Der installeres ikke Homebrew, Fastlane eller nye Python-pakker.
 Ingen browsercookies, Xcode-login-tokens eller private Apple-API'er bruges.

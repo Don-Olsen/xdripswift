@@ -138,6 +138,35 @@ class ReleaseGuardTests(unittest.TestCase):
     def authorized(self, version="7.0.0"):
         return mock.patch.dict(os.environ, {"XDRIP_GO_UPLOAD": "YES", "XDRIP_GO_UPLOAD_VERSION": version})
 
+    def test_build_passes_external_team_key_to_xcode_without_key_contents(self):
+        root = self.root / "build/release"
+        root.mkdir(parents=True)
+        allocation = root / "allocation.json"
+        allocation.write_text("{}", encoding="utf-8")
+        state = {"step": "tagged", "tag": "testflight-7.0.0-4265",
+                 "build": "4265", "allocationPath": str(allocation),
+                 "allocationSha256": release.sha256_file(allocation)}
+        key_path = self.root / "external/AuthKey_SYNTHETIC.p8"
+        client = mock.Mock(issuer_id="synthetic-issuer", key_id="SYNTHETIC1",
+                           private_key_path=key_path)
+        passed = {}
+
+        def synthetic_archive(args, *, env):
+            passed.update(env)
+            exported = root / "build/export"
+            exported.mkdir(parents=True)
+            (exported / "xdrip.ipa").write_bytes(b"synthetic IPA")
+
+        with mock.patch.object(release, "ensure_published"), \
+             mock.patch.object(release, "apple_client", return_value=client), \
+             mock.patch.object(release, "run", side_effect=synthetic_archive):
+            release.build(root, root / "release-state.json", state)
+        self.assertEqual(state["step"], "built")
+        self.assertEqual(passed["XDRIP_XCODE_AUTH_KEY_PATH"], str(key_path))
+        self.assertEqual(passed["XDRIP_XCODE_AUTH_KEY_ID"], "SYNTHETIC1")
+        self.assertEqual(passed["XDRIP_XCODE_AUTH_KEY_ISSUER_ID"], "synthetic-issuer")
+        self.assertNotIn("PRIVATE KEY", repr(passed))
+
     def prepared_checkpoint(self):
         self.remote()
         with mock.patch.object(release, "ensure_origin"), \
