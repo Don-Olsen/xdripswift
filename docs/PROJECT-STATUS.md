@@ -1,3 +1,15 @@
+<!-- testflight-7.1.1-4267:start -->
+### TestFlight 7.1.1 (4267)
+
+- Kildecommit og tag: `c11e27b135565c6fd971bdd7d4dc632986806c5a` / `testflight-7.1.1-4267`.
+- Tests: 1001/1001 bestået; 0 fejlet; 0 skipped. iPhone- og Watch-simulatorbuilds bestod.
+- Apple-status (2026-09-24T14:58:33.150542+00:00): [Internal / Testing](https://appstoreconnect.apple.com/apps/6795645396/testflight/ios/db8aeb8a-6980-47c5-952f-ae98c7a6a286).
+- Eksisterende intern gruppe: Ole Internal er bekræftet tilknyttet.
+- Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
+<!-- testflight-7.1.1-4267:end -->
+
+De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
+
 # Nuværende featuregren: Apple Sundhed-bolus og kulhydrater
 
 Opdateret 24. september 2026. **Denne funktion er kun gemt som kildekode på
