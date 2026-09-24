@@ -97,10 +97,16 @@ inklusive entitlements, profiler, version/build og indbygget source commit.
 `verify` pakker den faktiske IPA ud igen og verificerer den, inden IPA- og
 arkivhashes gemmes.
 
-Umiddelbart før upload læses Apple igen. Ved et optaget nummer **før eget
-uploadforsøg** vælges automatisk et nyt nummer, versionsfilen ændres og
-release-kontrollerne køres igen før nyt checkpoint/tag/arkiv. Det gamle tag
-flyttes aldrig. Der tillades højst tre automatiske kollisionsrunder.
+Umiddelbart før Xcode-eksport og igen før upload læses Apple. Eksporten kan selv
+oprette et tomt `AWAITING_UPLOAD`-objekt for den valgte version og build.
+Kun hvis præcis ét sådant objekt **ikke fandtes før eksporten**, blev set med sit
+konkrete ID efter eksporten og stadig har samme ID og tomme status før upload,
+må den verificerede IPA sendes til denne plads. Et faktisk Build, et andet ID,
+en anden status eller flere konkurrerende poster er en kollision. Ved en sådan
+optaget plads **før eget uploadforsøg** vælges automatisk et nyt nummer,
+versionsfilen ændres og release-kontrollerne køres igen før nyt
+checkpoint/tag/arkiv. Det gamle tag flyttes aldrig. Der tillades højst tre
+automatiske kollisionsrunder.
 Upload bruger Apples `xcrun altool --upload-package` på den verificerede IPA;
 der laves ikke en ny eksport med andre bytes i uploadtrinnet. Eksporten har
 `testFlightInternalTestingOnly=true` og `manageAppVersionAndBuildNumber=false`.

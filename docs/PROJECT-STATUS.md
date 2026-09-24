@@ -26,8 +26,8 @@ eller et manuelt buildnummer.
   faste proces. Den lokale parent-workspace `../AGENTS.md` peger nu også på
   den aktuelle 7.1.1-worktree. Personlig API-konfiguration er ignoreret/afvist
   fra Git. Ingen nye værktøjer eller dependencies er installeret.
-- Nye lokale Python-resultater: **12/12, 30/30, 17/17, 23/23 og 40/40**.
-  De 23 release-guards inkluderer syntetisk Git-checkpoint/push/tag/status,
+- Nye lokale Python-resultater: **12/12, 30/30, 17/17, 24/24 og 40/40**.
+  De 24 release-guards inkluderer syntetisk Git-checkpoint/push/tag/status,
   fuld genallokering/gentest ved nummerkonflikt, versionsspecifik uploadtilladelse,
   uændrede tags, direkte IPA-upload og afvisning af usikker status.
   De 40 API-tests dækker authentication, pagination, numerisk valg, processing,
@@ -63,12 +63,23 @@ blev uploadet. Apples API viser nu 4264 som `AWAITING_UPLOAD`, ikke som et
 modtaget eller testbart build. Den efterfølgende manuelle eksport var kun en
 signeringsprøve; den er ikke uploadet.
 
-Release-scriptet er nu rettet til at sende den eksterne Admin-teamnøgles sti og
-ikke-hemmelige ID'er til Xcodes understøttede signeringsflag ved arkiv og eksport.
-Fordi 4264 er registreret hos Apple, skal den automatiske proces vælge et nyt,
-ledigt nummer, ændre den tracked versionsfil, **teste den nye release-tree igen**,
-oprette et nyt uflyttet checkpoint/tag og først derefter bygge og uploade den
-verificerede IPA. 4264-tagget bevares som bevis for det tidligere forsøg.
+Den næste automatiske kørsel valgte **4265** og testede netop den release-tree
+med **983/983** beståede XCTest, 0 fejl/skipped og begge simulator-builds.
+Checkpoint `e150560769e467c6c801b931c586e3c5b811118f` blev pushet med det
+uflyttede tag `testflight-7.1.1-4265`. Både det signede Release-arkiv og den
+distributionssignerede IPA blev oprettet og kontrolleret for de fem bundles.
+Ingen IPA er uploadet: Xcodes eksport oprettede selv et tomt `AWAITING_UPLOAD`
+hos Apple, som den gamle upload-guard fejlagtigt klassificerede som et fremmed
+upload. Apple viser nu både 4264 og 4265 som `AWAITING_UPLOAD`, uden modtaget
+Build for 7.1.1. Begge tags og de lokale produkter bevares.
+
+Release-scriptet er nu rettet til at sende Admin-teamnøglens eksterne sti og
+ikke-hemmelige ID'er til Xcodes understøttede signeringsflag. Det registrerer
+Apple-status før eksport og det præcise ID på en ny, tom eksportreservation efter
+eksport. Kun samme tomme ID må accepteres før altool-upload; andre poster
+stopper eller udløser ny allokering. **24/24** syntetiske release-guards består,
+inklusive den nye reservationstest. Den næste allokerede kandidat er **4266**;
+den skal testes, checkpointes, tagges, bygges og verificeres særskilt før upload.
 
 Den separate `invalidPayload`-risiko og fysisk Watch-afprøvning er stadig åbne.
 Ingen fysisk iPhone eller Watch er installeret, startet eller ændret. De følgende

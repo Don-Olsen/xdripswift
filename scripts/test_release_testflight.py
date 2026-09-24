@@ -144,11 +144,14 @@ class ReleaseGuardTests(unittest.TestCase):
         allocation = root / "allocation.json"
         allocation.write_text("{}", encoding="utf-8")
         state = {"step": "tagged", "tag": "testflight-7.0.0-4265",
-                 "build": "4265", "allocationPath": str(allocation),
+                 "version": "7.0.0", "build": "4265", "allocationPath": str(allocation),
                  "allocationSha256": release.sha256_file(allocation)}
         key_path = self.root / "external/AuthKey_SYNTHETIC.p8"
         client = mock.Mock(issuer_id="synthetic-issuer", key_id="SYNTHETIC1",
                            private_key_path=key_path)
+        pending = {"id": "synthetic-xcode-reservation", "version": "7.0.0",
+                   "build": "4265", "state": "AWAITING_UPLOAD"}
+        client.snapshot.side_effect = [self.snapshot(), self.snapshot(uploads=[pending])]
         passed = {}
 
         def synthetic_archive(args, *, env):
@@ -162,10 +165,40 @@ class ReleaseGuardTests(unittest.TestCase):
              mock.patch.object(release, "run", side_effect=synthetic_archive):
             release.build(root, root / "release-state.json", state)
         self.assertEqual(state["step"], "built")
+        self.assertEqual(state["exportUploadID"], pending["id"])
         self.assertEqual(passed["XDRIP_XCODE_AUTH_KEY_PATH"], str(key_path))
         self.assertEqual(passed["XDRIP_XCODE_AUTH_KEY_ID"], "SYNTHETIC1")
         self.assertEqual(passed["XDRIP_XCODE_AUTH_KEY_ISSUER_ID"], "synthetic-issuer")
         self.assertNotIn("PRIVATE KEY", repr(passed))
+
+    def test_upload_accepts_only_xcodes_recorded_empty_export_slot(self):
+        root, _, _, state = self.artifacts()
+        pending = {"id": "synthetic-xcode-reservation", "version": "7.0.0",
+                   "build": "4265", "state": "AWAITING_UPLOAD"}
+        state["exportUploadID"] = pending["id"]
+        self.client.snapshot.return_value = self.snapshot(uploads=[pending])
+        with mock.patch.object(release, "ensure_published"), \
+             mock.patch.object(release, "apple_client", return_value=self.client), \
+             mock.patch.object(release, "run", return_value=0) as command, self.authorized():
+            release.upload(root, root / "state.json", state)
+        command.assert_called_once()
+        self.assertEqual(state["step"], "uploaded")
+        self.assertEqual(json.loads((root / "upload-attempt.json").read_text())["outcome"], "received")
+        (root / "upload-attempt.json").unlink()
+
+        for row in (dict(pending, id="another-reservation"),
+                    dict(pending, state="PROCESSING")):
+            with self.subTest(row=row):
+                root2, _, _, state2 = self.artifacts()
+                state2["exportUploadID"] = pending["id"]
+                self.client.snapshot.return_value = self.snapshot(uploads=[row])
+                with mock.patch.object(release, "ensure_published"), \
+                     mock.patch.object(release, "apple_client", return_value=self.client), \
+                     mock.patch.object(release, "run") as command, self.authorized():
+                    with self.assertRaises(release.SlotOccupied):
+                        release.upload(root2, root2 / "state.json", state2)
+                    command.assert_not_called()
+                self.assertFalse((root2 / "upload-attempt.json").exists())
 
     def prepared_checkpoint(self):
         self.remote()

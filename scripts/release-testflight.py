@@ -216,12 +216,29 @@ def slot_records(snapshot, version, build):
             if row["version"] == version and row["build"] == build]
 
 
-def number_in_use(snapshot, build):
+def colliding_rows(snapshot, build):
     def numeric(value):
         parts = tuple(int(part) for part in value.split("."))
         return parts + (0,) * (3 - len(parts))
-    return any(numeric(row["build"]) == numeric(build) for collection in ("builds", "uploads")
-               for row in snapshot[collection])
+    return [(collection, row) for collection in ("builds", "uploads")
+            for row in snapshot[collection] if numeric(row["build"]) == numeric(build)]
+
+
+def number_in_use(snapshot, build):
+    return bool(colliding_rows(snapshot, build))
+
+
+def export_pending_id(snapshot, version, build):
+    """Accept only the single empty upload slot created by Xcode export."""
+    collisions = colliding_rows(snapshot, build)
+    if not collisions:
+        return None
+    if len(collisions) == 1:
+        collection, row = collisions[0]
+        if (collection == "uploads" and row["version"] == version and
+                row["build"] == build and row["state"] == "AWAITING_UPLOAD"):
+            return row["id"]
+    raise SlotOccupied("Apple has a processed, active, or ambiguous build/upload in this slot")
 
 
 def release_source_changed(state):
@@ -444,12 +461,17 @@ def build(root, path, state):
                    XDRIP_XCODE_AUTH_KEY_ISSUER_ID=client.issuer_id)
     if sha256_file(Path(state["allocationPath"])) != state["allocationSha256"]:
         fail("Apple allocation receipt changed since checkpoint")
+    before = apple_snapshot(client, state["version"], root / "apple-before-export.json")
+    if number_in_use(before, state["build"]):
+        raise SlotOccupied("Apple occupied the build number before Xcode export")
     run([str(ROOT / "scripts/local-build.sh"), "archive"], env=env)
     ipa_files = list((output / "export").glob("*.ipa"))
     if len(ipa_files) != 1:
         fail("expected exactly one locally exported IPA")
+    after = apple_snapshot(client, state["version"], root / "apple-after-export.json")
+    pending_id = export_pending_id(after, state["version"], state["build"])
     state.update(step="built", archive=str(output / "archive/xdrip.xcarchive"),
-                 ipa=str(ipa_files[0]), builtAt=utc_now())
+                 ipa=str(ipa_files[0]), exportUploadID=pending_id, builtAt=utc_now())
     save_state(path, state)
 
 
@@ -507,8 +529,9 @@ def upload(root, path, state):
         reconcile_attempt(client, root, path, state)
         return
     snapshot = apple_snapshot(client, state["version"], root / "apple-before-upload.json")
-    if number_in_use(snapshot, state["build"]):
-        raise SlotOccupied("a different Apple upload now occupies the selected build number")
+    pending_id = export_pending_id(snapshot, state["version"], state["build"])
+    if pending_id != state.get("exportUploadID"):
+        raise SlotOccupied("Apple's awaiting-upload slot differs from the one observed after Xcode export")
     auth_args = client.upload_auth_args()
     # Exclusive creation prevents two local upload commands racing past the guard.
     attempt_data = {"startedAt": utc_now(), "checkpoint": state["checkpoint"],
