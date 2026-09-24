@@ -6241,6 +6241,241 @@ extension LibreWatchValuePipelineTests {
 extension LibreWatchValuePipelineTests {
     private enum OutboxFileTestError: Error { case injectedWriteFailure }
 
+    private func submissionCache(_ reading: LibreWatchDirectReadingPayload,
+                                 confirmed: Bool? = nil) -> LibreWatchPersistedDirectReading {
+        LibreWatchPersistedDirectReading(sessionID: session.id, sensorIdentity: session.redactedIdentity(),
+            sourceReading: reading, displayedGlucoseMGDL: 100, displayedTrendMGDLPerMinute: nil,
+            calibrationRevision: reading.calibrationRevision, queuePersistenceConfirmed: confirmed)
+    }
+
+    func testSubmissionCommitsRealOutboxBeforePublishingAndAllowsDiagnosticReads() throws {
+        let fixture = try outboxFileFixture()
+        let store = LibreWatchOutboxFileStore(fileURL: fixture.fileURL, defaults: fixture.defaults)
+        var outbox = try store.load(at: receivedAt)
+        var acceptance = LibreWatchReadingAcceptancePolicy()
+        var published = 0
+        for index in 0..<3 {
+            let now = receivedAt.addingTimeInterval(Double(index) * 60)
+            let reading = try XCTUnwrap(fileOutboxReading(index, at: now).reading)
+            XCTAssertTrue(LibreWatchReadingSubmission.receive(reading, sessionID: session.id,
+                acceptance: acceptance, outbox: outbox, at: now,
+                persist: { pending in
+                    do { try store.prepareForDelivery(&pending, sessionID: self.session.id, at: now); return true }
+                    catch { XCTFail("Unexpected persistence failure: \(error)"); return false }
+                }, publishLocally: { commit in
+                    // Use the same value-copy boundary as WatchStateModel, including reads
+                    // during publication: no inout property may remain exclusively borrowed.
+                    outbox = commit.outbox
+                    acceptance = commit.acceptance
+                    XCTAssertEqual(commit.persistence, .durable)
+                    XCTAssertTrue(acceptance.acceptedPayloadIDs.contains(reading.id))
+                    let restarted = try? LibreWatchOutboxFileStore(fileURL: fixture.fileURL,
+                        defaults: fixture.defaults).load(at: now)
+                    XCTAssertEqual(restarted, outbox, "Publication must follow the real file commit")
+                    LibreWatchSessionStore.saveReading(self.submissionCache(reading, confirmed: true), defaults: fixture.defaults)
+                    published += 1
+                }))
+        }
+        XCTAssertEqual(published, 3)
+        XCTAssertEqual(outbox.items.count, 3)
+        XCTAssertEqual(LibreWatchSessionStore.loadReading(defaults: fixture.defaults)?.queuePersistenceConfirmed, true)
+    }
+
+    func testSubmissionRestartBetweenQueueAndDisplayCacheRecoversNewestReading() throws {
+        let fixture = try outboxFileFixture()
+        let store = LibreWatchOutboxFileStore(fileURL: fixture.fileURL, defaults: fixture.defaults)
+        let old = try XCTUnwrap(fileOutboxReading(0, at: receivedAt).reading)
+        LibreWatchSessionStore.saveReading(submissionCache(old, confirmed: true), defaults: fixture.defaults)
+        let now = receivedAt.addingTimeInterval(60)
+        let newest = try XCTUnwrap(fileOutboxReading(1, at: now).reading)
+        let outbox = try store.load(at: now)
+        XCTAssertTrue(LibreWatchReadingSubmission.receive(newest, sessionID: session.id,
+            acceptance: LibreWatchReadingAcceptancePolicy(), outbox: outbox, at: now,
+            persist: { pending in
+                do { try store.prepareForDelivery(&pending, sessionID: self.session.id, at: now); return true }
+                catch { XCTFail("Unexpected persistence failure: \(error)"); return false }
+            }, publishLocally: { _ in
+                // Stop at the production publication boundary; deliberately no cache write.
+            }))
+        let restarted = LibreWatchOutboxFileStore(fileURL: fixture.fileURL, defaults: fixture.defaults)
+        let restored = try XCTUnwrap(LibreWatchReadingSubmission.restore(
+            cached: LibreWatchSessionStore.loadReading(defaults: fixture.defaults),
+            outbox: try restarted.load(at: now), session: session,
+            calibration: calibration(type: .fixedSlope, slope: 1, intercept: 0), at: now,
+            persist: { pending in (try? restarted.prepareForDelivery(&pending, sessionID: self.session.id, at: now)) != nil }))
+        XCTAssertEqual(restored.reading, newest)
+        XCTAssertEqual(restored.persistence, .durable)
+        XCTAssertEqual(restored.outbox.items.map(\.id), [newest.id])
+    }
+
+    func testSubmissionRepairsLegacyAndFailedWriteCacheOnceWithoutChangingID() throws {
+        for confirmed: Bool? in [nil, false] {
+            let fixture = try outboxFileFixture()
+            let reading = try XCTUnwrap(fileOutboxReading(0, at: receivedAt).reading)
+            let original = submissionCache(reading, confirmed: confirmed)
+            let encoded = try JSONEncoder().encode(original)
+            if confirmed == nil {
+                let json = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+                XCTAssertNil(json["queuePersistenceConfirmed"], "Old v2 cache needs no migration")
+            }
+            let cached = try JSONDecoder().decode(LibreWatchPersistedDirectReading.self, from: encoded)
+            for _ in 0..<2 {
+                let restarted = LibreWatchOutboxFileStore(fileURL: fixture.fileURL, defaults: fixture.defaults)
+                let restored = try XCTUnwrap(LibreWatchReadingSubmission.restore(cached: cached,
+                    outbox: try restarted.load(at: receivedAt), session: session,
+                    calibration: calibration(type: .fixedSlope, slope: 1, intercept: 0), at: receivedAt,
+                    persist: { pending in
+                        (try? restarted.prepareForDelivery(&pending, sessionID: self.session.id, at: self.receivedAt)) != nil
+                    }))
+                XCTAssertEqual(restored.reading, reading)
+                XCTAssertEqual(restored.outbox.items.map(\.id), [reading.id])
+                XCTAssertEqual(restored.persistence, .durable)
+            }
+        }
+    }
+
+    func testSubmissionConfirmedAndAcknowledgedCacheIsNotRequeuedOnRestart() throws {
+        let reading = try XCTUnwrap(fileOutboxReading(0, at: receivedAt).reading)
+        let restored = try XCTUnwrap(LibreWatchReadingSubmission.restore(
+            cached: submissionCache(reading, confirmed: true), outbox: LibreWatchConnectivityOutbox(),
+            session: session, calibration: calibration(type: .fixedSlope, slope: 1, intercept: 0),
+            at: receivedAt, persist: { _ in true }))
+        XCTAssertEqual(restored.reading, reading)
+        XCTAssertTrue(restored.outbox.items.isEmpty)
+        XCTAssertEqual(restored.persistence, .durable)
+    }
+
+    func testSubmissionFailedWriteKeepsRAMAndClinicalPublicationThenRetries() throws {
+        let fixture = try outboxFileFixture()
+        var failWrite = false
+        let store = LibreWatchOutboxFileStore(fileURL: fixture.fileURL, defaults: fixture.defaults) { data, url in
+            if failWrite { throw OutboxFileTestError.injectedWriteFailure }
+            try data.write(to: url, options: .atomic)
+        }
+        var outbox = try store.load(at: receivedAt)
+        outbox.enqueue(fileOutboxReading(0, at: receivedAt), now: receivedAt)
+        try store.save(outbox)
+        let before = try Data(contentsOf: fixture.fileURL)
+        failWrite = true
+        let now = receivedAt.addingTimeInterval(60)
+        let reading = try XCTUnwrap(fileOutboxReading(1, at: now).reading)
+        var published = 0
+        XCTAssertTrue(LibreWatchReadingSubmission.receive(reading, sessionID: session.id,
+            acceptance: LibreWatchReadingAcceptancePolicy(), outbox: outbox, at: now,
+            persist: { pending in (try? store.prepareForDelivery(&pending, sessionID: self.session.id, at: now)) != nil },
+            publishLocally: { commit in
+                outbox = commit.outbox
+                XCTAssertEqual(commit.persistence, .pendingWrite)
+                XCTAssertNotNil(commit.persistence.issue)
+                LibreWatchSessionStore.saveReading(self.submissionCache(reading, confirmed: false), defaults: fixture.defaults)
+                published += 1 // Local clinical path is not disabled by phone/disk availability.
+            }))
+        XCTAssertEqual(published, 1)
+        XCTAssertEqual(try Data(contentsOf: fixture.fileURL), before)
+        XCTAssertEqual(outbox.items.count, 2)
+        XCTAssertEqual(LibreWatchSessionStore.loadReading(defaults: fixture.defaults)?.queuePersistenceConfirmed, false)
+        failWrite = false
+        try store.prepareForDelivery(&outbox, sessionID: session.id, at: now)
+        XCTAssertEqual(try LibreWatchOutboxFileStore(fileURL: fixture.fileURL,
+            defaults: fixture.defaults).load(at: now), outbox)
+        XCTAssertEqual(published, 1, "Persistence retry must not publish or alarm again")
+    }
+
+    func testSubmissionRestartRepairsLatestCachedReadingAfterQueueWriteFailure() throws {
+        let fixture = try outboxFileFixture()
+        let reading = try XCTUnwrap(fileOutboxReading(0, at: receivedAt).reading)
+        let failed = LibreWatchOutboxFileStore(fileURL: fixture.fileURL, defaults: fixture.defaults) { _, _ in
+            throw OutboxFileTestError.injectedWriteFailure
+        }
+        let empty = try failed.load(at: receivedAt)
+        XCTAssertTrue(LibreWatchReadingSubmission.receive(reading, sessionID: session.id,
+            acceptance: LibreWatchReadingAcceptancePolicy(), outbox: empty, at: receivedAt,
+            persist: { pending in (try? failed.prepareForDelivery(&pending, sessionID: self.session.id)) != nil },
+            publishLocally: { commit in
+                LibreWatchSessionStore.saveReading(self.submissionCache(reading,
+                    confirmed: commit.persistence == .durable), defaults: fixture.defaults)
+            }))
+        let restarted = LibreWatchOutboxFileStore(fileURL: fixture.fileURL, defaults: fixture.defaults)
+        let restored = try XCTUnwrap(LibreWatchReadingSubmission.restore(
+            cached: LibreWatchSessionStore.loadReading(defaults: fixture.defaults), outbox: try restarted.load(at: receivedAt),
+            session: session, calibration: calibration(type: .fixedSlope, slope: 1, intercept: 0), at: receivedAt,
+            persist: { pending in (try? restarted.prepareForDelivery(&pending, sessionID: self.session.id)) != nil }))
+        XCTAssertEqual(restored.outbox.items.map(\.id), [reading.id])
+        XCTAssertEqual(restored.persistence, .durable)
+    }
+
+    func testSubmissionDuplicateOutOfOrderAndWrongSessionDoNotPersistOrPublish() throws {
+        let reading = try XCTUnwrap(fileOutboxReading(1, at: receivedAt).reading)
+        var acceptance = LibreWatchReadingAcceptancePolicy()
+        acceptance.reset(for: session.id, seeding: reading)
+        let older = try XCTUnwrap(fileOutboxReading(0, at: receivedAt.addingTimeInterval(-60)).reading)
+        for (candidate, expectedSession) in [(reading, session.id), (older, session.id), (reading, UUID())] {
+            XCTAssertFalse(LibreWatchReadingSubmission.receive(candidate, sessionID: expectedSession,
+                acceptance: acceptance, outbox: LibreWatchConnectivityOutbox(), at: receivedAt,
+                persist: { _ in XCTFail("Rejected reading must not write"); return true },
+                publishLocally: { _ in XCTFail("Rejected reading must not publish/alert") }))
+        }
+    }
+
+    func testSubmissionRestorePreservesSessionCalibrationAndAgeBounds() throws {
+        let reading = try XCTUnwrap(fileOutboxReading(0, at: receivedAt).reading)
+        let cached = submissionCache(reading)
+        var queue = LibreWatchConnectivityOutbox()
+        queue.enqueue(.reading(reading), now: receivedAt)
+        let newerCalibration = calibration(type: .fixedSlope, slope: 1, intercept: 0, revision: 11)
+        let wrongSession = LibreWatchDirectSession(id: UUID(), createdAt: session.createdAt,
+            sensorUID: session.sensorUID, patchInfo: session.patchInfo, sensorSerialNumber: session.sensorSerialNumber,
+            sensorTypeRawValue: session.sensorTypeRawValue, expectedPeripheralName: session.expectedPeripheralName,
+            unlockCode: session.unlockCode, unlockCount: session.unlockCount, algorithmParameters: session.algorithmParameters)
+        XCTAssertNil(LibreWatchReadingSubmission.restore(cached: cached, outbox: queue, session: wrongSession,
+            calibration: newerCalibration, at: receivedAt, persist: { _ in XCTFail("Wrong session"); return true }))
+        // Display recalculation is still allowed; repair must not insert across calibration revisions.
+        let recalibrated = try XCTUnwrap(LibreWatchReadingSubmission.restore(cached: cached,
+            outbox: LibreWatchConnectivityOutbox(), session: session, calibration: newerCalibration,
+            at: receivedAt, persist: { _ in true }))
+        XCTAssertTrue(recalibrated.outbox.items.isEmpty)
+        let expired = try XCTUnwrap(LibreWatchReadingSubmission.restore(cached: cached, outbox: queue, session: session,
+            calibration: calibration(type: .fixedSlope, slope: 1, intercept: 0),
+            at: receivedAt.addingTimeInterval(LibreWatchConnectivityOutbox.maximumAge + 1), persist: { _ in true }))
+        XCTAssertTrue(expired.outbox.items.isEmpty)
+        XCTAssertEqual(expired.reading.receivedAt, reading.receivedAt, "Do not freshen stale display timestamps")
+        XCTAssertEqual(expired.persistence, .notRetained)
+    }
+
+    func testSubmissionRestoreSelectsNewerFileReadingAfterInitialReadFailure() throws {
+        let fixture = try outboxFileFixture()
+        let old = try XCTUnwrap(fileOutboxReading(0, at: receivedAt).reading)
+        let now = receivedAt.addingTimeInterval(60)
+        let newer = try XCTUnwrap(fileOutboxReading(1, at: now).reading)
+        let firstStore = LibreWatchOutboxFileStore(fileURL: fixture.fileURL, defaults: fixture.defaults)
+        var onDisk = try firstStore.load(at: now)
+        XCTAssertTrue(onDisk.enqueue(.reading(newer), now: now))
+        try firstStore.save(onDisk)
+
+        var readFails = true
+        let recoveringStore = LibreWatchOutboxFileStore(fileURL: fixture.fileURL, defaults: fixture.defaults,
+            reader: { url in
+                if readFails { throw CocoaError(.fileReadNoPermission) }
+                return try Data(contentsOf: url)
+            })
+        XCTAssertThrowsError(try recoveringStore.load(at: now))
+        readFails = false
+        let restored = try XCTUnwrap(LibreWatchReadingSubmission.restore(
+            cached: submissionCache(old, confirmed: true),
+            outbox: LibreWatchConnectivityOutbox(),
+            session: session,
+            calibration: calibration(type: .fixedSlope, slope: 1, intercept: 0),
+            at: now,
+            persist: { pending in
+                (try? recoveringStore.prepareForDelivery(&pending, sessionID: self.session.id, at: now)) != nil
+            }))
+        XCTAssertEqual(restored.reading.id, newer.id)
+        XCTAssertEqual(restored.outbox.items.map(\.id), [newer.id])
+        XCTAssertEqual(restored.persistence, .durable)
+        XCTAssertEqual(try LibreWatchOutboxFileStore(fileURL: fixture.fileURL,
+            defaults: fixture.defaults).load(at: now), restored.outbox)
+    }
+
     private func outboxFileFixture() throws -> (fileURL: URL, defaults: UserDefaults) {
         let identifier = UUID().uuidString
         let directory = FileManager.default.temporaryDirectory

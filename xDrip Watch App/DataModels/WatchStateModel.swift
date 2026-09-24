@@ -167,6 +167,7 @@ final class WatchStateModel: NSObject, ObservableObject {
     /// Source of the displayed measurement; Bluetooth ownership is tracked independently.
     @Published private(set) var isShowingDirectLibreReading = false
     @Published private(set) var directLibreReadingIsStale = false
+    @Published private(set) var libreWatchStorageIssue: String?
     @Published private(set) var localAlarmStatus = "Watch-alarmer: venter på iPhone-indstillinger"
     private let localAlarms = LibreWatchAlarmController()
 
@@ -174,6 +175,7 @@ final class WatchStateModel: NSObject, ObservableObject {
     /// recompute the Watch-only presentation without altering values sent back to iPhone.
     private var directReadingHistory: [LibreWatchDirectReadingPayload] = []
     private var latestDirectSourceDelta: Double?
+    private var latestReadingQueuePersistenceConfirmed: Bool?
     private var directReadingAcceptance = LibreWatchReadingAcceptancePolicy()
     private var connectivityOutbox = LibreWatchSessionStore.loadOutbox()
     private var evidenceConfirmedOutboxIDs = Set<UUID>()
@@ -795,23 +797,45 @@ final class WatchStateModel: NSObject, ObservableObject {
             return false
         }
 
-        guard directReadingAcceptance.accept(
+        let now = Date()
+        let priorAcceptance = directReadingAcceptance
+        let accepted = LibreWatchReadingSubmission.receive(
             reading,
-            for: directSession.id,
-            now: Date()
-        ) else {
+            sessionID: directSession.id,
+            acceptance: directReadingAcceptance,
+            outbox: connectivityOutbox,
+            at: now,
+            persist: { pending in
+                LibreWatchSessionStore.prepareOutboxForDelivery(&pending, sessionID: directSession.id, at: now)
+            },
+            publishLocally: { commit in
+                // Storage is attempted before publication, without holding any inout
+                // access during the existing display and local alarm paths.
+                connectivityOutbox = commit.outbox
+                directReadingAcceptance = commit.acceptance
+                latestReadingQueuePersistenceConfirmed = commit.persistence == .durable
+                libreWatchStorageIssue = commit.persistence.issue
+                WatchDeliveryEvidenceStore.shared.recordReading(.accepted, reading: reading)
+                let durable = commit.persistence == .durable
+                WatchDeliveryEvidencePipeline.localWrite(
+                    durable,
+                    item: .reading(reading),
+                    failureReason: commit.persistence == .notRetained
+                        ? "notRetainedByOutbox" : "atomicOutboxWriteFailed"
+                )
+                if durable { evidenceConfirmedOutboxIDs.insert(reading.id) }
+                applyLibreWatchReadingLocally(reading)
+                if let glucose = snapshot.displayedGlucose(for: reading) {
+                    localAlarms.acceptedDirectReading(reading, glucose: glucose)
+                }
+            }
+        )
+        guard accepted else {
             WatchDeliveryEvidenceStore.shared.recordReading(.rejected, reading: reading,
-                outcome: WatchDeliveryEvidencePipeline.rejection(of: reading, policy: directReadingAcceptance, at: Date()))
+                outcome: WatchDeliveryEvidencePipeline.rejection(of: reading, policy: priorAcceptance, at: now))
             return false
         }
-        WatchDeliveryEvidenceStore.shared.recordReading(.accepted, reading: reading)
-
-        applyLibreWatchReadingLocally(reading)
-        if let glucose = snapshot.displayedGlucose(for: reading) {
-            localAlarms.acceptedDirectReading(reading, glucose: glucose)
-        }
-
-        enqueueForWatchConnectivity(.reading(reading))
+        flushWatchConnectivityOutbox()
         return true
     }
 
@@ -859,7 +883,8 @@ final class WatchStateModel: NSObject, ObservableObject {
             displayedGlucoseMGDL: displayed.glucose,
             displayedTrendMGDLPerMinute: displayed.trend,
             displayedDeltaMGDL: displayedDelta,
-            calibrationRevision: displayed.revision
+            calibrationRevision: displayed.revision,
+            queuePersistenceConfirmed: latestReadingQueuePersistenceConfirmed
         )
         LibreWatchSessionStore.saveReading(stored)
         updateComplicationData()
@@ -1000,23 +1025,32 @@ final class WatchStateModel: NSObject, ObservableObject {
 
     private func restorePersistedLibreWatchReadingIfPossible() {
         guard let directSession = libreWatchDirectSession,
-              let snapshot = libreWatchCalibrationSnapshot,
-              let stored = LibreWatchSessionStore.loadReading(),
-              stored.isValid(for: directSession, calibration: snapshot)
+              let snapshot = libreWatchCalibrationSnapshot
         else { return }
-
+        let stored = LibreWatchSessionStore.loadReading()
+        let now = Date()
+        guard let restored = LibreWatchReadingSubmission.restore(
+            cached: stored, outbox: connectivityOutbox, session: directSession, calibration: snapshot, at: now,
+            persist: { pending in
+                LibreWatchSessionStore.prepareOutboxForDelivery(&pending, sessionID: directSession.id, at: now)
+            }
+        ) else { return }
+        connectivityOutbox = restored.outbox
+        latestReadingQueuePersistenceConfirmed = restored.persistence == .durable
+        libreWatchStorageIssue = restored.persistence.issue
         directReadingAcceptance.reset(
             for: directSession.id,
-            seeding: stored.sourceReading
+            seeding: restored.reading
         )
-        let storedCalibrationIsCurrent = stored.calibrationRevision == libreWatchCalibrationSnapshot?.revision
+        let displayOverride = stored.flatMap { cached -> (Double, Double?, UInt64?)? in
+            guard cached.sourceReading.id == restored.reading.id,
+                  cached.calibrationRevision == snapshot.revision,
+                  cached.isValid(for: directSession, calibration: snapshot) else { return nil }
+            return (cached.displayedGlucoseMGDL, cached.displayedTrendMGDLPerMinute, cached.calibrationRevision)
+        }
         applyLibreWatchReadingLocally(
-            stored.sourceReading,
-            displayedOverride: storedCalibrationIsCurrent ? (
-                stored.displayedGlucoseMGDL,
-                stored.displayedTrendMGDLPerMinute,
-                stored.calibrationRevision
-            ) : nil,
+            restored.reading,
+            displayedOverride: displayOverride,
             sourceDeltaOverride: nil,
             displayedDeltaOverride: nil
         )
@@ -1123,7 +1157,8 @@ final class WatchStateModel: NSObject, ObservableObject {
             displayedGlucoseMGDL: displayed.glucose,
             displayedTrendMGDLPerMinute: displayed.trend,
             displayedDeltaMGDL: displayedDelta,
-            calibrationRevision: displayed.revision
+            calibrationRevision: displayed.revision,
+            queuePersistenceConfirmed: latestReadingQueuePersistenceConfirmed
         ))
         updateMainViewDate = .now
         updateBigNumberViewDate = .now
@@ -1138,6 +1173,8 @@ final class WatchStateModel: NSObject, ObservableObject {
         bgReadingDatesAsDouble = bgReadingDates.map { $0.timeIntervalSince1970 }
         directReadingHistory.removeAll()
         latestDirectSourceDelta = nil
+        latestReadingQueuePersistenceConfirmed = nil
+        libreWatchStorageIssue = nil
         isShowingDirectLibreReading = false
         directLibreReadingIsStale = false
         LibreWatchSessionStore.clearReading()
@@ -1446,6 +1483,7 @@ final class WatchStateModel: NSObject, ObservableObject {
         guard opportunity.allowsDelivery,
               LibreWatchSessionStore.prepareOutboxForDelivery(&connectivityOutbox,
                   sessionID: libreWatchDirectSession?.id, at: date) else { return }
+        confirmLatestReadingQueuePersistenceIfPossible()
         recordConfirmedOutboxWrites()
         LibreWatchConnectivityDeliveryPolicy.retryPendingDelivery(
             outbox: connectivityOutbox, at: date, opportunity: opportunity,
@@ -1454,6 +1492,18 @@ final class WatchStateModel: NSObject, ObservableObject {
         ) {
             flushWatchConnectivityOutbox()
         }
+    }
+
+    /// Update the display cache only after the full current queue is on disk.
+    private func confirmLatestReadingQueuePersistenceIfPossible() {
+        guard latestReadingQueuePersistenceConfirmed != true,
+              var cached = LibreWatchSessionStore.loadReading(),
+              cached.sessionID == libreWatchDirectSession?.id,
+              connectivityOutbox.items.contains(where: { $0.id == cached.sourceReading.id }) else { return }
+        cached.queuePersistenceConfirmed = true
+        LibreWatchSessionStore.saveReading(cached)
+        latestReadingQueuePersistenceConfirmed = true
+        libreWatchStorageIssue = nil
     }
 
     /// Recovers the narrow crash window between journal persistence and outbox persistence.
@@ -1529,6 +1579,7 @@ final class WatchStateModel: NSObject, ObservableObject {
         // opportunity; do not send/reload an older snapshot or create a retry timer.
         guard LibreWatchSessionStore.prepareOutboxForDelivery(&connectivityOutbox,
             sessionID: libreWatchDirectSession?.id) else { return }
+        confirmLatestReadingQueuePersistenceIfPossible()
         recordConfirmedOutboxWrites()
         guard let item = connectivityOutbox.nextEligible() else { return }
         if session.activationState == .activated,

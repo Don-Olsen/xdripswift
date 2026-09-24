@@ -2629,6 +2629,97 @@ struct LibreWatchReadingAcceptancePolicy {
     }
 }
 
+/// The production acceptance boundary: write the delivery queue before publishing the
+/// local reading. No inout access remains open while local display/alarms run.
+enum LibreWatchReadingSubmission {
+    enum Persistence: String {
+        case durable, pendingWrite, notRetained
+
+        var issue: String? {
+            switch self {
+            case .durable: return nil
+            case .pendingWrite: return "Målinger afventer sikker lokal lagring"
+            case .notRetained: return "En måling kunne ikke gemmes i leveringskøen"
+            }
+        }
+    }
+
+    struct Commit {
+        let acceptance: LibreWatchReadingAcceptancePolicy
+        let outbox: LibreWatchConnectivityOutbox
+        let persistence: Persistence
+    }
+
+    @discardableResult
+    static func receive(
+        _ reading: LibreWatchDirectReadingPayload,
+        sessionID: UUID,
+        acceptance: LibreWatchReadingAcceptancePolicy,
+        outbox: LibreWatchConnectivityOutbox,
+        at date: Date,
+        persist: (inout LibreWatchConnectivityOutbox) -> Bool,
+        publishLocally: (Commit) -> Void
+    ) -> Bool {
+        var candidateAcceptance = acceptance
+        guard candidateAcceptance.accept(reading, for: sessionID, now: date) else { return false }
+        var pending = outbox
+        let admitted = pending.enqueue(.reading(reading), now: date)
+        let saved = admitted && persist(&pending)
+        let retained = pending.items.contains { $0.id == reading.id }
+        let persistence: Persistence = !retained ? .notRetained : (saved ? .durable : .pendingWrite)
+        // Local clinical acceptance is not a phone receipt, nor a claim that a failed
+        // disk write succeeded. Keep local display/alarms available during storage failure.
+        publishLocally(Commit(acceptance: candidateAcceptance, outbox: pending, persistence: persistence))
+        return true
+    }
+
+    struct Restoration {
+        let reading: LibreWatchDirectReadingPayload
+        let outbox: LibreWatchConnectivityOutbox
+        let persistence: Persistence
+    }
+
+    static func restore(
+        cached: LibreWatchPersistedDirectReading?,
+        outbox: LibreWatchConnectivityOutbox,
+        session: LibreWatchDirectSession,
+        calibration: LibreWatchCalibrationSnapshot,
+        at date: Date,
+        persist: (inout LibreWatchConnectivityOutbox) -> Bool
+    ) -> Restoration? {
+        guard calibration.matches(session: session) else { return nil }
+        let cached = cached.flatMap { $0.isValid(for: session, calibration: calibration) ? $0 : nil }
+        var pending = outbox
+        pending.retain(sessionID: session.id)
+        pending.prune(at: date)
+        if let cached, cached.queuePersistenceConfirmed != true,
+           cached.sourceReading.calibrationRevision == calibration.revision {
+            // Repair an old-version accept-before-enqueue window or a failed queue write.
+            // Stable IDs make repair idempotent; enqueue still enforces age/size bounds.
+            pending.enqueue(.reading(cached.sourceReading), now: date)
+        }
+        // A previous file read may have failed. Persistence can merge a newer
+        // on-disk reading into pending, so select the displayed reading afterward.
+        let saved = persist(&pending)
+        let queued = pending.items.compactMap(\.reading).filter {
+            $0.sessionID == session.id && $0.calibrationRevision == calibration.revision &&
+                $0.isValid(for: calibration, at: date)
+        }.max { $0.receivedAt < $1.receivedAt }
+        // A process may stop after the queue commit but before the display cache commit.
+        let reading: LibreWatchDirectReadingPayload
+        if let queued, cached.map({ queued.receivedAt > $0.sourceReading.receivedAt }) ?? true {
+            reading = queued
+        } else if let cached {
+            reading = cached.sourceReading
+        } else { return nil }
+        let retained = pending.items.contains { $0.id == reading.id }
+        let previouslyCommitted = cached?.sourceReading.id == reading.id && cached?.queuePersistenceConfirmed == true
+        let persistence: Persistence = previouslyCommitted || (retained && saved) ? .durable
+            : (retained ? .pendingWrite : .notRetained)
+        return Restoration(reading: reading, outbox: pending, persistence: persistence)
+    }
+}
+
 struct LibreWatchDirectDeltaPolicy {
     static let maximumGap: TimeInterval = 3 * 60
 
@@ -2823,6 +2914,8 @@ struct LibreWatchPersistedDirectReading: Codable, Equatable {
     let displayedTrendMGDLPerMinute: Double?
     let displayedDeltaMGDL: Double?
     let calibrationRevision: UInt64?
+    // Optional for existing v2 caches. Unknown legacy commits get one idempotent repair.
+    var queuePersistenceConfirmed: Bool?
 
     init(
         version: Int = Self.currentVersion,
@@ -2833,7 +2926,8 @@ struct LibreWatchPersistedDirectReading: Codable, Equatable {
         displayedGlucoseMGDL: Double,
         displayedTrendMGDLPerMinute: Double?,
         displayedDeltaMGDL: Double? = nil,
-        calibrationRevision: UInt64?
+        calibrationRevision: UInt64?,
+        queuePersistenceConfirmed: Bool? = nil
     ) {
         self.version = version
         self.sessionID = sessionID
@@ -2844,6 +2938,7 @@ struct LibreWatchPersistedDirectReading: Codable, Equatable {
         self.displayedTrendMGDLPerMinute = displayedTrendMGDLPerMinute
         self.displayedDeltaMGDL = displayedDeltaMGDL
         self.calibrationRevision = calibrationRevision
+        self.queuePersistenceConfirmed = queuePersistenceConfirmed
     }
 
     func isValid(

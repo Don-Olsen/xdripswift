@@ -81,6 +81,13 @@ struct LibreDirectView: View {
 
                 controls
 
+                if let storageIssue = watchState.libreWatchStorageIssue {
+                    Text(storageIssue)
+                        .font(.caption2)
+                        .multilineTextAlignment(.center)
+                        .foregroundStyle(.orange)
+                }
+
                 Text(watchState.localAlarmStatus)
                     .font(.caption2)
                     .multilineTextAlignment(.center)
