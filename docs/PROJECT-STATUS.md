@@ -20,6 +20,29 @@ De følgende afsnit bevarer integrations- og testhistorikken før denne udgivels
 - Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
 <!-- testflight-7.1.1-4267:end -->
 
+## Opfølgning på fysisk 4268-test af Home-grafen
+
+24. september 2026 meldte brugeren, at Home-grafen med kulhydrat/insulin stadig
+giver et kort dyk ved hver åbning af den installerede 4268. 4268 ændrede ikke
+grafens akseberegning eller Watch-forbindelsens BLE-genopretning.
+
+Den efterfølgende kodegennemgang fandt to mulige årsager til dykket:
+IOB/COB-kurverne indlæses asynkront, og først når de er til stede, udvides
+grafens nederste akse fra den almindelige glukosegrænse til terapiområdet.
+Desuden nulstillede et almindeligt Home-/forgrundsskift den beholdte øverste
+akse før den asynkrone dataopdatering. Den lokale næste kandidat reserverer
+terapiområdet fra første tegning, når kurverne er slået til, og bevarer den
+øverste akse under almindeligt Home-/forgrundsskift. Et eksplicit dobbelttryk
+på grafen kan fortsat nulstille aksen. **1007/1007** lokale XCTest-tests og
+begge simulatorbuilds bestod for denne kildeændring; fysisk 4268-observation
+kan ikke bevise, at kandidatens visuelle effekt er korrekt, før den er testet
+på iPhone.
+
+Der foreligger endnu ingen ny fysisk 4268-Watch-log, som viser BLE-hullerne
+med de nye frame-gap-spor. De ni manglende minutter i 4267-forløbet og den
+særskilte modtagerkontekst-risiko nedenfor er fortsat åbne. En grafrettelse
+må ikke beskrives som en rettelse af Watch Direct-forbindelsen.
+
 ## Fysisk 4267-stabilitetstest og næste interne kandidat
 
 24. september 2026 blev en times Libre 2 Plus EU Direct Watch-forløb sammenholdt

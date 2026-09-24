@@ -64,6 +64,16 @@ struct GlucoseChartYAxisRetentionState {
     }
 }
 
+/// Keep the Home chart's lower scale steady while its IOB/COB curves load.
+/// The series arrives separately from cached glucose and treatment marks.
+struct GlucoseChartTherapyDomain {
+    static func minimum(basalMinimum: Double, therapyBaseline: Double, plottedMinimum: Double,
+                        hasVisiblePlots: Bool, reservesSpaceWhileLoading: Bool) -> Double {
+        guard hasVisiblePlots || reservesSpaceWhileLoading else { return basalMinimum }
+        return min(basalMinimum, therapyBaseline, plottedMinimum)
+    }
+}
+
 /// Reflect cached basal heights without changing treatment data or glucose-axis retention.
 /// Trio uses the same top-minus-height mapping in its Home ChartElements/BasalChart.swift.
 struct GlucoseChartBasalLayout {
@@ -102,6 +112,7 @@ struct GlucoseChartBasalLayout {
 /// cached state manager and this renderer.
 struct GlucoseChartView: View {
     private var therapySeries = TherapyChartSeries()
+    private var reservesTherapyDomainWhileLoading = false
     private var renderBasalDownwards = false
 
     // MARK: - Input Data
@@ -296,9 +307,10 @@ struct GlucoseChartView: View {
         return view
     }
 
-    func therapyPlots(_ series: TherapyChartSeries) -> Self {
+    func therapyPlots(_ series: TherapyChartSeries, reservesDomainWhileLoading: Bool = false) -> Self {
         var view = self
         view.therapySeries = series
+        view.reservesTherapyDomainWhileLoading = reservesDomainWhileLoading
         return view
     }
 
@@ -644,8 +656,13 @@ struct GlucoseChartView: View {
         let therapyScale = TherapyChartScale(series: visibleTherapy, baseline: therapyBaseline)
         let therapyMinimum = (visibleTherapy.iob.map { therapyScale.glucoseValue(amount: $0.amount, isIOB: true) }
             + visibleTherapy.cob.map { therapyScale.glucoseValue(amount: $0.amount, isIOB: false) }).min() ?? therapyBaseline
-        let effectiveMinimumChartValue = hasTherapy
-            ? min(basalMinimumChartValue, therapyBaseline, therapyMinimum) : basalMinimumChartValue
+        let effectiveMinimumChartValue = GlucoseChartTherapyDomain.minimum(
+            basalMinimum: basalMinimumChartValue,
+            therapyBaseline: therapyBaseline,
+            plottedMinimum: therapyMinimum,
+            hasVisiblePlots: hasTherapy,
+            reservesSpaceWhileLoading: showsTreatments && usesMainChartYAxisContext && reservesTherapyDomainWhileLoading
+        )
         let showsBasalDomain = effectiveMinimumChartValue < ConstantsGlucoseChartSwiftUI.yAxisAbsoluteMinimumChartValueInMgDl
         let lowerDomainPadding = showsBasalDomain ? ConstantsGlucoseChartSwiftUI.yAxisBasalDomainPaddingInMgDl : ConstantsGlucoseChartSwiftUI.yAxisDomainPaddingInMgDl
         let minimumDomainValue = min((allBgValues.min() ?? 40), urgentLowLimitInMgDl, effectiveMinimumChartValue)

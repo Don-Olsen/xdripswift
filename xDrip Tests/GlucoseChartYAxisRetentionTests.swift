@@ -11,6 +11,31 @@ import XCTest
 
 final class GlucoseChartYAxisRetentionTests: XCTestCase {
 
+    func testHomeTherapyAxisDoesNotDipWhenCurvesArriveAfterGlucose() {
+        // Home initially renders cached glucose before the separate IOB/COB request completes.
+        let beforeLoad = GlucoseChartTherapyDomain.minimum(
+            basalMinimum: 38, therapyBaseline: -10, plottedMinimum: -10,
+            hasVisiblePlots: false, reservesSpaceWhileLoading: true
+        )
+        let afterLoad = GlucoseChartTherapyDomain.minimum(
+            basalMinimum: 38, therapyBaseline: -10, plottedMinimum: 4,
+            hasVisiblePlots: true, reservesSpaceWhileLoading: true
+        )
+        XCTAssertEqual(beforeLoad, -10)
+        XCTAssertEqual(afterLoad, beforeLoad)
+
+        // Turning off the therapy overlay restores the ordinary glucose domain.
+        XCTAssertEqual(GlucoseChartTherapyDomain.minimum(
+            basalMinimum: 38, therapyBaseline: -10, plottedMinimum: -10,
+            hasVisiblePlots: false, reservesSpaceWhileLoading: false
+        ), 38)
+        // Genuine values below the reserved floor must remain visible.
+        XCTAssertEqual(GlucoseChartTherapyDomain.minimum(
+            basalMinimum: 38, therapyBaseline: -10, plottedMinimum: -14,
+            hasVisiblePlots: true, reservesSpaceWhileLoading: true
+        ), -14)
+    }
+
     func testBasalDirectionPreferenceDefaultsAndPersistence() throws {
         let suite = "BasalDirectionTests-" + UUID().uuidString
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))

@@ -71,7 +71,10 @@ struct RootHomeMainChartView: View {
                 .mainChartYAxisContext(
                     resetRevision: yAxisResetRevision, renderBasalDownwards: renderBasalDownwards
                 )
-                .therapyPlots(TherapyChartSeries(iob: hasIOB ? therapySeries.iob : [], cob: hasCOB ? therapySeries.cob : []))
+                .therapyPlots(
+                    TherapyChartSeries(iob: hasIOB ? therapySeries.iob : [], cob: hasCOB ? therapySeries.cob : []),
+                    reservesDomainWhileLoading: showsTreatments && allowsTherapyCharts && showIOBCOB
+                )
                 .transaction { transaction in
                     transaction.animation = nil
                 }

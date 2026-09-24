@@ -142,7 +142,6 @@ struct RootHomeView: View {
         .onAppear {
             healthTherapySelectionSignature = currentHealthTherapySelectionSignature
             scrollCoordinator.resetToNow()
-            chartYAxisResetRevision &+= 1
             if state.usesScreenLockNightLayout {
                 applyClockModeState(isEnabled: true)
             } else if UIDevice.current.userInterfaceIdiom != .pad {
@@ -1186,7 +1185,9 @@ struct RootHomeView: View {
 
     private func resetMainChartToNow() {
         scrollCoordinator.resetToNow()
-        chartYAxisResetRevision &+= 1
+        // Foregrounding Home can precede its asynchronous chart refresh. Preserve the displayed
+        // vertical scale until fresh data arrives instead of briefly resetting it from stale data.
+        // An explicit chart double tap still resets the scale via finishChartScroll.
         requestChartState(forceReset: false, showsLoading: false, refreshCachedData: true)
     }
 
