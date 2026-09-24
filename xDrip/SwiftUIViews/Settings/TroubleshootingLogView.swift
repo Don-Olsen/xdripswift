@@ -83,6 +83,8 @@ struct TroubleshootingLogView: View {
     @State private var evidenceURL: URL?
     @State private var sharingEvidence = false
     @State private var evidenceExportFailed = false
+    @State private var reportShareItem: TroubleshootingLogShareItem?
+    @State private var hasAppeared = false
 
     init(
         store: TroubleshootingLogStore = .shared,
@@ -181,16 +183,31 @@ struct TroubleshootingLogView: View {
                 .tint(ConstantsAppColors.toolbarAction)
                 .accessibilityLabel(copied ? "Copied" : "Copy Troubleshooting Log")
 
-                ShareLink(item: report.reportText) {
+                Button {
+                    // A large Watch journal can make the complete report expensive to format.
+                    // Keep the toolbar and scrolling independent of export until Share is tapped.
+                    reportShareItem = TroubleshootingLogShareItem(text: report.reportText)
+                } label: {
                     Image(systemName: "square.and.arrow.up")
                 }
                 .tint(ConstantsAppColors.toolbarAction)
                 .accessibilityLabel("Share Troubleshooting Log")
             }
         }
-        .onAppear(perform: viewModel.reload)
+        .onAppear {
+            // StateObject loads the first complete snapshot during initialization. Avoid immediately
+            // loading the same bounded file and Core Data context a second time on the first frame.
+            if hasAppeared {
+                viewModel.reload()
+            } else {
+                hasAppeared = true
+            }
+        }
         .sheet(isPresented: $sharingEvidence) {
             if let evidenceURL { WatchDeliveryEvidenceShareSheet(url: evidenceURL) }
+        }
+        .sheet(item: $reportShareItem) { item in
+            TroubleshootingLogTextShareSheet(text: item.text)
         }
     }
 
@@ -330,7 +347,9 @@ struct TroubleshootingLogView: View {
                     .padding(.bottom, 8)
             }
 
-            VStack(spacing: 0) {
+            // This can contain thousands of long Watch diagnostics in a single day. The outer
+            // LazyVStack only defers whole days; keep the rows lazy as well.
+            LazyVStack(spacing: 0) {
                 ForEach(Array(group.entries.enumerated()), id: \.element.id) { index, entry in
                     troubleshootingRow(entry)
                     if index < group.entries.count - 1 {
@@ -344,21 +363,24 @@ struct TroubleshootingLogView: View {
     }
 
     private func troubleshootingRow(_ entry: TroubleshootingLogEntry) -> some View {
+        let reportBuilder = report
+        let time = reportBuilder.timeText(for: entry)
+        let message = reportBuilder.message(for: entry)
         // These items deliberately use SwiftUI's standard HStack spacing. Fixed icon and timestamp
         // columns introduced invisible trailing space inside both views, which made the row appear
         // to have several unrelated gaps even though its declared stack spacing was small.
-        HStack(alignment: .firstTextBaseline) {
+        return HStack(alignment: .firstTextBaseline) {
             // Temporarily hide the semantic row symbol while evaluating the denser text-first layout.
             // Keep the mapping below intact so restoring the symbols after device testing is trivial.
 //            Image(systemName: symbol(for: entry))
 //                .font(compactRowFont.weight(.semibold))
 //                .foregroundStyle(color(for: entry))
 
-            Text(report.timeText(for: entry))
+            Text(time)
                 .font(compactRowFont.monospacedDigit())
                 .foregroundStyle(Color(.colorSecondary))
 
-            Text(report.message(for: entry))
+            Text(message)
                 .font(compactRowFont)
                 .foregroundStyle(Color(.colorPrimary))
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -369,7 +391,7 @@ struct TroubleshootingLogView: View {
         .accessibilityElement(children: .combine)
         // VoiceOver receives the same controlled sentence as Copy and Share, with the visual columns
         // combined into one natural utterance.
-        .accessibilityLabel("\(report.timeText(for: entry)), \(report.message(for: entry))")
+        .accessibilityLabel("\(time), \(message)")
     }
 
     /// A semantic caption keeps the visible timestamp and message compact while continuing to follow
@@ -537,13 +559,28 @@ struct TroubleshootingLogView: View {
 
     private func copyReport() {
         // Do not reconstruct text for the pasteboard. `reportText` is the parity contract shared with
-        // `ShareLink`, including every retained entry, the export-only header and empty-state wording.
+        // Share, including every retained entry, the export-only header and empty-state wording.
         UIPasteboard.general.string = report.reportText
         copied = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
             copied = false
         }
     }
+}
+
+private struct TroubleshootingLogShareItem: Identifiable {
+    let id = UUID()
+    let text: String
+}
+
+private struct TroubleshootingLogTextShareSheet: UIViewControllerRepresentable {
+    let text: String
+
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: [text], applicationActivities: nil)
+    }
+
+    func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
 }
 
 /// Lightweight presentation grouping only. It is never persisted as a second history format.

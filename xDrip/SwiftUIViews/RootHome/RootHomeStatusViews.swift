@@ -75,6 +75,8 @@ struct RootHomeLoopView: View {
             .padding(.horizontal, 10)
             .padding(.vertical, 6)
             .frame(maxWidth: .infinity)
+            // Keep the strip at 34 points. An expanding outer frame competes with the flexible
+            // glucose chart for vertical space when Home first lays out or updates.
             .frame(height: Layout.height)
             .background(panelBackground(isHistorical: state.isHistorical))
             .clipShape(RoundedRectangle(cornerRadius: ConstantsHomeView.standardCornerRadius, style: .continuous))
@@ -90,7 +92,6 @@ struct RootHomeLoopView: View {
             // Calculation updates replace label text immediately. Threshold colors animate separately.
             transaction.animation = nil
         }
-        .frame(maxHeight: .infinity)
     }
 
     private func metricButton(isIOB: Bool) -> some View {

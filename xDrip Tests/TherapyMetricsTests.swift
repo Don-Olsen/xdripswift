@@ -246,6 +246,27 @@ final class TherapyMetricsTests: XCTestCase {
         }
     }
 
+    func testHomeKeepsConfirmedTherapyStripDuringCacheMissWithoutReusingAmount() throws {
+        let confirmed = metric([entry(2)])
+        let deadline = try XCTUnwrap(confirmed.visibilityDeadline)
+        let cacheMiss = metric(nil)
+        XCTAssertEqual(cacheMiss.reason, .readFailed)
+        XCTAssertFalse(cacheMiss.isVisible(at: now))
+        XCTAssertEqual(RootHomeStateModel.retainingConfirmedLocalVisibility(cacheMiss, from: nil, at: now), cacheMiss)
+
+        let waiting = RootHomeStateModel.retainingConfirmedLocalVisibility(cacheMiss, from: confirmed, at: now)
+        XCTAssertTrue(waiting.isVisible(at: now))
+        XCTAssertNil(waiting.value(at: now))
+        XCTAssertNil(waiting.amount)
+        XCTAssertEqual(waiting.formatted(isIOB: true, at: now), "- U")
+
+        let loaded = metric([entry(1)])
+        XCTAssertEqual(RootHomeStateModel.retainingConfirmedLocalVisibility(loaded, from: waiting, at: now), loaded)
+        let expired = RootHomeStateModel.retainingConfirmedLocalVisibility(cacheMiss, from: confirmed, at: deadline)
+        XCTAssertFalse(expired.isVisible(at: deadline))
+        XCTAssertNil(expired.visibilityDeadline)
+    }
+
     func testLocalValuesHaveNoApproximationSymbol() {
         XCTAssertEqual(metric([entry(2)]).formatted(isIOB: true, at: now), "2 U")
         XCTAssertEqual(metric([entry(20, isIOB: false)], isIOB: false).formatted(isIOB: false, at: now), "20 g")

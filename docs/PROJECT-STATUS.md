@@ -8,6 +8,32 @@
 - Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
 <!-- testflight-7.1.1-4267:end -->
 
+## Fysisk 4267-stabilitetstest og næste interne kandidat
+
+24. september 2026 blev en times Libre 2 Plus EU Direct Watch-forløb sammenholdt
+med den lokale Watch-leveringslog og iPhone-log. For intervallet ca. 17:05–18:05
+blev 51 entydige Watch-målinger dekodet og accepteret; alle 51 blev lagret og
+kvitteret af iPhone. Ni forventede sensor-minutter manglede allerede **før** en
+vellykket Watch-dekodning. Flere huller lå nær CoreBluetooth-afbrydelser
+(`CBErrorDomain` 6/7), men loggen kan ikke alene skelne sensor/radio/watchOS fra
+delvise BLE-frames. Watch-runtime blev også invalideret i intervallet, så
+timerbaseret genopretning kunne ikke forventes at køre kontinuerligt. Der blev
+ikke observeret en app-iværksat annullering under de pågældende huller.
+
+Aktivitetsloggen var tung ved åbning med mange lange Watch-poster. Skærmbilledet
+"Watch transport is not reachable" beskrev øjeblikkets iPhone/Watch-transport;
+en lokal Watch-log blev senere faktisk modtaget. Home-indholdets højde kunne
+ændre sig ved første datavisning og ved et kortvarigt lokalt terapi-cache-miss.
+Den næste interne kandidat retter disse reproducerbare UI-forløb og tilføjer
+afgrænset Watch-diagnostik for fremtidige BLE-huller. Det er ikke dokumentation
+for, at de ni minutters målinger nu er genoprettet; fysisk gentest er påkrævet.
+
+En særskilt risiko er fortsat åben: Telefonen kan klassificere midlertidigt
+manglende sensor-/kalibreringskontekst som terminal `invalidPayload`, hvorefter
+Watch fjerner en måling fra leveringskøen. Det forekom ikke i den undersøgte
+51/51-sekvens. Rettelse kræver fokuserede tests for genforsøg, uændret
+kalibreringsrevision og reelt sensorskift før ændring af modtagersemantik.
+
 Det følgende afsnit beskriver featuregrundlaget og den fysiske afprøvning;
 ældre releasehistorik følger derefter.
 

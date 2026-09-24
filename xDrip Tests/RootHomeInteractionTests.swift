@@ -7,10 +7,22 @@
 //
 
 import CoreData
+import SwiftUI
 import XCTest
 @testable import xdrip
 
 final class RootHomeInteractionTests: XCTestCase {
+
+    @MainActor
+    func testTherapyStripKeepsCompactHeightWhenHomeHasExtraVerticalSpace() {
+        let host = UIHostingController(rootView: RootHomeLoopView(
+            state: RootHomeLoopState(), actions: RootHomeActions()
+        ))
+
+        let size = host.sizeThatFits(in: CGSize(width: 320, height: 240))
+
+        XCTAssertEqual(size.height, 34, accuracy: 0.5)
+    }
 
     func testIPadLayoutClassRespondsToWindowWidth() {
         XCTAssertEqual(IPadLayoutClass.resolve(isPad: false, width: 1_366, usesAccessibilityText: false), .compact)

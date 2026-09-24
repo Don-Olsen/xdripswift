@@ -338,6 +338,14 @@ struct InitialCalibrationRequestGate {
                     bgPostProcessingManager: bgPostProcessingManager
                 )
 
+                // Populate the Home layout before publishing its dependencies. Otherwise the
+                // first frame uses placeholder rows and the chart changes size on first refresh.
+                self.rootHomeStateModel.refresh(
+                    activeSensor: self.activeSensor,
+                    isScreenLocked: self.screenIsLocked,
+                    usesScreenLockNightLayout: self.screenLockUsesNightLayout
+                )
+
                 self.rootTabStateModel?.configure(
                     coreDataManager: coreDataManager,
                     statisticsManager: statisticsManager,

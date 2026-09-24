@@ -336,7 +336,7 @@ final class RootHomeStateModel: ObservableObject {
         newState.isScreenLocked = isScreenLocked
         newState.usesScreenLockNightLayout = usesScreenLockNightLayout
 
-        applyTherapyMetrics(to: &newState.loop)
+        applyTherapyMetrics(to: &newState.loop, previous: state.loop.therapyMetrics)
         newState.visibility.showsLoop = !usesScreenLockNightLayout && (newState.loop.showsIOB || newState.loop.showsCOB || newState.visibility.showsLoop)
         publish(newState)
     }
@@ -362,6 +362,7 @@ final class RootHomeStateModel: ObservableObject {
         let latestSiteChangeDate = treatmentEntryAccessor?.latestSiteChangeDate()
 
         updateState { state in
+            let previousTherapyMetrics = state.loop.therapyMetrics
             state.pump = self.pumpState(
                 deviceStatus: deviceStatus,
                 latestSiteChangeDate: latestSiteChangeDate
@@ -377,19 +378,36 @@ final class RootHomeStateModel: ObservableObject {
             } else {
                 state.loop = RootHomeLoopState()
             }
-            self.applyTherapyMetrics(to: &state.loop)
+            self.applyTherapyMetrics(to: &state.loop, previous: previousTherapyMetrics)
             state.visibility.showsLoop = !state.usesScreenLockNightLayout && (state.loop.showsIOB || state.loop.showsCOB || state.loop.showsAIDStatus)
         }
     }
 
-    func applyTherapyMetrics(to loop: inout RootHomeLoopState, at date: Date = .now, external: AIDStatus? = nil, historical: Bool = false) {
-        let metrics = TherapyMetricsManager.shared.snapshot(at: date, external: external, historical: historical)
+    func applyTherapyMetrics(to loop: inout RootHomeLoopState, at date: Date = .now, external: AIDStatus? = nil,
+                             historical: Bool = false, previous: TherapyMetricsSnapshot? = nil) {
+        var metrics = TherapyMetricsManager.shared.snapshot(at: date, external: external, historical: historical)
+        if !historical {
+            metrics.iob = Self.retainingConfirmedLocalVisibility(metrics.iob, from: previous?.iob, at: date)
+            metrics.cob = Self.retainingConfirmedLocalVisibility(metrics.cob, from: previous?.cob, at: date)
+        }
         loop.therapyMetrics = metrics
         loop.showsIOB = metrics.iob.isVisible(at: date)
         loop.showsCOB = metrics.cob.isVisible(at: date)
         loop.showsAIDStatus = UserDefaults.standard.dataFlowPolicy.showsTherapyStatus
         loop.iob.value = metrics.iob.formatted(isIOB: true, at: date)
         loop.cob.value = metrics.cob.formatted(isIOB: false, at: date)
+    }
+
+    /// A transient local cache miss must not collapse an already visible Home strip. Retain only
+    /// the prior confirmed visibility window; the fresh unavailable metric still displays "-".
+    static func retainingConfirmedLocalVisibility(_ metric: TherapyMetricState,
+                                                    from previous: TherapyMetricState?, at date: Date) -> TherapyMetricState {
+        guard metric.source == .local, metric.reason == .readFailed, metric.visibilityDeadline == nil,
+              let previous, previous.source == .local,
+              let deadline = previous.visibilityDeadline, deadline > date else { return metric }
+        var result = metric
+        result.visibilityDeadline = deadline
+        return result
     }
 
     func setStatisticsLoading() {

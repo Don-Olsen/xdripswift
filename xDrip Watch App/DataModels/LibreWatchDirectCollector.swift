@@ -26,6 +26,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
     private var writeCharacteristic: CBCharacteristic?
     private var receiveCharacteristic: CBCharacteristic?
     private var frameAssembler = Libre2WatchDirectFrameAssembler()
+    private var frameGapTracker = LibreWatchFrameGapTracker()
     private var frameLiveness = LibreWatchFrameLiveness()
     private var scanIsPending = false
     private var deliberatelyDisconnecting = false
@@ -142,6 +143,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
 
         preparedSession = resolvedSession
         if previousSessionID != resolvedSession?.id || previousSensorUID != resolvedSession?.sensorUID {
+            frameGapTracker.reset()
             discoveryHandoff.invalidate()
             cancelReconnectFallback()
             connectionTiming.invalidate()
@@ -187,7 +189,10 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
     }
 
     func ownershipDidChange(_ ownership: LibreWatchOwnership) {
-        if ownership != .watch { discoveryHandoff.invalidate() }
+        if ownership != .watch {
+            frameGapTracker.reset()
+            discoveryHandoff.invalidate()
+        }
         switch ownership {
         case .watch:
             reconcileRecoveryState(at: Date(), source: .initialPreparation)
@@ -415,6 +420,21 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         LibreWatchLifecyclePolicy.receivingExecutionBudget(
             applicationState: applicationState,
             extendedRuntimeIsRunning: extendedRuntimeIsRunning
+        )
+    }
+
+    private func resetFrameAssembler() {
+        frameGapTracker.assemblerReset(hadPartial: frameAssembler.assembledByteCount > 0)
+        frameAssembler.reset()
+    }
+
+    private func frameGapState(for peripheral: CBPeripheral) -> WatchDeliveryEvidenceFrameState {
+        WatchDeliveryEvidenceFrameState(
+            applicationState: applicationState.rawValue,
+            runtimeRunning: extendedRuntimeIsRunning,
+            connectionPhase: connectionTiming.phase?.rawValue ?? "idle",
+            peripheralState: observedState(of: peripheral).rawValue,
+            connectionGeneration: connectionTiming.generation
         )
     }
 
@@ -663,7 +683,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         setupGeneration = nil
         writeCharacteristic = nil
         receiveCharacteristic = nil
-        frameAssembler.reset()
+        resetFrameAssembler()
         state.reconnecting(error: nil)
         // An observed .connecting already represents one system/ongoing attempt.
         systemAutoReconnectIsActive = peripheral.state == .connecting
@@ -694,7 +714,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         setupService = nil
         writeCharacteristic = nil
         receiveCharacteristic = nil
-        frameAssembler.reset()
+        resetFrameAssembler()
         frameLiveness = LibreWatchFrameLiveness()
         state.connecting()
         reportBluetoothAction("discoverServices", reason: "freshConnectionSetup")
@@ -745,7 +765,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         setupGeneration = nil
         writeCharacteristic = nil
         receiveCharacteristic = nil
-        frameAssembler.reset()
+        resetFrameAssembler()
         frameLiveness = LibreWatchFrameLiveness()
         bindRestoredGATTObjects(from: peripheral)
     }
@@ -873,7 +893,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
             monotonicTime: monotonicNow
         )
         restorationState?.beginConnectionGeneration(connectionTiming.generation)
-        frameAssembler.reset()
+        resetFrameAssembler()
         systemAutoReconnectIsActive = systemIsReconnecting
         state.reconnecting(error: nil)
     }
@@ -927,7 +947,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
             executionIsAvailable: timedRecoveryIsAllowed,
             monotonicTime: monotonicNow
         ) else { return false }
-        frameAssembler.reset()
+        resetFrameAssembler()
         writeUnlock(to: peripheral, characteristic: writeCharacteristic)
         return true
     }
@@ -1239,7 +1259,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         setupGeneration = nil
         writeCharacteristic = nil
         receiveCharacteristic = nil
-        frameAssembler.reset()
+        resetFrameAssembler()
         prepareForExpectedDisconnectCallback()
         reportBluetoothAction("cancel", reason: scanAfterReconnectCancellation
             ? "controlledRecovery"
@@ -1339,7 +1359,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         setupGeneration = nil
         writeCharacteristic = nil
         receiveCharacteristic = nil
-        frameAssembler.reset()
+        resetFrameAssembler()
         frameLiveness = LibreWatchFrameLiveness()
         connectionTiming.invalidate()
     }
@@ -1405,6 +1425,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         reconnectObservationSource: LibreWatchReconnectObservationSource
     ) {
         guard peripheral === sensorPeripheral else { return }
+        frameGapTracker.linkInterrupted()
         currentReconcileSource = .didDisconnect
         let nsError = error.map { $0 as NSError }
 
@@ -1443,7 +1464,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         setupService = nil
         writeCharacteristic = nil
         receiveCharacteristic = nil
-        frameAssembler.reset()
+        resetFrameAssembler()
         // Keep an already observed system reconnect deadline when a legacy callback arrives
         // while Core Bluetooth already reports the peripheral as connecting.
         if connectionTiming.phase != .connection { connectionTiming.invalidate() }
@@ -1832,6 +1853,7 @@ extension LibreWatchDirectCollector: WKExtendedRuntimeSessionDelegate {
         guard self.extendedRuntimeSession === extendedRuntimeSession else { return }
         self.extendedRuntimeSession = nil
         extendedRuntimeIsRunning = false
+        frameGapTracker.runtimeDidInvalidate()
         userInitiatedRuntimeStart = false
         currentReconcileSource = .extendedRuntimeInvalidated
         reportDiagnostic(
@@ -2089,7 +2111,7 @@ extension LibreWatchDirectCollector: CBCentralManagerDelegate {
             setupService = nil
             writeCharacteristic = nil
             receiveCharacteristic = nil
-            frameAssembler.reset()
+            resetFrameAssembler()
             if wasCurrentRestoration {
                 restorationState?.beginConnectionGeneration(connectionTiming.generation)
             }
@@ -2327,7 +2349,7 @@ extension LibreWatchDirectCollector: CBPeripheralDelegate {
         setupService = nil
         writeCharacteristic = nil
         receiveCharacteristic = nil
-        frameAssembler.reset()
+        resetFrameAssembler()
         connectionTiming.beginSetup(
             at: Date(),
             startingAt: .services,
@@ -2572,7 +2594,9 @@ extension LibreWatchDirectCollector: CBPeripheralDelegate {
         // already in the outbox even if this fragment is partial or downstream rejects it.
         // This grants no timer, scan, reconnect, handoff, or alarm-configuration work.
         defer { watchState?.retryPendingLibreReadingsAfterBLENotification(at: Date()) }
+        frameGapTracker.notification()
         if let error {
+            frameGapTracker.notificationError()
             let errorAction = notificationErrorAction(for: error)
             reportCoreBluetoothCallback(
                 "didUpdateValue",
@@ -2594,12 +2618,26 @@ extension LibreWatchDirectCollector: CBPeripheralDelegate {
             }
             return
         }
-        guard let fragment = characteristic.value, !fragment.isEmpty else { return }
+        guard let fragment = characteristic.value, !fragment.isEmpty else {
+            frameGapTracker.emptyCallback()
+            return
+        }
+
+        let fragmentAt = Date()
+        frameGapTracker.fragmentArrived(
+            at: fragmentAt,
+            bufferedPartial: frameAssembler.assembledByteCount > 0,
+            maximumFragmentGap: Libre2WatchDirectConstants.maximumFragmentGap
+        )
+        var assembledFrame = false
 
         do {
-            guard let frame = try frameAssembler.append(fragment: fragment, at: Date()),
-                  let preparedSession
-            else { return }
+            guard let frame = try frameAssembler.append(fragment: fragment, at: fragmentAt) else {
+                frameGapTracker.partialFragment(at: fragmentAt)
+                return
+            }
+            assembledFrame = true
+            guard let preparedSession else { return }
             let now = Date()
             let decrypted = try Libre2WatchDirectAlgorithms.decryptBLE(
                 sensorUID: preparedSession.sensorUID,
@@ -2611,6 +2649,17 @@ extension LibreWatchDirectCollector: CBPeripheralDelegate {
                 receivedAt: now
             )
             let payloadID = UUID()
+            if let gap = frameGapTracker.decoded(
+                minute: reading.sensorTimeInMinutes,
+                at: now,
+                state: frameGapState(for: peripheral)
+            ) {
+                WatchDeliveryEvidenceStore.shared.record(
+                    stage: .frameGap, sessionID: preparedSession.id,
+                    measuredAt: now, sensorElapsedMinutes: reading.sensorTimeInMinutes,
+                    outcome: "missingDecodedSensorMinutes", stream: .diagnostic, frameGap: gap
+                )
+            }
             WatchDeliveryEvidenceStore.shared.record(stage: .decoded, payloadID: payloadID,
                 sessionID: preparedSession.id, measuredAt: reading.receivedAt,
                 sensorElapsedMinutes: reading.sensorTimeInMinutes, outcome: "validDecryptedFrame")
@@ -2640,9 +2689,14 @@ extension LibreWatchDirectCollector: CBPeripheralDelegate {
                     sensorElapsedMinutes: reading.sensorTimeInMinutes, outcome: "missingWatchState")
             }
         } catch {
+            if assembledFrame {
+                frameGapTracker.decodeFailure()
+            } else {
+                frameGapTracker.assemblyFailure()
+            }
             WatchDeliveryEvidenceStore.shared.record(stage: .rejected, sessionID: preparedSession?.id,
                 outcome: "frameDecodeFailed:\(WatchDeliveryEvidenceStore.errorClass(error))")
-            frameAssembler.reset()
+            resetFrameAssembler()
             state.fail(.invalidFrame, error: error.localizedDescription)
             if frameLiveness.invalidFrame() {
                 beginControlledSensorRecovery(

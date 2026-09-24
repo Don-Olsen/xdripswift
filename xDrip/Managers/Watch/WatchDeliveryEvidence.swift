@@ -7,7 +7,125 @@ enum WatchDeliveryEvidenceStream: String, Codable {
 enum WatchDeliveryEvidenceStage: String, Codable {
     case decoded, accepted, rejected, localWriteConfirmed, localWriteFailed
     case sendAttempt, phoneReceived, phoneStored, phoneRejected, acknowledgement
-    case coalesced, suppressed, transportFailed, transportReceived, alarmReadiness
+    case coalesced, suppressed, transportFailed, transportReceived, alarmReadiness, frameGap
+}
+
+/// State sampled at a valid frame. It does not assert what watchOS did while suspended.
+struct WatchDeliveryEvidenceFrameState: Codable, Equatable {
+    let applicationState: String
+    let runtimeRunning: Bool
+    let connectionPhase: String
+    let peripheralState: String
+    let connectionGeneration: UUID
+}
+
+/// Observations between two successfully decoded Libre frames. Callback counts include
+/// the callback that produced the later frame; zero callbacks cannot be observed by code.
+struct WatchDeliveryEvidenceFrameGap: Codable, Equatable {
+    let previousDecodedAt: Date
+    let previousSensorElapsedMinutes: UInt16
+    let missingSensorMinutes: UInt16
+    let notificationCallbacks: UInt16
+    let partialFragments: UInt16
+    let abandonedPartialFrames: UInt16
+    let emptyCallbacks: UInt16
+    let notificationErrors: UInt16
+    let assemblyFailures: UInt16
+    let decodeFailures: UInt16
+    /// Counts disconnect callbacks, including deliberate handoff; does not prove radio failure.
+    let linkInterruptions: UInt16
+    let runtimeInvalidated: Bool
+    let previousState: WatchDeliveryEvidenceFrameState
+    let currentState: WatchDeliveryEvidenceFrameState
+}
+
+/// In-memory observations only; emits one bounded journal event when the next valid
+/// sensor minute proves that one or more nominal minutes had no decoded frame.
+struct LibreWatchFrameGapTracker {
+    private var previous: (minute: UInt16, at: Date, state: WatchDeliveryEvidenceFrameState)?
+    private var notificationCallbacks: UInt16 = 0
+    private var partialFragments: UInt16 = 0
+    private var abandonedPartialFrames: UInt16 = 0
+    private var emptyCallbacks: UInt16 = 0
+    private var notificationErrors: UInt16 = 0
+    private var assemblyFailures: UInt16 = 0
+    private var decodeFailures: UInt16 = 0
+    private var linkInterruptions: UInt16 = 0
+    private var runtimeInvalidated = false
+    private var lastPartialFragmentAt: Date?
+
+    mutating func reset() { self = Self() }
+
+    mutating func notification() { Self.increment(&notificationCallbacks) }
+
+    mutating func fragmentArrived(at date: Date, bufferedPartial: Bool, maximumFragmentGap: TimeInterval) {
+        if bufferedPartial, let lastPartialFragmentAt,
+           date.timeIntervalSince(lastPartialFragmentAt) > maximumFragmentGap {
+            Self.increment(&abandonedPartialFrames)
+            self.lastPartialFragmentAt = nil
+        }
+    }
+
+    mutating func partialFragment(at date: Date) {
+        Self.increment(&partialFragments)
+        lastPartialFragmentAt = date
+    }
+
+    mutating func assemblerReset(hadPartial: Bool) {
+        if hadPartial { Self.increment(&abandonedPartialFrames) }
+        lastPartialFragmentAt = nil
+    }
+
+    mutating func emptyCallback() { Self.increment(&emptyCallbacks) }
+    mutating func notificationError() { Self.increment(&notificationErrors) }
+    mutating func assemblyFailure() { Self.increment(&assemblyFailures); lastPartialFragmentAt = nil }
+    mutating func decodeFailure() { Self.increment(&decodeFailures); lastPartialFragmentAt = nil }
+    mutating func linkInterrupted() { Self.increment(&linkInterruptions) }
+    mutating func runtimeDidInvalidate() { runtimeInvalidated = true }
+
+    mutating func decoded(minute: UInt16, at date: Date,
+                          state: WatchDeliveryEvidenceFrameState) -> WatchDeliveryEvidenceFrameGap? {
+        let prior = previous
+        // A duplicate or older payload must not move the baseline or discard observations
+        // before the next new sensor minute, including a disconnect during a gap.
+        if let prior, minute <= prior.minute { return nil }
+        let gap: WatchDeliveryEvidenceFrameGap?
+        if let prior, Int(minute) > Int(prior.minute) + 1 {
+            gap = WatchDeliveryEvidenceFrameGap(
+                previousDecodedAt: prior.at,
+                previousSensorElapsedMinutes: prior.minute,
+                missingSensorMinutes: minute - prior.minute - 1,
+                notificationCallbacks: notificationCallbacks,
+                partialFragments: partialFragments,
+                abandonedPartialFrames: abandonedPartialFrames,
+                emptyCallbacks: emptyCallbacks,
+                notificationErrors: notificationErrors,
+                assemblyFailures: assemblyFailures,
+                decodeFailures: decodeFailures,
+                linkInterruptions: linkInterruptions,
+                runtimeInvalidated: runtimeInvalidated,
+                previousState: prior.state, currentState: state
+            )
+        } else {
+            gap = nil
+        }
+        previous = (minute, date, state)
+        notificationCallbacks = 0
+        partialFragments = 0
+        abandonedPartialFrames = 0
+        emptyCallbacks = 0
+        notificationErrors = 0
+        assemblyFailures = 0
+        decodeFailures = 0
+        linkInterruptions = 0
+        runtimeInvalidated = false
+        lastPartialFragmentAt = nil
+        return gap
+    }
+
+    private static func increment(_ value: inout UInt16) {
+        if value < UInt16.max { value += 1 }
+    }
 }
 
 /// Device provenance is captured when the event originates, never supplied by the exporter.
@@ -48,6 +166,8 @@ struct WatchDeliveryEvidenceEvent: Codable, Equatable {
     let sensorTime: Date?
     let sensorElapsedMinutes: UInt16?
     let outcome: String?
+    /// Optional for compatibility with journals from earlier builds.
+    let frameGap: WatchDeliveryEvidenceFrameGap?
 }
 
 struct WatchDeliveryEvidenceSnapshot: Codable {
@@ -157,7 +277,8 @@ final class WatchDeliveryEvidenceStore {
     @discardableResult
     func record(stage: WatchDeliveryEvidenceStage, payloadID: UUID? = nil, sessionID: UUID? = nil,
                 measuredAt: Date? = nil, sensorTime: Date? = nil, sensorElapsedMinutes: UInt16? = nil,
-                outcome: String? = nil, stream: WatchDeliveryEvidenceStream = .reading) -> Bool {
+                outcome: String? = nil, stream: WatchDeliveryEvidenceStream = .reading,
+                frameGap: WatchDeliveryEvidenceFrameGap? = nil) -> Bool {
         queue.sync {
             let now = clock()
             if journalNeedsRepair {
@@ -169,7 +290,8 @@ final class WatchDeliveryEvidenceStore {
             let event = WatchDeliveryEvidenceEvent(sequence: metadata.sequence, origin: origin,
                 at: now, uptime: uptime(), stream: stream, stage: stage, payloadID: payloadID,
                 sessionID: sessionID, watchReceivedAt: measuredAt, sensorTime: sensorTime,
-                sensorElapsedMinutes: sensorElapsedMinutes, outcome: Self.safeLabel(outcome))
+                sensorElapsedMinutes: sensorElapsedMinutes, outcome: Self.safeLabel(outcome),
+                frameGap: frameGap)
             if stage == .alarmReadiness, let value = Self.safeLabel(outcome),
                let component = value.split(separator: ":").first {
                 var readiness = metadata.alarmReadiness ?? [:]

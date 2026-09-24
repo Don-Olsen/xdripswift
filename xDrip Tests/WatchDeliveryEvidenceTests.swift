@@ -41,6 +41,91 @@ final class WatchDeliveryEvidenceTests: XCTestCase {
             sensorTimeInMinutes: sensorMinute, receivedAt: now, calibrationRevision: 1)
     }
 
+    private func frameState(runtime: Bool, phase: String, generation: UUID = UUID()) -> WatchDeliveryEvidenceFrameState {
+        .init(applicationState: runtime ? "active" : "inactive", runtimeRunning: runtime,
+              connectionPhase: phase, peripheralState: phase == "receiving" ? "connected" : "connecting",
+              connectionGeneration: generation)
+    }
+
+    func testFrameGapShowsNoInterveningNotificationsAndPersistsExecutionContext() throws {
+        var tracker = LibreWatchFrameGapTracker()
+        let before = frameState(runtime: true, phase: "receiving")
+        let after = frameState(runtime: false, phase: "receiving")
+        tracker.notification()
+        XCTAssertNil(tracker.decoded(minute: 100, at: now, state: before))
+        tracker.linkInterrupted()
+        tracker.runtimeDidInvalidate()
+        now += 180
+        tracker.notification() // The single callback that decoded the later frame.
+        let gap = try XCTUnwrap(tracker.decoded(minute: 103, at: now, state: after))
+        XCTAssertEqual(gap.previousSensorElapsedMinutes, 100)
+        XCTAssertEqual(gap.missingSensorMinutes, 2)
+        XCTAssertEqual(gap.notificationCallbacks, 1)
+        XCTAssertEqual(gap.partialFragments, 0)
+        XCTAssertEqual(gap.linkInterruptions, 1)
+        XCTAssertTrue(gap.runtimeInvalidated)
+        XCTAssertEqual(gap.previousState, before)
+        XCTAssertEqual(gap.currentState, after)
+
+        let journal = store()
+        XCTAssertTrue(journal.record(stage: .frameGap, sensorElapsedMinutes: 103,
+            outcome: "missingDecodedSensorMinutes", stream: .diagnostic, frameGap: gap))
+        let exported = try JSONEncoder().encode(journal.snapshot())
+        let restored = try JSONDecoder().decode(WatchDeliveryEvidenceSnapshot.self, from: exported)
+        XCTAssertEqual(restored.events.first?.frameGap, gap)
+        XCTAssertEqual(restored.events.first?.stream, .diagnostic)
+    }
+
+    func testFrameGapDistinguishesAbandonedPartialAndDecodeFailureThenResets() throws {
+        var tracker = LibreWatchFrameGapTracker()
+        let state = frameState(runtime: false, phase: "receiving")
+        XCTAssertNil(tracker.decoded(minute: 200, at: now, state: state))
+        tracker.notification()
+        tracker.partialFragment(at: now.addingTimeInterval(60))
+        tracker.assemblerReset(hadPartial: true)
+        tracker.notification()
+        tracker.notificationError()
+        tracker.assemblyFailure()
+        tracker.decodeFailure()
+        tracker.notification()
+        let gap = try XCTUnwrap(tracker.decoded(minute: 203, at: now.addingTimeInterval(180), state: state))
+        XCTAssertEqual(gap.notificationCallbacks, 3)
+        XCTAssertEqual(gap.partialFragments, 1)
+        XCTAssertEqual(gap.abandonedPartialFrames, 1)
+        XCTAssertEqual(gap.notificationErrors, 1)
+        XCTAssertEqual(gap.assemblyFailures, 1)
+        XCTAssertEqual(gap.decodeFailures, 1)
+        tracker.notification()
+        XCTAssertNil(tracker.decoded(minute: 204, at: now.addingTimeInterval(240), state: state))
+        tracker.notification()
+        XCTAssertNil(tracker.decoded(minute: 202, at: now.addingTimeInterval(300), state: state))
+        tracker.notification()
+        let next = try XCTUnwrap(tracker.decoded(minute: 206, at: now.addingTimeInterval(360), state: state))
+        XCTAssertEqual(next.previousSensorElapsedMinutes, 204)
+        XCTAssertEqual(next.missingSensorMinutes, 1)
+        XCTAssertEqual(next.notificationCallbacks, 2)
+        XCTAssertEqual(next.partialFragments, 0)
+        XCTAssertEqual(next.decodeFailures, 0)
+    }
+
+    func testDuplicateAndOlderDecodedMinutesPreserveGapBaselineAndCallbacks() throws {
+        var tracker = LibreWatchFrameGapTracker()
+        let state = frameState(runtime: false, phase: "receiving")
+        XCTAssertNil(tracker.decoded(minute: 100, at: now, state: state))
+        tracker.linkInterrupted()
+        tracker.notification()
+        XCTAssertNil(tracker.decoded(minute: 100, at: now.addingTimeInterval(60), state: state))
+        tracker.notification()
+        XCTAssertNil(tracker.decoded(minute: 90, at: now.addingTimeInterval(90), state: state))
+        tracker.notification()
+        let gap = try XCTUnwrap(tracker.decoded(minute: 102, at: now.addingTimeInterval(120), state: state))
+        XCTAssertEqual(gap.previousDecodedAt, now)
+        XCTAssertEqual(gap.previousSensorElapsedMinutes, 100)
+        XCTAssertEqual(gap.missingSensorMinutes, 1)
+        XCTAssertEqual(gap.notificationCallbacks, 3)
+        XCTAssertEqual(gap.linkInterruptions, 1)
+    }
+
     func testDecodedFrameUsesSameExplicitIDThroughProductionPayloadAdapter() {
         let id = UUID(), session = UUID()
         let frame = Libre2WatchDirectReading(nativeGlucoseMGDL: 110, previousNativeGlucoseMGDL: 108,
