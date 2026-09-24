@@ -22,8 +22,13 @@ releaseblokeringer i [PROJECT-STATUS.md](PROJECT-STATUS.md).
 Mac-værktøjer, lokal identitetskonfiguration og signeringsaktiver er genbrugt.
 Marketingversionen er 7.1.1 på alle fem bundles, men det næste release-buildnummer
 er endnu ikke bekræftet hos Apple. Simulatorens fallback 4231 må ikke uploades.
-Alle nye relevante upstream-testfejl skal afklares, før release-forløbet nedenfor
-bruges. Den tidligere GO UPLOAD gjaldt kun 4263.
+De konkrete releaseblokeringer er rettet: 983/983 XCTest-tests og begge
+simulatorbuilds består; detaljer står i PROJECT-STATUS.md. Brugeren har
+efterfølgende godkendt upload af 7.1.1 med
+“opload”; der kræves ikke endnu en godkendelse for samme udgivelse. Et aktuelt
+Apple-bekræftet buildnummer og den faste tag-baserede releaseproces mangler
+fortsat. Genbrug ikke udviklingsbuildet eller et historisk testresultat som
+release-kvittering efter ændring af versionsfilen.
 
 ## Fast TestFlight-proces fra næste build
 

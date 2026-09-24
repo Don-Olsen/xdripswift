@@ -6,6 +6,117 @@ Opdateret 24. september 2026. Den officielle opdatering er integreret på
 noget på fysiske enheder.** 7.0.0 (4263) er fortsat det seneste bekræftede
 Internal / Testing-build; dets historiske kildebeskrivelse nedenfor er bevaret.
 
+## Rettelser efter integrationens første testkørsel
+
+Brugeren godkendte de konkrete releaseblokeringer rettet med “fix det” og har
+allerede godkendt upload af 7.1.1 med “opload”. Der kræves ikke et nyt GO UPLOAD
+for denne samme udgivelse. **Upload er endnu ikke udført**: App Store Connect
+har ikke kunnet kontrolleres gennem det tilgængelige browserværktøj, og næste
+buildnummer må fortsat ikke gættes. Intet release-tag, signeret 7.1.1-arkiv
+eller IPA er oprettet.
+
+Kode-/testrettelserne er committet som
+**`f90b1dcb1d716aea41a0c68be7c6a47cc405ceee`**, oven på
+`200afbb03e525e4ce70f9c16eb491db17c874fa5`
+(integrationskoden `a0a4a101c921b41e2942873f2bf58883bddb707f` med efterfølgende
+statusdokumentation). Den præcise testede lokale diff og 1220 hashes af
+versionerede filer uden dokumentation er bevaret lokalt i
+`build/release-fixes-7.1.1/source-before-tests.patch` og
+`tested-source-hashes.json`. Resultaterne nedenfor er nye kørsler af den rettede
+kode; de historiske fejl og deres oprindelige bevis er bevaret længere nede.
+
+De konkrete ændringer er:
+
+- Dexcom-batteriets seks timers opstartsfilter gælder kun de to
+  Dexcom-batterialarmtyper. Andre alarmtyper, herunder glukose og manglende
+  målinger, bliver ikke undertrykt af dette batterifilter. Alarmgrænser,
+  snooze, delegation og Watch-lokal alarmkode er uændrede.
+- Nightscout-treatment-download gemmer URL/port før forespørgslen og bruger
+  samme kilde ved præcise ID-opslag. Forældede svar og fortsættelser afvises
+  igen på Core Data-køen før import, kvittering eller sletningsmarkering.
+  Seks isolerede tests dækker URL-/portskift og den uændrede normale vej.
+  Dette er en afgrænset rettelse af download/afstemning, ikke en ny atomisk
+  transaktion for alle treatment-uploadveje. Glukosehistorikkøen er uændret.
+- Statistikvisningens heltalsfordeling håndterer matematisk ens decimalrester
+  deterministisk trods binær afrundingsstøj. Reelle forskelle bevarer deres
+  rækkefølge; procent- og minuttotaler bevares. Glukoseberegning ændres ikke.
+- CareLinks syntetiske hukommelseslager beskytter samtidig load/save/clear.
+  Logout-testen holder et mock-svar eksplicit tilbage, og therapy-testen
+  isolerer sin patientopsætning fra separat auto-selection/KVO-polling.
+  Appens Keychain-lager og loginadfærd er uændrede.
+- Core Data-roundtriptestene venter på afsluttet save i parent-testlageret, bruger
+  permanente object-ID'er
+  og nulstiller begge konteksters cache. Roundtriptestene bruger et
+  hukommelseslager; de er ikke bevis for diskvarighed. Migrationstesten bruger sine private
+  konteksters køer. Appens Core Data-manager og migrationsmodeller er uændrede.
+- Tre GS1-testforventninger er rettet til de faktisk indkodede serienumre;
+  en ekstra regression bevarer et ægte indledende 1-tal. Parseren er uændret.
+  Dexcom-statustesten sammenligner de korrekte lokaliseringsnøgler frem for
+  engelske tekster på en dansk simulator. Submission-kontrollerne er bevaret.
+
+Alle 228 eksisterende metoder i de seks ændrede testfiler er bevaret, og
+11 regressioner er tilføjet. Ingen tests er slået fra eller gjort til forventede
+fejl. Bluetooth/reconnect, sensoridentitet/-overdragelse, Watch/Libre,
+durability/restore, kalibrering, smoothing, alarmansvar og snooze er uændrede.
+Ingen nye funktioner, dependencies, Apple-ændringer eller fysiske installationer.
+
+Den første kompilering i denne rettelsesrunde stoppede ved en ældre test, som
+læste og skrev direkte til det nu private syntetiske tokenfelt; ingen XCTest
+blev kørt. Den bruger nu samme trådsikre load/save-API som andre forbrugere. Loggen
+`build/release-fixes-7.1.1/logs/all-xctest.log` er bevaret særskilt.
+
+Den afsluttende kørsel har **983/983 beståede tests, 0 fejl, 0 skipped** i den
+færdige `.xcresult`; `xcodebuild` afsluttede med exit 0 / `TEST SUCCEEDED`.
+De ti konkrete tidligere fejl er hver især slået op som bestået i resultattræet.
+Den tidligere røde kørsel nedenfor ændres ikke til grøn med tilbagevirkende kraft.
+
+| Kontrol på den rettede kode | Resultat | Lokalt bevis under `build/release-fixes-7.1.1/` |
+| --- | --- | --- |
+| Hele `xdripTests`, iPhone 17 / iOS 27 simulator | **983/983**, 0 fejl/skipped | `full-v2/results/AllTests.xcresult`, `logs/all-xctest-v2.log` |
+| De otte krævede suites, som delmængde af samme fulde kørsel | **490/490** | `full-v2/results/stability-summary.json` og tilhørende Xcode-summary/test-tree |
+| De otte Windows-durability-tests plus restore-regressionen | **9/9**, hver metode kontrolleret | `regression-comparison.json` |
+| De 11 nye regressioner og de ti tidligere fejlede metoder | **Alle bestået**, navne kontrolleret i resultattræet | `regression-comparison.json` |
+| Offline Python-kontroller | **12/12, 30/30, 17/17, 8/8** | `python/logs/` |
+| iPhone-simulatorbuild, scheme `xdrip` | **Bestået** | `simulator-builds/logs/iphone-build.log` |
+| Watch-simulatorbuild, scheme `xDrip Watch App` | **Bestået** | `simulator-builds/logs/watch-build.log` |
+| Fem produktidentiteter, version og Watch-indlejring | **Bestået**, version 7.1.1 / udviklingsfallback 4231 | `simulator-products.json` |
+
+De otte krævede suites består af LibreWatch 259, Troubleshooting 87,
+WatchRefresh 41, PhoneRefresh 25, Snapshot 6, Delivery 30, NightscoutHistory 26
+og RootHomeInteraction 16. De berørte øvrige suites består også: CareLink
+108/108, DexcomG6SensorLabel 22/22, DexcomG7Calibration 41/41,
+FollowerBackgroundKeepAlive 26/26 og GlucoseRangeDistribution 16/16.
+Disse tal er delmængder af 983, ikke ekstra testkørsler.
+
+De 11 nye metoder, alle bestået:
+
+- `testMemoryTokenStoreConcurrentAccessKeepsWholeCredentials`
+- `testSerialPreservesLeadingDigitsAfterApplicationIdentifier`
+- `testDexcomBatterySettlingNeverSuppressesOtherAlertKinds`
+- `testAllocatorKeepsDecimalTiesStableAcrossEquivalentWeights`
+- `testAllocatorKeepsGenuinelyDifferentRemaindersOrdered`
+- `testTreatmentBulkResponseAfterSiteSwitchCannotImportUpdateOrAcknowledge`
+- `testTreatmentBulkResponseAfterPortSwitchCannotImportUpdateOrAcknowledge`
+- `testTreatmentSiteSwitchDuringExactLookupPreservesEntriesAndStopsLookups`
+- `testTreatmentPortSwitchDuringExactLookupPreservesEntriesAndStopsLookups`
+- `testTreatmentReconciliationRechecksSourceBeforeApplyingExactResponse`
+- `testTreatmentUnchangedSourceImportsUpdatesAndConfirmsDeletion`
+
+Xcodes efterfølgende diagnoseindsamling ramte samme 600-sekunders timeout som
+før; testkørslen selv sluttede normalt uden host-crash. Den færdige resultatpakke
+og exitstatus er kontrolleret efter timeouten. Den er ikke talt som en testfejl
+eller skjult i loggen. Simulator- og testbuilds genbrugte eksisterende DerivedData
+fra første 7.1.1-kørsel; de nye logs/resultatpakker har egne stier og overskriver
+ikke de tidligere fejlbeviser. Ingen fysisk enhed eller ekstern testtjeneste blev
+brugt. Alle 1220 ikke-dokumentationsfiler matcher den efterfølgende kodecommit
+byte-for-byte; manifestet angiver både testens oprindelige HEAD og kodecommitten.
+
+Den separate `invalidPayload`-risiko og fysisk Watch-test er stadig åbne.
+Simulatorresultater beviser ikke fysisk Bluetooth-stabilitet eller hørbare
+alarmer. Når Apples buildnummer er bekræftet, skal det sættes i den tracked
+versionsfil **før** release-scriptets nye testkvittering, checkpoint/push, tag,
+arkiv/IPA fra tagget og verifikation. Udviklingsfallback 4231 må ikke uploades.
+
 ## Kildegrundlag og konfliktløsning
 
 - Uændret checkpoint før opdateringen: `checkpoint/post-testflight-4263`,
@@ -14,8 +125,9 @@ Internal / Testing-build; dets historiske kildebeskrivelse nedenfor er bevaret.
   `c268542e64626c564e626658fa9a6b90a059ada4`.
 - Integrationskodecommit: **`a0a4a101c921b41e2942873f2bf58883bddb707f`**,
   med checkpointet og det officielle tag-commit som de to forældre. Det er et
-  integrationscheckpoint, ikke et release-tag. Denne efterfølgende statusændring
-  ændrer kun dokumentation.
+  integrationscheckpoint, ikke et release-tag. Statuscommitten `200afbb03e525e4ce70f9c16eb491db17c874fa5`
+  efter denne kodecommit ændrede kun dokumentation; den nyere rettelsesrunde
+  er beskrevet ovenfor.
   Det lokale reference-tag hedder
   `upstream/7.1.1`; det er ikke et TestFlight-tag og pushes ikke.
 - Der er foretaget en konkret trevejssammenfletning, ikke en erstatning med
@@ -57,7 +169,7 @@ Internal / Testing-build; dets historiske kildebeskrivelse nedenfor er bevaret.
   Apple-ændringer. `codemagic.yaml` er urørt. Release-commitbeskeden har nu
   `[skip ci]`; workflows har ingen aktive push/tag-triggere.
 
-## Verifikation af 7.1.1
+## Historisk verifikation før release-rettelserne
 
 Resultaterne for 4263 nedenfor må ikke bruges som bevis for denne integration.
 De nye logs og `.xcresult` ligger under `build/upstream-7.1.1-integration/`.
@@ -120,9 +232,11 @@ Bevis: `build/migration-v27-v32-audit/summary.json`, `authoritative.log` og
 `reopen.log`. Dette er macOS-migrationsbevis, ikke test på alle understøttede
 fysiske iOS-versioner.
 
-## Åbne fund og releaseblokeringer
+## Historiske fund før release-rettelserne
 
-Den fulde suite er ikke grøn. Nye fund må ikke kaldes gamle fejl alene på grund
+Dette afsnit bevarer de tidligere fejl og vurderinger. Deres aktuelle status
+fremgår af rettelsesafsnittet ovenfor; de er ikke slettet fra historikken.
+Den daværende fulde suite var ikke grøn. Nye fund må ikke kaldes gamle fejl alene på grund
 af tidligere suiteproblemer. Sammenligningen bruger den oprindelige rå log
 `../xdripswift/build/local-setup-20260923/logs/all-xctest-iphone17.log` og den nye
 resultatpakke (`baseline-comparison.json`):
@@ -180,7 +294,8 @@ buildnummer hos Apple. Browserkontrollen afviste adgang til App Store Connect;
 der er ikke forsøgt omgåelse, og der er ikke gættet på 4264 eller kopieret et
 upstream-buildnummer. Når det er afklaret, sættes nummeret i den versionerede
 `xDrip/Version.xcconfig` **før** release-scriptets tests, checkpoint/push, tag og
-arkiv/IPA fra tagget. Upload kræver et nyt, særskilt **GO UPLOAD** for denne version.
+arkiv/IPA fra tagget. Brugerens senere “opload” godkender upload af denne version; Apple-nummeret og
+den faste releaseproces mangler fortsat som beskrevet ovenfor.
 
 ---
 
