@@ -1,6 +1,6 @@
 # Projektstatus – officiel 7.1.1-integration
 
-Opdateret 24. september 2026. Den officielle opdatering er integreret lokalt på
+Opdateret 24. september 2026. Den officielle opdatering er integreret på
 `integration/upstream-7.1.1` i `../xdripswift-upstream-7.1.1`.
 **Dette er ikke en TestFlight-udgivelse. Der er ikke uploadet eller installeret
 noget på fysiske enheder.** 7.0.0 (4263) er fortsat det seneste bekræftede
@@ -11,7 +11,12 @@ Internal / Testing-build; dets historiske kildebeskrivelse nedenfor er bevaret.
 - Uændret checkpoint før opdateringen: `checkpoint/post-testflight-4263`,
   `5a0ce985c86909e3827970f4487ca573bd46a7a5`.
 - Officiel kilde: `JohanDegraeve/xdripswift`, tag **7.1.1**, verificeret til
-  `c268542e64626c564e626658fa9a6b90a059ada4`. Det lokale reference-tag hedder
+  `c268542e64626c564e626658fa9a6b90a059ada4`.
+- Integrationskodecommit: **`a0a4a101c921b41e2942873f2bf58883bddb707f`**,
+  med checkpointet og det officielle tag-commit som de to forældre. Det er et
+  integrationscheckpoint, ikke et release-tag. Denne efterfølgende statusændring
+  ændrer kun dokumentation.
+  Det lokale reference-tag hedder
   `upstream/7.1.1`; det er ikke et TestFlight-tag og pushes ikke.
 - Der er foretaget en konkret trevejssammenfletning, ikke en erstatning med
   upstream-filer. De 16 konfliktfiler er løst enkeltvis.
@@ -43,6 +48,11 @@ Internal / Testing-build; dets historiske kildebeskrivelse nedenfor er bevaret.
 - Testens telefonparser har fået det krævede `newestReadingDate`-argument.
   En forældet logfilter-forventning er tilpasset det officielle format, hvor
   enheden står i rapporthovedet. Ingen test er deaktiveret.
+- Resultatparseren skelner nu mellem XCTest-klassen og dens extensions, når
+  upstream placerer flere testklasser i samme Swift-fil. De syv nye
+  `RootHomeStatisticsEasterEggTests` tilskrives ikke længere fejlagtigt
+  `RootHomeInteractionTests`. Intet krav eller testudvalg er fjernet;
+  parserens syntetiske ejerskabs-/resultatkontroller er udvidet til 30.
 - Mac-værktøjer og signeringsopsætning er genbrugt uden installationer eller
   Apple-ændringer. `codemagic.yaml` er urørt. Release-commitbeskeden har nu
   `[skip ci]`; workflows har ingen aktive push/tag-triggere.
@@ -53,7 +63,46 @@ Resultaterne for 4263 nedenfor må ikke bruges som bevis for denne integration.
 De nye logs og `.xcresult` ligger under `build/upstream-7.1.1-integration/`.
 Den første kompilering stoppede ved det nye parserargument; den er bevaret i
 `initial-full/`. Den efterfølgende fulde suite og den afsluttende Watch-regression
-rapporteres separat nedenfor, når Xcodes resultater er færdigskrevet.
+rapporteres separat:
+
+| Kørsel | Faktisk resultat | Bevis |
+| --- | --- | --- |
+| Fuld `xdripTests`, før logtest-tilpasning | **972 udført; 962 bestået, 10 fejlet, 0 skipped** | `full-v2/results/AllTests.xcresult`, `full-v2-summary.json`, `full-v2-test-tree.json` |
+| Afsluttende otte Watch/Libre-suiter | **484 udført; 484 bestået, 0 fejlet, 0 skipped**, bekræftet i færdig `.xcresult` og parser | `final-ci/results/Verification.xcresult`, `final-ci/results/stability-summary.json`, `final-ci/logs/xctest-verification.log` |
+| Officiel Dexcom G7-statustest med engelsk sprog | **1/1 bestået** | `english-status.xcresult`, `english-status-summary.json` |
+| Offline Python-kontroller | **12/12, 30/30, 17/17 og 8/8** | `python-final/logs/` |
+
+Den fulde suites afsluttende konsollinje talte kun sidste test-host-proces
+(748 tests); de **972** ovenfor er Xcodes samlede `.xcresult` inklusive
+host-genstarter. Den fulde suite er ikke efterfølgende omklassificeret som grøn.
+Appkoden er den samme i fuld kørsel og afsluttende regression; logtestens
+forventning og resultatparseren er de beskrevne efterfølgende testværktøjstilpasninger.
+Alle 617 kilde-/test-/projekt-/modelhashes fra den afsluttende kandidat blev
+kontrolleret uændrede ved integrationens commit. Manifestet er
+`tested-source-hashes.json`; testens oprindelige Git HEAD var basiscommitten,
+fordi sammenfletningen endnu ikke var committet, da XCTest startede.
+
+Den afsluttende udvælgelse består af `LibreWatchValuePipelineTests` 259,
+`TroubleshootingLogTests` 87, `WatchRefreshCoordinatorTests` 41,
+`WatchPhoneRefreshServiceTests` 25, `WatchSnapshotSemanticsTests` 6,
+`WatchDeliveryEvidenceTests` 30, `NightscoutHistoryWriteTests` 20 og
+`RootHomeInteractionTests` 16. De otte `testSubmission…`-metoder og
+`testSubmissionRestoreSelectsNewerFileReadingAfterInitialReadFailure`, som
+navngives i 4263-afsnittet nedenfor, er genkørt og bestået i denne integration.
+Den nye `testHealthKitCadenceDeletionRetainsOtherRevisionsAndSurvivesRestart`
+er også bestået. Dette er nye resultater, ikke genbrug af de historiske 475/475.
+
+Den fulde kørsel indeholder desuden blandt andet beståede officielle suites:
+`BasalInjectionTests` 24/24, `BatteryHistoryTests` 20/20,
+`BgReadingTrendTests` 4/4, `BluetoothSignalStrengthTests` 17/17,
+`GMIStatisticsTests` 6/6, `Libre2FrameAssemblerTests` 3/3,
+`LiveActivityWarmupTests` 7/7, `TherapyMetricsTests` 48/48 og
+`RootHomeStatisticsEasterEggTests` 7/7. Ingen fysiske enheder eller
+personlige testdata blev brugt.
+
+Xcodes efterfølgende simulator-diagnoseindsamling bruger igen op til 600 sekunder
+og kan melde timeout, ligesom baseline. XCTest-resultaterne ovenfor kommer fra
+selve testkørslerne; diagnoseindsamlingen er ikke talt som beståede tests.
 
 Begge separate simulatorbuilds er bestået (iPhone `xdrip` og Watch
 `xDrip Watch App`), med logs i `simulator-builds/logs/`. Kontrollen i
@@ -74,7 +123,31 @@ fysiske iOS-versioner.
 ## Åbne fund og releaseblokeringer
 
 Den fulde suite er ikke grøn. Nye fund må ikke kaldes gamle fejl alene på grund
-af tidligere suiteproblemer. Følgende er holdt adskilt fra integrationen:
+af tidligere suiteproblemer. Sammenligningen bruger den oprindelige rå log
+`../xdripswift/build/local-setup-20260923/logs/all-xctest-iphone17.log` og den nye
+resultatpakke (`baseline-comparison.json`):
+
+| Test | Sammenligning/status |
+| --- | --- |
+| `BluetoothPeripheralDisplayStatusTests.testNewPeripheralPersistsFalseActivationSuccessByDefault` | Tidligere fejlet, nu bestået. |
+| `DexcomG6SensorLabelTests.testDecodesAllObservedSensorLabels` | Samme tre strengafvigelser som baseline; stadig fejlet. |
+| `DexcomG6SensorLabelTests.testRoundTripsSensorStartMetadataThroughCoreData` | Samme Core Data 133000-fejl som baseline. |
+| `DexcomG6SensorLabelTests.testMigratesExistingSensorFromV26ToV27` | Crash; den gamle rå log viser også host-genstart ved denne metode, selv om den tidligere oversigt ikke navngav den. Den særskilte v27→v32-migration ovenfor er en anden test. |
+| `CareLinkTests.testBlockedTherapyImportCannotBlockGlucoseOrAnotherPoll` | Tidligere crash; nu assertion-fejl. Fejltypen er ændret og fortsat åben. |
+| `CareLinkTests.testSlowLogoutCannotClearANewerSession` | Tidligere bestået, nu crash. **Ny uafklaret regression**, ikke mærket som kendt baselinefejl. |
+| `DexcomG6SensorLabelTests.testRoundTripsDexcomG7LabelAndConnectionSettingsThroughCoreData` | Ny officiel test fejler med Core Data 133000; ingen tilsvarende baseline-metode. Uafklaret. |
+| `DexcomG7CalibrationTests.testCalibrationStatusShortDescriptionsAndSubmissionGating` | Fejler på danske strenge; uændret test består med engelsk sprog. |
+| `GlucoseRangeDistributionTests.testClinicalTIRBucketsShareWholePercentAndMinuteAllocation` og `testLargestRemainderPreventsIndependentRoundingFromProducing101Percent` | To nye officielle testfejl, reproduceret fra uændret upstream-kode. |
+| `TroubleshootingLogTests.testActivityLogFilterMatchesRenderedMessagesAndRestoresFullListForBlankText` | Fejlede i fuld kørsel; logformat-forventningen er tilpasset, og testen består i afsluttende regression. |
+
+De fem tidligere CareLink-crashmetoder `testAllPersonalGlucoseFamilies`,
+`testCarePartnerResolvesLinkedPatientsAndScopesPeriodicRequest`,
+`testPeriodicCompatibilityEndpointFallback`,
+`testPumpOnlyPeriodicPayloadRemainsUsableDuringSensorGap` og
+`testSuccessfulEmptyRouteTakesPrecedenceOverLaterFallbackErrors` består nu.
+Ingen af disse resultater ændrer den historiske 4263-rapport.
+
+Følgende er holdt adskilt fra integrationen:
 
 - Officiel afrundingskode giver `[3, 88, 9]`, hvor to nye tests forventer
   `[4, 87, 9]`. Uændrede kilde-/testfiler er sammenlignet byte-for-byte med
