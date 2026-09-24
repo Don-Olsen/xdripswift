@@ -1149,7 +1149,18 @@ final class GlucoseChartStateManager: ObservableObject, @unchecked Sendable {
         var mapped = [CachedTreatment]()
 
         context.performAndWait {
-            mapped = treatments.map {
+            let importer = HealthKitTherapyImportManager.shared
+            let eligibleHealthIDs = Set(TherapyMetricsManager.eligibleTreatments(
+                treatments.filter { !$0.treatmentdeleted && ($0.treatmentType == .Insulin || $0.treatmentType == .Carbs) },
+                policy: UserDefaults.standard.dataFlowPolicy,
+                insulinSource: importer.selectedSource(.insulin)?.bundleIdentifier,
+                carbsSource: importer.selectedSource(.carbohydrates)?.bundleIdentifier,
+                insulinEnabled: importer.isEnabled(.insulin),
+                carbsEnabled: importer.isEnabled(.carbohydrates)
+            ).compactMap(\.healthKitSampleUUID))
+            mapped = treatments.filter { entry in
+                !entry.isHealthKitImported || (entry.healthKitSampleUUID.map { eligibleHealthIDs.contains($0) } ?? false)
+            }.map {
                 CachedTreatment(date: $0.date, value: $0.value, valueSecondary: $0.valueSecondary, type: $0.treatmentType, isDeleted: $0.treatmentdeleted, notes: $0.notes)
             }.sorted { $0.date < $1.date }
         }

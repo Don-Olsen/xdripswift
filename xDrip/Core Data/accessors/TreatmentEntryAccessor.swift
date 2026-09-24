@@ -48,6 +48,13 @@ class TreatmentEntryAccessor {
         return getLatestTreatments(limit:limit, howOld:nil)
     }
 
+    /// HealthKit treatment import is local-only. Exclude it in the fetch predicate,
+    /// before applying Nightscout's limit, so imported rows cannot crowd out
+    /// manual treatments waiting to sync.
+    func getLatestTreatmentsForNightscout(limit: Int) -> [TreatmentEntry] {
+        fetchTreatments(limit: limit, fromDate: nil, excludingHealthKit: true)
+    }
+
     /// Gives treatments with maximumDays old
     ///
     /// - parameters:
@@ -306,16 +313,21 @@ class TreatmentEntryAccessor {
     ///     - fromDate : if specified, only return readings with timestamp > fromDate
     /// - returns:
     ///     List of treatments, descending, ie first is youngest
-    private func fetchTreatments(limit:Int?, fromDate:Date?) -> [TreatmentEntry] {
+    private func fetchTreatments(limit:Int?, fromDate:Date?, excludingHealthKit: Bool = false) -> [TreatmentEntry] {
         let fetchRequest: NSFetchRequest<TreatmentEntry> = TreatmentEntry.fetchRequest()
         fetchRequest.sortDescriptors = [NSSortDescriptor(key: #keyPath(TreatmentEntry.date), ascending: false)]
         fetchRequest.returnsObjectsAsFaults = false
         fetchRequest.includesPropertyValues = true
 
-        // if fromDate specified then create predicate
+        var predicates: [NSPredicate] = []
         if let fromDate = fromDate {
-            let predicate = NSPredicate(format: "date > %@", fromDate as NSDate)
-            fetchRequest.predicate = predicate
+            predicates.append(NSPredicate(format: "date > %@", fromDate as NSDate))
+        }
+        if excludingHealthKit {
+            predicates.append(NSPredicate(format: "healthKitSampleUUID == nil"))
+        }
+        if !predicates.isEmpty {
+            fetchRequest.predicate = NSCompoundPredicate(andPredicateWithSubpredicates: predicates)
         }
 
         // set fetchLimit

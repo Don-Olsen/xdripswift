@@ -27,6 +27,8 @@ final class BatteryHistoryTests: XCTestCase {
         for key in ["nightscoutFollowerGapFillCoverageV2", "nightscoutFollowerGapFillSite",
                     "nightscoutFollowerGapFillLastAuditEndDate", "careLinkTimestampRepairCompleted",
                     "careLinkPatientAliases", "pendingHealthKitReplacements", "healthKitSyncVersion",
+                    "healthTherapyImport.v1.insulin.enabled", "healthTherapyImport.v1.carbs.anchor",
+                    "healthTherapyImport.v1.insulin.selectedSource",
                     "dexcomG7PairingCode-ABC", "dexcomG7BluetoothSlot-ABC", "m5StackWiFiPassword1",
                     "m5StackWiFiPassword2", "m5StackWiFiPassword3", "careLinkPassword"] {
             XCTAssertFalse(BackupService.isPortableSetting(key), key)
@@ -34,6 +36,63 @@ final class BatteryHistoryTests: XCTestCase {
         for key in ["speakReadingsScheduleEnabled", "localInsulinPeak", "showIOBCOB", "carPlayLiveActivityType"] {
             XCTAssertTrue(BackupService.isPortableSetting(key), key)
         }
+    }
+
+    @MainActor
+    func testHealthKitTreatmentBackupPreservesProvenanceAndDistinctSameTimeEntries() async throws {
+        let source = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let context = source.mainManagedObjectContext
+        let sampleUUIDs = [UUID().uuidString, UUID().uuidString]
+        for (index, uuid) in sampleUUIDs.enumerated() {
+            let treatment = TreatmentEntry(
+                date: now, value: 2, valueSecondary: 0, treatmentType: .Insulin,
+                nightscoutEventType: nil, enteredBy: "Apple Health", nsManagedObjectContext: context
+            )
+            treatment.healthKitSampleUUID = uuid
+            treatment.healthKitSourceBundleIdentifier = "com.example.therapy"
+            treatment.healthKitExternalUUID = "external-\(index)"
+            treatment.healthKitSyncIdentifier = "sync-\(index)"
+        }
+        _ = TreatmentEntry(date: now, value: 2, valueSecondary: 0, treatmentType: .Insulin,
+                           nightscoutEventType: nil, enteredBy: nil, nsManagedObjectContext: context)
+        XCTAssertTrue(source.saveChangesSynchronously())
+
+        let exporter = BackupService(coreDataManager: source)
+        let archive = try await exporter.createBackup(options: BackupOptions(
+            includesSettings: false, includesAccounts: false, includesBgReadings: false, includesTreatments: true
+        ))
+        defer { try? FileManager.default.removeItem(at: archive.url) }
+        let inspection = try exporter.inspectBackup(at: archive.url)
+        XCTAssertEqual(inspection.payload.treatments.count, 3)
+
+        let destination = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let importer = BackupService(coreDataManager: destination)
+        _ = try await importer.restore(inspection: inspection, mode: .keepCurrent,
+                                       restoresSettings: false, restoredAccountCategories: [])
+        _ = try await importer.restore(inspection: inspection, mode: .keepCurrent,
+                                       restoresSettings: false, restoredAccountCategories: [])
+        let restored = try destination.mainManagedObjectContext.fetch(TreatmentEntry.fetchRequest())
+        XCTAssertEqual(restored.count, 3)
+        XCTAssertEqual(Set(restored.compactMap(\.healthKitSampleUUID)), Set(sampleUUIDs))
+        XCTAssertEqual(restored.filter { $0.healthKitSampleUUID == nil }.count, 1)
+        for (index, uuid) in sampleUUIDs.enumerated() {
+            let treatment = try XCTUnwrap(restored.first { $0.healthKitSampleUUID == uuid })
+            XCTAssertEqual(treatment.healthKitSourceBundleIdentifier, "com.example.therapy")
+            XCTAssertEqual(treatment.healthKitExternalUUID, "external-\(index)")
+            XCTAssertEqual(treatment.healthKitSyncIdentifier, "sync-\(index)")
+        }
+
+        let encoded = try JSONEncoder().encode(try XCTUnwrap(inspection.payload.treatments.first))
+        var legacyObject = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        for key in ["healthKitSampleUUID", "healthKitSourceBundleIdentifier", "healthKitExternalUUID", "healthKitSyncIdentifier"] {
+            legacyObject.removeValue(forKey: key)
+        }
+        let legacy = try JSONDecoder().decode(BackupTreatment.self,
+                                              from: JSONSerialization.data(withJSONObject: legacyObject))
+        XCTAssertNil(legacy.healthKitSampleUUID)
+        XCTAssertNil(legacy.healthKitSourceBundleIdentifier)
+        XCTAssertNil(legacy.healthKitExternalUUID)
+        XCTAssertNil(legacy.healthKitSyncIdentifier)
     }
 
     @MainActor

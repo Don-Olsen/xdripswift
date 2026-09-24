@@ -898,14 +898,14 @@ public class NightscoutSyncManager: NSObject, ObservableObject {
         
         // get the latest treatments from the last maxTreatmentsDaysToUpload days
         // this includes treatments in with treatmentDeleted = true
-        let treatmentsToSync = treatmentEntryAccessor.getLatestTreatments(limit: ConstantsNightscout.maxTreatmentsToUpload)
+        let treatmentsToSync = treatmentEntryAccessor.getLatestTreatmentsForNightscout(limit: ConstantsNightscout.maxTreatmentsToUpload)
         
         // **************************************************************************************************
         // start with uploading treatments that are in status not uploaded and have no id yet (ie never uploaded to NS before) - and off course not deleted
         // **************************************************************************************************
         trace("in syncWithNightscout, calling uploadTreatmentsToNightscout", log: oslog, category: ConstantsLog.categoryNightscoutSyncManager, type: .debug)
         
-        uploadTreatmentsToNightscout(treatmentsToUpload: treatmentsToSync.filter { treatment in treatment.id == TreatmentEntry.EmptyId && !treatment.uploaded && !treatment.treatmentdeleted }) { nightscoutResult in
+        uploadTreatmentsToNightscout(treatmentsToUpload: treatmentsToSync.filter { treatment in !treatment.isHealthKitImported && treatment.id == TreatmentEntry.EmptyId && !treatment.uploaded && !treatment.treatmentdeleted }) { nightscoutResult in
             
             trace("in syncWithNightscout, uploadTreatmentsToNightscout result = %{public}@", log: self.oslog, category: ConstantsLog.categoryNightscoutSyncManager, type: .debug, nightscoutResult.description())
             
@@ -917,7 +917,7 @@ public class NightscoutSyncManager: NSObject, ObservableObject {
                 // *********************************************************************
                 
                 // create new array of treatmentEntries to update - they will be processed one by one, a processed element is removed from treatmentsToUpdate
-                var treatmentsToUpdate = treatmentsToSync.filter { treatment in treatment.id != TreatmentEntry.EmptyId && !treatment.uploaded && !treatment.treatmentdeleted }
+                var treatmentsToUpdate = treatmentsToSync.filter { treatment in !treatment.isHealthKitImported && treatment.id != TreatmentEntry.EmptyId && !treatment.uploaded && !treatment.treatmentdeleted }
                 
                 if treatmentsToUpdate.count > 0 {
                     trace("in syncWithNightscout, uploadTreatmentsToNightscout, there are %{public}@ treatments to be updated", log: self.oslog, category: ConstantsLog.categoryNightscoutSyncManager, type: .info, treatmentsToUpdate.count.description)
@@ -967,7 +967,7 @@ public class NightscoutSyncManager: NSObject, ObservableObject {
                                 // delete treatments
                                 // *********************************************************************
                                 // create new array of treatmentEntries to delete - they will be processed one by one, a processed element is removed from treatmentsToDelete
-                                var treatmentsToDelete = treatmentsToSync.filter { treatment in treatment.treatmentdeleted && !treatment.uploaded }
+                                var treatmentsToDelete = treatmentsToSync.filter { treatment in !treatment.isHealthKitImported && treatment.treatmentdeleted && !treatment.uploaded }
                                 
                                 if treatmentsToDelete.count > 0 {
                                     trace("in updateTreatment, there are %{public}@ treatments to be deleted", log: self.oslog, category: ConstantsLog.categoryNightscoutSyncManager, type: .info, treatmentsToDelete.count.description)
@@ -1579,7 +1579,7 @@ public class NightscoutSyncManager: NSObject, ObservableObject {
         // Use the same time window as the download. Older history is outside this sync pass.
         let earliestDate = Date().addingTimeInterval(-ConstantsNightscout.maxHoursTreatmentsToDownload * 3600)
         let candidates = treatments.filter {
-            $0.uploaded && !$0.treatmentdeleted && !$0.isDeleted && $0.id != TreatmentEntry.EmptyId
+            !$0.isHealthKitImported && $0.uploaded && !$0.treatmentdeleted && !$0.isDeleted && $0.id != TreatmentEntry.EmptyId
                 && $0.date >= earliestDate && !presentIDs.contains($0.id)
         }
         // A Nightscout record can have several local components. Check its id only once.
@@ -1611,7 +1611,7 @@ public class NightscoutSyncManager: NSObject, ObservableObject {
                        let records = try? JSONSerialization.jsonObject(with: data) as? [Any], records.isEmpty {
                         for treatment in grouped[remoteID] ?? [] {
                             // The user may have edited or deleted the entry while the request ran.
-                            guard !treatment.isDeleted, treatment.uploaded, !treatment.treatmentdeleted,
+                            guard !treatment.isDeleted, !treatment.isHealthKitImported, treatment.uploaded, !treatment.treatmentdeleted,
                                   treatment.id == remoteID + treatment.treatmentType.idExtension() else { continue }
                             // Keep uploaded true: the remote deletion is confirmed, so no DELETE is queued.
                             treatment.treatmentdeleted = true
@@ -2123,6 +2123,9 @@ public class NightscoutSyncManager: NSObject, ObservableObject {
     ///     - completionHandler : to be called after completion, takes NightscoutResult as argument
     ///     - treatmentsToUpload : Treatments to upload
     private func uploadTreatmentsToNightscout(treatmentsToUpload: [TreatmentEntry], completionHandler: @escaping (_ nightscoutResult: NightscoutResult) -> Void) {
+        // Keep the local HealthKit read path separate from the Nightscout write path,
+        // even when this method is called independently of the normal sync filter.
+        let treatmentsToUpload = treatmentsToUpload.filter { !$0.isHealthKitImported }
         guard treatmentsToUpload.count > 0 else {
             trace("in uploadTreatmentsToNightscout, no treatments to upload", log: oslog, category: ConstantsLog.categoryNightscoutSyncManager, type: .debug)
             
@@ -2232,6 +2235,10 @@ public class NightscoutSyncManager: NSObject, ObservableObject {
     ///     - completionHandler : to be called after completion, takes NightscoutResult as argument
     ///     - treatmentToUpdate : Treatment to update
     private func updateTreatmentToNightscout(treatmentToUpdate: TreatmentEntry, completionHandler: @escaping (_ nightscoutResult: NightscoutResult) -> Void) {
+        guard !treatmentToUpdate.isHealthKitImported else {
+            completionHandler(.success(0))
+            return
+        }
         trace("in updateTreatmentsToNightscout", log: oslog, category: ConstantsLog.categoryNightscoutSyncManager, type: .info)
         
         // treatmentToUpdate as dictionary
@@ -2243,7 +2250,7 @@ public class NightscoutSyncManager: NSObject, ObservableObject {
         var otherTreatmentEntries: [TreatmentEntry] = []
         let treatmentToUpdateIdSplitted = treatmentToUpdate.id.split(separator: "-")
         if treatmentToUpdateIdSplitted.count > 0 {
-            otherTreatmentEntries = treatmentEntryAccessor.getTreatments(thatContainId: String(treatmentToUpdateIdSplitted[0])).filter { treatment in !treatment.treatmentdeleted }
+            otherTreatmentEntries = treatmentEntryAccessor.getTreatments(thatContainId: String(treatmentToUpdateIdSplitted[0])).filter { treatment in !treatment.isHealthKitImported && !treatment.treatmentdeleted }
         }
         
         // iterate through otherTreatmentEntries with the same starting id (ie id that starts with same string ad treatment to delete)
@@ -2285,6 +2292,10 @@ public class NightscoutSyncManager: NSObject, ObservableObject {
     ///     - completionHandler : to be called after completion, takes NightscoutResult as argument
     ///     - treatmentToDelete : Treatment to delete
     private func deleteTreatmentAtNightscout(treatmentToDelete: TreatmentEntry, completionHandler: @escaping (_ nightscoutResult: NightscoutResult) -> Void) {
+        guard !treatmentToDelete.isHealthKitImported else {
+            completionHandler(.success(0))
+            return
+        }
         trace("in deleteTreatmentAtNightscout", log: oslog, category: ConstantsLog.categoryNightscoutSyncManager, type: .info)
         
         // before deleting, check first if there's treatmenentries that have the same id (id sthat starts with same string) and if yes add them to treatmentToUploadToNightscout
@@ -2294,7 +2305,7 @@ public class NightscoutSyncManager: NSObject, ObservableObject {
         var otherTreatmentEntries: [TreatmentEntry] = []
         let treatmentToDeleteIdSplitted = treatmentToDelete.id.split(separator: "-")
         if treatmentToDeleteIdSplitted.count > 0 {
-            otherTreatmentEntries = treatmentEntryAccessor.getTreatments(thatContainId: String(treatmentToDeleteIdSplitted[0])).filter { treatment in !treatment.treatmentdeleted || (treatment.treatmentdeleted && treatment.id == treatmentToDelete.id) }
+            otherTreatmentEntries = treatmentEntryAccessor.getTreatments(thatContainId: String(treatmentToDeleteIdSplitted[0])).filter { treatment in !treatment.isHealthKitImported && (!treatment.treatmentdeleted || (treatment.treatmentdeleted && treatment.id == treatmentToDelete.id)) }
         }
         
         // if otherTreatmentEntries size > 1, then the treatmentToDelete will not be deleted, but an update will be sent to Nightscout, with the other treatments with same starting id, in this update, and wihtout the treatment to be deleted
@@ -2390,6 +2401,7 @@ public class NightscoutSyncManager: NSObject, ObservableObject {
         
         // iterate through treatmentEntries
         for treatmentEntry in treatmentEntries {
+            guard !treatmentEntry.isHealthKitImported else { continue }
             // only handle treatmentEntries that are already uploaded
             if treatmentEntry.uploaded && treatmentEntry.id != TreatmentEntry.EmptyId {
                 for treatmentNSResponse in treatmentNSResponses {
@@ -2461,6 +2473,7 @@ public class NightscoutSyncManager: NSObject, ObservableObject {
         var amountOfNewTreatmentEntries = 0
         
         for treatmentEntry in treatmentEntries {
+            guard !treatmentEntry.isHealthKitImported else { continue }
             if !treatmentEntry.uploaded && treatmentEntry.id == TreatmentEntry.EmptyId {
                 for treatmentNSResponse in treatmentNSResponses {
                     if treatmentNSResponse.matchesTreatmentEntry(treatmentEntry) {

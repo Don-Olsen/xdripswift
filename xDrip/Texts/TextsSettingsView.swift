@@ -647,6 +647,87 @@ class Texts_SettingsView {
     static let labelHealthKit: String = {
         return NSLocalizedString("settingsviews_healthkit", tableName: filename, bundle: Bundle.main, value: "Write to Apple Health", comment: "healthkit settings, literally 'healthkit'")
     }()
+
+    static let healthKitImportBolusInsulin = NSLocalizedString(
+        "settingsviews_healthkit_import_bolus", tableName: filename, bundle: Bundle.main,
+        value: "Import bolus insulin", comment: "opt-in Apple Health insulin import switch"
+    )
+
+    static let healthKitImportCarbohydrates = NSLocalizedString(
+        "settingsviews_healthkit_import_carbohydrates", tableName: filename, bundle: Bundle.main,
+        value: "Import carbohydrates", comment: "opt-in Apple Health carbohydrate import switch"
+    )
+
+    static let healthKitInsulinSource = NSLocalizedString(
+        "settingsviews_healthkit_insulin_source", tableName: filename, bundle: Bundle.main,
+        value: "Insulin source", comment: "choose the Apple Health source for bolus insulin"
+    )
+
+    static let healthKitCarbohydrateSource = NSLocalizedString(
+        "settingsviews_healthkit_carbohydrate_source", tableName: filename, bundle: Bundle.main,
+        value: "Carbohydrate source", comment: "choose the Apple Health source for carbohydrates"
+    )
+
+    static let healthKitInsulinStatus = NSLocalizedString(
+        "settingsviews_healthkit_insulin_status", tableName: filename, bundle: Bundle.main,
+        value: "Insulin import", comment: "Apple Health insulin import status"
+    )
+
+    static let healthKitCarbohydrateStatus = NSLocalizedString(
+        "settingsviews_healthkit_carbohydrate_status", tableName: filename, bundle: Bundle.main,
+        value: "Carbohydrate import", comment: "Apple Health carbohydrate import status"
+    )
+
+    static let healthKitChooseSource = NSLocalizedString(
+        "settingsviews_healthkit_choose_source", tableName: filename, bundle: Bundle.main,
+        value: "Choose a source", comment: "no Apple Health import source has been selected"
+    )
+
+    static let healthKitFindingSources = NSLocalizedString(
+        "settingsviews_healthkit_finding_sources", tableName: filename, bundle: Bundle.main,
+        value: "Finding sources…", comment: "Apple Health source discovery is underway"
+    )
+
+    static let healthKitNoSources = NSLocalizedString(
+        "settingsviews_healthkit_no_sources", tableName: filename, bundle: Bundle.main,
+        value: "No readable sources found yet", comment: "Apple Health has not returned a source for this sample type"
+    )
+
+    static let healthKitRefreshSources = NSLocalizedString(
+        "settingsviews_healthkit_refresh_sources", tableName: filename, bundle: Bundle.main,
+        value: "Refresh sources", comment: "retry Apple Health source discovery"
+    )
+
+    static let healthKitSourceHint = NSLocalizedString(
+        "settingsviews_healthkit_source_hint", tableName: filename, bundle: Bundle.main,
+        value: "Choose the app or device that wrote this data to Apple Health", comment: "accessibility hint for the Health source picker"
+    )
+
+    static let healthKitNeverSynced = NSLocalizedString(
+        "settingsviews_healthkit_never_synced", tableName: filename, bundle: Bundle.main,
+        value: "Never synchronized", comment: "Apple Health import has not completed a synchronization"
+    )
+
+    static let healthKitLastSyncFormat = NSLocalizedString(
+        "settingsviews_healthkit_last_sync_format", tableName: filename, bundle: Bundle.main,
+        value: "Last sync: %@", comment: "last Apple Health import synchronization date and time"
+    )
+
+    static let healthKitImportDisabled = NSLocalizedString(
+        "settingsviews_healthkit_import_disabled", tableName: filename, bundle: Bundle.main,
+        value: "Import is off", comment: "Apple Health treatment import is disabled"
+    )
+
+    static let healthKitImportError = NSLocalizedString(
+        "settingsviews_healthkit_import_error", tableName: filename, bundle: Bundle.main,
+        value: "Apple Health import", comment: "title for an Apple Health import error"
+    )
+
+    static let healthKitTherapyImportExplanation = NSLocalizedString(
+        "settingsviews_healthkit_therapy_import_explanation", tableName: filename, bundle: Bundle.main,
+        value: "Import reads only from your chosen Apple Health sources. Unclassified insulin is excluded from IOB. Apple Health may limit what can be read; a completed permission dialog does not prove all entries are available.",
+        comment: "explains treatment import, ambiguous insulin and limits of HealthKit read authorization"
+    )
     
     // MARK: - Section Dexcom Share (including Share Follower)
     

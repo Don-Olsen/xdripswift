@@ -94,7 +94,7 @@
 	<key>NSContactsUsageDescription</key>
 	<string>To update the contact photo with an image showing the current BG values</string>
 	<key>NSHealthShareUsageDescription</key>
-	<string>Store bloodglucose readings</string>
+	<string>Read bolus insulin doses and carbohydrate entries from the Apple Health sources you choose to calculate IOB and COB in xDrip.</string>
 	<key>NSHealthUpdateUsageDescription</key>
 	<string>Store bloodglucose readings</string>
 	<key>NSSupportsLiveActivities</key>

@@ -111,10 +111,12 @@ final class TherapyMetricsManager {
         let recentEntries = needsInputs && historical ? treatments(from: currentDate.addingTimeInterval(-window),
             to: currentDate, policy: policy, settings: settings) : []
         return Self.resolve(at: date, external: status, policy: policy, settings: settings, entries: entries,
-            currentDate: currentDate, recentEntries: recentEntries)
+            currentDate: currentDate, recentEntries: recentEntries,
+            localIOBAvailable: !HealthKitTherapyImportManager.shared.localInputIsIncomplete(.insulin),
+            localCOBAvailable: !HealthKitTherapyImportManager.shared.localInputIsIncomplete(.carbohydrates))
     }
 
-    static func resolve(at date: Date, external status: AIDStatus?, policy: DataFlowPolicy, settings: TherapyModelSettings, entries: [TherapyTreatment]?, currentDate: Date? = nil, recentEntries: [TherapyTreatment]? = []) -> TherapyMetricsSnapshot {
+    static func resolve(at date: Date, external status: AIDStatus?, policy: DataFlowPolicy, settings: TherapyModelSettings, entries: [TherapyTreatment]?, currentDate: Date? = nil, recentEntries: [TherapyTreatment]? = [], localIOBAvailable: Bool = true, localCOBAvailable: Bool = true) -> TherapyMetricsSnapshot {
         var result = TherapyMetricsSnapshot.external(status, at: date)
         // Ownership is configured capability, even when a poll has returned no status at all.
         if let source = policy.externalIOBSource {
@@ -126,10 +128,10 @@ final class TherapyMetricsManager {
             if status == nil { result.cob.reason = .missingExternalData }
         }
         if policy.externalIOBSource == nil {
-            result.iob = Self.localMetric(entries: entries, isIOB: true, date: date, settings: settings, currentDate: currentDate, recentEntries: recentEntries)
+            result.iob = Self.localMetric(entries: localIOBAvailable ? entries : nil, isIOB: true, date: date, settings: settings, currentDate: currentDate, recentEntries: localIOBAvailable ? recentEntries : nil)
         }
         if policy.externalCOBSource == nil {
-            result.cob = Self.localMetric(entries: entries, isIOB: false, date: date, settings: settings, currentDate: currentDate, recentEntries: recentEntries)
+            result.cob = Self.localMetric(entries: localCOBAvailable ? entries : nil, isIOB: false, date: date, settings: settings, currentDate: currentDate, recentEntries: localCOBAvailable ? recentEntries : nil)
         }
         return result
     }
@@ -223,14 +225,15 @@ final class TherapyMetricsManager {
             let request = TreatmentEntry.fetchRequest()
             request.predicate = NSPredicate(format: "date >= %@ AND date <= %@ AND (treatmentdeleted == NO OR treatmentdeleted == nil) AND treatmentType IN %@", from as NSDate, to as NSDate, [TreatmentType.Insulin.rawValue, TreatmentType.Carbs.rawValue])
             do {
-                result = try context.fetch(request).filter { entry in
-                    let careLink = entry.careLinkSourceIdentifier != nil || (entry.nightscoutEventType != nil && entry.enteredBy == "CareLink")
-                    if careLink { return policy.importsTherapyFromCareLink }
-                    // Local bolus/carb entries keep a nil remote event type through upload and
-                    // reconciliation. enteredBy is editable text, not reliable source identity.
-                    let local = entry.id.isEmpty || entry.nightscoutEventType == nil
-                    return local || policy.importsTreatmentsFromNightscout
-                }.map { TherapyTreatment(date: $0.date, amount: $0.value, isIOB: $0.treatmentType == .Insulin) }
+                let fetched = try context.fetch(request)
+                let selectedInsulin = HealthKitTherapyImportManager.shared.selectedSource(.insulin)?.bundleIdentifier
+                let selectedCarbs = HealthKitTherapyImportManager.shared.selectedSource(.carbohydrates)?.bundleIdentifier
+                let healthInsulinOn = HealthKitTherapyImportManager.shared.isEnabled(.insulin)
+                let healthCarbsOn = HealthKitTherapyImportManager.shared.isEnabled(.carbohydrates)
+                result = Self.eligibleTreatments(fetched, policy: policy,
+                    insulinSource: selectedInsulin, carbsSource: selectedCarbs,
+                    insulinEnabled: healthInsulinOn, carbsEnabled: healthCarbsOn)
+                    .map { TherapyTreatment(date: $0.date, amount: $0.value, isIOB: $0.treatmentType == .Insulin) }
             } catch { result = nil }
         }
         lock.lock()
@@ -241,6 +244,44 @@ final class TherapyMetricsManager {
         treatmentCache[cacheKey] = result
         if result == nil { failedReads[cacheKey] = Date() }
         return result
+    }
+
+    /// Source selection and cross-import precedence are pure so synthetic Core Data tests can
+    /// assert that only shared origin identifiers deduplicate. Time and dose are never identity.
+    static func eligibleTreatments(_ fetched: [TreatmentEntry], policy: DataFlowPolicy,
+                                   insulinSource: String?, carbsSource: String?,
+                                   insulinEnabled: Bool, carbsEnabled: Bool) -> [TreatmentEntry] {
+        let sourceEligible = fetched.filter { entry in
+            let careLink = entry.careLinkSourceIdentifier != nil ||
+                (entry.nightscoutEventType != nil && entry.enteredBy == "CareLink")
+            if careLink { return policy.importsTherapyFromCareLink }
+            if entry.isHealthKitImported {
+                let selected = entry.treatmentType == .Insulin ? insulinSource : carbsSource
+                let enabled = entry.treatmentType == .Insulin ? insulinEnabled : carbsEnabled
+                return enabled && selected != nil && entry.healthKitSourceBundleIdentifier == selected
+            }
+            // Local entries keep a nil remote event type through upload and reconciliation.
+            // enteredBy is editable text, not reliable source identity.
+            let local = entry.id.isEmpty || entry.nightscoutEventType == nil
+            return local || policy.importsTreatmentsFromNightscout
+        }
+        var higherPriorityIDs: [Int16: Set<String>] = [:]
+        for entry in sourceEligible where !entry.isHealthKitImported {
+            var ids = [String]()
+            if let careLinkID = entry.careLinkSourceIdentifier { ids.append(careLinkID) }
+            if !entry.id.isEmpty {
+                ids.append(entry.id)
+                let suffix = entry.treatmentType.idExtension()
+                if entry.id.hasSuffix(suffix) { ids.append(String(entry.id.dropLast(suffix.count))) }
+            }
+            higherPriorityIDs[entry.treatmentType.rawValue, default: []].formUnion(ids)
+        }
+        return sourceEligible.filter { entry in
+            guard entry.isHealthKitImported else { return true }
+            let ids = higherPriorityIDs[entry.treatmentType.rawValue] ?? []
+            return ![entry.healthKitExternalUUID, entry.healthKitSyncIdentifier]
+                .compactMap { $0 }.contains(where: ids.contains)
+        }
     }
 
     func chart(from start: Date, to end: Date) async -> TherapyChartSeries {
@@ -281,7 +322,10 @@ final class TherapyMetricsManager {
             }
         } ?? []
         guard !isCancelled() else { return TherapyChartSeries() }
-        let result = Self.chartSeries(entries: entries, statuses: statuses, policy: policy, settings: settings, start: start, end: end, currentDate: currentDate, recentEntries: recentEntries, isCancelled: isCancelled)
+        let result = Self.chartSeries(entries: entries, statuses: statuses, policy: policy, settings: settings, start: start, end: end, currentDate: currentDate, recentEntries: recentEntries,
+            localIOBAvailable: !HealthKitTherapyImportManager.shared.localInputIsIncomplete(.insulin),
+            localCOBAvailable: !HealthKitTherapyImportManager.shared.localInputIsIncomplete(.carbohydrates),
+            isCancelled: isCancelled)
         guard !isCancelled() else { return TherapyChartSeries() }
         lock.lock(); defer { lock.unlock() }
         guard generation == revision else { return TherapyChartSeries() }
@@ -289,12 +333,13 @@ final class TherapyMetricsManager {
         chartCache[cacheKey] = result
         return result
     }
-    static func chartSeries(entries: [TherapyTreatment]?, statuses: [NightscoutDeviceStatusSnapshot], policy: DataFlowPolicy, settings: TherapyModelSettings, start: Date, end: Date, currentDate: Date? = nil, recentEntries: [TherapyTreatment]? = [], isCancelled: () -> Bool = { false }) -> TherapyChartSeries {
+    static func chartSeries(entries: [TherapyTreatment]?, statuses: [NightscoutDeviceStatusSnapshot], policy: DataFlowPolicy, settings: TherapyModelSettings, start: Date, end: Date, currentDate: Date? = nil, recentEntries: [TherapyTreatment]? = [], localIOBAvailable: Bool = true, localCOBAvailable: Bool = true, isCancelled: () -> Bool = { false }) -> TherapyChartSeries {
         func series(isIOB: Bool) -> [TherapyChartPoint] {
             guard !isCancelled() else { return [] }
             if (isIOB ? policy.externalIOBSource : policy.externalCOBSource) != nil {
                 return externalChartPoints(statuses: statuses, isIOB: isIOB, start: start, end: end, isCancelled: isCancelled)
             }
+            guard isIOB ? localIOBAvailable : localCOBAvailable else { return [] }
             guard let entries else { return [] }
             var dates = Set([start, end])
             var t = ceil(start.timeIntervalSince1970 / 300) * 300

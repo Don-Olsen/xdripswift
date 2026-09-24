@@ -53,5 +53,16 @@ extension TreatmentEntry {
 
     /// Stable CareLink marker identity used to prevent duplicate imports across overlapping polls.
     @NSManaged public var careLinkSourceIdentifier: String?
+
+    /// Original HealthKit sample identity. Present only for locally imported treatments.
+    @NSManaged public var healthKitSampleUUID: String?
+
+    /// HealthKit source and cross-system identities retained for provenance/deduplication.
+    @NSManaged public var healthKitSourceBundleIdentifier: String?
+    @NSManaged public var healthKitExternalUUID: String?
+    @NSManaged public var healthKitSyncIdentifier: String?
+
+    /// HealthKit imports are read-only and must never be forwarded to Nightscout.
+    public var isHealthKitImported: Bool { healthKitSampleUUID != nil }
     
 }

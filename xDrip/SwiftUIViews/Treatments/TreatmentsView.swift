@@ -193,12 +193,14 @@ struct TreatmentsListView: View {
                             }
                         }
                         .swipeActions(edge: .trailing, allowsFullSwipe: true) {
-                            Button(role: .destructive) {
-                                viewModel.deleteTreatment(treatment)
-                            } label: {
-                                Label(Texts_Common.delete, systemImage: "trash")
+                            if !treatment.isHealthKitImported {
+                                Button(role: .destructive) {
+                                    viewModel.deleteTreatment(treatment)
+                                } label: {
+                                    Label(Texts_Common.delete, systemImage: "trash")
+                                }
+                                .tint(.red)
                             }
-                            .tint(.red)
                         }
                 }
                 .listRowBackground(Color(.secondarySystemGroupedBackground))

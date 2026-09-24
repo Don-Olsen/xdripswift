@@ -84,6 +84,18 @@ curves use the current model, not an audit trail of values previously displayed.
 
 ## Integration and freshness
 
+The optional Apple Health treatment import is described in
+[`HEALTHKIT-THERAPY-IMPORT.md`](HEALTHKIT-THERAPY-IMPORT.md). Its selected-source,
+UUID-identified point boluses and individual carbohydrate records enter the same
+local treatment inputs, with their original sample timestamps. Basal, unclear or
+interval insulin is excluded from bolus IOB. A read/write failure, unfinished
+anchored page sequence or recent unclassified record makes the affected local
+metric unavailable rather than a confident zero. Source changes retain manual
+records and apply only to Health-imported rows. Exact shared origin identifiers
+give existing external treatment records precedence; equal time and amount alone
+never merge treatments. External IOB/COB ownership and these calculation formulas
+remain unchanged.
+
 `TherapyMetricsManager` reads detached treatments on the Core Data context, resolves
 source ownership and supplies the same metrics to Home and companion payloads.
 Inputs and chart series are cached by source, settings, revision and buffered time

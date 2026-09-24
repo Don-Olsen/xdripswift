@@ -76,6 +76,7 @@ struct RootHomeView: View {
     @State private var showOriginalBGReadingsOnly = false
     @State private var chartYAxisResetRevision = 0
     @State private var showsExpandedIPadChart = false
+    @State private var healthTherapySelectionSignature = ""
     @AppStorage(UserDefaults.KeysCharts.chartWidthInHours.rawValue) private var chartWidthInHours = ConstantsGlucoseChart.defaultChartWidthInHours
     @AppStorage("showTherapySummary") private var showTherapySummary = UserDefaults.standard.showTherapySummary
     @AppStorage(UserDefaults.Key.miniChartHoursToShow.rawValue) private var miniChartHoursToShow = ConstantsGlucoseChart.miniChartHoursToShow1
@@ -88,6 +89,11 @@ struct RootHomeView: View {
     private let actions: RootHomeActions
     private let chartRefreshTimer = Timer.publish(every: ConstantsHomeView.updateHomeViewIntervalInSeconds, on: .main, in: .common).autoconnect()
     private let clockRefreshTimer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
+    private var currentHealthTherapySelectionSignature: String {
+        let importer = HealthKitTherapyImportManager.shared
+        return "\(importer.isEnabled(.insulin))|\(importer.selectedSource(.insulin)?.bundleIdentifier ?? "")|"
+            + "\(importer.isEnabled(.carbohydrates))|\(importer.selectedSource(.carbohydrates)?.bundleIdentifier ?? "")"
+    }
     private static let pannedReadingDateFormatter: DateFormatter = {
         let dateFormatter = DateFormatter()
         dateFormatter.amSymbol = ConstantsUI.timeFormatAM
@@ -134,6 +140,7 @@ struct RootHomeView: View {
         }
         .colorScheme(.dark)
         .onAppear {
+            healthTherapySelectionSignature = currentHealthTherapySelectionSignature
             scrollCoordinator.resetToNow()
             chartYAxisResetRevision &+= 1
             if state.usesScreenLockNightLayout {
@@ -153,6 +160,12 @@ struct RootHomeView: View {
         .onReceive(chartRefreshTimer) { _ in
             refreshCurrentTimeRangeIfNeeded(showsLoading: false)
             requestMiniChartState(forceReset: false)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: HealthKitTherapyImportManager.statusDidChange)) { _ in
+            let signature = currentHealthTherapySelectionSignature
+            guard signature != healthTherapySelectionSignature else { return }
+            healthTherapySelectionSignature = signature
+            requestChartState(forceReset: true, showsLoading: false)
         }
         .onReceive(clockRefreshTimer) { _ in
             if state.visibility.showsClock {

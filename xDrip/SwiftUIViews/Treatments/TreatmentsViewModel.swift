@@ -69,7 +69,14 @@ import OSLog
 
         let treatments = treatmentEntryAccessor
             .getLatestTreatments(howOld: nil)
-            .filter { !$0.treatmentdeleted }
+            .filter { entry in
+                guard !entry.treatmentdeleted else { return false }
+                guard entry.isHealthKitImported else { return true }
+                let kind: HealthTherapyImportKind = entry.treatmentType == .Insulin ? .insulin : .carbohydrates
+                let importer = HealthKitTherapyImportManager.shared
+                return importer.isEnabled(kind) &&
+                    entry.healthKitSourceBundleIdentifier == importer.selectedSource(kind)?.bundleIdentifier
+            }
             .sorted(by: { $0.date > $1.date })
 
         // Rows and edit routes retain object IDs rather than managed objects. Make those IDs
@@ -269,6 +276,7 @@ struct TreatmentSnapshot: Hashable {
     let valueSecondary: Double
     let enteredBy: String?
     let notes: String?
+    let isHealthKitImported: Bool
 
     init(treatmentEntry: TreatmentEntry) {
         objectID = treatmentEntry.objectID
@@ -278,9 +286,13 @@ struct TreatmentSnapshot: Hashable {
         valueSecondary = treatmentEntry.valueSecondary
         enteredBy = treatmentEntry.enteredBy
         notes = treatmentEntry.notes
+        isHealthKitImported = treatmentEntry.isHealthKitImported
     }
 
     var isEditable: Bool {
+        // Health-sourced values are corrected in their source app and arrive as a documented
+        // HealthKit deletion/new sample. Editing a copy would silently break provenance.
+        if isHealthKitImported { return false }
         switch treatmentType {
         case .Insulin, .BasalInjection, .Carbs, .Exercise, .BgCheck, .Note:
             return true
@@ -338,6 +350,7 @@ struct TreatmentSnapshot: Hashable {
     }
 
     var secondaryText: String? {
+        if isHealthKitImported { return enteredBy }
         if treatmentType == .Basal {
             return "\(Int(valueSecondary))\(Texts_Common.minuteshort)"
         }

@@ -536,7 +536,11 @@ final class BackupService: @unchecked Sendable {
                 treatmentType: $0.treatmentType.rawValue,
                 uploaded: $0.uploaded,
                 value: $0.value,
-                valueSecondary: $0.valueSecondary
+                valueSecondary: $0.valueSecondary,
+                healthKitSampleUUID: $0.healthKitSampleUUID,
+                healthKitSourceBundleIdentifier: $0.healthKitSourceBundleIdentifier,
+                healthKitExternalUUID: $0.healthKitExternalUUID,
+                healthKitSyncIdentifier: $0.healthKitSyncIdentifier
             )
         }
     }
@@ -795,6 +799,10 @@ final class BackupService: @unchecked Sendable {
             )
             treatment.treatmentdeleted = record.treatmentDeleted
             treatment.careLinkSourceIdentifier = record.careLinkSourceIdentifier
+            treatment.healthKitSampleUUID = record.healthKitSampleUUID
+            treatment.healthKitSourceBundleIdentifier = record.healthKitSourceBundleIdentifier
+            treatment.healthKitExternalUUID = record.healthKitExternalUUID
+            treatment.healthKitSyncIdentifier = record.healthKitSyncIdentifier
             if !record.id.isEmpty {
                 ids.insert(record.id)
             }
@@ -1044,11 +1052,20 @@ final class BackupService: @unchecked Sendable {
             treatmentType: treatment.treatmentType.rawValue,
             uploaded: treatment.uploaded,
             value: treatment.value,
-            valueSecondary: treatment.valueSecondary
+            valueSecondary: treatment.valueSecondary,
+            healthKitSampleUUID: treatment.healthKitSampleUUID,
+            healthKitSourceBundleIdentifier: treatment.healthKitSourceBundleIdentifier,
+            healthKitExternalUUID: treatment.healthKitExternalUUID,
+            healthKitSyncIdentifier: treatment.healthKitSyncIdentifier
         ))
     }
 
     private func treatmentFingerprint(_ treatment: BackupTreatment) -> String {
+        // HealthKit UUIDs, rather than rounded time and amount, distinguish repeated real
+        // doses and prevent an imported treatment from merging with a manual entry.
+        if let uuid = treatment.healthKitSampleUUID, !uuid.isEmpty {
+            return "healthkit|\(uuid)"
+        }
         let timestampBucket = Int64(treatment.date.timeIntervalSince1970 / 30)
         let notes = treatment.notes?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return "\(timestampBucket)|\(treatment.treatmentType)|\(treatment.value)|\(treatment.valueSecondary)|\(notes)"
@@ -1058,6 +1075,7 @@ final class BackupService: @unchecked Sendable {
 
     static func isPortableSetting(_ key: String) -> Bool {
         !accountKeys.contains(key) && !excludedSettingKeys.contains(key)
+            && !key.hasPrefix("healthTherapyImport.v1.")
             && !key.hasPrefix(UserDefaults.Key.dexcomG7PairingCode.rawValue + "-")
             && !key.hasPrefix(UserDefaults.Key.dexcomG7BluetoothSlot.rawValue + "-")
     }

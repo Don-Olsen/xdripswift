@@ -791,6 +791,8 @@ struct InitialCalibrationRequestGate {
         
         // setup healthkitmanager
         healthKitManager = HealthKitManager(coreDataManager: coreDataManager)
+        // Read-only insulin/carbohydrate import has its own opt-in and never gates glucose export.
+        HealthKitTherapyImportManager.shared.configure(coreDataManager: coreDataManager)
         
         // setup bgPostProcessingManager
         bgPostProcessingManager = BgPostProcessingManager(coreDataManager: coreDataManager, nightscoutSyncManager: nightscoutSyncManager, healthKitManager: healthKitManager)

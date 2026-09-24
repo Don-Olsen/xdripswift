@@ -234,6 +234,11 @@ struct BackupTreatment: Codable, Sendable {
     let careLinkSourceIdentifier: String?
     let date: Date
     let enteredBy: String?
+    // Optional so archives made before HealthKit therapy import still decode.
+    let healthKitSampleUUID: String?
+    let healthKitSourceBundleIdentifier: String?
+    let healthKitExternalUUID: String?
+    let healthKitSyncIdentifier: String?
     let id: String
     let nightscoutEventType: String?
     let notes: String?
@@ -242,6 +247,40 @@ struct BackupTreatment: Codable, Sendable {
     let uploaded: Bool
     let value: Double
     let valueSecondary: Double
+
+    init(
+        careLinkSourceIdentifier: String?,
+        date: Date,
+        enteredBy: String?,
+        id: String,
+        nightscoutEventType: String?,
+        notes: String?,
+        treatmentDeleted: Bool,
+        treatmentType: Int16,
+        uploaded: Bool,
+        value: Double,
+        valueSecondary: Double,
+        healthKitSampleUUID: String? = nil,
+        healthKitSourceBundleIdentifier: String? = nil,
+        healthKitExternalUUID: String? = nil,
+        healthKitSyncIdentifier: String? = nil
+    ) {
+        self.careLinkSourceIdentifier = careLinkSourceIdentifier
+        self.date = date
+        self.enteredBy = enteredBy
+        self.healthKitSampleUUID = healthKitSampleUUID
+        self.healthKitSourceBundleIdentifier = healthKitSourceBundleIdentifier
+        self.healthKitExternalUUID = healthKitExternalUUID
+        self.healthKitSyncIdentifier = healthKitSyncIdentifier
+        self.id = id
+        self.nightscoutEventType = nightscoutEventType
+        self.notes = notes
+        self.treatmentDeleted = treatmentDeleted
+        self.treatmentType = treatmentType
+        self.uploaded = uploaded
+        self.value = value
+        self.valueSecondary = valueSecondary
+    }
 }
 
 // The address preserves history without restoring a Bluetooth connection.
