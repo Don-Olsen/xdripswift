@@ -12,104 +12,157 @@ branchen bevarer denne vejledning og release-scriptet. Oplysningerne under
 
 ## Aktuel 7.1.1-integrationsworktree
 
-Den officielle 7.1.1-opdatering arbejdes på i
-`../xdripswift-upstream-7.1.1`, branch `integration/upstream-7.1.1`, fra
-checkpoint `5a0ce985c86909e3827970f4487ca573bd46a7a5`. Den gamle
-integrationsworktree og checkpointet er bevaret. Genbrug denne eksisterende
-worktree; begynd ikke igen i 4263-checkoutet. Se den aktuelle teststatus og
-releaseblokeringer i [PROJECT-STATUS.md](PROJECT-STATUS.md).
+Fortsæt i `../xdripswift-upstream-7.1.1`, branch `integration/upstream-7.1.1`.
+Appkodecommit `f90b1dcb1d716aea41a0c68be7c6a47cc405ceee` har 983/983 beståede
+XCTest-tests og beståede iPhone-/Watch-simulatorbuilds. De efterfølgende
+procesændringer ændrer ikke appkoden. Checkpointet for 4263 og den ældre
+arbejdskopi er bevaret. Se aktuel adgangs-/uploadstatus i PROJECT-STATUS.md.
 
-Mac-værktøjer, lokal identitetskonfiguration og signeringsaktiver er genbrugt.
-Marketingversionen er 7.1.1 på alle fem bundles, men det næste release-buildnummer
-er endnu ikke bekræftet hos Apple. Simulatorens fallback 4231 må ikke uploades.
-De konkrete releaseblokeringer er rettet: 983/983 XCTest-tests og begge
-simulatorbuilds består; detaljer står i PROJECT-STATUS.md. Brugeren har
-efterfølgende godkendt upload af 7.1.1 med
-“opload”; der kræves ikke endnu en godkendelse for samme udgivelse. Et aktuelt
-Apple-bekræftet buildnummer og den faste tag-baserede releaseproces mangler
-fortsat. Genbrug ikke udviklingsbuildet eller et historisk testresultat som
-release-kvittering efter ændring af versionsfilen.
+Brugeren har givet **GO UPLOAD for 7.1.1**, inklusive automatisk valg af nummer,
+tracked versionsændring, checkpoint/push/tag, signering, arkiv/IPA, upload og
+Ole Internal. Der kræves ikke endnu et GO UPLOAD for samme udgivelse.
+Marketingversionen er 7.1.1 på alle fem bundles. Fallback 4231 er ikke et
+release-buildnummer og må ikke uploades.
 
-## Fast TestFlight-proces fra næste build
+## Permanent automatisk TestFlight-proces
 
-Læs [AGENTS.md](../AGENTS.md) og [aktuel projektstatus](PROJECT-STATUS.md).
-En ny Codex-chat skal udføre checkpoint, commit, push og tag som en normal del
-af enhver fremtidig TestFlight-udgivelse. Brug samme eksisterende app
-`6795645396`, team `GFZ896KN66` og de fem bundle IDs. Få det næste ledige
-buildnummer fra App Store Connect; versionsfilens ældre fallback er ikke nok.
+Læs [AGENTS.md](../AGENTS.md) og [PROJECT-STATUS.md](PROJECT-STATUS.md).
+Forløbet er **test → Apple-buildstatus → automatisk nummer → tracked version/build
+→ test release-tree → commit/push → tag → arkiv/IPA fra tag → verify → autoriseret
+upload → Apple-status/Ole Internal → statuscommit/push**.
 
-Inden test sættes `CURRENT_PROJECT_VERSION` i den **tracked**
-`xDrip/Version.xcconfig` til det bekræftede buildnummer. Gennemgå koden og
-stage præcis den kildekode, tests, projektkonfiguration og dokumentation, der
-skal med. Gennemgå den faktiske staged diff for funktionalitet, utilsigtede
-filer og secrets. Release-scriptet stager intet selv og afviser både unstaged
-ændringer, untracked filer og kendte artefakt-/credential-filnavne. Ignorerede
-signeringsindstillinger er lokale; de er aldrig en del af Git-træet.
-
-Kør derefter sekvensen med det samme buildnummer i miljøet:
+Agenten gennemgår/stager den ønskede kode, tests og projekt-/procesfiler.
+Den almindelige lokale buildproces uploader aldrig. Efter brugerens GO UPLOAD
+for den konkrete version køres:
 
 ```sh
-export XDRIP_BUILD_NUMBER=<bekræftet-ledigt-nummer>
-export XDRIP_ASC_BUILD_CONFIRMED=YES
-./scripts/release-testflight.py check
-
-# Efter gennemgang af `git diff --cached`:
-XDRIP_STAGED_DIFF_REVIEWED=YES ./scripts/release-testflight.py checkpoint
-./scripts/release-testflight.py publish
-./scripts/release-testflight.py build
-./scripts/release-testflight.py verify
+# Kun efter agentens gennemgang af den præcise staged diff og brugerens GO UPLOAD:
+XDRIP_STAGED_DIFF_REVIEWED=YES \
+XDRIP_GO_UPLOAD=YES XDRIP_GO_UPLOAD_VERSION=7.1.1 \
+  python3 -B scripts/release-testflight.py release
 ```
 
-`checkpoint` kører Python-kontroller (inklusive syntetiske release-spærretests),
-de otte relevante XCTest-suiter og
-separate iPhone-/Watch-simulatorbuilds på præcis samme staged Git-træ. Kun ved
-bestået resultat committes det træ; træ-hashen kontrolleres igen bagefter.
-`publish` pusher checkpoint-committen og opretter/pusher et **annoteret** tag
-`testflight-<version>-<buildnummer>` på præcis denne commit. Begge fjernrefs
-kontrolleres. Eksisterende tags flyttes aldrig. Alle tests, logs og
-release-state gemmes lokalt under `build/testflight-<version>-<buildnummer>/`.
+Ingen buildnummer- eller Apple-statusvariabler udfyldes manuelt. `release`
+genoptager det registrerede forløb og kører selv prepare, checkpoint, publish,
+build, verify, upload, processing-kontrol og status. Ved en afsluttet release
+og nye kildeændringer vælges et nyt nummer; uændret kode gen-uploades ikke.
+En anden marketingversion kræver sin egen brugerautorisation og matchende
+`XDRIP_GO_UPLOAD_VERSION`.
 
-`build` kræver et rent working tree, testkvitteringen samt pushet branch og tag
-på samme commit. `scripts/local-build.sh archive` udtrækker kildekoden direkte
-fra taggets Git-træ og bygger det developer-signerede arkiv og den lokalt
-cloud-distributionssignerede IPA. Buildnummeret kommer fra den taggede
-versionsfil; der skrives ingen ny versionsfil ind i buildkilden. Det indbyggede
-`XDripSourceCommit` kommer fra checkpoint-committen via Xcode-buildsettingen
-og kontrolleres i iPhone- og Watch-produktet. De fem bundles, profiler,
-entitlements, version og build verificeres. `verify` genkontrollerer den
-eksporterede app og gemmer IPA'ens SHA-256. Ingen af disse kommandoer uploader.
-
-**Kun efter brugerens udtrykkelige `GO UPLOAD` for dette build** og et frisk
-opslag af app/version/build i App Store Connect må uploadtrinnet udføres:
+Deltrinene kan køres særskilt, f.eks. under en teknisk undersøgelse:
 
 ```sh
-XDRIP_GO_UPLOAD=YES XDRIP_ASC_UPLOAD_SLOT_CONFIRMED=YES \
-  ./scripts/release-testflight.py upload
+python3 -B scripts/release-testflight.py apple-status  # Read-only Apple-opslag
+XDRIP_STAGED_DIFF_REVIEWED=YES python3 -B scripts/release-testflight.py prepare
+XDRIP_STAGED_DIFF_REVIEWED=YES python3 -B scripts/release-testflight.py checkpoint
+python3 -B scripts/release-testflight.py publish
+python3 -B scripts/release-testflight.py build
+python3 -B scripts/release-testflight.py verify
+# Upload kræver stadig versionsspecifik GO UPLOAD, også som selvstændigt trin.
+XDRIP_GO_UPLOAD=YES XDRIP_GO_UPLOAD_VERSION=7.1.1 \
+  python3 -B scripts/release-testflight.py upload
+python3 -B scripts/release-testflight.py status
 ```
 
-Dette bruger Xcodes `-exportArchive` med `destination=upload`, automatic
-signing, `testFlightInternalTestingOnly=true` og det samme arkiv som den
-verificerede eksport. En lokal `upload-attempt.json` skrives **før** kaldet,
-så timeout eller ukendt resultat ikke udløser et automatisk dobbelt-upload.
-Kontrollér først Apples faktiske modtagelsesstatus ved usikkerhed.
+`prepare` kontrollerer API-adgang, kører de indledende Python-kontroller og
+henter alle sider af Apples builds og buildUploads samt eksplicit den aktuelle
+versions builds/uploads. App-ID, bundle-ID og iOS-platform valideres. Nummeret
+vælges numerisk over alle registrerede numre, også igangværende, fejlede og
+andre marketingversioner. Dotted buildnumre sammenlignes numerisk; ukendte
+formater eller ufuldstændige svar stopper uden at gætte. Et allerede brugt eller
+lokalt reserveret tag/nummer genbruges ikke. `allocation.json` gemmer valgt
+nummer og det sanitiserede API-snapshot under `build/testflight-<version>-<build>/`.
+Aktivt forløb registreres i `build/release-automation/active.json`.
 
-Når Apple er kontrolleret, angives den observerede status (`received`,
-`processing` eller `internal-testing`) og det præcise buildlink. Ved intern
-test angives også navnet på den **eksisterende** gruppe:
+Kun `xDrip/Version.xcconfig` stages automatisk efter nummerændringen. Andre
+ændringer skal allerede være gennemgået og staged. Personlige konfigurationer,
+secrets og buildprodukter afvises fra indekset. `checkpoint` kører nu
+`local-build.sh release-test`: alle Python-kontroller, **hele XCTest-suiten**,
+resultatkontrol af de otte krævede Watch/Libre-suiter samt begge simulatorbuilds.
+Den fulde suite omfatter også CareLink, Dexcom og statistikrettelserne.
+Git tree-hash kontrolleres før/efter test og efter commit. Tidligere 983/983 er
+baseline, ikke release-kvittering for en senere ændret versionsfil.
 
-```sh
-XDRIP_ASC_STATUS=internal-testing \
-XDRIP_ASC_BUILD_URL=<buildets-App-Store-Connect-link> \
-XDRIP_ASC_INTERNAL_GROUP=<eksisterende-gruppenavn> \
-  ./scripts/release-testflight.py status
+`publish` pusher checkpointet og et uforanderligt annoteret
+`testflight-<version>-<build>`-tag; begge fjernrefs verificeres. `build` kræver
+rent working tree, matching testkvittering og Apple-allokering. Kilden udtrækkes
+fra tagget med `git archive`. Xcode genbruger team GFZ896KN66 og automatisk
+signering; eksisterende signeringsaktiver bevares. Alle fem bundles kontrolleres,
+inklusive entitlements, profiler, version/build og indbygget source commit.
+`verify` pakker den faktiske IPA ud igen og verificerer den, inden IPA- og
+arkivhashes gemmes.
+
+Umiddelbart før upload læses Apple igen. Ved et optaget nummer **før eget
+uploadforsøg** vælges automatisk et nyt nummer, versionsfilen ændres og
+release-kontrollerne køres igen før nyt checkpoint/tag/arkiv. Det gamle tag
+flyttes aldrig. Der tillades højst tre automatiske kollisionsrunder.
+Upload bruger Apples `xcrun altool --upload-package` på den verificerede IPA;
+der laves ikke en ny eksport med andre bytes i uploadtrinnet. Eksporten har
+`testFlightInternalTestingOnly=true` og `manageAppVersionAndBuildNumber=false`.
+
+En eksklusivt oprettet `upload-attempt.json` gemmer source commit, tag og
+IPA-hash **før** upload. Ved uklar afslutning undersøges Apple, men et matchende
+buildnummer alene bruges ikke som bevis for, at vores bytes blev modtaget.
+Der startes ikke automatisk et nyt upload eller vælges et nyt nummer i denne
+situation. Et dokumenteret modtaget upload fortsætter til processing-kontrol.
+
+Der følges med i op til 15 minutter. `VALID` og `INTERNAL_ONLY` kontrolleres,
+og kun den eksisterende interne gruppe **Ole Internal** tilknyttes. Den faktiske
+buildrelation og `IN_BETA_TESTING` skal være bekræftet, før status bliver
+**Internal / Testing**. Der oprettes ingen grupper/testere eller ekstern test.
+Manglende compliance-erklæringer, aftaler og rettigheder gættes ikke.
+En processing-timeout registreres som faktisk modtaget/behandles, ikke som
+mislykket upload. `status` gemmer Apples observerede status i PROJECT-STATUS.md
+og laver/pusher en separat dokumentationscommit uden at flytte release-tagget.
+
+## App Store Connect API-adgang
+
+Xcodes eksisterende Apple-login bruges fortsat til signering. Apples offentlige
+REST API kræver en Apple-udstedt ES256 `.p8`-nøgle; der findes ikke en understøttet
+konvertering fra et almindeligt Xcode-login til denne API-adgang.
+`scripts/apple_release.py` bruger Python-standardbiblioteket og macOS' eksisterende
+OpenSSL. Der installeres ikke Homebrew, Fastlane eller nye Python-pakker.
+Ingen browsercookies, Xcode-login-tokens eller private Apple-API'er bruges.
+
+Genbrug en eksisterende API-nøgle, hvis den findes. Ellers skal kontoejeren via
+Apples normale App Store Connect-konto oprette/downloade en individuel API-nøgle
+eller en teamnøgle med de nødvendige app-/TestFlight-rettigheder. En individuel
+nøgle arver brugerens adgang og kan bruges til denne proces; Xcode håndterer
+fortsat provisioning. Hvis generering ikke er tilladt, skal en administrator
+give den relevante API-adgang. Private nøgledata må aldrig indsættes i chatten.
+
+Konfigurationen ligger som standard uden for Git i
+`~/.config/xdrip-release/app-store-connect.json` (eller stien i
+`XDRIP_ASC_CONFIG`). Både konfigurationen og `.p8` skal ejes af den aktuelle
+Mac-bruger og have adgang `600`. Eksempel med fiktive, offentlige ID'er:
+
+```json
+{
+  "keyID": "ABCDEFGHIJ",
+  "privateKeyPath": "/Users/<bruger>/.appstoreconnect/private_keys/AuthKey_ABCDEFGHIJ.p8"
+}
 ```
 
-`status` opdaterer kun `docs/PROJECT-STATUS.md`, laver en separat
-dokumentationscommit og pusher den. Tagget bliver på den oprindelige
-build-commit. Oplys også fortsat kendte fejl og fysisk testbehov; et bestået
-simulatorbuild dokumenterer ikke fysisk Bluetooth-drift eller hørbare alarmer.
-Ingen `.ipa`, `.xcarchive`, `.xcresult`, DerivedData, profiler, certifikater,
-nøgler, tokens, logs eller sundhedsdata må pushes.
+Ved en teamnøgle tilføjes dens `issuerID`; ved en individuel nøgle udelades det.
+Nøglen og konfigurationen må ikke ligge i nogen Git-worktree. JWT signeres og
+beholdes i hukommelsen; hverken private nøgledata eller JWT skrives i logs/Git.
+Kun `https://api.appstoreconnect.apple.com/v1/` tillades, inklusive pagination;
+redirects videresender ikke authentication. Midlertidige GET-fejl genforsøges
+begrænset, men mutationer gentages ikke blindt. Et usikkert gruppesvar kontrolleres
+ved efterfølgende læsning af relationen.
+
+Manglende API-adgang er en reel authentication-/rettighedsblokering. Agenten
+skal afklare denne adgang og fortsætte de uafhængige lokale trin; den må ikke
+omgå problemet ved at bede om et manuelt buildnummer. Den endelige upload må
+ikke påstås udført, før Apple faktisk har kvitteret.
+
+Officielle kilder:
+
+- [API-nøgler](https://developer.apple.com/documentation/appstoreconnectapi/creating-api-keys-for-app-store-connect-api)
+- [JWT-autentifikation](https://developer.apple.com/documentation/appstoreconnectapi/generating-tokens-for-api-requests)
+- [Buildoversigt](https://developer.apple.com/documentation/appstoreconnectapi/get-v1-builds)
+- [Build uploads, inklusive processing og fejl](https://developer.apple.com/documentation/appstoreconnectapi/get-v1-apps-_id_-builduploads)
+- [Intern gruppetilknytning](https://developer.apple.com/documentation/appstoreconnectapi/post-v1-betagroups-_id_-relationships-builds)
 
 ## Historisk Mac-baseline 23. september 2026
 

@@ -36,6 +36,7 @@ Commands:
   test-all            Run the complete xdripTests target serially.
   build               Build the iPhone and Watch simulator products unsigned.
   all                 Run Python checks, test-ci and both simulator builds.
+  release-test        Run Python, the complete XCTest suite and both builds.
   release-preflight   Check local inputs for Xcode cloud-managed signing.
   archive             Archive the clean, pushed TestFlight tag and export locally.
   verify-signed       Verify an existing archive/export app (XDRIP_APP_PATH,
@@ -46,8 +47,8 @@ The script has no upload command and never registers devices. The archive
 command allows Xcode to manage signing assets, creates a developer-signed
 .xcarchive, and then makes a cloud-signed App Store Connect export locally.
 It requires a clean, remotely pushed release commit and tag, plus the matching
-test receipt from scripts/release-testflight.py. XDRIP_BUILD_NUMBER must be
-read from App Store Connect and XDRIP_ASC_BUILD_CONFIRMED must be YES.
+test receipt from scripts/release-testflight.py. That process automatically
+queries Apple and supplies the build number and its allocation receipt.
 EOF
 }
 
@@ -119,6 +120,8 @@ run_python_checks() {
     | tee "$logs_dir/python-verify-watch-release-self-test.log"
   python3 -B scripts/test_release_testflight.py 2>&1 \
     | tee "$logs_dir/python-release-guards.log"
+  python3 -B scripts/test_apple_release.py 2>&1 \
+    | tee "$logs_dir/python-apple-release.log"
 }
 
 run_ci_tests() {
@@ -281,14 +284,31 @@ PY
   elif ! printf '%s' "$XDRIP_BUILD_NUMBER" | grep -Eq '^[1-9][0-9]*$'; then
     echo "ASC-confirmed next build number: invalid"
     blocked=1
-  elif [ "${XDRIP_ASC_BUILD_CONFIRMED:-}" != "YES" ]; then
-    echo "ASC-confirmed next build number: not confirmed"
+  elif ! verify_apple_allocation; then
+    echo "Apple allocation receipt missing or inconsistent; run release-testflight.py prepare"
     blocked=1
   else
     echo "ASC-confirmed next build number: $XDRIP_BUILD_NUMBER"
   fi
 
   [ "$blocked" -eq 0 ] || return 1
+}
+
+verify_apple_allocation() {
+  python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+path = os.environ.get("XDRIP_ASC_ALLOCATION_PATH", "")
+if not path or not Path(path).is_file():
+    raise SystemExit(1)
+receipt = json.loads(Path(path).read_text(encoding="utf-8"))
+if (receipt.get("appID") != "6795645396" or
+        receipt.get("selectedBuild") != os.environ.get("XDRIP_BUILD_NUMBER") or
+        not receipt.get("observedAt") or receipt.get("snapshot", {}).get("appID") != "6795645396"):
+    raise SystemExit(1)
+PY
 }
 
 verify_release_checkpoint() {
@@ -321,6 +341,7 @@ verify_release_checkpoint() {
   RELEASE_STATE_PATH="$state" RELEASE_COMMIT="$commit" RELEASE_TREE="$source_tree" \
     RELEASE_TAG="$tag" RELEASE_BUILD="${XDRIP_BUILD_NUMBER:-}" \
     python3 - <<'PY'
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -338,6 +359,11 @@ if state.get("step") != "tagged":
     raise SystemExit("release receipt must be at the tagged step before archive")
 if state.get("tests", {}).get("verificationPassed") is not True:
     raise SystemExit("release receipt does not confirm passing tests")
+allocation = Path(os.environ.get("XDRIP_ASC_ALLOCATION_PATH", ""))
+if not allocation.is_file() or str(allocation) != state.get("allocationPath"):
+    raise SystemExit("release receipt is missing its Apple allocation")
+if hashlib.sha256(allocation.read_bytes()).hexdigest() != state.get("allocationSha256"):
+    raise SystemExit("Apple allocation changed since the tested checkpoint")
 PY
 
   remote_branch="$(git ls-remote origin "refs/heads/$branch" | cut -f1)"
@@ -519,13 +545,12 @@ archive_release() {
   local ipa_count ipa_path unpacked_path exported_phone
   local build_number="${XDRIP_BUILD_NUMBER:-}"
 
-  [ -n "$build_number" ] || die "set XDRIP_BUILD_NUMBER from App Store Connect"
+  [ -n "$build_number" ] || die "run release-testflight.py prepare for automatic Apple build selection"
   case "$build_number" in
     *[!0-9]*|'') die "XDRIP_BUILD_NUMBER must be a positive integer" ;;
   esac
   [ "$build_number" -gt 0 ] || die "XDRIP_BUILD_NUMBER must be positive"
-  [ "${XDRIP_ASC_BUILD_CONFIRMED:-}" = "YES" ] \
-    || die "set XDRIP_ASC_BUILD_CONFIRMED=YES only after checking App Store Connect"
+  verify_apple_allocation || die "Apple allocation receipt does not match the selected build"
   source_commit="$(verify_release_checkpoint)"
   source_tree="$(git rev-parse 'HEAD^{tree}')"
   release_preflight || die "release preflight is blocked"
@@ -658,6 +683,14 @@ case "${1:-}" in
   all)
     run_python_checks
     run_ci_tests
+    build_simulators
+    ;;
+  release-test)
+    run_python_checks
+    run_all_tests
+    python3 -B scripts/record-watch-test-results.py \
+      "$results_dir/AllTests.xcresult" "$results_dir/stability-summary.json" \
+      --include-verify-only 2>&1 | tee "$logs_dir/record-xctest-results.log"
     build_simulators
     ;;
   release-preflight) release_preflight ;;

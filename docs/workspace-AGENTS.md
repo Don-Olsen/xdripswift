@@ -1,22 +1,25 @@
-# Workspace entry point for Codex
+# Local xDrip4iOS workspace
 
-For the official 7.1.1 integration, continue the existing
-`xdripswift-upstream-7.1.1` worktree on `integration/upstream-7.1.1`, based on
-checkpoint `5a0ce985c86909e3827970f4487ca573bd46a7a5`. Read the current status
-before treating it as release-ready; upstream test failures and the unconfirmed
-Apple build number are documented there. This task has no upload authorization.
+For current work on `Don-Olsen/xdripswift`, continue
+`xdripswift-upstream-7.1.1` on `integration/upstream-7.1.1`. First read that
+repository's `AGENTS.md`, `docs/PROJECT-STATUS.md` and `docs/MAC-BUILD.md`.
+The preserved 4263 checkpoint is `xdripswift-watch-reading-integration` on
+`checkpoint/post-testflight-4263`; the older sibling `xdripswift` is not the
+current release source. Do not restart or overwrite those worktrees.
 
-In the local Mac workspace, the preserved 4263 integration checkout is named
-`xdripswift-watch-reading-integration`. An older sibling checkout named
-`xdripswift` does not contain the code used for TestFlight 7.0.0 (4263).
-Start release work in the integration checkout on
-`checkpoint/post-testflight-4263` or its reviewed successor. First read the
-repository root `AGENTS.md`, `docs/PROJECT-STATUS.md` and `docs/MAC-BUILD.md`.
+Future releases automatically query authenticated Apple build/upload status,
+choose an unused build number, update tracked release metadata, test the exact
+release tree, commit/push, tag, build from the tag, verify, upload only with
+explicit version-specific GO UPLOAD, check Internal / Testing and the existing
+Ole Internal group, then commit/push status without moving the tag.
+Use `scripts/release-testflight.py`; never ask for a manual build number when
+Apple's public API can obtain it. Missing API authentication is a credential
+setup issue, not a build-number issue. No browser-cookie or Xcode-token scraping.
+Normal builds never upload. Preserve all signing assets and app identity.
+The user has explicitly authorized this 7.1.1 release, including the automatic
+number/checkpoint/tag/signing/upload steps; see current project status for
+remaining technical blockers. Other releases need their own GO UPLOAD.
 
-Build 4263 was uploaded from local integration changes before the new Git
-checkpoint rule. Never describe it as built from a release tag. Every later
-TestFlight upload follows the tested checkpoint, pushed branch, pushed tag,
-tagged build, verification, explicit `GO UPLOAD` and Apple-status sequence.
-
-This file preserves the useful project guidance from a local parent-workspace
-`AGENTS.md` inside Git. The parent file itself is outside this repository.
+Build 4263 was uploaded before this process. Never create a retroactive tag or
+claim it was tag-built. The repository copy of these workspace instructions is
+`docs/workspace-AGENTS.md`; this parent workspace file is outside the repository.

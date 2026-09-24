@@ -56,6 +56,8 @@ build/
 .env
 .env.*
 !.env.example
+# Personal App Store Connect API configuration belongs outside Git.
+app-store-connect.json
 
 
 #####

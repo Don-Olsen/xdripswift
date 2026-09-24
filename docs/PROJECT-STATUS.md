@@ -1,3 +1,85 @@
+# Aktuel status – automatisk 7.1.1-release
+
+Opdateret 24. september 2026. Brugeren har nu givet udtrykkeligt **GO UPLOAD for
+7.1.1**, inklusive automatisk buildnummer, tracked versionsændring,
+checkpoint/push/tag, signering, arkiv/IPA, upload til app `6795645396`,
+tilknytning til **Ole Internal** og efterfølgende statuscommit. Tilladelsen
+skal genbruges for denne release; der skal ikke spørges om et nyt GO UPLOAD
+eller et manuelt buildnummer.
+
+## Permanent automatisering og faktisk verifikation
+
+- Udgangspunkt: integrationsgren `integration/upstream-7.1.1`,
+  dokumentationscommit `48a1ccc59fba38c752c8dddff778fdf836307d71` og uændret
+  appkodecommit `f90b1dcb1d716aea41a0c68be7c6a47cc405ceee`.
+- `scripts/apple_release.py` læser Apples offentlige API med en ekstern ES256
+  API-nøgle. Alle sider af builds og buildUploads samt den aktuelle versions
+  eksplicitte resultater kontrolleres. Nummeret vælges automatisk over alle
+  registrerede numre; igangværende og fejlede uploads medregnes.
+- `scripts/release-testflight.py release` håndterer automatisk allokering,
+  tracked buildnummer, fuld release-tree-test, checkpoint/push/tag, arkiv og
+  IPA fra tagget, source/signaturkontrol, direkte upload af den verificerede
+  IPA, op til 15 minutters processing, intern gruppetilknytning og statuscommit.
+  En optaget slot før upload medfører nyt nummer og nye test-/buildprodukter;
+  gamle tags bevares. Uklar upload undersøges uden blind gentagelse.
+- `AGENTS.md`, `docs/MAC-BUILD.md` og `docs/workspace-AGENTS.md` beskriver den
+  faste proces. Den lokale parent-workspace `../AGENTS.md` peger nu også på
+  den aktuelle 7.1.1-worktree. Personlig API-konfiguration er ignoreret/afvist
+  fra Git. Ingen nye værktøjer eller dependencies er installeret.
+- Nye lokale Python-resultater: **12/12, 30/30, 17/17, 22/22 og 40/40**.
+  De 22 release-guards inkluderer syntetisk Git-checkpoint/push/tag/status,
+  fuld genallokering/gentest ved nummerkonflikt, versionsspecifik uploadtilladelse,
+  uændrede tags, direkte IPA-upload og afvisning af usikker status.
+  De 40 API-tests dækker authentication, pagination, numerisk valg, processing,
+  transient GET-retry og bekræftet intern gruppetilknytning. Alle tests er offline
+  med syntetiske data og midlertidige repositories; fixture-numre i logs er ikke
+  rigtige Apple-buildnumre.
+- Shell-/Python-syntaks og diff-kontrol består. **1149 app-/projekt-/XCTest-filer**
+  matcher den tidligere testede appkode byte-for-byte. Der er ikke lavet ny
+  appkode eller genkørt XCTest/simulatorbuild i denne procesrunde. De tidligere
+  **983/983** og begge simulatorbuilds er fortsat baseline; en fremtidig tracked
+  nummerændring udløser automatisk nye fulde release-kontroller.
+- GitHubs eksisterende adgang fungerer med release-scriptets normale Git-kald;
+  `push --dry-run` bestod uden nye credentials eller konfigurationsændringer.
+- Logs og bevis ligger lokalt under `build/release-automation-7.1.1/`:
+  `python/logs/`, `auth-check/result.log`, `auth-check/release-attempt.log` og
+  `source-scope.json`. De pushes ikke.
+
+## Den konkrete resterende blokering
+
+Det understøttede `apple-status`-kald er forsøgt og stopper med:
+**“App Store Connect API configuration is unavailable”** før en HTTP-forespørgsel.
+Der er ingen konfigureret API-nøgle i de undersøgte miljøvariabler eller
+standardmapper, og ingen `.p8` blev fundet i Downloads, Documents eller Desktop.
+Den samlede `release`-kommando er også kørt med den udtrykkelige 7.1.1-
+autorisation og stopper ved samme authentication-kontrol. Den ændrede ikke
+versionsfilen, oprettede ikke et release-tag og kaldte hverken Xcode eller upload.
+Der er derfor endnu **ikke** hentet en autentificeret buildoversigt hos Apple.
+Dette dokumenterer manglende lokal API-authentication, ikke at kontoen mangler
+bestemte roller; rettighederne kan først verificeres efter authentication.
+
+Xcodes eksisterende login er bevaret og kan fortsat bruges til signering, men
+Apple kræver en særskilt, Apple-udstedt API-nøgle til den offentlige REST API.
+Der findes ingen understøttet måde at aflede den af Xcode-login. Browsercookies,
+private Apple-API'er og udtræk af Xcode-login-tokens bruges ikke som omvej.
+Kontoejeren skal først aktivere/hente en individuel API-nøgle via Apples normale
+kontointerface, eller stille en eksisterende API-nøgle til rådighed lokalt.
+Hvis kontoen ikke må generere nøgler, skal dens administrator give API-adgang.
+Den præcise sikre lokale konfiguration står i [MAC-BUILD.md](MAC-BUILD.md).
+Private nøgledata eller passwords skal aldrig sendes i chatten.
+
+**Ingen manuel buildnummer-oplysning kræves.** Når API-adgangen findes, fortsætter
+samme allerede godkendte release-kommando selv med nummerering og resten af
+forløbet. Indtil da er der intet valgt release-buildnummer, intet TestFlight-tag,
+intet signeret 7.1.1-arkiv/IPA og intet upload. Ole Internal er ikke blevet ændret.
+Appversionen er 7.1.1; tracked 4231 er fortsat kun udviklingsfallback.
+
+Den separate `invalidPayload`-risiko og fysisk Watch-afprøvning er stadig åbne.
+Ingen fysisk iPhone eller Watch er installeret, startet eller ændret. De følgende
+afsnit bevarer tidligere resultater og fejl som historik; de omklassificeres ikke.
+
+---
+
 # Projektstatus – officiel 7.1.1-integration
 
 Opdateret 24. september 2026. Den officielle opdatering er integreret på
