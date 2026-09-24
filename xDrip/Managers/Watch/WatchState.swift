@@ -46,6 +46,7 @@ struct WatchStatus: WatchPayload {
 
     var aidStatus: AIDStatus?
     var libreAlarmSettings: LibreWatchAlarmSettings?
+    var therapyMetrics: TherapyMetricsSnapshot? = nil
 }
 
 /// current BG chart data used to manage watch views

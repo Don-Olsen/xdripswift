@@ -51,7 +51,7 @@ final class TransmitterReadSuccessManager {
     /// Compute reading success for the given sensor and return 24h totals plus hourly buckets.
     /// - Parameters:
     ///   - sensor: Current sensor/session to evaluate.
-    ///   - now: Optional override of current time; defaults to `nowProvider()`.
+    ///   - now: Optional override of current time, defaults to `nowProvider()`.
     ///   - cutoff: Optional cutoff date to clamp analysis to readings no earlier than this timestamp.
     /// - Returns: A display model with expected/actual/success for 24h and hourly bucket data.
     func getReadSuccess(forSensor sensor: Sensor, now: Date? = nil, notBefore cutoff: Date? = nil) -> TransmitterReadSuccessDisplay {
@@ -116,7 +116,7 @@ final class TransmitterReadSuccessManager {
     /// Convenience accessor intended for log production. Ensures that at most one result is returned per hour.
     /// - Parameters:
     ///   - sensor: Current sensor/session to evaluate.
-    ///   - now: Optional override of current time; defaults to `nowProvider()`.
+    ///   - now: Optional override of current time, defaults to `nowProvider()`.
     ///   - cutoff: Optional cutoff date to clamp analysis.
     /// - Returns: Display model when allowed by throttle, otherwise `nil`.
     func getReadSuccessForLogs(forSensor sensor: Sensor, now: Date? = nil, notBefore cutoff: Date? = nil, timeStampOfLastLogCreated: Date?) -> TransmitterReadSuccessDisplay? {

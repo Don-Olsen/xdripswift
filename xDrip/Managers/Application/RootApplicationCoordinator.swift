@@ -44,6 +44,10 @@ struct InitialCalibrationRequestGate {
 /// receives transmitter, follower, notification and UserDefaults callbacks, none of which require
 /// a view-controller lifecycle.
 @MainActor final class RootApplicationCoordinator: NSObject {
+    private var dexcomG6InitialCalibrationPolicy = DexcomG6InitialCalibrationPolicy()
+    private var dexcomG6CalibrationInputID: UUID?
+    private weak var dexcomG6CalibrationTransmitter: CGMG5Transmitter?
+    private let applicationManagerKeyDexcomG6Calibration = "dexcomG6InitialCalibration"
     
     // MARK: - Constants for ApplicationManager usage
     
@@ -181,6 +185,11 @@ struct InitialCalibrationRequestGate {
     
     /// statisticsManager instance
     private var statisticsManager: StatisticsManager?
+
+    /// lets us ignore an older calculation when a newer one has already been requested
+    private var statisticsRequestGeneration = 0
+    /// settings and local day for the latest request, including one which is still calculating
+    private var statisticsContext: RootHomeStatisticsContext?
     
     /// watchManager instance
     private var watchManager: WatchManager?
@@ -212,6 +221,10 @@ struct InitialCalibrationRequestGate {
     
     /// initiate a Timer object that we will use keep the follower connection status updated every 30 seconds or so
     private var followerConnectionTimer: Timer?
+    private var therapyMetricsObserver: NSObjectProtocol?
+    private var lastTherapyPublication: TherapyMetricsSnapshot?
+    private var lastTherapyPublicationAt = Date.distantPast
+    private var pendingTherapyPublication: Task<Void, Never>?
     
     /// Last timestamp when a log line was produced by TransmitterReadSuccessManager
     private var transmitterReadSuccessTimeStampOfLastLogCreated: Date?
@@ -443,6 +456,7 @@ struct InitialCalibrationRequestGate {
         // if live action type is updated
         UserDefaults.standard.addObserver(self, forKeyPath: UserDefaults.Key.liveActivityType.rawValue, options: .new, context: nil)
         UserDefaults.standard.addObserver(self, forKeyPath: UserDefaults.Key.carPlayLiveActivityType.rawValue, options: .new, context: nil)
+        UserDefaults.standard.addObserver(self, forKeyPath: UserDefaults.Key.liveActivityShowIOBCOB.rawValue, options: .new, context: nil)
         
         // high mark , low mark , urgent high mark, urgent low mark. change requires redraw of chart
         UserDefaults.standard.addObserver(self, forKeyPath: UserDefaults.Key.urgentLowMarkValue.rawValue, options: .new, context: nil)
@@ -586,10 +600,10 @@ struct InitialCalibrationRequestGate {
                 self.updateDataSourceInfo()
                 // update statistics related outlets
                 self.updateStatistics(animate: true)
-                // check and see if we need to restart the live activity in case the user dismissed it from the lock screen
-                // the app cannot restart the activity from the background so let's check it now
-                // we'll also take advantage to restart the live activity when the user brings the app to the foregroud
-                self.updateLiveActivityAndWidgets(forceRestart: true)
+                // Restart only if the app is still active after this delayed foreground refresh.
+                // A quick return to the background must keep the existing Live Activity alive:
+                // ActivityKit permits updating it there, but rejects creation of its replacement.
+                self.updateLiveActivityAndWidgets(forceRestart: UIApplication.shared.applicationState == .active)
                 self.updatePumpAndAIDStatusViews()
             }
         })
@@ -598,6 +612,7 @@ struct InitialCalibrationRequestGate {
         // launch nightscout treatment sync whenever the app comes to the foreground
         ApplicationManager.shared.addClosureToRunWhenAppWillEnterForeground(key: applicationManagerKeyStartNightscoutTreatmentSync, closure: {
             self.setNightscoutSyncRequiredToTrue(forceNow: false)
+            self.publishTherapyMetricsIfNeeded()
         })
         
     }
@@ -688,6 +703,19 @@ struct InitialCalibrationRequestGate {
         migrateStoredAlertSnoozePeriodsToReducedOptionsIfNeeded(coreDataManager: coreDataManager)
         
         // get currently active sensor
+        TherapyMetricsManager.shared.configure(coreDataManager: coreDataManager) { [weak self] in
+            let policy = UserDefaults.standard.dataFlowPolicy
+            if policy.importsTherapyFromCareLink { return CareLinkAccountState.shared.snapshot.aidStatus }
+            return policy.importsStatusFromNightscout ? self?.nightscoutSyncManager?.deviceStatus.aidStatus : nil
+        }
+        if therapyMetricsObserver == nil {
+            therapyMetricsObserver = NotificationCenter.default.addObserver(forName: TherapyMetricsManager.changed, object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    if UIApplication.shared.applicationState == .active { self?.publishRootHomeState() }
+                    self?.publishTherapyMetricsIfNeeded()
+                }
+            }
+        }
         activeSensor = SensorsAccessor.init(coreDataManager: coreDataManager).fetchActiveSensor()
         
         // instantiate bgReadingsAccessor
@@ -838,6 +866,11 @@ struct InitialCalibrationRequestGate {
         var hasCapturedInitialTroubleshootingCGMSource = false
         var previousTroubleshootingCGMSource: TroubleshootingLogSource?
         let cgmTransmitterInfoChanged = {
+            if self.dexcomG6InitialCalibrationPolicy.requiredState != nil,
+               self.bluetoothPeripheralManager?.getCGMTransmitter() as? CGMG5Transmitter !== self.dexcomG6CalibrationTransmitter {
+                self.dexcomG6InitialCalibrationPolicy = DexcomG6InitialCalibrationPolicy()
+                self.clearDexcomG6CalibrationPrompt()
+            }
             // A callback can occur inside BluetoothPeripheralManager.init, before Swift has assigned
             // that finished manager to this coordinator. Do not seed the comparison with a false nil
             // source in that window or the following explicit initialization call would look like a
@@ -980,7 +1013,7 @@ struct InitialCalibrationRequestGate {
     /// Existing AlertType records may contain a duration that the consolidated picker no longer
     /// offers. Each unsupported value is rounded down to the nearest supported duration so an
     /// upgrade never silently lengthens an alarm's configured snooze. Values below the new
-    /// 15-minute minimum are clamped to 15 minutes because no lower supported option exists.
+    /// 10-minute minimum are clamped to 10 minutes because no lower supported option exists.
     private func migrateStoredAlertSnoozePeriodsToReducedOptionsIfNeeded(coreDataManager: CoreDataManager) {
         let userDefaults = UserDefaults.standard
         guard !userDefaults.didMigrateAlertSnoozePeriodsToReducedOptions else { return }
@@ -1114,6 +1147,19 @@ struct InitialCalibrationRequestGate {
             // value. Only a completed reading may fan out to alerts and integrations.
             var newStoredRawReadingCreated = false
             var newDownstreamReadingCreated = false
+            var acceptedReadings: [(reading: BgReading, acceptedAt: Date)] = []
+            defer {
+                // Snapshot processed/original values after post-processing, including Watch
+                // history that deliberately returns before the live alarm/integration path.
+                for accepted in acceptedReadings {
+                    TroubleshootingLogStore.shared.record(.standard(.glucoseAccepted(
+                        mgDl: accepted.reading.finalValue,
+                        source: TroubleshootingLogSource(directTransmitterType: cgmTransmitter.cgmTransmitterType()),
+                        measuredAt: accepted.reading.timeStamp,
+                        originalMgDl: accepted.reading.calculatedValue
+                    ), timestamp: accepted.acceptedAt))
+                }
+            }
             
             // assign value of timeStampLastBgReading
             var timeStampLastBgReading = Date(timeIntervalSince1970: 0)
@@ -1211,27 +1257,12 @@ struct InitialCalibrationRequestGate {
                             activeSensor.noiseHistoryIsComplete = false
                         }
                         
-                        // Every accepted reading belongs in the consumer history, including one-minute
-                        // sources and backfills. Troubleshooting uses its own acceptance time while the
-                        // reading keeps the sensor's original measurement timestamp.
                         if isValidForDownstream {
                             trace(
                                 "in processNewGlucoseData, new reading created, timestamp = %{public}@, calculatedValue = %{public}@",
                                 log: self.log,
                                 category: ConstantsLog.categoryRootView,
                                 type: .debug,
-                                troubleshooting: .standard(
-                                    // Persist the controlled CGM description with the reading. A generic
-                                    // "direct sensor" label does not identify which acquisition path was
-                                    // active, while the typed mapping still excludes transmitter IDs.
-                                    .glucoseAccepted(
-                                        mgDl: newReading.calculatedValue,
-                                        source: TroubleshootingLogSource(
-                                            directTransmitterType: cgmTransmitter.cgmTransmitterType()
-                                        ),
-                                        measuredAt: newReading.timeStamp
-                                    )
-                                ),
                                 newReading.timeStamp.description(with: .current),
                                 newReading.calculatedValue.description.replacingOccurrences(of: ".", with: ",")
                             )
@@ -1254,6 +1285,7 @@ struct InitialCalibrationRequestGate {
                             continue
                         }
                         if isValidForDownstream {
+                            acceptedReadings.append((newReading, Date()))
                             savedDownstreamReadingCount += 1
                             let receipt = TransmitterReadSuccessReceipt(id: newReading.id,
                                 sensorID: activeSensor.id, measuredAt: newReading.timeStamp, storedAt: Date(),
@@ -1397,9 +1429,9 @@ struct InitialCalibrationRequestGate {
                 }
                 
                 // Always run the normal latest-reading Nightscout upload path.
-                // If post processing is also rewriting a recent BG tail, the
-                // sync manager serializes the overlap and runs this direct
-                // upload immediately afterwards.
+                // Historical rewrites may queue an overlapping direct upload until
+                // their exact deletions and updates finish. Automatic smoothing
+                // leaves the newest reading to this normal path.
                 nightscoutSyncManager?.uploadLatestBgReadings(lastConnectionStatusChangeTimeStamp: lastConnectionStatusChangeTimeStamp())
                 
                 nightscoutSyncManager?.syncAllWithNightscout()
@@ -1499,7 +1531,7 @@ struct InitialCalibrationRequestGate {
             
             updateLiveActivityAndWidgets(forceRestart: false)
             
-        case UserDefaults.Key.liveActivityType, UserDefaults.Key.carPlayLiveActivityType, UserDefaults.Key.allowStandByHighContrast, UserDefaults.Key.forceStandByBigNumbers:
+        case UserDefaults.Key.liveActivityType, UserDefaults.Key.carPlayLiveActivityType, UserDefaults.Key.liveActivityShowIOBCOB, UserDefaults.Key.allowStandByHighContrast, UserDefaults.Key.forceStandByBigNumbers:
             // check and configure the live activity and widgets if applicable
             updateLiveActivityAndWidgets(forceRestart: false)
             
@@ -1567,6 +1599,10 @@ struct InitialCalibrationRequestGate {
             
         case UserDefaults.Key.timeStampOfLastHeartBeat:
             updateDataSourceInfo()
+            // warm-up can start or finish without a new glucose reading
+            if liveActivitySensorWarmupEndDate() != nil || LiveActivityManager.shared.contentStateForPreview?.sensorWarmupEndDate != nil {
+                updateLiveActivityAndWidgets(forceRestart: false)
+            }
             
         case UserDefaults.Key.updateSnoozeStatus:
             updateSnoozeStatus()
@@ -1774,7 +1810,7 @@ struct InitialCalibrationRequestGate {
     /// opens an alert, that requests user to enter a calibration value, and calibrates
     /// - parameters:
     ///     - userRequested : if true, it's a requestCalibration initiated by user clicking on the calibrate button in the homescreen
-    private func requestCalibration(userRequested:Bool) {
+    private func requestCalibration(userRequested:Bool, expectedDexcomInitialCalibrationState: DexcomAlgorithmState? = nil) {
         // unwrap calibrationsAccessor, coreDataManager , bgReadingsAccessor
         guard let calibrationsAccessor = calibrationsAccessor, let coreDataManager = self.coreDataManager, let bgReadingsAccessor = self.bgReadingsAccessor else {
             trace("in requestCalibration, calibrationsAccessor or coreDataManager or bgReadingsAccessor is nil, no further processing", log: log, category: ConstantsLog.categoryRootView, type: .error)
@@ -1810,13 +1846,40 @@ struct InitialCalibrationRequestGate {
         
         // assign deviceName, needed in the closure when creating alert. As closures can create strong references (to bluetoothTransmitter in this case), I'm fetching the deviceName here
         let deviceName = bluetoothTransmitter.deviceName
-        
+
+        let prefill = expectedDexcomInitialCalibrationState == .SecondofTwoBGsNeeded
+            && dexcomG6InitialCalibrationPolicy.matches(sensorStartDate: activeSensor.startDate)
+            ? dexcomG6InitialCalibrationPolicy.secondCalibrationPrefill : nil
+        let calibrationStage = expectedDexcomInitialCalibrationState.map {
+            $0 == .FirstofTwoBGsNeeded ? " (1/2)" : " (2/2)"
+        } ?? ""
+
         rootTabStateModel?.presentTextInput(
-            title: Texts_Calibrations.enterCalibrationValue,
+            title: Texts_Calibrations.enterCalibrationValue + calibrationStage,
             placeholder: "...",
-            usesDecimalKeyboard: !UserDefaults.standard.bloodGlucoseUnitIsMgDl
+            usesDecimalKeyboard: !UserDefaults.standard.bloodGlucoseUnitIsMgDl,
+            initialText: prefill?.valueInMgDl.mgDlToMmolAndToString(mgDl: UserDefaults.standard.bloodGlucoseUnitIsMgDl) ?? "",
+            message: prefill.map {
+                String(format: Texts_Calibrations.previousCalibrationPrefillMessage,
+                       $0.enteredAt.toStringInUserLocale(timeStyle: .short, dateStyle: .none))
+            }
         ) { text in
+            if let expectedDexcomInitialCalibrationState {
+                guard self.activeSensor?.id == activeSensor.id,
+                      self.bluetoothPeripheralManager?.getCGMTransmitter() as? CGMG5Transmitter === self.dexcomG6CalibrationTransmitter,
+                      self.dexcomG6InitialCalibrationPolicy.hasPendingPrompt,
+                      self.dexcomG6InitialCalibrationPolicy.matches(sensorStartDate: activeSensor.startDate),
+                      self.dexcomG6InitialCalibrationPolicy.requiredState == expectedDexcomInitialCalibrationState else {
+                    return
+                }
+            }
             guard let valueAsDouble = text.toDouble() else {
+                self.presentAlert(title: Texts_Common.warning, message: Texts_Common.invalidValue)
+                return
+            }
+
+            if expectedDexcomInitialCalibrationState != nil,
+               !(40.0...400.0).contains(valueAsDouble.mmolToMgdl(mgDl: UserDefaults.standard.bloodGlucoseUnitIsMgDl)) {
                 self.presentAlert(title: Texts_Common.warning, message: Texts_Common.invalidValue)
                 return
             }
@@ -1832,6 +1895,9 @@ struct InitialCalibrationRequestGate {
             ) {
                 self.presentAlert(title: Texts_Common.warning, message: errorMessage)
             }
+        }
+        if expectedDexcomInitialCalibrationState != nil {
+            dexcomG6CalibrationInputID = rootTabStateModel?.textInputRequest?.id
         }
     }
 
@@ -1886,6 +1952,14 @@ struct InitialCalibrationRequestGate {
         coreDataManager.saveChanges()
         watchManager?.publishLibreWatchCalibration()
         sensorNoiseManager?.update(activeSensor: activeSensor)
+
+        if cgmTransmitter is CGMG5Transmitter {
+            dexcomG6InitialCalibrationPolicy.calibrationSubmitted(
+                valueInMgDl: dexcomG6InitialCalibrationPolicy.matches(sensorStartDate: activeSensor.startDate)
+                    ? valueAsDoubleConvertedToMgDl : nil
+            )
+            clearDexcomG6CalibrationPrompt()
+        }
 
         // Record the exact immutable snapshot supplied by CalibrationView. Recomputing here after
         // calibration could make the developer trace and Activity Log disagree with what the user saw.
@@ -1989,6 +2063,34 @@ struct InitialCalibrationRequestGate {
         })
     }
     
+    private func clearDexcomG6CalibrationPrompt() {
+        let identifier = ConstantsNotifications.NotificationIdentifiersForCalibration.dexcomG6InitialCalibrationRequest
+        UNUserNotificationCenter.current().removePendingNotificationRequests(withIdentifiers: [identifier])
+        UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [identifier])
+        ApplicationManager.shared.removeClosureToRunWhenAppWillEnterForeground(key: applicationManagerKeyDexcomG6Calibration)
+        if let dexcomG6CalibrationInputID, rootTabStateModel?.textInputRequest?.id == dexcomG6CalibrationInputID {
+            rootTabStateModel?.textInputRequest = nil
+        }
+        dexcomG6CalibrationInputID = nil
+    }
+
+    private func presentDexcomG6InitialCalibration() {
+        if let dexcomG6CalibrationInputID, rootTabStateModel?.textInputRequest?.id == dexcomG6CalibrationInputID {
+            return
+        }
+        clearDexcomG6CalibrationPrompt()
+        guard UserDefaults.standard.isMaster,
+              let transmitter = bluetoothPeripheralManager?.getCGMTransmitter() as? CGMG5Transmitter,
+              transmitter === dexcomG6CalibrationTransmitter,
+              transmitter.needsSensorStartCode(),
+              dexcomG6InitialCalibrationPolicy.hasPendingPrompt,
+              let activeSensor,
+              dexcomG6InitialCalibrationPolicy.matches(sensorStartDate: activeSensor.startDate),
+              let state = dexcomG6InitialCalibrationPolicy.requiredState else { return }
+
+        requestCalibration(userRequested: false, expectedDexcomInitialCalibrationState: state)
+    }
+
     /// creates bgreading notification, and set app badge to value of reading
     /// - parameters:
     ///     - if overrideShowReadingInNotification then badge counter will be set (if enabled off course) with function UIApplication.shared.applicationIconBadgeNumber. To be used if badge counter is  to be set eg when UserDefaults.standard.showReadingInAppBadge is changed
@@ -2118,14 +2220,47 @@ struct InitialCalibrationRequestGate {
     /// - parameters:
     ///     - overrideApplicationState : if true, then update will be done even if state is not .active
     ///     - forceReset : if true, then force the update to be done even if the main chart is panned back in time (used for the double tap gesture). This will also rescale the chart y-axis.
+    private func publishTherapyMetricsIfNeeded() {
+        let snapshot = TherapyMetricsManager.shared.snapshot()
+        let hasLocalMetrics = (snapshot.iob.source == .local && snapshot.iob.isVisible()) || (snapshot.cob.source == .local && snapshot.cob.isVisible())
+        guard hasLocalMetrics || lastTherapyPublication != nil else { return }
+        // Coalesce changing amounts too. Source/availability transitions remain immediate.
+        if let last = lastTherapyPublication,
+           last.iob.source == snapshot.iob.source, last.cob.source == snapshot.cob.source,
+           last.iob.reason == snapshot.iob.reason, last.cob.reason == snapshot.cob.reason,
+           last.iob.isVisible() == snapshot.iob.isVisible(), last.cob.isVisible() == snapshot.cob.isVisible() {
+            let remaining = 60 - Date().timeIntervalSince(lastTherapyPublicationAt)
+            if remaining > 0 {
+                if pendingTherapyPublication == nil {
+                    pendingTherapyPublication = Task { @MainActor [weak self] in
+                        try? await Task.sleep(nanoseconds: UInt64(remaining * 1_000_000_000))
+                        guard !Task.isCancelled, let self else { return }
+                        self.pendingTherapyPublication = nil
+                        self.publishTherapyMetricsIfNeeded()
+                    }
+                }
+                return
+            }
+        }
+        pendingTherapyPublication?.cancel()
+        pendingTherapyPublication = nil
+        lastTherapyPublication = hasLocalMetrics ? snapshot : nil
+        lastTherapyPublicationAt = .now
+        watchManager?.updateTherapyMetrics(snapshot)
+        updateLiveActivityAndWidgets(forceRestart: false, therapyMetrics: snapshot)
+    }
+
     @objc private func updateLabelsAndChart(overrideApplicationState: Bool = false, forceReset: Bool = false) {
         setNightscoutSyncRequiredToTrue(forceNow: false)
+        publishTherapyMetricsIfNeeded()
         
         // this is not really the nicest place to do this, but it works well
         // take advantage of the timer execution to update the AID status views
         updatePumpAndAIDStatusViews()
         
         guard UIApplication.shared.applicationState == .active || overrideApplicationState else {return}
+
+        refreshStatisticsEasterEgg(overrideApplicationState: overrideApplicationState)
 
         if forceReset {
             rootHomeStateModel.resetChartsToNow()
@@ -2160,8 +2295,6 @@ struct InitialCalibrationRequestGate {
     private func checkAlertsCreateNotificationAndSetAppBadge() {
         // unwrap alerts and check alerts
         if let alertManager = alertManager {
-            createNotificationImages()
-
             // check if an immediate alert went off that shows the current reading
             let immediateGlucoseNotificationCreated = alertManager.checkAlerts(maxAgeOfLastBgReadingInSeconds: ConstantsFollower.maximumBgReadingAgeForAlertsInSeconds)
 
@@ -2196,6 +2329,30 @@ struct InitialCalibrationRequestGate {
     }
     
     
+    /// capture the selected period and range so we can recognise a result which is no longer wanted
+    private func currentStatisticsContext(now: Date, calendar: Calendar) -> RootHomeStatisticsContext {
+        let range = UserDefaults.standard.timeInRangeType
+        return RootHomeStatisticsContext(
+            days: UserDefaults.standard.daysToUseStatistics, range: range.rawValue,
+            lowLimit: range.lowerLimitInMgDl, highLimit: range.higherLimitInMgDl,
+            isMgDl: UserDefaults.standard.bloodGlucoseUnitIsMgDl, now: now, calendar: calendar
+        )
+    }
+
+    /// use the existing foreground timer to check for 16:00, midnight and seasonal changes
+    private func refreshStatisticsEasterEgg(overrideApplicationState: Bool) {
+        guard UserDefaults.standard.showStatistics else { return }
+        let now = Date()
+        let calendar = Calendar.current
+        let context = currentStatisticsContext(now: now, calendar: calendar)
+        // a new day or changed settings needs fresh statistics. Otherwise, just recheck the emoji.
+        if statisticsContext != context {
+            updateStatistics(overrideApplicationState: overrideApplicationState)
+        } else {
+            rootHomeStateModel.updateStatisticsEasterEgg(days: context.days, now: now, calendar: calendar)
+        }
+    }
+
     /// helper function to calculate statistics and publish them into the SwiftUI home state
     /// - Parameters:
     ///   - animate: requests animation where the current statistics presentation supports it
@@ -2214,19 +2371,30 @@ struct InitialCalibrationRequestGate {
         }
         
         // declare constants/variables
-        let daysToUseStatistics = UserDefaults.standard.daysToUseStatistics
+        let now = Date()
+        let calendar = Calendar.current
+        let context = currentStatisticsContext(now: now, calendar: calendar)
+        statisticsContext = context
+        statisticsRequestGeneration += 1
+        let generation = statisticsRequestGeneration
+        let daysToUseStatistics = context.days
         let fromDate: Date
         
         // if the user has selected 0 (to chose "today") then set the fromDate to the previous midnight
         if daysToUseStatistics == 0 {
-            fromDate = Calendar(identifier: .gregorian).startOfDay(for: Date())
+            fromDate = calendar.startOfDay(for: now)
         } else {
             fromDate = Date(timeIntervalSinceNow: -3600.0 * 24.0 * Double(daysToUseStatistics))
         }
 
         rootHomeStateModel.setStatisticsLoading()
         statisticsManager?.calculateStatistics(fromDate: fromDate, toDate: nil) { [weak self] statistics in
-            self?.rootHomeStateModel.updateStatistics(statistics)
+            // don't let an older result bring back the emoji after changing periods or crossing midnight
+            guard let self, UserDefaults.standard.showStatistics,
+                  generation == self.statisticsRequestGeneration,
+                  context == self.currentStatisticsContext(now: Date(), calendar: .current) else { return }
+            self.rootHomeStateModel.updateStatistics(statistics)
+            self.rootHomeStateModel.updateStatisticsEasterEgg(days: context.days, now: Date(), calendar: .current)
         }
         return
     }
@@ -2417,9 +2585,13 @@ struct InitialCalibrationRequestGate {
         activeSensor = newSensor
         sensorNoiseManager?.update(activeSensor: newSensor)
         loopManager?.shareMetadata(clearReadings: true, clearSensorState: true)
+        updateLiveActivityAndWidgets(forceRestart: false)
     }
     
     private func stopSensor(cGMTransmitter: CGMTransmitter?, sendToTransmitter: Bool) {
+        dexcomG6InitialCalibrationPolicy = DexcomG6InitialCalibrationPolicy()
+        dexcomG6CalibrationTransmitter = nil
+        clearDexcomG6CalibrationPrompt()
         // create stopDate
         let stopDate = Date()
         
@@ -2528,9 +2700,51 @@ struct InitialCalibrationRequestGate {
         )
     }
     
+    /// use the same warm-up durations as Home, only for sources with known sensor timing
+    private func liveActivitySensorWarmupEndDate(sensorStartDate: Date? = nil) -> Date? {
+        let now = Date()
+        let transmitter = bluetoothPeripheralManager?.getCGMTransmitter()
+        let duration: Double
+        var startDate: Date?
+
+        if UserDefaults.standard.isMaster {
+            startDate = activeSensor?.startDate
+            if let transmitter = transmitter as? CGMG7Transmitter,
+               let peripheral = bluetoothPeripheralManager?.getBluetoothPeripheral(for: transmitter) as? DexcomG7 {
+                startDate = peripheral.sensorStartDate ?? startDate
+            }
+            startDate = sensorStartDate ?? startDate
+            switch transmitter?.cgmTransmitterType().sensorType() {
+            case .Libre:
+                duration = ConstantsMaster.minimumSensorWarmUpRequiredInMinutes
+            case .Dexcom:
+                if transmitter?.cgmTransmitterType() == .dexcomG7 {
+                    duration = ConstantsMaster.minimumSensorWarmUpRequiredInMinutesDexcomG7
+                } else {
+                    duration = transmitter?.isAnubisG6() == true
+                        ? ConstantsMaster.minimumSensorWarmUpRequiredInMinutesDexcomG6Anubis
+                        : ConstantsMaster.minimumSensorWarmUpRequiredInMinutesDexcomG5G6
+                }
+            default:
+                return nil
+            }
+        } else if UserDefaults.standard.followerDataSourceType == .libreLinkUp {
+            startDate = UserDefaults.standard.activeSensorStartDate
+            duration = ConstantsLibreLinkUp.sensorWarmUpRequiredInMinutesForLibre
+        } else {
+            return nil
+        }
+
+        guard let startDate, startDate <= now else { return nil }
+        let endDate = startDate.addingTimeInterval(duration * 60)
+        let confirmationUntil = (transmitter as? CGMG5Transmitter)?.sensorWarmupConfirmationUntil(for: startDate, now: now)
+        return endDate > now || confirmationUntil != nil ? endDate : nil
+    }
+
     /// check if the conditions are correct to start a live activity, update it, or end it
     /// also update the widget data stored in user defaults
-    private func updateLiveActivityAndWidgets(forceRestart: Bool) {
+    private func updateLiveActivityAndWidgets(forceRestart: Bool, therapyMetrics: TherapyMetricsSnapshot? = nil, sensorStartDate: Date? = nil) {
+        let sensorWarmupEndDate = liveActivitySensorWarmupEndDate(sensorStartDate: sensorStartDate)
         let keepAliveDisabledMessage = !UserDefaults.standard.isMaster && UserDefaults.standard.followerBackgroundKeepAliveType == .disabled
             ? "\(Texts_SettingsView.labelfollowerKeepAliveType) \(Texts_SettingsView.followerKeepAliveTypeDisabled)"
             : ""
@@ -2566,8 +2780,8 @@ struct InitialCalibrationRequestGate {
             // Chart payload reduction must never change these values.
             let latestBgReadings = bgReadingsAccessor.get2LatestBgReadings(minimumTimeIntervalInMinutes: 4)
             
-            if bgReadings.count > 0, let latestBgReading = latestBgReadings.first {
-                let slopeOrdinal = latestBgReading.slopeOrdinal()
+            if (bgReadings.count > 0 && !latestBgReadings.isEmpty) || sensorWarmupEndDate != nil {
+                let slopeOrdinal = latestBgReadings.first?.slopeOrdinal() ?? 0
                 var deltaValueInUserUnit: Double = 0
                 var bgReadingValues: [Double] = []
                 var bgReadingDates: [Date] = []
@@ -2575,7 +2789,7 @@ struct InitialCalibrationRequestGate {
                 // add delta if available
                 if latestBgReadings.count > 1 {
                     var previousValueInUserUnit: Double = latestBgReadings[1].finalValue.mgDlToMmol(mgDl: isMgDl)
-                    var actualValueInUserUnit: Double = latestBgReading.finalValue.mgDlToMmol(mgDl: isMgDl)
+                    var actualValueInUserUnit: Double = latestBgReadings[0].finalValue.mgDlToMmol(mgDl: isMgDl)
                     
                     // if the values are in mmol/L, then round them to the nearest decimal point in order to get the same precision out of the next operation
                     if !isMgDl {
@@ -2591,7 +2805,11 @@ struct InitialCalibrationRequestGate {
                     bgReadingDates.append(bgReading.timeStamp)
                 }
                 
-                let dataSourceDescription = UserDefaults.standard.isMaster ? UserDefaults.standard.activeSensorDescription ?? "" : UserDefaults.standard.followerDataSourceType.description
+                // Change the displayed source without changing the stored name used by integrations.
+                let sensorDescription = bluetoothPeripheralManager?.getCGMTransmitter()?.isAnubisG6() == true
+                    ? DexcomProductNameResolver.anubisTitle
+                    : UserDefaults.standard.activeSensorDescription ?? ""
+                let dataSourceDescription = UserDefaults.standard.isMaster ? sensorDescription : UserDefaults.standard.followerDataSourceType.description
                 var sensorNoiseStateRawValue: Int?
 
                 if UserDefaults.standard.isMaster,
@@ -2626,12 +2844,20 @@ struct InitialCalibrationRequestGate {
                     aidStatus = nil
                 }
                 
+                let resolvedTherapyMetrics = therapyMetrics ?? TherapyMetricsManager.shared.snapshot()
                 // show the live activity if we're in master mode or (follower with a heartbeat) and only if the user has requested to show it
                 // if we should show it, then let's continue processing the lastReading array to create a valid contentState
                 if (UserDefaults.standard.isMaster || (!UserDefaults.standard.isMaster && UserDefaults.standard.followerBackgroundKeepAliveType == .heartbeat)) && UserDefaults.standard.liveActivityType != .disabled {
                     // create the contentState that will update the dynamic attributes of the Live Activity Widget
-                    let contentState = XDripWidgetAttributes.ContentState( bgReadingValues: bgReadingValues, bgReadingDates: bgReadingDates, isMgDl: UserDefaults.standard.bloodGlucoseUnitIsMgDl, slopeOrdinal: slopeOrdinal, deltaValueInUserUnit: deltaValueInUserUnit, urgentLowLimitInMgDl: UserDefaults.standard.urgentLowMarkValue, lowLimitInMgDl: UserDefaults.standard.lowMarkValue, highLimitInMgDl: UserDefaults.standard.highMarkValue, urgentHighLimitInMgDl: UserDefaults.standard.urgentHighMarkValue, liveActivityType: UserDefaults.standard.liveActivityType, carPlayLiveActivityType: UserDefaults.standard.carPlayLiveActivityType, dataSourceDescription: dataSourceDescription, followerPatientName: !UserDefaults.standard.isMaster ? UserDefaults.standard.followerPatientName : nil, sensorNoiseStateRawValue: sensorNoiseStateRawValue, aidStatus: aidStatus)
+                    var contentState = XDripWidgetAttributes.ContentState( bgReadingValues: bgReadingValues, bgReadingDates: bgReadingDates, isMgDl: UserDefaults.standard.bloodGlucoseUnitIsMgDl, slopeOrdinal: slopeOrdinal, deltaValueInUserUnit: deltaValueInUserUnit, urgentLowLimitInMgDl: UserDefaults.standard.urgentLowMarkValue, lowLimitInMgDl: UserDefaults.standard.lowMarkValue, highLimitInMgDl: UserDefaults.standard.highMarkValue, urgentHighLimitInMgDl: UserDefaults.standard.urgentHighMarkValue, liveActivityType: UserDefaults.standard.liveActivityType, carPlayLiveActivityType: UserDefaults.standard.carPlayLiveActivityType, dataSourceDescription: dataSourceDescription, followerPatientName: !UserDefaults.standard.isMaster ? UserDefaults.standard.followerPatientName : nil, sensorNoiseStateRawValue: sensorNoiseStateRawValue, aidStatus: aidStatus, therapyMetrics: resolvedTherapyMetrics)
                     
+                    contentState.showIOBCOB = UserDefaults.standard.liveActivityShowIOBCOB
+                    contentState.sensorWarmupEndDate = sensorWarmupEndDate
+                    if UserDefaults.standard.isMaster,
+                       let transmitter = bluetoothPeripheralManager?.getCGMTransmitter() as? CGMG5Transmitter,
+                       let startDate = activeSensor?.startDate {
+                        contentState.sensorWarmupConfirmationUntil = transmitter.sensorWarmupConfirmationUntil(for: startDate)
+                    }
                     LiveActivityManager.shared.update(contentState: contentState, forceRestart: forceRestart)
                 } else {
                     Task { await LiveActivityManager.shared.endAllActivities() }
@@ -2642,11 +2868,11 @@ struct InitialCalibrationRequestGate {
                     date.timeIntervalSince1970
                 }
                 
-                let widgetSharedUserDefaultsModel = WidgetSharedUserDefaultsModel(bgReadingValues: bgReadingValues, bgReadingDatesAsDouble: bgReadingDatesAsDouble, isMgDl: UserDefaults.standard.bloodGlucoseUnitIsMgDl, slopeOrdinal: slopeOrdinal, deltaValueInUserUnit: deltaValueInUserUnit, urgentLowLimitInMgDl: UserDefaults.standard.urgentLowMarkValue, lowLimitInMgDl: UserDefaults.standard.lowMarkValue, highLimitInMgDl: UserDefaults.standard.highMarkValue, urgentHighLimitInMgDl: UserDefaults.standard.urgentHighMarkValue, dataSourceDescription: dataSourceDescription, followerPatientName: !UserDefaults.standard.isMaster ? UserDefaults.standard.followerPatientName : nil, aidStatus: aidStatus, allowStandByHighContrast: UserDefaults.standard.allowStandByHighContrast, forceStandByBigNumbers: UserDefaults.standard.forceStandByBigNumbers)
+                let widgetSharedUserDefaultsModel = WidgetSharedUserDefaultsModel(bgReadingValues: bgReadingValues, bgReadingDatesAsDouble: bgReadingDatesAsDouble, isMgDl: UserDefaults.standard.bloodGlucoseUnitIsMgDl, slopeOrdinal: slopeOrdinal, deltaValueInUserUnit: deltaValueInUserUnit, urgentLowLimitInMgDl: UserDefaults.standard.urgentLowMarkValue, lowLimitInMgDl: UserDefaults.standard.lowMarkValue, highLimitInMgDl: UserDefaults.standard.highMarkValue, urgentHighLimitInMgDl: UserDefaults.standard.urgentHighMarkValue, dataSourceDescription: dataSourceDescription, followerPatientName: !UserDefaults.standard.isMaster ? UserDefaults.standard.followerPatientName : nil, aidStatus: aidStatus, therapyMetrics: resolvedTherapyMetrics, allowStandByHighContrast: UserDefaults.standard.allowStandByHighContrast, forceStandByBigNumbers: UserDefaults.standard.forceStandByBigNumbers)
                 
                 // store the model in the shared user defaults using a name that is uniquely specific to this copy of the app as installed on
                 // the user's device - this allows several copies of the app to be installed without cross-contamination of widget data
-                if let widgetData = try? JSONEncoder().encode(widgetSharedUserDefaultsModel) {
+                if !bgReadingValues.isEmpty, let widgetData = try? JSONEncoder().encode(widgetSharedUserDefaultsModel) {
                     UserDefaults.storeInSharedUserDefaults(
                         value: widgetData,
                         forKey: WidgetSharedUserDefaultsModel.widgetDataKey(
@@ -2659,42 +2885,6 @@ struct InitialCalibrationRequestGate {
             }
         }
         WidgetCenter.shared.reloadAllTimelines()
-    }
-    
-    /// store notification glucose chart images in the app container documents folder
-    private func createNotificationImages() {
-        // create a small thumbnail glucose chart image to show in the standard iOS notification banner
-        createNotificationImage(glucoseChartType: .notificationImageThumbnail)
-        
-        /// create an image based upon a glucose chart view and save it to the app container documents directory
-        /// - Parameter glucoseChartType: the type of glucose chart type we want to generate (i.e. thumbnail or full notification chart)
-        func createNotificationImage(glucoseChartType: GlucoseChartType) {
-            if let bgReadingsAccessor = self.bgReadingsAccessor {
-                let bgReadings = bgReadingsAccessor.getLatestBgReadings(limit: nil, fromDate: Date().addingTimeInterval(-3600 * glucoseChartType.hoursToShow(liveActivityType: .normal)), forSensor: nil, ignoreRawData: true, ignoreCalculatedValue: false)
-                
-                if bgReadings.count > 0 {
-                    var bgReadingValues: [Double] = []
-                    var bgReadingDates: [Date] = []
-                    
-                    for bgReading in bgReadings {
-                        bgReadingValues.append(bgReading.finalValue)
-                        bgReadingDates.append(bgReading.timeStamp)
-                    }
-                    
-                    // create a chart view with just bg reading values and dates
-                    let glucoseChartView = GlucoseChartView(glucoseChartType: glucoseChartType, bgReadingValues: bgReadingValues, bgReadingDates: bgReadingDates, isMgDl: UserDefaults.standard.bloodGlucoseUnitIsMgDl, urgentLowLimitInMgDl: UserDefaults.standard.urgentLowMarkValue, lowLimitInMgDl: UserDefaults.standard.lowMarkValue, highLimitInMgDl: UserDefaults.standard.highMarkValue, urgentHighLimitInMgDl: UserDefaults.standard.urgentHighMarkValue, liveActivityType: .normal, hoursToShowScalingHours: nil, glucoseCircleDiameterScalingHours: nil, overrideChartHeight: nil, overrideChartWidth: nil, highContrast: nil)
-                    
-                    // render the glucose chart view as an image object
-                    guard let notificationImage = ImageRenderer(content: glucoseChartView).uiImage else { return }
-                    
-                    // try and save the image to the documents directory in the app container
-                    if let imageToSave = notificationImage.pngData() {
-                        let fileUrl = URL.documentsDirectory.appendingPathComponent("\(glucoseChartType.filename()).png")
-                        try? imageToSave.write(to: fileUrl)
-                    }
-                }
-            }
-        }
     }
     
     // updates the toolbar UI to show the current snooze status of the app
@@ -2722,6 +2912,71 @@ struct InitialCalibrationRequestGate {
 
 /// conform to CGMTransmitterDelegate
 extension RootApplicationCoordinator: @preconcurrency CGMTransmitterDelegate {
+    func dexcomG6CalibrationStateReceived(_ state: DexcomAlgorithmState, sensorStartDate: Date, from transmitter: CGMG5Transmitter) {
+        guard UserDefaults.standard.isMaster,
+              bluetoothPeripheralManager?.getCGMTransmitter() as? CGMG5Transmitter === transmitter,
+              transmitter.needsSensorStartCode() else { return }
+
+        if dexcomG6CalibrationTransmitter !== transmitter {
+            dexcomG6InitialCalibrationPolicy = DexcomG6InitialCalibrationPolicy()
+            clearDexcomG6CalibrationPrompt()
+            dexcomG6CalibrationTransmitter = transmitter
+        }
+
+        guard let activeSensor,
+              abs(activeSensor.startDate.timeIntervalSince(sensorStartDate)) <= CGMG5Transmitter.sensorStartDateTolerance else {
+            dexcomG6InitialCalibrationPolicy = DexcomG6InitialCalibrationPolicy()
+            clearDexcomG6CalibrationPrompt()
+            return
+        }
+
+        let shouldPrompt = dexcomG6InitialCalibrationPolicy.update(state: state, sensorStartDate: sensorStartDate)
+        guard dexcomG6InitialCalibrationPolicy.requiredState != nil else {
+            clearDexcomG6CalibrationPrompt()
+            return
+        }
+        guard shouldPrompt else { return }
+
+        clearDexcomG6CalibrationPrompt()
+        if UIApplication.shared.applicationState == .active {
+            presentDexcomG6InitialCalibration()
+        } else {
+            // As with the raw-calibration flow, reopening the app also opens entry without
+            // requiring a notification tap. Recheck the live state before presenting it.
+            ApplicationManager.shared.addClosureToRunWhenAppWillEnterForeground(key: applicationManagerKeyDexcomG6Calibration) { [weak self] in
+                self?.presentDexcomG6InitialCalibration()
+            }
+            createNotification(
+                title: Texts_Calibrations.calibrationNotificationRequestTitle,
+                body: Texts_Calibrations.calibrationNotificationRequestBody,
+                identifier: ConstantsNotifications.NotificationIdentifiersForCalibration.dexcomG6InitialCalibrationRequest,
+                sound: UNNotificationSound(named: UNNotificationSoundName(""))
+            )
+        }
+    }
+
+    func sensorSessionConfirmed(startDate: Date) {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in
+                self?.sensorSessionConfirmed(startDate: startDate)
+            }
+            return
+        }
+
+        guard bluetoothPeripheralManager?.getCGMTransmitter()?.needsSensorStartCode() == true,
+              let activeSensor,
+              let coreDataManager,
+              abs(activeSensor.startDate.timeIntervalSince(startDate)) <= CGMG5Transmitter.sensorStartDateTolerance,
+              activeSensor.confirmSessionStartedByApp() else {
+            return
+        }
+
+        trace("validated Dexcom glucose data confirms sensor session started by xDrip with requested code %{public}@", log: log, category: ConstantsLog.categoryRootView, type: .info, activeSensor.requestedSensorCode ?? "none")
+
+        coreDataManager.saveChanges()
+        updateLabelsAndChart(overrideApplicationState: false)
+    }
+
     func sensorSessionStartResultReceived(_ result: CGMSensorSessionStartResult) {
         guard Thread.isMainThread else {
             DispatchQueue.main.async { [weak self] in
@@ -2768,6 +3023,7 @@ extension RootApplicationCoordinator: @preconcurrency CGMTransmitterDelegate {
         
         UserDefaults.standard.activeSensorStartDate = nil
         UserDefaults.standard.activeSensorDescription = nil
+        updateLiveActivityAndWidgets(forceRestart: false)
     }
     
     func newSensorDetected(sensorStartDate: Date?) {
@@ -2927,7 +3183,27 @@ extension RootApplicationCoordinator: @preconcurrency CGMTransmitterDelegate {
         ) > 0 ? .historicalInserted : .historyNotInserted
     }
     
+    /// Enforces the configured warm-up boundary independently of the value carried in a packet.
+    /// A G7 can expose positive internal glucose estimates before warm-up completes. Those values
+    /// are not displayable readings and must not reach storage, alerts, widgets, Watch, or AID.
+    static func shouldSuppressReadingDuringWarmup(
+        sensorAgeInSeconds: TimeInterval,
+        minimumWarmUpRequiredInMinutes: Double
+    ) -> Bool {
+        sensorAgeInSeconds < minimumWarmUpRequiredInMinutes * 60
+    }
+
     func cgmTransmitterInfoReceived(glucoseData: inout [GlucoseData], transmitterBatteryInfo: TransmitterBatteryInfo?, sensorAge: TimeInterval?) {
+        // use the packet timestamp, as delayed readings must not move the warm-up end time
+        let sensorStartDate = sensorAge.flatMap { age in
+            age.isFinite && age >= 0 ? (glucoseData.map { $0.timeStamp }.max() ?? Date()).addingTimeInterval(-age) : nil
+        }
+        // update warm-up even when this packet doesn't produce a stored glucose reading
+        defer {
+            if liveActivitySensorWarmupEndDate(sensorStartDate: sensorStartDate) != nil || LiveActivityManager.shared.contentStateForPreview?.sensorWarmupEndDate != nil {
+                updateLiveActivityAndWidgets(forceRestart: false, sensorStartDate: sensorStartDate)
+            }
+        }
         trace("in cgmTransmitterInfoReceived, transmitterBatteryInfo %{public}@", log: log, category: ConstantsLog.categoryRootView, type: .debug, transmitterBatteryInfo?.description ?? "not received")
         trace("in cgmTransmitterInfoReceived, sensor time in days %{public}@", log: log, category: ConstantsLog.categoryRootView, type: .debug, sensorAge?.days.round(toDecimalPlaces: 1).description ?? "not received")
         trace("in cgmTransmitterInfoReceived, glucoseData array size = %{public}@ values", log: log, category: ConstantsLog.categoryRootView, type: .info, glucoseData.count.description)
@@ -2953,9 +3229,11 @@ extension RootApplicationCoordinator: @preconcurrency CGMTransmitterDelegate {
             let cgmTransmitterType = bluetoothPeripheralManager?.getCGMTransmitter()?.cgmTransmitterType()
             let minimumWarmUpRequiredInMinutes = cgmTransmitterType == .dexcomG7 ? ConstantsMaster.minimumSensorWarmUpRequiredInMinutesDexcomG7 : ConstantsMaster.minimumSensorWarmUpRequiredInMinutes
             let secondsUntilWarmUpComplete = (minimumWarmUpRequiredInMinutes * 60) - sensorAgeInSeconds
-            let isDexcomG7WithReceivedGlucose = cgmTransmitterType == .dexcomG7 && glucoseData.contains { $0.glucoseLevelRaw > 0 }
-            
-            if secondsUntilWarmUpComplete > 0 && !isDexcomG7WithReceivedGlucose {
+
+            if Self.shouldSuppressReadingDuringWarmup(
+                sensorAgeInSeconds: sensorAgeInSeconds,
+                minimumWarmUpRequiredInMinutes: minimumWarmUpRequiredInMinutes
+            ) {
                 supressReadingIfSensorIsWarmingUp = true
                 
                 let warmupMinutesRemaining = Int(secondsUntilWarmUpComplete / 60)
@@ -3031,6 +3309,12 @@ extension RootApplicationCoordinator: @preconcurrency CGMTransmitterDelegate {
             sensorStartDate: activeSensor?.startDate
         )
         loopManager?.shareMetadata(clearReadings: sensorHealthIssueManager.visibleIssue?.severity == .terminal)
+        // G6 status packets can finish warm-up or report a problem without delivering glucose.
+        if bluetoothPeripheralManager?.getCGMTransmitter() is CGMG5Transmitter,
+           liveActivitySensorWarmupEndDate() != nil || LiveActivityManager.shared.contentStateForPreview?.sensorWarmupEndDate != nil {
+            publishRootHomeState()
+            updateLiveActivityAndWidgets(forceRestart: false)
+        }
     }
 }
 
@@ -3040,6 +3324,11 @@ extension RootApplicationCoordinator: @preconcurrency CGMTransmitterDelegate {
 extension RootApplicationCoordinator: @preconcurrency UNUserNotificationCenterDelegate {
     // called when notification created while app is in foreground
     func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification, withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        if notification.request.identifier == ConstantsNotifications.NotificationIdentifiersForCalibration.dexcomG6InitialCalibrationRequest {
+            presentDexcomG6InitialCalibration()
+            completionHandler([])
+            return
+        }
         if notification.request.identifier == ConstantsNotifications.NotificationIdentifiersForCalibration.initialCalibrationRequest {
             
             // request calibration
@@ -3086,7 +3375,10 @@ extension RootApplicationCoordinator: @preconcurrency UNUserNotificationCenterDe
             completionHandler()
         }
         
-        if response.notification.request.identifier == ConstantsNotifications.NotificationIdentifiersForCalibration.initialCalibrationRequest {
+        if response.notification.request.identifier == ConstantsNotifications.NotificationIdentifiersForCalibration.dexcomG6InitialCalibrationRequest {
+            // Foreground entry may already have presented the same request.
+            presentDexcomG6InitialCalibration()
+        } else if response.notification.request.identifier == ConstantsNotifications.NotificationIdentifiersForCalibration.initialCalibrationRequest {
             // nothing required, the requestCalibration function will be called as it's been added to ApplicationManager
             trace("in userNotificationCenter didReceive, user pressed calibration notification to open the app, requestCalibration should be called because closure is added in ApplicationManager.shared", log: log, category: ConstantsLog.categoryRootView, type: .info)
         } else if response.notification.request.identifier == ConstantsNotifications.NotificationIdentifierForSensorNotDetected.sensorNotDetected {
@@ -3171,6 +3463,7 @@ extension RootApplicationCoordinator: @preconcurrency FollowerDelegate {
             let previousTimeStampLastBgReading = timeStampLastBgReading
             
             var firstCreatedBgReadingTimeStamp: Date?
+            var acceptedReadings: [(reading: BgReading, acceptedAt: Date)] = []
 
             let duplicateReadingWindow = TimeInterval(minutes: 2.5)
             let oldestIncomingTimeStamp = followGlucoseDataArray.map { $0.timeStamp }.min()
@@ -3232,20 +3525,13 @@ extension RootApplicationCoordinator: @preconcurrency FollowerDelegate {
                     }
 
                     if let newReading = newReading {
-                        // Record only after a manager has accepted and created the reading. The row
-                        // timestamp defaults to this actual acceptance time. `measuredAt` is retained
-                        // separately so a restored value can explain when the glucose was measured
-                        // without being sorted before the login or poll that retrieved it.
+                        // Keep every accepted sample, including backfills, for logging after processing.
+                        acceptedReadings.append((newReading, Date()))
                         trace(
                             "in followerInfoReceived, created new bgreading: value = %{public}@ %{public}@, timestamp = %{public}@",
                             log: self.log,
                             category: ConstantsLog.categoryRootView,
                             type: .info,
-                            troubleshooting: .standard(.glucoseAccepted(
-                                mgDl: followGlucoseData.sgv,
-                                source: TroubleshootingLogSource(UserDefaults.standard.followerDataSourceType),
-                                measuredAt: followGlucoseData.timeStamp
-                            )),
                             followGlucoseData.sgv.mgDlToMmol(mgDl: isMgDl).bgValueToString(mgDl: isMgDl),
                             isMgDl ? Texts_Common.mgdl : Texts_Common.mmol,
                             followGlucoseData.timeStamp.toStringForTrace(timeStyle: .long, dateStyle: .long)
@@ -3282,6 +3568,15 @@ extension RootApplicationCoordinator: @preconcurrency FollowerDelegate {
                     }
                 } else {
                     _ = bgPostProcessingManager?.processLatestReadings()
+                }
+
+                for accepted in acceptedReadings {
+                    TroubleshootingLogStore.shared.record(.standard(.glucoseAccepted(
+                        mgDl: accepted.reading.finalValue,
+                        source: TroubleshootingLogSource(UserDefaults.standard.followerDataSourceType),
+                        measuredAt: accepted.reading.timeStamp,
+                        originalMgDl: accepted.reading.calculatedValue
+                    ), timestamp: accepted.acceptedAt))
                 }
 
                 // Publish the final stored value before optional downstream consumers perform their work.

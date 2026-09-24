@@ -10,6 +10,21 @@ Den nuværende permanente checkpoint-branch er
 branchen bevarer denne vejledning og release-scriptet. Oplysningerne under
 "Historisk Mac-baseline" beskriver den ældre checkout før integrationen.
 
+## Aktuel 7.1.1-integrationsworktree
+
+Den officielle 7.1.1-opdatering arbejdes på i
+`../xdripswift-upstream-7.1.1`, branch `integration/upstream-7.1.1`, fra
+checkpoint `5a0ce985c86909e3827970f4487ca573bd46a7a5`. Den gamle
+integrationsworktree og checkpointet er bevaret. Genbrug denne eksisterende
+worktree; begynd ikke igen i 4263-checkoutet. Se den aktuelle teststatus og
+releaseblokeringer i [PROJECT-STATUS.md](PROJECT-STATUS.md).
+
+Mac-værktøjer, lokal identitetskonfiguration og signeringsaktiver er genbrugt.
+Marketingversionen er 7.1.1 på alle fem bundles, men det næste release-buildnummer
+er endnu ikke bekræftet hos Apple. Simulatorens fallback 4231 må ikke uploades.
+Alle nye relevante upstream-testfejl skal afklares, før release-forløbet nedenfor
+bruges. Den tidligere GO UPLOAD gjaldt kun 4263.
+
 ## Fast TestFlight-proces fra næste build
 
 Læs [AGENTS.md](../AGENTS.md) og [aktuel projektstatus](PROJECT-STATUS.md).

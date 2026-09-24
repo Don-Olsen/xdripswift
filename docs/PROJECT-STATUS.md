@@ -1,3 +1,116 @@
+# Projektstatus – officiel 7.1.1-integration
+
+Opdateret 24. september 2026. Den officielle opdatering er integreret lokalt på
+`integration/upstream-7.1.1` i `../xdripswift-upstream-7.1.1`.
+**Dette er ikke en TestFlight-udgivelse. Der er ikke uploadet eller installeret
+noget på fysiske enheder.** 7.0.0 (4263) er fortsat det seneste bekræftede
+Internal / Testing-build; dets historiske kildebeskrivelse nedenfor er bevaret.
+
+## Kildegrundlag og konfliktløsning
+
+- Uændret checkpoint før opdateringen: `checkpoint/post-testflight-4263`,
+  `5a0ce985c86909e3827970f4487ca573bd46a7a5`.
+- Officiel kilde: `JohanDegraeve/xdripswift`, tag **7.1.1**, verificeret til
+  `c268542e64626c564e626658fa9a6b90a059ada4`. Det lokale reference-tag hedder
+  `upstream/7.1.1`; det er ikke et TestFlight-tag og pushes ikke.
+- Der er foretaget en konkret trevejssammenfletning, ikke en erstatning med
+  upstream-filer. De 16 konfliktfiler er løst enkeltvis.
+- Projektfilen indeholder både alle officielle nye kildefiler og vores
+  Watch-/testfiler, uden dobbelte source-memberships. Team, fem bundle IDs,
+  entitlements/App Groups og kildecommit-stempling er bevaret. Alle fem
+  simulatorprodukter har marketingversion **7.1.1**.
+- Watch-status har fået upstreams therapy metrics gennem den eksisterende
+  samlede statuslevering. Watch-ejerskab, handoff, recovery, lokal målingskø,
+  restore-rettelse, alarmansvar og snooze er bevaret. Ingen ny statuskoordinator
+  eller Apple Sundhed-insulinimport er tilføjet.
+- Telefonens officielle Libre-frameassembler og ankomsttid bruges sammen med
+  vores ejerskabs-/pausekontroller. Den eksisterende pausekontrol blev flyttet
+  før upstreams udtrukne fælles connect-helper, så den fortsat stopper discovery.
+  Watch-modtagerens lagrings-/kvitteringsmetoder og parent-store completion er
+  uændrede. Køskrivefejl blokerer fortsat ikke Watch-lokal visning eller alarmer.
+- Nightscouts officielle upsert-ændring var allerede tilbageført med stærkere
+  historikkø-/site-/revisionkontroller. Den er ikke implementeret dobbelt.
+  Vores præcise SGV-sletning og kvitteringskø er bevaret; officiel afstemning
+  af slettede treatments er indarbejdet.
+- HealthKit beholder vores versionerede, serielle retry-kø. Officielle
+  forgrund-/unlock-genforsøg, validering mod aktuelle Core Data-værdier og
+  præcis sletning af skjulte målings-ID'er er integreret i samme kø. En ny
+  syntetisk regression dækker bevarede revisioner og sen completion efter
+  sletning/genoprettelse.
+- Officiel trend-/model-/backup-/UI-/Dexcom-funktionalitet er med. Diagnosejournal
+  og klinisk kø forbliver adskilte. Accepterede direkte målinger logges efter
+  efterbehandling; Watch-historik går fortsat uden om live-alarmvejen.
+- Testens telefonparser har fået det krævede `newestReadingDate`-argument.
+  En forældet logfilter-forventning er tilpasset det officielle format, hvor
+  enheden står i rapporthovedet. Ingen test er deaktiveret.
+- Mac-værktøjer og signeringsopsætning er genbrugt uden installationer eller
+  Apple-ændringer. `codemagic.yaml` er urørt. Release-commitbeskeden har nu
+  `[skip ci]`; workflows har ingen aktive push/tag-triggere.
+
+## Verifikation af 7.1.1
+
+Resultaterne for 4263 nedenfor må ikke bruges som bevis for denne integration.
+De nye logs og `.xcresult` ligger under `build/upstream-7.1.1-integration/`.
+Den første kompilering stoppede ved det nye parserargument; den er bevaret i
+`initial-full/`. Den efterfølgende fulde suite og den afsluttende Watch-regression
+rapporteres separat nedenfor, når Xcodes resultater er færdigskrevet.
+
+Begge separate simulatorbuilds er bestået (iPhone `xdrip` og Watch
+`xDrip Watch App`), med logs i `simulator-builds/logs/`. Kontrollen i
+`simulator-products.json` bekræfter korrekt indlejring og alle fem identiteter.
+Build **4231** er alene den bevarede udviklingsfallback i disse simulatorprodukter,
+**ikke** et valgt eller bekræftet næste TestFlight-buildnummer.
+
+En isoleret native macOS/Core Data-kontrol migrerede en SQLite-database oprettet
+med checkpointets præcise v27-model til den officielle v32-model og genåbnede
+den i en tredje proces. Otte syntetiske records og 22 værdi-/relationskontroller
+bestod ved både migration og genåbning: målings-ID/værdi/tid, kalibrering/sensor,
+alarmer, snooze og periferidata. Den gamle kilde-model var utilgængelig under
+migrationen. Derfor blev de officielle historiske modeller ikke ændret.
+Bevis: `build/migration-v27-v32-audit/summary.json`, `authoritative.log` og
+`reopen.log`. Dette er macOS-migrationsbevis, ikke test på alle understøttede
+fysiske iOS-versioner.
+
+## Åbne fund og releaseblokeringer
+
+Den fulde suite er ikke grøn. Nye fund må ikke kaldes gamle fejl alene på grund
+af tidligere suiteproblemer. Følgende er holdt adskilt fra integrationen:
+
+- Officiel afrundingskode giver `[3, 88, 9]`, hvor to nye tests forventer
+  `[4, 87, 9]`. Uændrede kilde-/testfiler er sammenlignet byte-for-byte med
+  `c268542`, og resultatet er reproduceret i en native Swift-kørsel.
+  Bevis: `build/upstream-baseline-reproduction/`.
+- En ny officiel Dexcom G7-test forventer engelske statustekster, men får de
+  officielle danske lokaliseringer på denne simulator. Den samme uændrede test
+  er efterfølgende kørt isoleret med `-testLanguage en -testRegion US` og bestod
+  **1/1**, dokumenteret i `english-status.xcresult` og
+  `english-status-summary.json`. Den danske fejl er bevaret, ikke skjult.
+- **Officiel Dexcom-alarmfejl:** den nye batteri-opstartskontrol i
+  `AlertManager.checkAlertAndFire` tester ikke alarmtypen. Ved en Dexcom-batteripakke
+  og hardware yngre end seks timer eller ukendt alder kan den også undertrykke
+  glukosealarmer og missed-reading-planlægning. Kaldesti og kode er verificeret
+  mod upstream; der er ikke foretaget fysisk alarmtest. Almindelige Libre-pakker
+  og vores Watch-lokale alarmvej går ikke gennem denne kontrol. En rettelse af
+  selve alarmreglen er en særskilt opgave, ikke udført her.
+- Officiel Nightscout-treatment-afstemning tager site-snapshot efter den første
+  netværksrespons. Et serverskift under forespørgslen kan derfor føre til kontrol
+  mod en forkert server. Dette er et kodegennemgangsfund i den uændrede officielle
+  treatment-vej; vores sitebundne glukosekø er bevaret. Ikke fysisk reproduceret.
+- Den separate `invalidPayload`-risiko fra 4263 og fysisk Watch-test af
+  forgrund/baggrund, reconnect, offline-efterlevering, alarmer og snooze er fortsat
+  åbne. Simulatorresultater dokumenterer ikke fysisk Bluetooth-stabilitet eller
+  hørbare alarmer.
+
+Der er **intet nyt release-checkpoint/tag, signeret arkiv eller IPA**.
+Release kræver afklaring af de nye relevante testfejl samt et aktuelt bekræftet
+buildnummer hos Apple. Browserkontrollen afviste adgang til App Store Connect;
+der er ikke forsøgt omgåelse, og der er ikke gættet på 4264 eller kopieret et
+upstream-buildnummer. Når det er afklaret, sættes nummeret i den versionerede
+`xDrip/Version.xcconfig` **før** release-scriptets tests, checkpoint/push, tag og
+arkiv/IPA fra tagget. Upload kræver et nyt, særskilt **GO UPLOAD** for denne version.
+
+---
+
 # Projektstatus – post-TestFlight 4263 checkpoint
 
 Opdateret 24. september 2026. Version **7.0.0 (4263)** er uploadet til den

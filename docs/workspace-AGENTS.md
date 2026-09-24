@@ -1,6 +1,12 @@
 # Workspace entry point for Codex
 
-In the local Mac workspace, the integration checkout is named
+For the official 7.1.1 integration, continue the existing
+`xdripswift-upstream-7.1.1` worktree on `integration/upstream-7.1.1`, based on
+checkpoint `5a0ce985c86909e3827970f4487ca573bd46a7a5`. Read the current status
+before treating it as release-ready; upstream test failures and the unconfirmed
+Apple build number are documented there. This task has no upload authorization.
+
+In the local Mac workspace, the preserved 4263 integration checkout is named
 `xdripswift-watch-reading-integration`. An older sibling checkout named
 `xdripswift` does not contain the code used for TestFlight 7.0.0 (4263).
 Start release work in the integration checkout on

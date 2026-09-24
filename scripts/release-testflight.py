@@ -258,7 +258,7 @@ def checkpoint(root, path, version, build, tag):
             "step": "tested",
         }
         save_state(path, state)
-    run(["git", "commit", "-m", f"testflight: checkpoint {version} ({build})"])
+    run(["git", "commit", "-m", f"testflight: checkpoint {version} ({build}) [skip ci]"])
     ensure_clean()
     checkpoint_sha = git("rev-parse", "HEAD")
     if git("rev-parse", "HEAD^{tree}") != tree:

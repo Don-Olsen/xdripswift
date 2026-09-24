@@ -71,6 +71,8 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
     private var alarmSnapshotUpdatePending = false
     private let handoffSnapshotCache = LibreWatchHandoffSnapshotCache()
     private var forcedComplicationPending = false
+    /// Preserve the upstream snapshot through our coalesced status delivery.
+    private var pendingTherapyMetrics: TherapyMetricsSnapshot?
     private var lastSessionSentRevision: UInt64?
     private var lastSessionSendUptime: TimeInterval = -.infinity
 
@@ -81,7 +83,8 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
             guard let self else { complete([:]); return }
             var result: [String: Any] = [:]
             if streams.contains("status") {
-                self.status = self.currentStatus()
+                self.status = self.currentStatus(therapyMetrics: self.pendingTherapyMetrics)
+                self.pendingTherapyMetrics = nil
                 result["status"] = self.status.asDictionary
                 if self.status.libreAlarmSettings?.revision != self.handoffSnapshotCache.snapshot?.alarmSettings?.revision {
                     self.sendLibreWatchSession()
@@ -294,7 +297,18 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
         sessionActivationLock.unlock()
     }
 
-    private func processWatchUpdate(updateTypes: Set<WatchUpdateType>, forceComplicationUpdate: Bool) {
+    private func processWatchUpdate(updateTypes: Set<WatchUpdateType>, forceComplicationUpdate: Bool, therapyMetrics: TherapyMetricsSnapshot? = nil) {
+        // KVO and WatchConnectivity may enter on a background queue. Status providers
+        // and UI-owned state are read on main without blocking the notifying writer.
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in
+                self?.processWatchUpdate(updateTypes: updateTypes, forceComplicationUpdate: forceComplicationUpdate, therapyMetrics: therapyMetrics)
+            }
+            return
+        }
+        if updateTypes.contains(.status) {
+            pendingTherapyMetrics = therapyMetrics
+        }
         forcedComplicationPending = forcedComplicationPending || forceComplicationUpdate
         phoneRefresh.changed(Set(updateTypes.map { type in
             switch type { case .status: return "status"; case .bgReadings: return "bgReadings"; case .agp: return "agp" }
@@ -341,7 +355,7 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
         return WatchBgReadings(generatedAt: Date().timeIntervalSince1970, hoursIncluded: hoursOfBgReadingsToSend, bgReadingValues: bgReadingValues, bgReadingDatesAsDouble: bgReadingDatesAsDouble, slopeOrdinal: slopeOrdinal, deltaValueInUserUnit: deltaValueInUserUnit)
     }
 
-    private func currentStatus() -> WatchStatus {
+    private func currentStatus(therapyMetrics: TherapyMetricsSnapshot? = nil) -> WatchStatus {
         var status = WatchStatus()
 
         if let session = libreWatchDirectSession {
@@ -355,6 +369,17 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
         status.highLimitInMgDl = UserDefaults.standard.highMarkValue
         status.urgentHighLimitInMgDl = UserDefaults.standard.urgentHighMarkValue
         status.activeSensorDescription = UserDefaults.standard.activeSensorDescription
+        if UserDefaults.standard.isMaster {
+            // Use the selected transmitter, not an inactive Anubis saved in the device list.
+            coreDataManager.mainManagedObjectContext.performAndWait {
+                let peripheral = BLEPeripheralAccessor(coreDataManager: coreDataManager)
+                    .getBLEPeripherals()
+                    .first(where: { $0.shouldconnect && $0.dexcomG5 != nil })
+                if peripheral?.dexcomG5?.isAnubis == true {
+                    status.activeSensorDescription = DexcomProductNameResolver.anubisTitle
+                }
+            }
+        }
         status.preferSensorCountdown = UserDefaults.standard.preferSensorCountdown
         status.isMaster = UserDefaults.standard.isMaster
         status.followerDataSourceTypeRawValue = UserDefaults.standard.followerDataSourceType.rawValue
@@ -419,6 +444,7 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
             status.aidStatus = nil
         }
 
+        status.therapyMetrics = therapyMetrics ?? TherapyMetricsManager.shared.snapshot()
         return status
     }
 
@@ -1259,6 +1285,10 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
     }
 
     // MARK: - Public functions
+
+    func updateTherapyMetrics(_ snapshot: TherapyMetricsSnapshot) {
+        processWatchUpdate(updateTypes: [.status], forceComplicationUpdate: false, therapyMetrics: snapshot)
+    }
 
     func updateWatchApp(forceComplicationUpdate: Bool) {
         processWatchUpdate(updateTypes: [.status, .bgReadings], forceComplicationUpdate: forceComplicationUpdate)

@@ -22,14 +22,135 @@ def require(condition, message):
         raise ValueError(message)
 
 
+def swift_source_tokens(source):
+    """Tokenize declaration boundaries, excluding comments and Swift string contents."""
+    def skip_comment(start):
+        if source.startswith('//', start):
+            end = source.find('\n', start)
+            return len(source) if end < 0 else end
+        depth, pos = 1, start + 2
+        while pos < len(source):
+            if source.startswith('/*', pos):
+                depth += 1
+                pos += 2
+            elif source.startswith('*/', pos):
+                depth -= 1
+                pos += 2
+                if depth == 0:
+                    return pos
+            else:
+                pos += 1
+        raise ValueError('Unterminated Swift block comment')
+
+    def skip_string(start, hashes, quote):
+        pos = start + len(hashes) + len(quote)
+        closing, escape = quote + hashes, '\\' + hashes
+        while pos < len(source):
+            if source.startswith(closing, pos):
+                return pos + len(closing)
+            if source.startswith(escape, pos):
+                pos += len(escape)
+                if source.startswith('(', pos):
+                    depth, pos = 1, pos + 1
+                    while pos < len(source) and depth:
+                        nested = re.match(r'(#*)("""|")', source[pos:])
+                        if source.startswith(('//', '/*'), pos):
+                            pos = skip_comment(pos)
+                        elif nested:
+                            pos = skip_string(pos, nested[1], nested[2])
+                        else:
+                            depth += (source[pos] == '(') - (source[pos] == ')')
+                            pos += 1
+                    require(depth == 0, 'Unterminated Swift string interpolation')
+                else:
+                    pos += 1
+            else:
+                pos += 1
+        raise ValueError('Unterminated Swift string')
+
+    tokens, pos = [], 0
+    while pos < len(source):
+        literal = re.match(r'(#*)("""|")', source[pos:])
+        if source.startswith(('//', '/*'), pos):
+            pos = skip_comment(pos)
+        elif literal:
+            pos = skip_string(pos, literal[1], literal[2])
+            tokens.append('<literal>')
+        elif source[pos].isspace():
+            pos += 1
+        else:
+            token = re.match(r'[A-Za-z_][A-Za-z_0-9]*|[0-9]+|[^\s]', source[pos:])[0]
+            tokens.append(token)
+            pos += len(token)
+    return tokens
+
+
+def suite_methods(source, suite):
+    """Require unambiguous direct XCTest methods in one class and its extensions.
+
+    Nested helpers and other classes do not own the selected suite's methods.
+    Conditional declarations, generic/qualified suite declarations and overloaded
+    or parameterized test methods require explicit discovery support, not guesses.
+    """
+    tokens = swift_source_tokens(source)
+    scopes, declarations, methods = [], {}, set()
+    class_count = 0
+    types = {'class', 'extension', 'struct', 'enum', 'protocol', 'actor'}
+    for index, token in enumerate(tokens):
+        if token == '/':
+            previous = tokens[index - 1] if index else ''
+            following = tokens[index + 1] if index + 1 < len(tokens) else ''
+            require((re.fullmatch(r'[A-Za-z_0-9]+', previous) or previous in {')', ']', '<literal>'})
+                    and previous not in {'return', 'throw', 'case', 'if', 'else', 'in', 'try', 'await'}
+                    and (re.fullmatch(r'[A-Za-z_0-9]+', following) or following in {'(', '<literal>'}),
+                    'Unsupported or ambiguous Swift regex/operator syntax in ' + suite)
+        if token == '#' and index + 1 < len(tokens):
+            require(tokens[index + 1] not in {'if', 'elseif', 'else', 'endif', '/'},
+                    'Unsupported conditional or regex declaration syntax in ' + suite)
+        if token in types and index + 1 < len(tokens):
+            name = tokens[index + 1]
+            if name == suite or (token == 'extension' and index + 3 < len(tokens)
+                                 and tokens[index + 2:index + 4] == ['.', suite]):
+                require(not scopes and name == suite, 'Unsupported nested/qualified suite: ' + suite)
+                end = index + 2
+                while end < len(tokens) and tokens[end] not in {'{', '}', ';'}:
+                    end += 1
+                require(end < len(tokens) and tokens[end] == '{', 'Missing suite body: ' + suite)
+                header = tokens[index + 2:end]
+                require(token in {'class', 'extension'} and '<' not in header and 'where' not in header,
+                        'Unsupported suite declaration: ' + suite)
+                if token == 'class':
+                    require(header == [':', 'XCTestCase'], 'Unsupported XCTest inheritance: ' + suite)
+                    class_count += 1
+                else:
+                    require(not header, 'Unsupported suite extension: ' + suite)
+                declarations[end] = suite
+        if token == '{':
+            scopes.append(declarations.get(index))
+        elif token == '}':
+            require(bool(scopes), 'Unbalanced Swift source in ' + suite)
+            scopes.pop()
+        elif token == 'func' and scopes and scopes[-1] == suite:
+            require(index + 1 < len(tokens), 'Missing function name in ' + suite)
+            name = tokens[index + 1]
+            require(name != '`', 'Unsupported escaped method name in ' + suite)
+            if re.fullmatch(r'test\w+', name):
+                require(tokens[index + 2:index + 4] == ['(', ')'],
+                        'Unsupported parameterized test: ' + suite + '/' + name)
+                require(index == 0 or tokens[index - 1] not in {'static', 'class'},
+                        'Unsupported static test: ' + suite + '/' + name)
+                require(name not in methods, 'Ambiguous duplicate test: ' + suite + '/' + name)
+                methods.add(name)
+    require(not scopes, 'Unbalanced Swift source in ' + suite)
+    require(class_count == 1, 'Expected exactly one XCTest class for ' + suite)
+    require(bool(methods), 'No declared tests for ' + suite)
+    return methods
+
+
 def declared_tests(root, suites=SUITES):
-    expected = {}
-    for suite in suites:
-        source = (root / 'xDrip Tests' / (suite + '.swift')).read_text(encoding='utf-8')
-        methods = set(re.findall(r'\bfunc\s+(test\w+)\s*\(', source))
-        require(bool(methods), 'No declared tests for ' + suite)
-        expected[suite] = methods
-    return expected
+    return {suite: suite_methods(
+        (root / 'xDrip Tests' / (suite + '.swift')).read_text(encoding='utf-8'), suite)
+        for suite in suites}
 
 
 def analyze(summary, tree, expected):
@@ -147,8 +268,71 @@ def self_test():
     duplicate = clone(tree)
     duplicate['testNodes'][0]['children'].append(clone(duplicate['testNodes'][0]['children'][0]))
     require(analyze(summary, duplicate, expected)[SUITES[0]]['uniquePassedMethods'] == 2, 'Duplicate result inflated unique test count')
-    print(json.dumps({'verification': 'synthetic local JSON fixtures only; no XCTest execution',
-                      'checksPassed': len(variants) + 2}))
+    # A file may hold another XCTest class and extensions before/after the owner.
+    # Shared method names must retain their class identity, and nested helpers,
+    # comments and strings must never introduce declarations.
+    source = r'''
+    extension SelectedTests { func testBefore() {} }
+    final class OtherTests: XCTestCase {
+        func testShared() {}
+        func testOnlyOther() {}
+    }
+    final class SelectedTests: XCTestCase {
+        func testShared() {
+            let text = "func testString() { } \(String("{ }"))"
+            let raw = #"func testRaw() { }"#
+            let multiline = """
+                func testMultiline() { }
+                """
+            let ratio = 10 / 2
+        }
+        /* nested /* func testComment() { } */ comment */
+        // func testLineComment() {}
+        struct Helper { func testNestedHelper() {} }
+    }
+    extension SelectedTests { func testAfter() async throws {} }
+    '''
+    selected = suite_methods(source, 'SelectedTests')
+    require(selected == {'testBefore', 'testShared', 'testAfter'}, 'Selected class/extension ownership mismatch')
+    require(suite_methods(source, 'OtherTests') == {'testShared', 'testOnlyOther'}, 'Other class ownership mismatch')
+    discovery_checks = 2
+    invalid_sources = [
+        source + 'extension SelectedTests { func testShared() {} }',
+        source + 'final class SelectedTests: XCTestCase { func testDuplicateClass() {} }',
+        'extension SelectedTests { func testOrphan() {} }',
+        'final class SelectedTests: CustomBase { func testUnknownInheritance() {} }',
+        'final class SelectedTests<T>: XCTestCase { func testGenericOwner() {} }',
+        'final class SelectedTests: XCTestCase { func testValue(_ value: Int) {} }',
+        'final class SelectedTests: XCTestCase { static func testStatic() {} }',
+        'final class SelectedTests: XCTestCase { func `testEscaped`() {} func testOne() {} }',
+        '#if DEBUG\n' + source + '\n#endif',
+        source + 'extension Module.SelectedTests { func testQualified() {} }',
+        source + 'extension SelectedTests where Value: Equatable { func testConstrained() {} }',
+        source + '}',
+        source + '/* unterminated',
+        source + 'let text = "unterminated',
+        source + 'let regex = /func testRegex() { }/',
+    ]
+    for fixture in invalid_sources:
+        try:
+            suite_methods(fixture, 'SelectedTests')
+        except ValueError:
+            discovery_checks += 1
+        else:
+            raise ValueError('Unsupported or ambiguous Swift declaration did not fail closed')
+    wrong_owner = {'testNodes': [{'name': 'OtherTests', 'nodeType': 'Test Suite', 'children': [
+        {'name': 'testShared()', 'nodeType': 'Test Case', 'result': 'Passed',
+         'nodeIdentifier': 'OtherTests/testShared()'}]}]}
+    try:
+        analyze({'totalTestCount': 1, 'passedTests': 1, 'failedTests': 0, 'skippedTests': 0},
+                wrong_owner, {'SelectedTests': {'testShared'}})
+    except ValueError:
+        discovery_checks += 1
+    else:
+        raise ValueError('Another class satisfied a required same-name test')
+    print(json.dumps({'verification': 'synthetic local JSON and Swift-source fixtures only; no XCTest execution',
+                      'checksPassed': len(variants) + 2 + discovery_checks,
+                      'resultChecks': len(variants) + 2, 'discoveryChecks': discovery_checks}))
 
 
 if __name__ == '__main__':

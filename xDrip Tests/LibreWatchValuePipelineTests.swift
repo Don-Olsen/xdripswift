@@ -904,6 +904,26 @@ extension LibreWatchValuePipelineTests {
         XCTAssertTrue(queue.entries.isEmpty)
     }
 
+    func testHealthKitCadenceDeletionRetainsOtherRevisionsAndSurvivesRestart() throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        var queue = HealthKitReplacementQueue()
+        queue.enqueue(id: "suppressed", timeStamp: now.addingTimeInterval(-600), value: 85, now: now)
+        queue.enqueue(id: "visible", timeStamp: now.addingTimeInterval(-300), value: 90, now: now)
+        let inFlight = try XCTUnwrap(queue.entries.first { $0.id == "suppressed" })
+        let retained = try XCTUnwrap(queue.entries.first { $0.id == "visible" })
+
+        queue.remove(ids: ["suppressed", "already-deleted"])
+        queue = try JSONDecoder().decode(HealthKitReplacementQueue.self, from: JSONEncoder().encode(queue))
+        XCTAssertEqual(queue.entries, [retained], "A cadence rebuild must retain other samples and their sync revisions")
+
+        queue.enqueue(id: inFlight.id, timeStamp: inFlight.timeStamp, value: 88, now: now.addingTimeInterval(30))
+        let reenabled = try XCTUnwrap(queue.entries.first { $0.id == inFlight.id })
+        XCTAssertGreaterThan(reenabled.revision, inFlight.revision)
+        queue.confirm(inFlight)
+        XCTAssertTrue(queue.entries.contains(reenabled), "A late completion from before deletion cannot clear a later revision")
+        XCTAssertTrue(queue.entries.contains(retained))
+    }
+
     func testHealthKitLegacyReplacementDoesNotSaveAfterQueryOrDeleteFailure() {
         enum Failure: Error { case query }
         var actions = [String]()
@@ -5646,7 +5666,8 @@ final class LibreWatchValuePipelineTests: XCTestCase {
         defer { clearPhoneLibreParserCache() }
         return Libre2BLEUtilities.parseBLEData(
             frame,
-            libre1DerivedAlgorithmParameters: parameters
+            libre1DerivedAlgorithmParameters: parameters,
+            newestReadingDate: receivedAt
         ).bleGlucose.first!.glucoseLevelRaw
     }
 
