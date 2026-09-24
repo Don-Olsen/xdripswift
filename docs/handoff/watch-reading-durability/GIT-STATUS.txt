@@ -1,0 +1,42 @@
+Captured from: worktrees/watch-reading-durability
+
+branch:
+fix/watch-reading-durability-4260
+
+HEAD / full basis commit:
+e11a6f4d3674b0ef58f1ac5159fcf0aac7ca8c21
+
+remote:
+origin  https://github.com/Don-Olsen/xdripswift.git (fetch)
+origin  https://github.com/Don-Olsen/xdripswift.git (push)
+
+git status --short --branch:
+## fix/watch-reading-durability-4260
+ M README.md
+ M "xDrip Tests/LibreWatchValuePipelineTests.swift"
+ M "xDrip Watch App/DataModels/WatchStateModel.swift"
+ M "xDrip Watch App/Views/LibreDirectView.swift"
+ M xDrip/Managers/Watch/LibreWatchDirectSession.swift
+?? AGENTS.md
+?? docs/
+
+git status --porcelain=v2 --branch:
+# branch.oid e11a6f4d3674b0ef58f1ac5159fcf0aac7ca8c21
+# branch.head fix/watch-reading-durability-4260
+1 .M N... 100644 100644 100644 fd308093537fa4ed91c33270a28e4782cf38ef9f fd308093537fa4ed91c33270a28e4782cf38ef9f README.md
+1 .M N... 100644 100644 100644 c0adb0d44fc9cbbca88dd910b61c59ea885875d0 c0adb0d44fc9cbbca88dd910b61c59ea885875d0 xDrip Tests/LibreWatchValuePipelineTests.swift
+1 .M N... 100644 100644 100644 5cea3c7d601d394914f9ca06792144d911f36a44 5cea3c7d601d394914f9ca06792144d911f36a44 xDrip Watch App/DataModels/WatchStateModel.swift
+1 .M N... 100644 100644 100644 d07a399fb40033fb257444abc9f76762df96336c d07a399fb40033fb257444abc9f76762df96336c xDrip Watch App/Views/LibreDirectView.swift
+1 .M N... 100644 100644 100644 9c9f9c3842b415544cee65bbd997ef06e10358f6 9c9f9c3842b415544cee65bbd997ef06e10358f6 xDrip/Managers/Watch/LibreWatchDirectSession.swift
+? AGENTS.md
+? docs/
+
+Swift draft numstat:
+201  0   xDrip Tests/LibreWatchValuePipelineTests.swift
+68   26  xDrip Watch App/DataModels/WatchStateModel.swift
+7    0   xDrip Watch App/Views/LibreDirectView.swift
+94   1   xDrip/Managers/Watch/LibreWatchDirectSession.swift
+TOTAL: 370 insertions, 27 deletions
+
+Staging state: no staged changes. The listed Swift draft is unstaged.
+Upstream state: no upstream configured for this local branch.

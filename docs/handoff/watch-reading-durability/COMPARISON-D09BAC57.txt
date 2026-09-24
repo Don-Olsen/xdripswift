@@ -1,0 +1,29 @@
+Target compared:
+d09bac575d9622d1368cbba0dc3039862d997ed3
+
+Ancestry:
+- merge-base(e11a6f4, d09bac57) = e11a6f4d3674b0ef58f1ac5159fcf0aac7ca8c21
+- d09bac57 is 25 commits ahead of e11a6f4 on the observed linear history.
+
+Absence evidence:
+- No commit or local ref contains LibreWatchReadingSubmission.
+- No commit or local ref contains queuePersistenceConfirmed.
+- No commit or local ref contains libreWatchStorageIssue.
+- None of the eight testSubmission... tests exists at d09bac57.
+
+Functional comparison:
+- At d09bac57, WatchStateModel still performs reading acceptance, then local
+  display/cache publication and alarm handling, and only afterwards calls
+  enqueueForWatchConnectivity.
+- The draft instead prepares/persists the outbox before the local publication
+  boundary and adds restart repair between the display cache and outbox.
+- Commit 265741a84c4d6f66891ba502256413f00a46c4ce added delivery evidence around
+  these paths but retained the old ordering; it did not replace the draft.
+- Later Watch recovery/discovery work and the two Nightscout commits through
+  d09bac57 do not add the draft's queue-before-publication or restart repair.
+
+Conclusion:
+The draft was neither committed nor functionally replaced. No preserved commit,
+reflog entry or release note records a deliberate abandonment. It therefore
+must be transferred as preserved work, while remaining subject to review and
+verification before release.

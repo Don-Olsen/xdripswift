@@ -1,0 +1,531 @@
+diff --git a/xDrip Tests/LibreWatchValuePipelineTests.swift b/xDrip Tests/LibreWatchValuePipelineTests.swift
+index c0adb0d44fc9cbbca88dd910b61c59ea885875d0..ecccd4326326a0e84a4cfac7d29cd954e44f9aa6 100644
+--- a/xDrip Tests/LibreWatchValuePipelineTests.swift	
++++ b/xDrip Tests/LibreWatchValuePipelineTests.swift	
+@@ -5861,6 +5861,207 @@ extension LibreWatchValuePipelineTests {
+ extension LibreWatchValuePipelineTests {
+     private enum OutboxFileTestError: Error { case injectedWriteFailure }
+ 
++    private func submissionCache(_ reading: LibreWatchDirectReadingPayload,
++                                 confirmed: Bool? = nil) -> LibreWatchPersistedDirectReading {
++        LibreWatchPersistedDirectReading(sessionID: session.id, sensorIdentity: session.redactedIdentity(),
++            sourceReading: reading, displayedGlucoseMGDL: 100, displayedTrendMGDLPerMinute: nil,
++            calibrationRevision: reading.calibrationRevision, queuePersistenceConfirmed: confirmed)
++    }
++
++    func testSubmissionCommitsRealOutboxBeforePublishingAndAllowsDiagnosticReads() throws {
++        let fixture = try outboxFileFixture()
++        let store = LibreWatchOutboxFileStore(fileURL: fixture.fileURL, defaults: fixture.defaults)
++        var outbox = try store.load(at: receivedAt)
++        var acceptance = LibreWatchReadingAcceptancePolicy()
++        var published = 0
++        for index in 0..<3 {
++            let now = receivedAt.addingTimeInterval(Double(index) * 60)
++            let reading = try XCTUnwrap(fileOutboxReading(index, at: now).reading)
++            XCTAssertTrue(LibreWatchReadingSubmission.receive(reading, sessionID: session.id,
++                acceptance: acceptance, outbox: outbox, at: now,
++                persist: { pending in
++                    do { try store.prepareForDelivery(&pending, sessionID: self.session.id, at: now); return true }
++                    catch { XCTFail("Unexpected persistence failure: \(error)"); return false }
++                }, publishLocally: { commit in
++                    // Use the same value-copy boundary as WatchStateModel, including reads
++                    // during publication: no inout property may remain exclusively borrowed.
++                    outbox = commit.outbox
++                    acceptance = commit.acceptance
++                    XCTAssertEqual(commit.persistence, .durable)
++                    XCTAssertTrue(acceptance.acceptedPayloadIDs.contains(reading.id))
++                    let restarted = try? LibreWatchOutboxFileStore(fileURL: fixture.fileURL,
++                        defaults: fixture.defaults).load(at: now)
++                    XCTAssertEqual(restarted, outbox, "Publication must follow the real file commit")
++                    LibreWatchSessionStore.saveReading(self.submissionCache(reading, confirmed: true), defaults: fixture.defaults)
++                    published += 1
++                }))
++        }
++        XCTAssertEqual(published, 3)
++        XCTAssertEqual(outbox.items.count, 3)
++        XCTAssertEqual(LibreWatchSessionStore.loadReading(defaults: fixture.defaults)?.queuePersistenceConfirmed, true)
++    }
++
++    func testSubmissionRestartBetweenQueueAndDisplayCacheRecoversNewestReading() throws {
++        let fixture = try outboxFileFixture()
++        let store = LibreWatchOutboxFileStore(fileURL: fixture.fileURL, defaults: fixture.defaults)
++        let old = try XCTUnwrap(fileOutboxReading(0, at: receivedAt).reading)
++        LibreWatchSessionStore.saveReading(submissionCache(old, confirmed: true), defaults: fixture.defaults)
++        let now = receivedAt.addingTimeInterval(60)
++        let newest = try XCTUnwrap(fileOutboxReading(1, at: now).reading)
++        let outbox = try store.load(at: now)
++        XCTAssertTrue(LibreWatchReadingSubmission.receive(newest, sessionID: session.id,
++            acceptance: LibreWatchReadingAcceptancePolicy(), outbox: outbox, at: now,
++            persist: { pending in
++                do { try store.prepareForDelivery(&pending, sessionID: self.session.id, at: now); return true }
++                catch { XCTFail("Unexpected persistence failure: \(error)"); return false }
++            }, publishLocally: { _ in
++                // Stop at the production publication boundary; deliberately no cache write.
++            }))
++        let restarted = LibreWatchOutboxFileStore(fileURL: fixture.fileURL, defaults: fixture.defaults)
++        let restored = try XCTUnwrap(LibreWatchReadingSubmission.restore(
++            cached: LibreWatchSessionStore.loadReading(defaults: fixture.defaults),
++            outbox: try restarted.load(at: now), session: session,
++            calibration: calibration(type: .fixedSlope, slope: 1, intercept: 0), at: now,
++            persist: { pending in (try? restarted.prepareForDelivery(&pending, sessionID: self.session.id, at: now)) != nil }))
++        XCTAssertEqual(restored.reading, newest)
++        XCTAssertEqual(restored.persistence, .durable)
++        XCTAssertEqual(restored.outbox.items.map(\.id), [newest.id])
++    }
++
++    func testSubmissionRepairsLegacyAndFailedWriteCacheOnceWithoutChangingID() throws {
++        for confirmed: Bool? in [nil, false] {
++            let fixture = try outboxFileFixture()
++            let reading = try XCTUnwrap(fileOutboxReading(0, at: receivedAt).reading)
++            let original = submissionCache(reading, confirmed: confirmed)
++            let encoded = try JSONEncoder().encode(original)
++            if confirmed == nil {
++                let json = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
++                XCTAssertNil(json["queuePersistenceConfirmed"], "Old v2 cache needs no migration")
++            }
++            let cached = try JSONDecoder().decode(LibreWatchPersistedDirectReading.self, from: encoded)
++            for _ in 0..<2 {
++                let restarted = LibreWatchOutboxFileStore(fileURL: fixture.fileURL, defaults: fixture.defaults)
++                let restored = try XCTUnwrap(LibreWatchReadingSubmission.restore(cached: cached,
++                    outbox: try restarted.load(at: receivedAt), session: session,
++                    calibration: calibration(type: .fixedSlope, slope: 1, intercept: 0), at: receivedAt,
++                    persist: { pending in
++                        (try? restarted.prepareForDelivery(&pending, sessionID: self.session.id, at: self.receivedAt)) != nil
++                    }))
++                XCTAssertEqual(restored.reading, reading)
++                XCTAssertEqual(restored.outbox.items.map(\.id), [reading.id])
++                XCTAssertEqual(restored.persistence, .durable)
++            }
++        }
++    }
++
++    func testSubmissionConfirmedAndAcknowledgedCacheIsNotRequeuedOnRestart() throws {
++        let reading = try XCTUnwrap(fileOutboxReading(0, at: receivedAt).reading)
++        let restored = try XCTUnwrap(LibreWatchReadingSubmission.restore(
++            cached: submissionCache(reading, confirmed: true), outbox: LibreWatchConnectivityOutbox(),
++            session: session, calibration: calibration(type: .fixedSlope, slope: 1, intercept: 0),
++            at: receivedAt, persist: { _ in true }))
++        XCTAssertEqual(restored.reading, reading)
++        XCTAssertTrue(restored.outbox.items.isEmpty)
++        XCTAssertEqual(restored.persistence, .durable)
++    }
++
++    func testSubmissionFailedWriteKeepsRAMAndClinicalPublicationThenRetries() throws {
++        let fixture = try outboxFileFixture()
++        var failWrite = false
++        let store = LibreWatchOutboxFileStore(fileURL: fixture.fileURL, defaults: fixture.defaults) { data, url in
++            if failWrite { throw OutboxFileTestError.injectedWriteFailure }
++            try data.write(to: url, options: .atomic)
++        }
++        var outbox = try store.load(at: receivedAt)
++        outbox.enqueue(fileOutboxReading(0, at: receivedAt), now: receivedAt)
++        try store.save(outbox)
++        let before = try Data(contentsOf: fixture.fileURL)
++        failWrite = true
++        let now = receivedAt.addingTimeInterval(60)
++        let reading = try XCTUnwrap(fileOutboxReading(1, at: now).reading)
++        var published = 0
++        XCTAssertTrue(LibreWatchReadingSubmission.receive(reading, sessionID: session.id,
++            acceptance: LibreWatchReadingAcceptancePolicy(), outbox: outbox, at: now,
++            persist: { pending in (try? store.prepareForDelivery(&pending, sessionID: self.session.id, at: now)) != nil },
++            publishLocally: { commit in
++                outbox = commit.outbox
++                XCTAssertEqual(commit.persistence, .pendingWrite)
++                XCTAssertNotNil(commit.persistence.issue)
++                LibreWatchSessionStore.saveReading(self.submissionCache(reading, confirmed: false), defaults: fixture.defaults)
++                published += 1 // Local clinical path is not disabled by phone/disk availability.
++            }))
++        XCTAssertEqual(published, 1)
++        XCTAssertEqual(try Data(contentsOf: fixture.fileURL), before)
++        XCTAssertEqual(outbox.items.count, 2)
++        XCTAssertEqual(LibreWatchSessionStore.loadReading(defaults: fixture.defaults)?.queuePersistenceConfirmed, false)
++        failWrite = false
++        try store.prepareForDelivery(&outbox, sessionID: session.id, at: now)
++        XCTAssertEqual(try LibreWatchOutboxFileStore(fileURL: fixture.fileURL,
++            defaults: fixture.defaults).load(at: now), outbox)
++        XCTAssertEqual(published, 1, "Persistence retry must not publish or alarm again")
++    }
++
++    func testSubmissionRestartRepairsLatestCachedReadingAfterQueueWriteFailure() throws {
++        let fixture = try outboxFileFixture()
++        let reading = try XCTUnwrap(fileOutboxReading(0, at: receivedAt).reading)
++        let failed = LibreWatchOutboxFileStore(fileURL: fixture.fileURL, defaults: fixture.defaults) { _, _ in
++            throw OutboxFileTestError.injectedWriteFailure
++        }
++        let empty = try failed.load(at: receivedAt)
++        XCTAssertTrue(LibreWatchReadingSubmission.receive(reading, sessionID: session.id,
++            acceptance: LibreWatchReadingAcceptancePolicy(), outbox: empty, at: receivedAt,
++            persist: { pending in (try? failed.prepareForDelivery(&pending, sessionID: self.session.id)) != nil },
++            publishLocally: { commit in
++                LibreWatchSessionStore.saveReading(self.submissionCache(reading,
++                    confirmed: commit.persistence == .durable), defaults: fixture.defaults)
++            }))
++        let restarted = LibreWatchOutboxFileStore(fileURL: fixture.fileURL, defaults: fixture.defaults)
++        let restored = try XCTUnwrap(LibreWatchReadingSubmission.restore(
++            cached: LibreWatchSessionStore.loadReading(defaults: fixture.defaults), outbox: try restarted.load(at: receivedAt),
++            session: session, calibration: calibration(type: .fixedSlope, slope: 1, intercept: 0), at: receivedAt,
++            persist: { pending in (try? restarted.prepareForDelivery(&pending, sessionID: self.session.id)) != nil }))
++        XCTAssertEqual(restored.outbox.items.map(\.id), [reading.id])
++        XCTAssertEqual(restored.persistence, .durable)
++    }
++
++    func testSubmissionDuplicateOutOfOrderAndWrongSessionDoNotPersistOrPublish() throws {
++        let reading = try XCTUnwrap(fileOutboxReading(1, at: receivedAt).reading)
++        var acceptance = LibreWatchReadingAcceptancePolicy()
++        acceptance.reset(for: session.id, seeding: reading)
++        let older = try XCTUnwrap(fileOutboxReading(0, at: receivedAt.addingTimeInterval(-60)).reading)
++        for (candidate, expectedSession) in [(reading, session.id), (older, session.id), (reading, UUID())] {
++            XCTAssertFalse(LibreWatchReadingSubmission.receive(candidate, sessionID: expectedSession,
++                acceptance: acceptance, outbox: LibreWatchConnectivityOutbox(), at: receivedAt,
++                persist: { _ in XCTFail("Rejected reading must not write"); return true },
++                publishLocally: { _ in XCTFail("Rejected reading must not publish/alert") }))
++        }
++    }
++
++    func testSubmissionRestorePreservesSessionCalibrationAndAgeBounds() throws {
++        let reading = try XCTUnwrap(fileOutboxReading(0, at: receivedAt).reading)
++        let cached = submissionCache(reading)
++        var queue = LibreWatchConnectivityOutbox()
++        queue.enqueue(.reading(reading), now: receivedAt)
++        let newerCalibration = calibration(type: .fixedSlope, slope: 1, intercept: 0, revision: 11)
++        let wrongSession = LibreWatchDirectSession(id: UUID(), createdAt: session.createdAt,
++            sensorUID: session.sensorUID, patchInfo: session.patchInfo, sensorSerialNumber: session.sensorSerialNumber,
++            sensorTypeRawValue: session.sensorTypeRawValue, expectedPeripheralName: session.expectedPeripheralName,
++            unlockCode: session.unlockCode, unlockCount: session.unlockCount, algorithmParameters: session.algorithmParameters)
++        XCTAssertNil(LibreWatchReadingSubmission.restore(cached: cached, outbox: queue, session: wrongSession,
++            calibration: newerCalibration, at: receivedAt, persist: { _ in XCTFail("Wrong session"); return true }))
++        // Display recalculation is still allowed; repair must not insert across calibration revisions.
++        let recalibrated = try XCTUnwrap(LibreWatchReadingSubmission.restore(cached: cached,
++            outbox: LibreWatchConnectivityOutbox(), session: session, calibration: newerCalibration,
++            at: receivedAt, persist: { _ in true }))
++        XCTAssertTrue(recalibrated.outbox.items.isEmpty)
++        let expired = try XCTUnwrap(LibreWatchReadingSubmission.restore(cached: cached, outbox: queue, session: session,
++            calibration: calibration(type: .fixedSlope, slope: 1, intercept: 0),
++            at: receivedAt.addingTimeInterval(LibreWatchConnectivityOutbox.maximumAge + 1), persist: { _ in true }))
++        XCTAssertTrue(expired.outbox.items.isEmpty)
++        XCTAssertEqual(expired.reading.receivedAt, reading.receivedAt, "Do not freshen stale display timestamps")
++        XCTAssertEqual(expired.persistence, .notRetained)
++    }
++
+     private func outboxFileFixture() throws -> (fileURL: URL, defaults: UserDefaults) {
+         let identifier = UUID().uuidString
+         let directory = FileManager.default.temporaryDirectory
+diff --git a/xDrip Watch App/DataModels/WatchStateModel.swift b/xDrip Watch App/DataModels/WatchStateModel.swift
+index 5cea3c7d601d394914f9ca06792144d911f36a44..f75f2eea1b5bf5a4e5d36f270193ae1faccb2896 100644
+--- a/xDrip Watch App/DataModels/WatchStateModel.swift	
++++ b/xDrip Watch App/DataModels/WatchStateModel.swift	
+@@ -133,6 +133,7 @@ final class WatchStateModel: NSObject, ObservableObject {
+     /// Source of the displayed measurement; Bluetooth ownership is tracked independently.
+     @Published private(set) var isShowingDirectLibreReading = false
+     @Published private(set) var directLibreReadingIsStale = false
++    @Published private(set) var libreWatchStorageIssue: String?
+     @Published private(set) var localAlarmStatus = "Watch-alarmer: venter på iPhone-indstillinger"
+     private let localAlarms = LibreWatchAlarmController()
+ 
+@@ -140,6 +141,7 @@ final class WatchStateModel: NSObject, ObservableObject {
+     /// recompute the Watch-only presentation without altering values sent back to iPhone.
+     private var directReadingHistory: [LibreWatchDirectReadingPayload] = []
+     private var latestDirectSourceDelta: Double?
++    private var latestReadingQueuePersistenceConfirmed: Bool?
+     private var directReadingAcceptance = LibreWatchReadingAcceptancePolicy()
+     private var connectivityOutbox = LibreWatchSessionStore.loadOutbox()
+     private var diagnosticJournal = LibreWatchSessionStore.loadDiagnosticJournal()
+@@ -737,19 +739,31 @@ final class WatchStateModel: NSObject, ObservableObject {
+               snapshot.displayedGlucose(for: reading) != nil
+         else { return false }
+ 
+-        guard directReadingAcceptance.accept(
++        let now = Date()
++        let accepted = LibreWatchReadingSubmission.receive(
+             reading,
+-            for: directSession.id,
+-            now: Date()
+-        ) else { return false }
+-
+-        applyLibreWatchReadingLocally(reading)
+-        if let glucose = snapshot.displayedGlucose(for: reading) {
+-            localAlarms.acceptedDirectReading(reading, glucose: glucose)
+-        }
+-
+-        enqueueForWatchConnectivity(.reading(reading))
+-        return true
++            sessionID: directSession.id,
++            acceptance: directReadingAcceptance,
++            outbox: connectivityOutbox,
++            at: now,
++            persist: { pending in
++                LibreWatchSessionStore.prepareOutboxForDelivery(&pending, sessionID: directSession.id, at: now)
++            },
++            publishLocally: { commit in
++                // No property is held inout across display, alarms or diagnostics.
++                connectivityOutbox = commit.outbox
++                directReadingAcceptance = commit.acceptance
++                latestReadingQueuePersistenceConfirmed = commit.persistence == .durable
++                libreWatchStorageIssue = commit.persistence.issue
++                log.info("Libre local acceptance payload=\(reading.id.uuidString, privacy: .public) measurement=\(reading.receivedAt.timeIntervalSince1970, privacy: .public) queue=\(commit.persistence.rawValue, privacy: .public)")
++                applyLibreWatchReadingLocally(reading)
++                if let glucose = snapshot.displayedGlucose(for: reading) {
++                    localAlarms.acceptedDirectReading(reading, glucose: glucose)
++                }
++            }
++        )
++        if accepted { flushWatchConnectivityOutbox() }
++        return accepted // Local clinical acceptance, not a durable phone receipt.
+     }
+ 
+     private func applyLibreWatchReadingLocally(
+@@ -796,7 +810,8 @@ final class WatchStateModel: NSObject, ObservableObject {
+             displayedGlucoseMGDL: displayed.glucose,
+             displayedTrendMGDLPerMinute: displayed.trend,
+             displayedDeltaMGDL: displayedDelta,
+-            calibrationRevision: displayed.revision
++            calibrationRevision: displayed.revision,
++            queuePersistenceConfirmed: latestReadingQueuePersistenceConfirmed
+         )
+         LibreWatchSessionStore.saveReading(stored)
+         updateComplicationData()
+@@ -937,23 +952,32 @@ final class WatchStateModel: NSObject, ObservableObject {
+ 
+     private func restorePersistedLibreWatchReadingIfPossible() {
+         guard let directSession = libreWatchDirectSession,
+-              let snapshot = libreWatchCalibrationSnapshot,
+-              let stored = LibreWatchSessionStore.loadReading(),
+-              stored.isValid(for: directSession, calibration: snapshot)
++              let snapshot = libreWatchCalibrationSnapshot
+         else { return }
+-
++        let stored = LibreWatchSessionStore.loadReading()
++        let now = Date()
++        guard let restored = LibreWatchReadingSubmission.restore(
++            cached: stored, outbox: connectivityOutbox, session: directSession, calibration: snapshot, at: now,
++            persist: { pending in
++                LibreWatchSessionStore.prepareOutboxForDelivery(&pending, sessionID: directSession.id, at: now)
++            }
++        ) else { return }
++        connectivityOutbox = restored.outbox
++        latestReadingQueuePersistenceConfirmed = restored.persistence == .durable
++        libreWatchStorageIssue = restored.persistence.issue
+         directReadingAcceptance.reset(
+             for: directSession.id,
+-            seeding: stored.sourceReading
++            seeding: restored.reading
+         )
+-        let storedCalibrationIsCurrent = stored.calibrationRevision == libreWatchCalibrationSnapshot?.revision
++        let displayOverride = stored.flatMap { cached -> (Double, Double?, UInt64?)? in
++            guard cached.sourceReading.id == restored.reading.id,
++                  cached.calibrationRevision == snapshot.revision,
++                  cached.isValid(for: directSession, calibration: snapshot) else { return nil }
++            return (cached.displayedGlucoseMGDL, cached.displayedTrendMGDLPerMinute, cached.calibrationRevision)
++        }
+         applyLibreWatchReadingLocally(
+-            stored.sourceReading,
+-            displayedOverride: storedCalibrationIsCurrent ? (
+-                stored.displayedGlucoseMGDL,
+-                stored.displayedTrendMGDLPerMinute,
+-                stored.calibrationRevision
+-            ) : nil,
++            restored.reading,
++            displayedOverride: displayOverride,
+             sourceDeltaOverride: nil,
+             displayedDeltaOverride: nil
+         )
+@@ -1050,7 +1074,8 @@ final class WatchStateModel: NSObject, ObservableObject {
+             displayedGlucoseMGDL: displayed.glucose,
+             displayedTrendMGDLPerMinute: displayed.trend,
+             displayedDeltaMGDL: displayedDelta,
+-            calibrationRevision: displayed.revision
++            calibrationRevision: displayed.revision,
++            queuePersistenceConfirmed: latestReadingQueuePersistenceConfirmed
+         ))
+         updateMainViewDate = .now
+         updateBigNumberViewDate = .now
+@@ -1065,6 +1090,8 @@ final class WatchStateModel: NSObject, ObservableObject {
+         bgReadingDatesAsDouble = bgReadingDates.map { $0.timeIntervalSince1970 }
+         directReadingHistory.removeAll()
+         latestDirectSourceDelta = nil
++        latestReadingQueuePersistenceConfirmed = nil
++        libreWatchStorageIssue = nil
+         isShowingDirectLibreReading = false
+         directLibreReadingIsStale = false
+         LibreWatchSessionStore.clearReading()
+@@ -1379,6 +1406,7 @@ final class WatchStateModel: NSObject, ObservableObject {
+         guard opportunity.allowsDelivery,
+               LibreWatchSessionStore.prepareOutboxForDelivery(&connectivityOutbox,
+                   sessionID: libreWatchDirectSession?.id, at: date) else { return }
++        confirmLatestReadingQueuePersistenceIfPossible()
+         LibreWatchConnectivityDeliveryPolicy.retryPendingDelivery(
+             outbox: connectivityOutbox, at: date, opportunity: opportunity,
+             sessionIsActivated: session.activationState == .activated,
+@@ -1388,6 +1416,19 @@ final class WatchStateModel: NSObject, ObservableObject {
+         }
+     }
+ 
++    /// Called only after the complete current queue has been successfully persisted.
++    private func confirmLatestReadingQueuePersistenceIfPossible() {
++        guard latestReadingQueuePersistenceConfirmed != true,
++              var cached = LibreWatchSessionStore.loadReading(),
++              cached.sessionID == libreWatchDirectSession?.id,
++              connectivityOutbox.items.contains(where: { $0.id == cached.sourceReading.id }) else { return }
++        cached.queuePersistenceConfirmed = true
++        LibreWatchSessionStore.saveReading(cached)
++        latestReadingQueuePersistenceConfirmed = true
++        libreWatchStorageIssue = nil
++        log.info("Libre pending local write committed payload=\(cached.sourceReading.id.uuidString, privacy: .public)")
++    }
++
+     /// Recovers the narrow crash window between journal persistence and outbox persistence.
+     /// Existing IDs make this idempotent; normal delivery remains the per-event outbox path.
+     private func restorePendingDiagnosticJournalToOutbox(at date: Date = Date()) {
+@@ -1472,6 +1513,7 @@ final class WatchStateModel: NSObject, ObservableObject {
+         // opportunity; do not send/reload an older snapshot or create a retry timer.
+         guard LibreWatchSessionStore.prepareOutboxForDelivery(&connectivityOutbox,
+             sessionID: libreWatchDirectSession?.id) else { return }
++        confirmLatestReadingQueuePersistenceIfPossible()
+         guard let item = connectivityOutbox.nextEligible() else { return }
+         if session.activationState == .activated,
+            session.outstandingUserInfoTransfers.contains(where: {
+diff --git a/xDrip Watch App/Views/LibreDirectView.swift b/xDrip Watch App/Views/LibreDirectView.swift
+index d07a399fb40033fb257444abc9f76762df96336c..2671bef196eabdd0017e29f49d2b95ff9e1e321a 100644
+--- a/xDrip Watch App/Views/LibreDirectView.swift	
++++ b/xDrip Watch App/Views/LibreDirectView.swift	
+@@ -81,6 +81,13 @@ struct LibreDirectView: View {
+ 
+                 controls
+ 
++                if let storageIssue = watchState.libreWatchStorageIssue {
++                    Text(storageIssue)
++                        .font(.caption2)
++                        .multilineTextAlignment(.center)
++                        .foregroundStyle(.orange)
++                }
++
+                 Text(watchState.localAlarmStatus)
+                     .font(.caption2)
+                     .multilineTextAlignment(.center)
+diff --git a/xDrip/Managers/Watch/LibreWatchDirectSession.swift b/xDrip/Managers/Watch/LibreWatchDirectSession.swift
+index 9c9f9c3842b415544cee65bbd997ef06e10358f6..1fea837f8fc5a4d2fab9954ef6ad62eae9eb942d 100644
+--- a/xDrip/Managers/Watch/LibreWatchDirectSession.swift
++++ b/xDrip/Managers/Watch/LibreWatchDirectSession.swift
+@@ -2310,6 +2310,95 @@ struct LibreWatchReadingAcceptancePolicy {
+     }
+ }
+ 
++/// The production acceptance boundary: write the delivery queue before publishing the
++/// local reading. No inout access remains open while local display/alarms run.
++enum LibreWatchReadingSubmission {
++    enum Persistence: String {
++        case durable, pendingWrite, notRetained
++
++        var issue: String? {
++            switch self {
++            case .durable: return nil
++            case .pendingWrite: return "Målinger afventer sikker lokal lagring"
++            case .notRetained: return "En måling kunne ikke gemmes i leveringskøen"
++            }
++        }
++    }
++
++    struct Commit {
++        let acceptance: LibreWatchReadingAcceptancePolicy
++        let outbox: LibreWatchConnectivityOutbox
++        let persistence: Persistence
++    }
++
++    @discardableResult
++    static func receive(
++        _ reading: LibreWatchDirectReadingPayload,
++        sessionID: UUID,
++        acceptance: LibreWatchReadingAcceptancePolicy,
++        outbox: LibreWatchConnectivityOutbox,
++        at date: Date,
++        persist: (inout LibreWatchConnectivityOutbox) -> Bool,
++        publishLocally: (Commit) -> Void
++    ) -> Bool {
++        var candidateAcceptance = acceptance
++        guard candidateAcceptance.accept(reading, for: sessionID, now: date) else { return false }
++        var pending = outbox
++        let admitted = pending.enqueue(.reading(reading), now: date)
++        let saved = admitted && persist(&pending)
++        let retained = pending.items.contains { $0.id == reading.id }
++        let persistence: Persistence = !retained ? .notRetained : (saved ? .durable : .pendingWrite)
++        // Local clinical acceptance is not a phone receipt, nor a claim that a failed
++        // disk write succeeded. Keep local display/alarms available during storage failure.
++        publishLocally(Commit(acceptance: candidateAcceptance, outbox: pending, persistence: persistence))
++        return true
++    }
++
++    struct Restoration {
++        let reading: LibreWatchDirectReadingPayload
++        let outbox: LibreWatchConnectivityOutbox
++        let persistence: Persistence
++    }
++
++    static func restore(
++        cached: LibreWatchPersistedDirectReading?,
++        outbox: LibreWatchConnectivityOutbox,
++        session: LibreWatchDirectSession,
++        calibration: LibreWatchCalibrationSnapshot,
++        at date: Date,
++        persist: (inout LibreWatchConnectivityOutbox) -> Bool
++    ) -> Restoration? {
++        guard calibration.matches(session: session) else { return nil }
++        let cached = cached.flatMap { $0.isValid(for: session, calibration: calibration) ? $0 : nil }
++        var pending = outbox
++        pending.retain(sessionID: session.id)
++        pending.prune(at: date)
++        if let cached, cached.queuePersistenceConfirmed != true,
++           cached.sourceReading.calibrationRevision == calibration.revision {
++            // Repair an old-version accept-before-enqueue window or a failed queue write.
++            // Stable IDs make repair idempotent; enqueue still enforces age/size bounds.
++            pending.enqueue(.reading(cached.sourceReading), now: date)
++        }
++        let queued = pending.items.compactMap(\.reading).filter {
++            $0.sessionID == session.id && $0.calibrationRevision == calibration.revision &&
++                $0.isValid(for: calibration, at: date)
++        }.max { $0.receivedAt < $1.receivedAt }
++        // A process may stop after the queue commit but before the display cache commit.
++        let reading: LibreWatchDirectReadingPayload
++        if let queued, cached.map({ queued.receivedAt > $0.sourceReading.receivedAt }) ?? true {
++            reading = queued
++        } else if let cached {
++            reading = cached.sourceReading
++        } else { return nil }
++        let saved = persist(&pending)
++        let retained = pending.items.contains { $0.id == reading.id }
++        let previouslyCommitted = cached?.sourceReading.id == reading.id && cached?.queuePersistenceConfirmed == true
++        let persistence: Persistence = previouslyCommitted || (retained && saved) ? .durable
++            : (retained ? .pendingWrite : .notRetained)
++        return Restoration(reading: reading, outbox: pending, persistence: persistence)
++    }
++}
++
+ struct LibreWatchDirectDeltaPolicy {
+     static let maximumGap: TimeInterval = 3 * 60
+ 
+@@ -2504,6 +2593,8 @@ struct LibreWatchPersistedDirectReading: Codable, Equatable {
+     let displayedTrendMGDLPerMinute: Double?
+     let displayedDeltaMGDL: Double?
+     let calibrationRevision: UInt64?
++    // Optional for existing v2 caches. Unknown legacy commits get one idempotent repair.
++    var queuePersistenceConfirmed: Bool?
+ 
+     init(
+         version: Int = Self.currentVersion,
+@@ -2514,7 +2605,8 @@ struct LibreWatchPersistedDirectReading: Codable, Equatable {
+         displayedGlucoseMGDL: Double,
+         displayedTrendMGDLPerMinute: Double?,
+         displayedDeltaMGDL: Double? = nil,
+-        calibrationRevision: UInt64?
++        calibrationRevision: UInt64?,
++        queuePersistenceConfirmed: Bool? = nil
+     ) {
+         self.version = version
+         self.sessionID = sessionID
+@@ -2525,6 +2617,7 @@ struct LibreWatchPersistedDirectReading: Codable, Equatable {
+         self.displayedTrendMGDLPerMinute = displayedTrendMGDLPerMinute
+         self.displayedDeltaMGDL = displayedDeltaMGDL
+         self.calibrationRevision = calibrationRevision
++        self.queuePersistenceConfirmed = queuePersistenceConfirmed
+     }
+ 
+     func isValid(
