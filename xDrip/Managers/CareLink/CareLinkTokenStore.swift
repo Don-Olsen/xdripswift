@@ -115,8 +115,26 @@ final class CareLinkKeychainTokenStore: CareLinkTokenStoring {
 
 /// Non-persistent test double used to exercise rotation and concurrency without Keychain state.
 final class CareLinkMemoryTokenStore: CareLinkTokenStoring {
-    var token: CareLinkToken?
-    func load() throws -> CareLinkToken? { token }
-    func save(_ token: CareLinkToken) throws { self.token = token }
-    func clear() throws { token = nil }
+    // A test may install a replacement session while the client's actor logs out. Copying the
+    // token's strings must be protected too, not just the assignment that clears the session.
+    private let lock = NSLock()
+    private var token: CareLinkToken?
+
+    func load() throws -> CareLinkToken? {
+        lock.lock()
+        defer { lock.unlock() }
+        return token
+    }
+
+    func save(_ token: CareLinkToken) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        self.token = token
+    }
+
+    func clear() throws {
+        lock.lock()
+        defer { lock.unlock() }
+        token = nil
+    }
 }

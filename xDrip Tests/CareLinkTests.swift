@@ -1698,6 +1698,7 @@ final class CareLinkTests: XCTestCase {
             .therapyDataSourceType,
             .careLinkRegion,
             .careLinkSelectedPatientID,
+            .careLinkVersion,
         ])
         let defaults = UserDefaults.standard
         defaults.isMaster = false
@@ -1705,7 +1706,10 @@ final class CareLinkTests: XCTestCase {
         defaults.followerBackgroundKeepAliveType = .heartbeat
         defaults.therapyDataSourceType = .automatic
         defaults.careLinkRegion = CareLinkRegion.outsideUnitedStates.rawValue
-        defaults.careLinkSelectedPatientID = nil
+        // Isolate therapy persistence from the separate initial patient-selection refresh.
+        // Starting with nil causes auto-selection KVO to queue another poll before the test can
+        // observe deliveryCount == 1; it can also make the later count == 2 assertion vacuous.
+        defaults.careLinkSelectedPatientID = "self"
 
         let delegate = FollowerDelegateSpy()
         let state = CareLinkAccountState()
@@ -2258,24 +2262,49 @@ final class CareLinkTests: XCTestCase {
     }
 
     func testSlowLogoutCannotClearANewerSession() async throws {
-        URLProtocolStub.logoutDelay = 0.2
         let store = CareLinkMemoryTokenStore()
         try store.save(credential())
         let client = CareLinkClient(session: URLSession(configuration: stubConfiguration()), tokenStore: store, now: { self.now })
+        let logoutStarted = expectation(description: "Logout reached the server after local clear")
+        URLProtocolStub.holdLogout(untilReleasedAfter: logoutStarted)
+        defer { URLProtocolStub.releaseLogout() }
 
         let logout = Task { await client.revokeAndClear() }
-        for _ in 0 ..< 100 {
-            if try store.load() == nil { break }
-            await Task.yield()
-        }
+        await fulfillment(of: [logoutStarted], timeout: 2)
         XCTAssertNil(try store.load())
 
         var replacement = credential()
         replacement.accessToken = "replacement"
         try store.save(replacement)
+        URLProtocolStub.releaseLogout()
         await logout.value
 
         XCTAssertEqual(try store.load()?.accessToken, "replacement")
+    }
+
+    func testMemoryTokenStoreConcurrentAccessKeepsWholeCredentials() throws {
+        let store = CareLinkMemoryTokenStore()
+        let original = credential()
+        let failuresLock = NSLock()
+        var mismatchedCredentials = 0
+
+        DispatchQueue.concurrentPerform(iterations: 1_000) { index in
+            var token = original
+            token.accessToken = "session-\(index)"
+            token.refreshToken = token.accessToken
+            try! store.save(token)
+            if let loaded = try! store.load(), loaded.accessToken != loaded.refreshToken {
+                failuresLock.lock()
+                mismatchedCredentials += 1
+                failuresLock.unlock()
+            }
+            try! store.clear()
+        }
+
+        XCTAssertEqual(mismatchedCredentials, 0)
+        try store.save(original)
+        XCTAssertEqual(try store.load()?.accessToken, original.accessToken)
+        XCTAssertEqual(try store.load()?.refreshToken, original.refreshToken)
     }
 
     func testTokenRefreshCannotRestoreASessionAfterLogout() async throws {
@@ -2426,6 +2455,8 @@ private final class URLProtocolStub: URLProtocol {
     static var usesCurrentGlucoseTime = false
     static var pumpOnly = false
     static var logoutDelay: TimeInterval = 0
+    static var logoutStartedExpectation: XCTestExpectation?
+    static var pendingLogoutResponse: (() -> Void)?
     static var refreshDelay: TimeInterval = 0
     static var refreshStartedExpectation: XCTestExpectation?
     static var linkedPatients: [[String: Any]] = [["username": "linked1", "firstName": "Linked", "lastName": "Patient"]]
@@ -2449,6 +2480,8 @@ private final class URLProtocolStub: URLProtocol {
         emptyPersonalAccount = false
         pumpOnly = false
         logoutDelay = 0
+        logoutStartedExpectation = nil
+        pendingLogoutResponse = nil
         refreshDelay = 0
         refreshStartedExpectation = nil
         linkedPatients = [["username": "linked1", "firstName": "Linked", "lastName": "Patient"]]
@@ -2471,6 +2504,20 @@ private final class URLProtocolStub: URLProtocol {
         lock.lock()
         refreshStartedExpectation = expectation
         lock.unlock()
+    }
+
+    static func holdLogout(untilReleasedAfter expectation: XCTestExpectation) {
+        lock.lock()
+        logoutStartedExpectation = expectation
+        lock.unlock()
+    }
+
+    static func releaseLogout() {
+        lock.lock()
+        let response = pendingLogoutResponse
+        pendingLogoutResponse = nil
+        lock.unlock()
+        response?()
     }
 
     override func startLoading() {
@@ -2544,7 +2591,16 @@ private final class URLProtocolStub: URLProtocol {
         if path == "/oauth/revoke" {
             Self.lock.lock()
             let delay = Self.logoutDelay
+            let startedExpectation = Self.logoutStartedExpectation
+            Self.logoutStartedExpectation = nil
+            if startedExpectation != nil {
+                Self.pendingLogoutResponse = { self.respond(200, [:]) }
+            }
             Self.lock.unlock()
+            if let startedExpectation {
+                startedExpectation.fulfill()
+                return
+            }
             guard delay > 0 else { return respond(200, [:]) }
             DispatchQueue.global().asyncAfter(deadline: .now() + delay) {
                 self.respond(200, [:])

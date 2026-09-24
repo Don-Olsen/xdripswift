@@ -32,6 +32,21 @@ final class GlucoseRangeDistributionTests: XCTestCase {
         XCTAssertEqual(ProportionalIntegerAllocator.allocate([1, 1, 1]), [34, 33, 33])
     }
 
+    func testAllocatorKeepsDecimalTiesStableAcrossEquivalentWeights() {
+        for scale in [1.0, 10.0, 1_000.0] {
+            let weights = [3.6, 87.6, 8.8].map { $0 * scale }
+            XCTAssertEqual(ProportionalIntegerAllocator.allocate(weights), [4, 87, 9])
+            XCTAssertEqual(ProportionalIntegerAllocator.allocate(weights, total: 1_440), [52, 1_261, 127])
+        }
+    }
+
+    func testAllocatorKeepsGenuinelyDifferentRemaindersOrdered() {
+        XCTAssertEqual(
+            ProportionalIntegerAllocator.allocate([3.6, 87.600001, 8.799999]),
+            [3, 88, 9]
+        )
+    }
+
     func testAllocatorPreservesTinyNonZeroCategoryWhenItsRemainderEarnsAUnit() {
         let allocated = ProportionalIntegerAllocator.allocate([0.8, 98.4, 0.8])
 

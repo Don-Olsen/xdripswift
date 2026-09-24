@@ -563,7 +563,7 @@ final class FollowerBackgroundKeepAliveManagerTests: XCTestCase {
     }
 
     @MainActor
-    func testCareLinkRequiresOAuthSessionButNotOptionalPrefillBeforeStartingSharedManager() async {
+    func testCareLinkRequiresOAuthSessionButNotOptionalPrefillBeforeStartingSharedManager() async throws {
         let snapshot = StandardDefaultsSnapshot(keys: [
             .isMaster,
             .followerDataSourceType,
@@ -601,7 +601,7 @@ final class FollowerBackgroundKeepAliveManagerTests: XCTestCase {
         defaults.careLinkUsername = nil
         defaults.careLinkPassword = nil
         let orphanedTokenStore = CareLinkMemoryTokenStore()
-        orphanedTokenStore.token = makeCareLinkTestToken()
+        try orphanedTokenStore.save(makeCareLinkTestToken())
         let authenticatedKeepAlive = RecordingFollowerBackgroundKeepAliveManager()
         let authenticatedState = CareLinkAccountState()
         let authenticatedPollingSchedulerFactory = FakeFollowerTimerFactory()
@@ -624,7 +624,7 @@ final class FollowerBackgroundKeepAliveManagerTests: XCTestCase {
         XCTAssertEqual(authenticatedPollingSchedulerFactory.timers.first?.resumeCount, 1)
         XCTAssertEqual(authenticatedState.snapshot.status, .connecting)
         XCTAssertFalse(authenticatedStatuses.contains(.loginRequired))
-        XCTAssertNotNil(orphanedTokenStore.token)
+        XCTAssertNotNil(try orphanedTokenStore.load())
         authenticatedManager = nil
         XCTAssertEqual(authenticatedKeepAlive.stoppedSources.last, .careLink)
         XCTAssertEqual(authenticatedPollingSchedulerFactory.timers.first?.suspendCount, 1)

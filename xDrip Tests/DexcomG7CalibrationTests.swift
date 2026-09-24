@@ -93,13 +93,13 @@ final class DexcomG7CalibrationTests: XCTestCase {
     }
 
     func testCalibrationStatusShortDescriptionsAndSubmissionGating() {
-        XCTAssertEqual(CGMTransmitterCalibrationStatus.queued.shortDescription, "Queued")
-        XCTAssertEqual(CGMTransmitterCalibrationStatus.sentAwaitingResponse.shortDescription, "Sent")
-        XCTAssertEqual(CGMTransmitterCalibrationStatus.processing.shortDescription, "Processing")
-        XCTAssertEqual(CGMTransmitterCalibrationStatus.completedHigh.shortDescription, "Completed")
-        XCTAssertEqual(CGMTransmitterCalibrationStatus.completedLow.shortDescription, "Completed")
-        XCTAssertEqual(CGMTransmitterCalibrationStatus.rejected(.duplicate).shortDescription, "Rejected")
-        XCTAssertEqual(CGMTransmitterCalibrationStatus.notPermitted.shortDescription, "Error")
+        XCTAssertEqual(CGMTransmitterCalibrationStatus.queued.shortDescription, Texts_HomeView.sensorManagementCalibrationQueued)
+        XCTAssertEqual(CGMTransmitterCalibrationStatus.sentAwaitingResponse.shortDescription, Texts_HomeView.sensorManagementCalibrationSentShort)
+        XCTAssertEqual(CGMTransmitterCalibrationStatus.processing.shortDescription, Texts_HomeView.sensorManagementCalibrationProcessing)
+        XCTAssertEqual(CGMTransmitterCalibrationStatus.completedHigh.shortDescription, Texts_HomeView.sensorManagementCalibrationCompletedShort)
+        XCTAssertEqual(CGMTransmitterCalibrationStatus.completedLow.shortDescription, Texts_HomeView.sensorManagementCalibrationCompletedShort)
+        XCTAssertEqual(CGMTransmitterCalibrationStatus.rejected(.duplicate).shortDescription, Texts_HomeView.sensorManagementCalibrationRejectedShort)
+        XCTAssertEqual(CGMTransmitterCalibrationStatus.notPermitted.shortDescription, Texts_HomeView.sensorManagementCalibrationErrorShort)
 
         XCTAssertTrue(CGMTransmitterCalibrationStatus.queued.preventsCalibrationSubmission)
         XCTAssertTrue(CGMTransmitterCalibrationStatus.sentAwaitingResponse.preventsCalibrationSubmission)
@@ -498,25 +498,27 @@ final class DexcomG7CalibrationTests: XCTestCase {
         )
 
         XCTAssertEqual(ConstantsAlerts.dexcomBatteryAlertSuppressionPeriodInHours, 6)
-        XCTAssertTrue(DexcomBatteryAlertPolicy.shouldSuppress(hardwareStartDate: nil, now: now))
-        XCTAssertTrue(
-            DexcomBatteryAlertPolicy.shouldSuppress(
-                hardwareStartDate: now.addingTimeInterval(-suppressionInterval + 1),
-                now: now
-            )
-        )
-        XCTAssertFalse(
-            DexcomBatteryAlertPolicy.shouldSuppress(
-                hardwareStartDate: now.addingTimeInterval(-suppressionInterval),
-                now: now
-            )
-        )
-        XCTAssertFalse(
-            DexcomBatteryAlertPolicy.shouldSuppress(
-                hardwareStartDate: now.addingTimeInterval(-suppressionInterval - 1),
-                now: now
-            )
-        )
+        for alertKind in [AlertKind.dexcomG5BatteryLow, .dexcomG7BatteryLow] {
+            XCTAssertTrue(DexcomBatteryAlertPolicy.shouldSuppress(alertKind: alertKind, hardwareStartDate: nil, now: now))
+            XCTAssertTrue(DexcomBatteryAlertPolicy.shouldSuppress(
+                alertKind: alertKind, hardwareStartDate: now.addingTimeInterval(-suppressionInterval + 1), now: now))
+            XCTAssertFalse(DexcomBatteryAlertPolicy.shouldSuppress(
+                alertKind: alertKind, hardwareStartDate: now.addingTimeInterval(-suppressionInterval), now: now))
+            XCTAssertFalse(DexcomBatteryAlertPolicy.shouldSuppress(
+                alertKind: alertKind, hardwareStartDate: now.addingTimeInterval(-suppressionInterval - 1), now: now))
+        }
+    }
+
+    func testDexcomBatterySettlingNeverSuppressesOtherAlertKinds() {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let hardwareStarts: [Date?] = [nil, now, now.addingTimeInterval(-3_600), now.addingTimeInterval(60)]
+        for alertKind in AlertKind.allCases where alertKind != .dexcomG5BatteryLow && alertKind != .dexcomG7BatteryLow {
+            for hardwareStart in hardwareStarts {
+                XCTAssertFalse(DexcomBatteryAlertPolicy.shouldSuppress(
+                    alertKind: alertKind, hardwareStartDate: hardwareStart, now: now),
+                    "Battery settling must not suppress \(alertKind), including scheduled missing-reading alarms")
+            }
+        }
     }
 
     func testBatteryAlertRoutingSelectsThePayloadFamilyConfiguration() {

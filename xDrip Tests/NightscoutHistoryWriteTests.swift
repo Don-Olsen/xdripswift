@@ -27,6 +27,7 @@ final class NightscoutHistoryWriteTests: XCTestCase {
             defaults.nightscoutAPIKey = "synthetic-test-secret"
             defaults.nightscoutToken = nil
             defaults.nightscoutEnabled = true
+            defaults.therapyDataSourceType = .nightscout
             defaults.nightscoutUseSchedule = false
             defaults.uploadSensorStartTimeToNS = false
             defaults.transmitterBatteryInfo = nil
@@ -51,6 +52,17 @@ final class NightscoutHistoryWriteTests: XCTestCase {
             reading.calculatedValue = value
             reading.ageAdjustedRawValue = value
             return reading
+        }
+
+        func treatment(_ id: String, value: Double = 20, offset: TimeInterval = 0) -> TreatmentEntry {
+            TreatmentEntry(id: id, date: base.addingTimeInterval(offset), value: value,
+                treatmentType: .Carbs, nightscoutEventType: "Carb Correction", enteredBy: "isolated-test",
+                nsManagedObjectContext: stack.mainManagedObjectContext)
+        }
+
+        func seedTreatment(_ remoteID: String, value: Double = 20, offset: TimeInterval = 0) {
+            server.seed(["_id": remoteID, "created_at": base.addingTimeInterval(offset).ISOStringFromDate(),
+                "carbs": value, "eventType": "Carb Correction", "enteredBy": "isolated-test"])
         }
 
         func finish() async {
@@ -184,6 +196,134 @@ final class NightscoutHistoryWriteTests: XCTestCase {
         await h.manager.waitForBgReplacements()
         XCTAssertEqual(h.server.requests.count, 1)
         XCTAssertEqual(UserDefaults.standard.timeStampLatestNightscoutUploadedBgReading, .distantPast)
+        await h.finish()
+    }
+
+    @MainActor func testTreatmentBulkResponseAfterSiteSwitchCannotImportUpdateOrAcknowledge() async throws {
+        try await assertTreatmentBulkResponseIgnoredAfterSourceChange(changePort: false)
+    }
+
+    @MainActor func testTreatmentBulkResponseAfterPortSwitchCannotImportUpdateOrAcknowledge() async throws {
+        try await assertTreatmentBulkResponseIgnoredAfterSourceChange(changePort: true)
+    }
+
+    @MainActor private func assertTreatmentBulkResponseIgnoredAfterSourceChange(changePort: Bool) async throws {
+        let h = Harness()
+        let otherServer = NightscoutHistoryServer()
+        NightscoutHistoryURLProtocol.register(otherServer)
+        defer { NightscoutHistoryURLProtocol.unregister(otherServer) }
+        let existing = h.treatment("existing-carbs")
+        let pending = h.treatment(TreatmentEntry.EmptyId, value: 35, offset: 60)
+        h.seedTreatment("existing", value: 99)
+        h.seedTreatment("pending", value: 35, offset: 60)
+        h.seedTreatment("new", value: 45, offset: 120)
+        XCTAssertTrue(h.stack.saveChanges())
+        let started = expectation(description: "bulk treatment download")
+        let completed = expectation(description: "stale treatment download discarded")
+        h.server.holdNextRequest { started.fulfill() }
+        h.manager.getLatestTreatmentsNSResponses(treatmentsToSync: [existing, pending]) { result in
+            XCTAssertEqual(result.amountOfNewOrUpdatedTreatments(), 0)
+            completed.fulfill()
+        }
+        await fulfillment(of: [started], timeout: 5)
+        if changePort {
+            UserDefaults.standard.nightscoutPort = 8443
+        } else {
+            UserDefaults.standard.nightscoutUrl = "https://" + otherServer.host
+        }
+        h.server.releaseHeld()
+        await fulfillment(of: [completed], timeout: 5)
+        XCTAssertEqual(existing.value, 20)
+        XCTAssertFalse(existing.treatmentdeleted)
+        XCTAssertEqual(pending.id, TreatmentEntry.EmptyId)
+        XCTAssertFalse(pending.uploaded)
+        XCTAssertEqual(try h.stack.mainManagedObjectContext.count(for: TreatmentEntry.fetchRequest()), 2)
+        XCTAssertEqual(h.server.requests.count, 1)
+        XCTAssertTrue(otherServer.requests.isEmpty)
+        await h.finish()
+    }
+
+    @MainActor func testTreatmentSiteSwitchDuringExactLookupPreservesEntriesAndStopsLookups() async {
+        await assertTreatmentExactLookupIgnoredAfterSourceChange(changePort: false)
+    }
+
+    @MainActor func testTreatmentPortSwitchDuringExactLookupPreservesEntriesAndStopsLookups() async {
+        await assertTreatmentExactLookupIgnoredAfterSourceChange(changePort: true)
+    }
+
+    @MainActor private func assertTreatmentExactLookupIgnoredAfterSourceChange(changePort: Bool) async {
+        let h = Harness()
+        let otherServer = NightscoutHistoryServer()
+        NightscoutHistoryURLProtocol.register(otherServer)
+        defer { NightscoutHistoryURLProtocol.unregister(otherServer) }
+        let missing = [h.treatment("first-carbs"), h.treatment("second-carbs", offset: 60)]
+        XCTAssertTrue(h.stack.saveChanges())
+        let started = expectation(description: "first exact treatment lookup")
+        let completed = expectation(description: "source change stops reconciliation")
+        h.server.holdNextRequest(matching: { $0.query.contains { $0.name == "find[_id]" } }) {
+            started.fulfill()
+        }
+        h.manager.getLatestTreatmentsNSResponses(treatmentsToSync: missing) { result in
+            XCTAssertEqual(result.amountOfNewOrUpdatedTreatments(), 0)
+            completed.fulfill()
+        }
+        await fulfillment(of: [started], timeout: 5)
+        if changePort {
+            UserDefaults.standard.nightscoutPort = 8443
+        } else {
+            UserDefaults.standard.nightscoutUrl = "https://" + otherServer.host
+        }
+        h.server.releaseHeld()
+        await fulfillment(of: [completed], timeout: 5)
+        XCTAssertTrue(missing.allSatisfy { !$0.treatmentdeleted && $0.uploaded })
+        XCTAssertEqual(h.server.requests.count, 2) // Bulk and the first exact lookup only.
+        XCTAssertTrue(otherServer.requests.isEmpty)
+        await h.finish()
+    }
+
+    @MainActor func testTreatmentReconciliationRechecksSourceBeforeApplyingExactResponse() async {
+        let h = Harness()
+        let missing = [h.treatment("first-carbs"), h.treatment("second-carbs", offset: 60)]
+        var sourceIsCurrent = true
+        var lookedUp: [String] = []
+        var completed = false
+        h.manager.reconcileRemoteTreatmentDeletions(treatments: missing, downloaded: [],
+            isSourceCurrent: { sourceIsCurrent }, lookup: { id, finished in
+                lookedUp.append(id)
+                // Even a successful response is obsolete before the Core Data mutation.
+                sourceIsCurrent = false
+                finished(Data("[]".utf8), true)
+            }) { count in
+                XCTAssertEqual(count, 0)
+                completed = true
+            }
+        XCTAssertTrue(completed)
+        XCTAssertEqual(lookedUp, ["first"])
+        XCTAssertTrue(missing.allSatisfy { !$0.treatmentdeleted })
+        await h.finish()
+    }
+
+    @MainActor func testTreatmentUnchangedSourceImportsUpdatesAndConfirmsDeletion() async throws {
+        let h = Harness()
+        let existing = h.treatment("existing-carbs")
+        let missing = h.treatment("missing-carbs", offset: 180)
+        h.seedTreatment("existing", value: 99)
+        h.seedTreatment("new", value: 45, offset: 120)
+        XCTAssertTrue(h.stack.saveChanges())
+        let completed = expectation(description: "current source treatment sync")
+        h.manager.getLatestTreatmentsNSResponses(treatmentsToSync: [existing, missing]) { result in
+            XCTAssertTrue(result.successFull())
+            XCTAssertGreaterThan(result.amountOfNewOrUpdatedTreatments(), 0)
+            completed.fulfill()
+        }
+        await fulfillment(of: [completed], timeout: 5)
+        XCTAssertEqual(existing.value, 99)
+        XCTAssertTrue(missing.treatmentdeleted)
+        XCTAssertTrue(missing.uploaded)
+        let entries = try h.stack.mainManagedObjectContext.fetch(TreatmentEntry.fetchRequest())
+        XCTAssertEqual(entries.count, 3)
+        XCTAssertTrue(entries.contains { $0.id == "new-carbs" && $0.value == 45 })
+        XCTAssertEqual(h.server.requests.count, 2)
         await h.finish()
     }
 
@@ -426,9 +566,12 @@ private final class NightscoutHistoryServer {
     var nextDeleteBody: Data?
     var failNextUploadAfterStoring = false
     private var onHeld: (() -> Void)?
+    private var shouldHold: ((Request) -> Bool)?
     private var held: (() -> Void)?
 
-    func holdNextRequest(_ callback: @escaping () -> Void) { lock.lock(); onHeld = callback; lock.unlock() }
+    func holdNextRequest(matching predicate: @escaping (Request) -> Bool = { _ in true }, _ callback: @escaping () -> Void) {
+        lock.lock(); onHeld = callback; shouldHold = predicate; lock.unlock()
+    }
     func releaseHeld() { lock.lock(); let action = held; held = nil; lock.unlock(); action?() }
     func seed(_ entry: [String: Any]) { lock.lock(); stored.append(entry); lock.unlock() }
     func entry(at timestamp: Int64, type: String) -> [String: Any]? {
@@ -465,7 +608,7 @@ private final class NightscoutHistoryServer {
         }
         if status == 200 && row.method == "GET" {
             let id = row.query.first { $0.name == "find[_id]" }?.value
-            data = (try? JSONSerialization.data(withJSONObject: stored.filter { $0["_id"] as? String == id })) ?? Data("[]".utf8)
+            data = (try? JSONSerialization.data(withJSONObject: stored.filter { id == nil || $0["_id"] as? String == id })) ?? Data("[]".utf8)
         }
         if status == 200 && row.method == "DELETE" {
             let type = row.query.first { $0.name == "find[type]" }?.value
@@ -478,8 +621,8 @@ private final class NightscoutHistoryServer {
             nextDeleteBody = nil
         }
         let complete = { reply(status, data, failure) }
-        if let callback = onHeld {
-            onHeld = nil; held = complete; lock.unlock(); callback()
+        if let callback = onHeld, shouldHold?(row) == true {
+            onHeld = nil; shouldHold = nil; held = complete; lock.unlock(); callback()
         } else { lock.unlock(); complete() }
     }
 }

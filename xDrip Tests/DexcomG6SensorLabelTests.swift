@@ -23,10 +23,10 @@ final class DexcomG6SensorLabelTests: XCTestCase {
             ("105337765\(separator)21122084G\(separator)2405955", "5337765", "122084G", "5955"),
             ("105337765\(separator)21928983G\(separator)2409117", "5337765", "928983G", "9117"),
             ("105337765\(separator)21873252D\(separator)2409311", "5337765", "873252D", "9311"),
-            ("105337765\(separator)21153812F\(separator)2405937", "5337765", "1153812F", "5937"),
-            ("105337765\(separator)21151019D\(separator)2409311", "5337765", "1151019D", "9311"),
+            ("105337765\(separator)21153812F\(separator)2405937", "5337765", "153812F", "5937"),
+            ("105337765\(separator)21151019D\(separator)2409311", "5337765", "151019D", "9311"),
             ("105337765\(separator)21806736E\(separator)2409311", "5337765", "806736E", "9311"),
-            ("105337765\(separator)21133322H\(separator)2409159", "5337765", "1133322H", "9159")
+            ("105337765\(separator)21133322H\(separator)2409159", "5337765", "133322H", "9159")
         ]
 
         for sample in samples {
@@ -35,6 +35,14 @@ final class DexcomG6SensorLabelTests: XCTestCase {
             XCTAssertEqual(label.serialNumber, sample.serial)
             XCTAssertEqual(label.sensorCode, sample.code)
         }
+    }
+
+    func testSerialPreservesLeadingDigitsAfterApplicationIdentifier() throws {
+        // AI 21 is exactly two characters; a serial that itself starts with 1 keeps that digit.
+        let label = try DexcomG6SensorLabelParser.parse(
+            "10LOT1\(separator)211153812F\(separator)2405937"
+        )
+        XCTAssertEqual(label.serialNumber, "1153812F")
     }
 
     func testAllowsAdditionalSeparatedFields() throws {
@@ -157,10 +165,7 @@ final class DexcomG6SensorLabelTests: XCTestCase {
         sensor.sensorSessionOrigin = .startedByApp
         sensor.sensorCalibrationMode = .factoryCoded
 
-        coreDataManager.saveChanges()
-        let objectID = sensor.objectID
-        context.reset()
-
+        let objectID = try saveAndReset(coreDataManager, object: sensor)
         let restored = try XCTUnwrap(context.existingObject(with: objectID) as? Sensor)
         XCTAssertEqual(restored.requestedSensorCode, "5937")
         XCTAssertEqual(restored.sensorLabelCode, "5937")
@@ -274,10 +279,7 @@ final class DexcomG6SensorLabelTests: XCTestCase {
         dexcomG7.batteryTemperature = 25
         dexcomG7.batteryLastReadDate = Date(timeIntervalSince1970: 2_000_000_000)
         dexcomG7.apply(sensorLabel: label)
-        coreDataManager.saveChanges()
-        let objectID = dexcomG7.objectID
-        context.reset()
-
+        let objectID = try saveAndReset(coreDataManager, object: dexcomG7)
         let restored = try XCTUnwrap(context.existingObject(with: objectID) as? DexcomG7)
         XCTAssertFalse(restored.useOtherApp)
         XCTAssertEqual(restored.resolvedDexcomG7BluetoothSlot(), .smartWatch)
@@ -325,10 +327,13 @@ final class DexcomG6SensorLabelTests: XCTestCase {
         )
         let sourceContext = NSManagedObjectContext(concurrencyType: .privateQueueConcurrencyType)
         sourceContext.persistentStoreCoordinator = sourceCoordinator
-        let sourceSensor = NSEntityDescription.insertNewObject(forEntityName: "Sensor", into: sourceContext)
-        sourceSensor.setValue(sensorID, forKey: "id")
-        sourceSensor.setValue(startDate, forKey: "startDate")
-        try sourceContext.save()
+        try sourceContext.performAndWait {
+            let sourceSensor = NSEntityDescription.insertNewObject(forEntityName: "Sensor", into: sourceContext)
+            sourceSensor.setValue(sensorID, forKey: "id")
+            sourceSensor.setValue(startDate, forKey: "startDate")
+            try sourceContext.save()
+            sourceContext.reset()
+        }
         try sourceCoordinator.remove(sourceStore)
 
         let destinationCoordinator = NSPersistentStoreCoordinator(managedObjectModel: v27)
@@ -336,7 +341,7 @@ final class DexcomG6SensorLabelTests: XCTestCase {
             NSMigratePersistentStoresAutomaticallyOption: true,
             NSInferMappingModelAutomaticallyOption: true
         ]
-        _ = try destinationCoordinator.addPersistentStore(
+        let destinationStore = try destinationCoordinator.addPersistentStore(
             ofType: NSSQLiteStoreType,
             configurationName: nil,
             at: storeURL,
@@ -344,14 +349,22 @@ final class DexcomG6SensorLabelTests: XCTestCase {
         )
         let destinationContext = NSManagedObjectContext(concurrencyType: .privateQueueConcurrencyType)
         destinationContext.persistentStoreCoordinator = destinationCoordinator
-        let request = NSFetchRequest<NSManagedObject>(entityName: "Sensor")
-        let migratedSensor = try XCTUnwrap(destinationContext.fetch(request).first)
+        defer {
+            destinationContext.performAndWait { destinationContext.reset() }
+            try? destinationCoordinator.remove(destinationStore)
+        }
+        try destinationContext.performAndWait {
+            let request = NSFetchRequest<NSManagedObject>(entityName: "Sensor")
+            let migratedSensors = try destinationContext.fetch(request)
+            XCTAssertEqual(migratedSensors.count, 1)
+            let migratedSensor = try XCTUnwrap(migratedSensors.first)
 
-        XCTAssertEqual(migratedSensor.value(forKey: "id") as? String, sensorID)
-        XCTAssertEqual(migratedSensor.value(forKey: "startDate") as? Date, startDate)
-        XCTAssertNil(migratedSensor.value(forKey: "requestedSensorCode"))
-        XCTAssertEqual((migratedSensor.value(forKey: "sensorSessionOriginRaw") as? NSNumber)?.int16Value, 0)
-        XCTAssertEqual((migratedSensor.value(forKey: "sensorCalibrationModeRaw") as? NSNumber)?.int16Value, 0)
+            XCTAssertEqual(migratedSensor.value(forKey: "id") as? String, sensorID)
+            XCTAssertEqual(migratedSensor.value(forKey: "startDate") as? Date, startDate)
+            XCTAssertNil(migratedSensor.value(forKey: "requestedSensorCode"))
+            XCTAssertEqual((migratedSensor.value(forKey: "sensorSessionOriginRaw") as? NSNumber)?.int16Value, 0)
+            XCTAssertEqual((migratedSensor.value(forKey: "sensorCalibrationModeRaw") as? NSNumber)?.int16Value, 0)
+        }
     }
 
     func testCopiesStartMetadataWhenExistingSessionIsAdopted() {
@@ -505,6 +518,21 @@ final class DexcomG6SensorLabelTests: XCTestCase {
         XCTAssertFalse(sensor.confirmSessionStartedByApp())
         XCTAssertEqual(sensor.sensorSessionOrigin, .existingSessionAdopted)
         XCTAssertNil(sensor.activeSensorCode)
+    }
+
+    /// Child saves schedule an asynchronous parent save and may retain temporary object IDs.
+    /// Round-trip assertions require a completed store save, a permanent ID and no cached objects.
+    private func saveAndReset(_ manager: CoreDataManager, object: NSManagedObject) throws -> NSManagedObjectID {
+        let context = manager.mainManagedObjectContext
+        try context.performAndWait { try context.obtainPermanentIDs(for: [object]) }
+        XCTAssertTrue(manager.saveChangesSynchronously())
+        let objectID = object.objectID
+        XCTAssertFalse(objectID.isTemporaryID)
+        context.performAndWait { context.reset() }
+        manager.privateManagedObjectContext.performAndWait {
+            manager.privateManagedObjectContext.reset()
+        }
+        return objectID
     }
 
     private func utcDate(year: Int, month: Int, day: Int) -> Date {

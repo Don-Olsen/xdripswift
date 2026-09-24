@@ -121,6 +121,22 @@ public class NightscoutSyncManager: NSObject, ObservableObject {
         let timeStamp: Date
         let dictionaryRepresentationForNightscoutUpload: [String: Any]
     }
+
+    /// The bulk response and every exact-id confirmation belong to the source that
+    /// was selected before the download started, including while waiting for Core Data.
+    private struct TreatmentDownloadSource {
+        let siteURL = UserDefaults.standard.nightscoutUrl
+        let port = UserDefaults.standard.nightscoutPort
+
+        var matchesSelectedSite: Bool {
+            siteURL == UserDefaults.standard.nightscoutUrl &&
+                port == UserDefaults.standard.nightscoutPort
+        }
+
+        var isCurrent: Bool {
+            matchesSelectedSite && UserDefaults.standard.dataFlowPolicy.importsTreatmentsFromNightscout
+        }
+    }
     
     // MARK: - public properties
     
@@ -932,6 +948,7 @@ public class NightscoutSyncManager: NSObject, ObservableObject {
                         // *********************************************************************
                         trace("in updateTreatment, calling getLatestTreatmentsNSResponses", log: self.oslog, category: ConstantsLog.categoryNightscoutSyncManager, type: .debug)
                         
+                        let treatmentDownloadSource = TreatmentDownloadSource()
                         self.getLatestTreatmentsNSResponses(treatmentsToSync: treatmentsToSync) { nightscoutResult in
                             
                             trace("in updateTreatment, getLatestTreatmentsNSResponses result = %{public}@", log: self.oslog, category: ConstantsLog.categoryNightscoutSyncManager, type: .debug, nightscoutResult.description())
@@ -940,6 +957,12 @@ public class NightscoutSyncManager: NSObject, ObservableObject {
                             treatmentsLocallyCreatedOrUpdated = nightscoutResult.amountOfNewOrUpdatedTreatments() > 0
                             
                             DispatchQueue.main.async {
+                                guard treatmentDownloadSource.matchesSelectedSite else {
+                                    // Do not continue this old source's sync by deleting treatments
+                                    // on the newly selected server. A later sync uses its own snapshot.
+                                    self.nightscoutSyncStartTimeStamp = nil
+                                    return
+                                }
                                 // *********************************************************************
                                 // delete treatments
                                 // *********************************************************************
@@ -1370,11 +1393,12 @@ public class NightscoutSyncManager: NSObject, ObservableObject {
     /// - parameters:
     ///     - completionHandler : handler that will be called with the result TreatmentNSResponse array
     ///     - treatmentsToSync : main goal of the function is not to upload, but to download. However the response will be used to verify if it has any of the treatments that has no id yet and also to verify if existing treatments have changed
-    private func getLatestTreatmentsNSResponses(treatmentsToSync: [TreatmentEntry], completionHandler: @escaping (_ result: NightscoutResult) -> Void) {
+    func getLatestTreatmentsNSResponses(treatmentsToSync: [TreatmentEntry], completionHandler: @escaping (_ result: NightscoutResult) -> Void) {
         // Nightscout may remain enabled as an export destination while CareLink owns therapy data.
         // In that mode, skipping the GET prevents exported CareLink treatments from immediately
         // returning through a second authoritative import path.
-        guard UserDefaults.standard.dataFlowPolicy.importsTreatmentsFromNightscout else {
+        let source = TreatmentDownloadSource()
+        guard source.isCurrent else {
             completionHandler(.success(0))
             return
         }
@@ -1382,8 +1406,8 @@ public class NightscoutSyncManager: NSObject, ObservableObject {
         // query for treatments older than maxHoursTreatmentsToDownload
         let queries = [URLQueryItem(name: "find[created_at][$gte]", value: String(Date(timeIntervalSinceNow: TimeInterval(hours: -ConstantsNightscout.maxHoursTreatmentsToDownload)).ISOStringFromDate()))]
         
-        performHTTPRequest(path: nightscoutTreatmentPath, queries: queries, httpMethod: nil) { (data: Data?, nightscoutResult: NightscoutResult) in
-            guard UserDefaults.standard.dataFlowPolicy.importsTreatmentsFromNightscout else {
+        performHTTPRequest(path: nightscoutTreatmentPath, queries: queries, httpMethod: nil, treatmentSource: source) { (data: Data?, nightscoutResult: NightscoutResult) in
+            guard source.isCurrent else {
                 completionHandler(.success(0))
                 return
             }
@@ -1406,6 +1430,10 @@ public class NightscoutSyncManager: NSObject, ObservableObject {
                     // Be sure to use the correct thread.
                     // Running in the completionHandler thread will result in issues.
                     self.coreDataManager.mainManagedObjectContext.performAndWait {
+                        guard source.isCurrent else {
+                            completionHandler(.success(0))
+                            return
+                        }
                         if treatmentNSResponses.count > 0 {
                             trace("in getLatestTreatmentsNSResponses, %{public}@ treatments downloaded", log: self.oslog, category: ConstantsLog.categoryNightscoutSyncManager, type: .debug, treatmentNSResponses.count.description)
                         }
@@ -1440,15 +1468,11 @@ public class NightscoutSyncManager: NSObject, ObservableObject {
                         
                         self.coreDataManager.saveChanges()
                         
-                        let siteURL = UserDefaults.standard.nightscoutUrl
-                        let sitePort = UserDefaults.standard.nightscoutPort
-                        self.reconcileRemoteTreatmentDeletions(treatments: treatmentsToSync, downloaded: treatmentNSResponses, lookup: { remoteID, finished in
+                        self.reconcileRemoteTreatmentDeletions(treatments: treatmentsToSync, downloaded: treatmentNSResponses, isSourceCurrent: { source.isCurrent }, lookup: { remoteID, finished in
                             let queries = [URLQueryItem(name: "find[_id]", value: remoteID), URLQueryItem(name: "count", value: "1")]
-                            self.performHTTPRequest(path: self.nightscoutTreatmentPath, queries: queries, httpMethod: "GET") { data, result in
+                            self.performHTTPRequest(path: self.nightscoutTreatmentPath, queries: queries, httpMethod: "GET", treatmentSource: source) { data, result in
                                 // A response from a previous source must not remove current local data.
-                                guard UserDefaults.standard.nightscoutUrl == siteURL,
-                                      UserDefaults.standard.nightscoutPort == sitePort,
-                                      UserDefaults.standard.dataFlowPolicy.importsTreatmentsFromNightscout else {
+                                guard source.isCurrent else {
                                     finished(nil, false)
                                     return
                                 }
@@ -1456,7 +1480,7 @@ public class NightscoutSyncManager: NSObject, ObservableObject {
                             }
                         }) { deleted in
                             // Include deletions so the normal sync completion refreshes the list and chart.
-                            completionHandler(.success(amountOfUpdatedTreatments + amountOfNewTreatments + deleted))
+                            completionHandler(.success(source.isCurrent ? amountOfUpdatedTreatments + amountOfNewTreatments + deleted : 0))
                         }
                     }
                     
@@ -1485,13 +1509,15 @@ public class NightscoutSyncManager: NSObject, ObservableObject {
     ///   - responseType: Decodable type to decode (optional)
     /// - Returns: Decoded response if responseType is provided, otherwise Data
     @discardableResult
-    private func nightscoutRequest<T: Decodable>(path: String, queryItems: [URLQueryItem]? = nil, httpMethod: String = "GET", body: Data? = nil, responseType: T.Type? = nil) async throws -> T? {
-        guard let baseUrl = UserDefaults.standard.nightscoutUrl else {
+    private func nightscoutRequest<T: Decodable>(path: String, queryItems: [URLQueryItem]? = nil, httpMethod: String = "GET", body: Data? = nil, responseType: T.Type? = nil, treatmentSource: TreatmentDownloadSource? = nil) async throws -> T? {
+        if let treatmentSource, !treatmentSource.isCurrent { throw URLError(.cancelled) }
+        guard let baseUrl = treatmentSource?.siteURL ?? UserDefaults.standard.nightscoutUrl else {
             throw NSError(domain: "Nightscout", code: 1, userInfo: [NSLocalizedDescriptionKey: "Nightscout URL not set"])
         }
         var urlComponents = URLComponents(string: baseUrl + path)
-        if UserDefaults.standard.nightscoutPort != 0 {
-            urlComponents?.port = UserDefaults.standard.nightscoutPort
+        let port = treatmentSource?.port ?? UserDefaults.standard.nightscoutPort
+        if port != 0 {
+            urlComponents?.port = port
         }
         if let queryItems = queryItems {
             urlComponents?.queryItems = queryItems
@@ -1517,6 +1543,7 @@ public class NightscoutSyncManager: NSObject, ObservableObject {
         }
         
         let (data, response) = try await urlSession.data(for: request)
+        if let treatmentSource, !treatmentSource.isCurrent { throw URLError(.cancelled) }
         guard let httpResponse = response as? HTTPURLResponse, (200 ... 299).contains(httpResponse.statusCode) else {
             throw NSError(domain: "Nightscout", code: 3, userInfo: [NSLocalizedDescriptionKey: "Nightscout request failed"])
         }
@@ -1547,7 +1574,7 @@ public class NightscoutSyncManager: NSObject, ObservableObject {
     /// A missing bulk result is only a candidate for deletion. An exact-id GET must return an
     /// empty array before we hide it locally. Keep failed lookups and pending local edits intact.
     /// The lookup closure lets tests exercise reconciliation without contacting a real server.
-    func reconcileRemoteTreatmentDeletions(treatments: [TreatmentEntry], downloaded: [TreatmentNSResponse], lookup: @escaping (String, @escaping (Data?, Bool) -> Void) -> Void, completion: @escaping (Int) -> Void) {
+    func reconcileRemoteTreatmentDeletions(treatments: [TreatmentEntry], downloaded: [TreatmentNSResponse], isSourceCurrent: @escaping () -> Bool = { true }, lookup: @escaping (String, @escaping (Data?, Bool) -> Void) -> Void, completion: @escaping (Int) -> Void) {
         let presentIDs = Set(downloaded.map(\.id))
         // Use the same time window as the download. Older history is outside this sync pass.
         let earliestDate = Date().addingTimeInterval(-ConstantsNightscout.maxHoursTreatmentsToDownload * 3600)
@@ -1565,6 +1592,10 @@ public class NightscoutSyncManager: NSObject, ObservableObject {
 
         // Run lookups one at a time rather than starting a request for every missing entry at once.
         func checkNext(_ index: Int) {
+            guard isSourceCurrent() else {
+                completion(0)
+                return
+            }
             guard index < remoteIDs.count else {
                 completion(deletedCount)
                 return
@@ -1572,6 +1603,10 @@ public class NightscoutSyncManager: NSObject, ObservableObject {
             let remoteID = remoteIDs[index]
             lookup(remoteID) { data, succeeded in
                 self.coreDataManager.mainManagedObjectContext.performAndWait {
+                    guard isSourceCurrent() else {
+                        completion(0)
+                        return
+                    }
                     if succeeded, let data,
                        let records = try? JSONSerialization.jsonObject(with: data) as? [Any], records.isEmpty {
                         for treatment in grouped[remoteID] ?? [] {
@@ -1592,11 +1627,11 @@ public class NightscoutSyncManager: NSObject, ObservableObject {
     }
 
     /// Backward-compatible callback-based HTTP request (replaces performHTTPRequest)
-    private func performHTTPRequest(path: String, queries: [URLQueryItem], httpMethod: String?, completionHandler: @escaping ((Data?, NightscoutResult) -> Void)) {
+    private func performHTTPRequest(path: String, queries: [URLQueryItem], httpMethod: String?, treatmentSource: TreatmentDownloadSource? = nil, completionHandler: @escaping ((Data?, NightscoutResult) -> Void)) {
         Task {
             do {
                 let method = httpMethod ?? "GET"
-                let data = try await nightscoutRequest(path: path, queryItems: queries, httpMethod: method, responseType: Data.self)
+                let data = try await nightscoutRequest(path: path, queryItems: queries, httpMethod: method, responseType: Data.self, treatmentSource: treatmentSource)
                 completionHandler(data, .success(0))
             } catch {
                 completionHandler(nil, .failed)
@@ -2507,7 +2542,7 @@ public class NightscoutSyncManager: NSObject, ObservableObject {
 // MARK: - NightscoutResult
 
 /// nightscout result
-private enum NightscoutResult: Equatable {
+enum NightscoutResult: Equatable {
     /// successful up or download with NS, with amount of locally updated or downloaded treatments
     case success(Int)
     
