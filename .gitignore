@@ -39,6 +39,24 @@ DerivedData/
 
 build/
 
+# Local release products, signing material and private run data must not enter Git.
+*.ipa
+*.xcarchive/
+*.xcresult/
+*.mobileprovision
+*.provisionprofile
+*.p12
+*.p8
+*.cer
+*.crt
+*.pem
+*.key
+*.log
+*.sqlite
+.env
+.env.*
+!.env.example
+
 
 #####
 # Xcode private settings (window sizes, bookmarks, breakpoints, custom executables, smart groups)

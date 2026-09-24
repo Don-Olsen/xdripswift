@@ -48,6 +48,8 @@
 	</array>
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>XDripSourceCommit</key>
+	<string>$(XDRIP_SOURCE_COMMIT)</string>
 	<key>INAlternativeAppNames</key>
 	<array>
 		<dict>

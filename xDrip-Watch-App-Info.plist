@@ -4,6 +4,8 @@
 <dict>
 	<key>AppGroupIdentifier</key>
 	<string>$(APP_GROUP_IDENTIFIER)</string>
+	<key>XDripSourceCommit</key>
+	<string>$(XDRIP_SOURCE_COMMIT)</string>
 	<key>MainAppBundleIdentifier</key>
 	<string>$(MAIN_APP_BUNDLE_IDENTIFIER)</string>
 	<key>NSBluetoothAlwaysUsageDescription</key>
