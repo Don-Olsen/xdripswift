@@ -8,14 +8,16 @@
 - Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
 <!-- testflight-7.1.1-4267:end -->
 
-De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
+Det følgende afsnit beskriver featuregrundlaget og den fysiske afprøvning;
+ældre releasehistorik følger derefter.
 
-# Nuværende featuregren: Apple Sundhed-bolus og kulhydrater
+# Apple Sundhed-bolus og kulhydrater – TestFlight 7.1.1 (4267)
 
-Opdateret 24. september 2026. **Denne funktion er kun gemt som kildekode på
-`feature/healthkit-bolus-carbs`; der er ikke lavet et nyt TestFlight-build,
-upload eller installation på fysiske enheder.** Den udgivne 7.1.1 (4266)
-forbliver uændret.
+Opdateret 24. september 2026. Funktionen er uploadet fra
+`feature/healthkit-bolus-carbs` som **Internal / Testing** til den eksisterende
+Ole Internal-gruppe i TestFlight 7.1.1 (4267). Ingen app er automatisk
+installeret eller startet på fysiske enheder. 4266-tagget og dets kilde er
+uændret.
 
 - Udgivet udgangspunkt: `testflight-7.1.1-4266`, kildecommit
   `a54cbcb492d3c1c411de5ed52cc6260350c69cb9`. Featuregrenen blev
@@ -24,7 +26,10 @@ forbliver uændret.
   statusændringerne efter 4266 blev bevaret. Den testede appkode, nye tests og
   funktionsvejledning er gemt i commit
   `eaf4773d2204a5c0330cddd4af7bf9d9315c1d06` (tree
-  `decbd3298473b5a2b18ac94cd5488e107237e0a8`).
+  `decbd3298473b5a2b18ac94cd5488e107237e0a8`). Buildnummerændringen blev
+  testet særskilt, committet som release-checkpoint
+  `c11e27b135565c6fd971bdd7d4dc632986806c5a` og tagget
+  `testflight-7.1.1-4267`, før arkiv og IPA blev bygget fra tagget.
 - To importkontakter er som standard slukket. Brugeren giver separat læseadgang
   og vælger en faktisk Apple Sundhed-kilde for insulin og kulhydrater. Den
   eksisterende glukoseeksport er uafhængig. Kun eksplicit bolusklassificerede,
@@ -45,20 +50,22 @@ forbliver uændret.
   backup-provenienstesten og relevante Watch/Libre-, Nightscout- og
   TherapyMetrics-tests. Projektets offline Python-kontroller bestod
   **12/12, 30/30, 17/17, 24/24 og 40/40**. Både iPhone- og
-  Watch-simulatorbuilds bestod. Det autoritative `.xcresult` og logs ligger
-  lokalt under `build/local/healthkit-feature-final-3/` (ignoreret af Git).
+  Watch-simulatorbuilds bestod. Det autoritative release-tree-`.xcresult`,
+  build-, arkiv-, eksport- og uploadlogs ligger lokalt under
+  `build/testflight-7.1.1-4267/` (ignoreret af Git). Featurekontrol før
+  versionsændringen ligger i `build/local/healthkit-feature-final-3/`.
   De tidligere **983/983** hører alene til 4266-baselinen.
-- Åbent før intern afprøvning: rigtige HealthKit-kilder, faktisk læseadgang,
+- Åbent for intern afprøvning af 4267: rigtige HealthKit-kilder, faktisk læseadgang,
   baggrundslevering, korrektion/sletning og iPhone/Watch-friskhed skal
-  efterprøves fysisk efter en særskilt godkendt TestFlight-release. Apple
-  afslører ikke fuld læseadgang; et synkroniseringstidspunkt er ikke bevis på
-  komplette data. Kilder uden delt oprindelses-ID kan ikke deduplikeres sikkert
+  efterprøves fysisk. Apple afslører ikke fuld læseadgang; et
+  synkroniseringstidspunkt er ikke bevis på komplette data. Kilder uden delt
+  oprindelses-ID kan ikke deduplikeres sikkert
   mod en anden import alene ud fra tid og mængde. Den særskilte
   `invalidPayload`-risiko og de historisk dokumenterede full-suite-fejl nedenfor
   er fortsat åbne. Se [førstegangsopsætning og fysisk testplan](HEALTHKIT-THERAPY-IMPORT.md).
 
-Det næste TestFlight-build skal stadig følge den faste tag-baserede proces og
-kræver en ny, versionsspecifik **GO UPLOAD**. Ingen ny API-nøgle eller ændring af
+4267 fulgte den faste tag-baserede proces. Det næste TestFlight-build kræver
+en ny, versionsspecifik **GO UPLOAD**. Ingen ny API-nøgle eller ændring af
 releaseautomatiseringen indgik i denne feature.
 
 ---
