@@ -1,3 +1,15 @@
+<!-- testflight-7.1.1-4273:start -->
+### TestFlight 7.1.1 (4273)
+
+- Kildecommit og tag: `817fa1b81e81658b8eca03a8597e34b5d8659366` / `testflight-7.1.1-4273`.
+- Tests: 1055/1055 bestået; 0 fejlet; 0 skipped. iPhone- og Watch-simulatorbuilds bestod.
+- Apple-status (2026-09-25T17:38:08.665227+00:00): [Internal / Testing](https://appstoreconnect.apple.com/apps/6795645396/testflight/ios/916b33b2-766e-400b-92ea-416cce1915b6).
+- Eksisterende intern gruppe: Ole Internal er bekræftet tilknyttet.
+- Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
+<!-- testflight-7.1.1-4273:end -->
+
+De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
+
 ## Afgrænset genoprettelse af fastlåst Watch-forbindelse efter 4272
 
 4272-testen den 25. september kl. 18:22–18:53 dokumenterede fire uplanlagte
