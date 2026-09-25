@@ -245,6 +245,7 @@ final class WatchDeliveryEvidenceStore {
     private let directory: URL
     private let clock: () -> Date
     private let uptime: () -> TimeInterval
+    private let callbackWorkProfiler: LibreWatchCallbackWorkProfiler
     let origin: WatchDeliveryEvidenceOrigin
     private let limits: Limits
     private let append: (Data, URL) throws -> Void
@@ -264,12 +265,14 @@ final class WatchDeliveryEvidenceStore {
          clock: @escaping () -> Date = Date.init,
          uptime: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
          limits: Limits = Limits(),
+         callbackWorkProfiler: LibreWatchCallbackWorkProfiler = .shared,
          append: ((Data, URL) throws -> Void)? = nil,
          replace: @escaping (Data, URL) throws -> Void = { try $0.write(to: $1, options: .atomic) }) {
         self.directory = directory ?? Self.defaultDirectory
         self.origin = origin
         self.clock = clock
         self.uptime = uptime
+        self.callbackWorkProfiler = callbackWorkProfiler
         self.limits = limits
         self.replace = replace
         self.append = append ?? { data, url in
@@ -300,50 +303,52 @@ final class WatchDeliveryEvidenceStore {
                 measuredAt: Date? = nil, sensorTime: Date? = nil, sensorElapsedMinutes: UInt16? = nil,
                 outcome: String? = nil, stream: WatchDeliveryEvidenceStream = .reading,
                 frameGap: WatchDeliveryEvidenceFrameGap? = nil) -> Bool {
-        queue.sync {
-            let now = clock()
-            if journalNeedsRepair {
-                guard rewrite(records) else { return false }
-                journalNeedsRepair = false
-            }
-            if now.timeIntervalSince(lastPrune) >= 300 { prune(at: now) }
-            metadata.sequence &+= 1
-            let event = WatchDeliveryEvidenceEvent(sequence: metadata.sequence, origin: origin,
-                at: now, uptime: uptime(), stream: stream, stage: stage, payloadID: payloadID,
-                sessionID: sessionID, watchReceivedAt: measuredAt, sensorTime: sensorTime,
-                sensorElapsedMinutes: sensorElapsedMinutes, outcome: Self.safeLabel(outcome),
-                frameGap: frameGap)
-            if stage == .alarmReadiness, let value = Self.safeLabel(outcome),
-               let component = value.split(separator: ":").first {
-                var readiness = metadata.alarmReadiness ?? [:]
-                if readiness.count < 16 || readiness[String(component)] != nil { readiness[String(component)] = value }
-                metadata.alarmReadiness = readiness
-            }
-            guard var line = try? JSONEncoder().encode(event) else { metadata.writeFailures &+= 1; return false }
-            // The iPhone Data extension has a generic integer overload: an untyped literal
-            // writes an eight-byte Int (LF followed by seven NULs), not one delimiter byte.
-            line.append(UInt8(0x0a))
-            guard line.count <= limits.bytes else { metadata.writeFailures &+= 1; return false }
-            // Remove a quarter when full: bounded amortized compaction, not a full rewrite per event.
-            if records.count >= limits.events || byteCount + line.count > limits.bytes {
-                compactForCapacity(incomingBytes: line.count)
-            }
-            guard records.count < limits.events, byteCount + line.count <= limits.bytes else {
-                metadata.writeFailures &+= 1
-                return false
-            }
-            do {
-                try append(line, journalURL)
-                records.append((event, line))
-                byteCount += line.count
-                checkpointIfDue()
-                return true
-            } catch {
-                metadata.writeFailures &+= 1
-                // A write can fail after a partial line. Repair only this independent journal
-                // before its next append, so a later valid event cannot join truncated JSON.
-                journalNeedsRepair = true
-                return false
+        callbackWorkProfiler.measure(.deliveryEvidence) {
+            queue.sync {
+                let now = clock()
+                if journalNeedsRepair {
+                    guard rewrite(records) else { return false }
+                    journalNeedsRepair = false
+                }
+                if now.timeIntervalSince(lastPrune) >= 300 { prune(at: now) }
+                metadata.sequence &+= 1
+                let event = WatchDeliveryEvidenceEvent(sequence: metadata.sequence, origin: origin,
+                    at: now, uptime: uptime(), stream: stream, stage: stage, payloadID: payloadID,
+                    sessionID: sessionID, watchReceivedAt: measuredAt, sensorTime: sensorTime,
+                    sensorElapsedMinutes: sensorElapsedMinutes, outcome: Self.safeLabel(outcome),
+                    frameGap: frameGap)
+                if stage == .alarmReadiness, let value = Self.safeLabel(outcome),
+                   let component = value.split(separator: ":").first {
+                    var readiness = metadata.alarmReadiness ?? [:]
+                    if readiness.count < 16 || readiness[String(component)] != nil { readiness[String(component)] = value }
+                    metadata.alarmReadiness = readiness
+                }
+                guard var line = try? JSONEncoder().encode(event) else { metadata.writeFailures &+= 1; return false }
+                // The iPhone Data extension has a generic integer overload: an untyped literal
+                // writes an eight-byte Int (LF followed by seven NULs), not one delimiter byte.
+                line.append(UInt8(0x0a))
+                guard line.count <= limits.bytes else { metadata.writeFailures &+= 1; return false }
+                // Remove a quarter when full: bounded amortized compaction, not a full rewrite per event.
+                if records.count >= limits.events || byteCount + line.count > limits.bytes {
+                    compactForCapacity(incomingBytes: line.count)
+                }
+                guard records.count < limits.events, byteCount + line.count <= limits.bytes else {
+                    metadata.writeFailures &+= 1
+                    return false
+                }
+                do {
+                    try append(line, journalURL)
+                    records.append((event, line))
+                    byteCount += line.count
+                    checkpointIfDue()
+                    return true
+                } catch {
+                    metadata.writeFailures &+= 1
+                    // A write can fail after a partial line. Repair only this independent journal
+                    // before its next append, so a later valid event cannot join truncated JSON.
+                    journalNeedsRepair = true
+                    return false
+                }
             }
         }
     }
@@ -358,12 +363,14 @@ final class WatchDeliveryEvidenceStore {
 
     /// Counts callbacks/attempts, never claims a radio packet count. Labels are controlled tokens.
     func recordTransport(stream: WatchDeliveryEvidenceStream, action: String, outcome: String? = nil) {
-        queue.sync {
-            let key = [stream.rawValue, Self.safeLabel(action) ?? "unknown", Self.safeLabel(outcome) ?? "none"].joined(separator: ".")
-            // Bound accidental high-cardinality labels; raw NSError descriptions must not be passed.
-            let boundedKey = metadata.counters[key] != nil || metadata.counters.count < 160 ? key : "overflow"
-            metadata.counters[boundedKey, default: 0] &+= 1
-            checkpointIfDue()
+        callbackWorkProfiler.measure(.deliveryEvidence) {
+            queue.sync {
+                let key = [stream.rawValue, Self.safeLabel(action) ?? "unknown", Self.safeLabel(outcome) ?? "none"].joined(separator: ".")
+                // Bound accidental high-cardinality labels; raw NSError descriptions must not be passed.
+                let boundedKey = metadata.counters[key] != nil || metadata.counters.count < 160 ? key : "overflow"
+                metadata.counters[boundedKey, default: 0] &+= 1
+                checkpointIfDue()
+            }
         }
     }
 
@@ -371,22 +378,24 @@ final class WatchDeliveryEvidenceStore {
         let isRuntimeStop = event.kind == .extendedRuntimeInvalidated
         let timing = event.completedCallbackTiming.flatMap { $0.isValid ? $0 : nil }
         guard isRuntimeStop || timing != nil else { return }
-        queue.sync {
-            let at = event.watchTimestamp ?? clock()
-            if isRuntimeStop {
-                let domain = event.errorDomain.map {
-                    ["WKExtendedRuntimeSessionErrorDomain", "WKErrorDomain"].contains($0) ? $0 : "other"
+        callbackWorkProfiler.measure(.deliveryEvidence) {
+            queue.sync {
+                let at = event.watchTimestamp ?? clock()
+                if isRuntimeStop {
+                    let domain = event.errorDomain.map {
+                        ["WKExtendedRuntimeSessionErrorDomain", "WKErrorDomain"].contains($0) ? $0 : "other"
+                    }
+                    metadata.lastRuntimeStop = WatchDeliveryEvidenceRuntimeStop(origin: origin, at: at,
+                        context: event.runtimeDiagnostic, reason: event.runtimeInvalidationReason,
+                        errorDomain: domain, errorCode: event.errorCode)
                 }
-                metadata.lastRuntimeStop = WatchDeliveryEvidenceRuntimeStop(origin: origin, at: at,
-                    context: event.runtimeDiagnostic, reason: event.runtimeInvalidationReason,
-                    errorDomain: domain, errorCode: event.errorCode)
+                if let timing {
+                    metadata.lastCallbackTiming = WatchDeliveryEvidenceCallbackTiming(origin: origin, at: at, summary: timing)
+                }
+                // Rare runtime stops are persisted immediately. Timing summaries share the existing
+                // once-a-minute checkpoint; they never add per-notification journal or WC traffic.
+                if isRuntimeStop { checkpoint(force: true) } else { checkpointIfDue() }
             }
-            if let timing {
-                metadata.lastCallbackTiming = WatchDeliveryEvidenceCallbackTiming(origin: origin, at: at, summary: timing)
-            }
-            // Rare runtime stops are persisted immediately. Timing summaries share the existing
-            // once-a-minute checkpoint; they never add per-notification journal or WC traffic.
-            if isRuntimeStop { checkpoint(force: true) } else { checkpointIfDue() }
         }
     }
 
@@ -404,7 +413,7 @@ final class WatchDeliveryEvidenceStore {
                 preservedRepairSourceBytes: metadata.preservedRepairSourceBytes,
                 counterWindowStartedAt: metadata.counterWindowStartedAt,
                 transportCounters: metadata.counters, lastAlarmReadinessEvidence: metadata.alarmReadiness, events: visible.map(\.event),
-                clockNote: "at is origin device wall clock; uptime is monotonic within origin.process only. Cross-device clock offset is unknown. watchReceivedAt is the existing Watch reception timestamp. sensorTime is unknown when absent; elapsed sensor minutes are not a wall-clock timestamp. Callback timings are monotonic elapsed time, not CPU time or prior system delivery delay; the retained summary covers completed callbacks in its original collector lifetime. Runtime startedAt is the observed start callback; expiresAt is reported expiration, not guaranteed execution time.",
+                clockNote: "at is origin device wall clock; uptime is monotonic within origin.process only. Cross-device clock offset is unknown. watchReceivedAt is the existing Watch reception timestamp. sensorTime is unknown when absent; elapsed sensor minutes are not a wall-clock timestamp. Callback timings are monotonic elapsed time, not CPU time or prior system delivery delay; the retained summary covers completed callbacks in its original collector lifetime. Optional workBreakdown stages are exclusive elapsed time within workSeconds, including waits, not isolated disk or CPU time. Calls count measured operations, not physical writes. decodedPayloadID identifies the frame decoded in that callback; transport may also retry older payloads. Runtime startedAt is the observed start callback; expiresAt is reported expiration, not guaranteed execution time.",
                 coverageNote: "Only retained successfully appended events are included. Rotation is diagnostic retention, not lost glucose. Counters may omit the final 60 seconds after abrupt termination. No events from before this instrumentation are reconstructed. An event's localWriteConfirmed refers to the existing atomic outbox save, not this journal. recoveredLegacyEvents counts valid existing JSON events successfully rewritten without the known old delimiter padding; historical unreadableLines is not reduced. Before repair, the first bounded raw source is retained locally as delivery-events-v1.pre-repair.jsonl, not included in this export. Later damaged raw sources are not archived; unreadable lines remain counted.")
             snapshot.lastRuntimeStop = metadata.lastRuntimeStop.flatMap { $0.at >= now.addingTimeInterval(-limits.age) ? $0 : nil }
             snapshot.lastCallbackTiming = metadata.lastCallbackTiming.flatMap { $0.at >= now.addingTimeInterval(-limits.age) ? $0 : nil }

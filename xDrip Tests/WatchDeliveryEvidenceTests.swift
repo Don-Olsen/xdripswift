@@ -98,6 +98,87 @@ final class WatchDeliveryEvidenceTests: XCTestCase {
         XCTAssertNil(legacy.lastCallbackTiming)
     }
 
+    func testCallbackProfilingKeepsEvidenceWriteOutcomeAndAddsNoJournalEntries() throws {
+        for writeSucceeds in [true, false] {
+            var monotonic: TimeInterval = 100
+            var appendCalls = 0
+            let profiler = LibreWatchCallbackWorkProfiler(clock: { monotonic }, isOwnerThread: { true })
+            let location = directory.appendingPathComponent(writeSucceeds ? "success" : "failure")
+            let journal = WatchDeliveryEvidenceStore(directory: location, origin: origin(),
+                clock: { self.now }, uptime: { monotonic }, callbackWorkProfiler: profiler,
+                append: { data, url in
+                    appendCalls += 1
+                    monotonic += 0.25
+                    if !writeSucceeds { throw CocoaError(.fileWriteOutOfSpace) }
+                    try data.write(to: url, options: .atomic)
+                })
+            let payload = reading()
+            profiler.begin(at: monotonic)
+            profiler.correlate(decodedPayloadID: payload.id)
+            let stored = profiler.measure(.transport) {
+                let result = journal.recordReading(.decoded, reading: payload)
+                journal.recordTransport(stream: .reading, action: "attempt", outcome: "transferUserInfo")
+                monotonic += 0.125
+                return result
+            }
+            let breakdown = try XCTUnwrap(profiler.finish(at: monotonic))
+            XCTAssertEqual(stored, writeSucceeds)
+            XCTAssertEqual(appendCalls, 1, "Timing must not emit another evidence event")
+            XCTAssertEqual(breakdown.decodedPayloadID, payload.id)
+            let evidence = try XCTUnwrap(breakdown.stages.first { $0.stage == .deliveryEvidence })
+            XCTAssertEqual(evidence.elapsedSeconds, 0.25, accuracy: 0.000001)
+            XCTAssertEqual(evidence.calls, 2, "The event and transport counter are operations, not two disk appends")
+            let transport = try XCTUnwrap(breakdown.stages.first { $0.stage == .transport })
+            XCTAssertEqual(transport.elapsedSeconds, 0.125, accuracy: 0.000001,
+                "Nested journal work must not also be charged to transport")
+            let snapshot = journal.snapshot()
+            XCTAssertEqual(snapshot.events.map(\.payloadID), writeSucceeds ? [payload.id] : [])
+            XCTAssertEqual(snapshot.writeFailures, writeSucceeds ? 0 : 1)
+            XCTAssertEqual(snapshot.transportCounters["reading.attempt.transferUserInfo"], 1)
+            let reopened = WatchDeliveryEvidenceStore(directory: location, origin: origin(), clock: { self.now })
+            XCTAssertEqual(reopened.snapshot().events.map(\.payloadID), snapshot.events.map(\.payloadID))
+        }
+    }
+
+    func testCallbackStageSummarySurvivesCheckpointAndReloadWithOriginalLongestPayload() throws {
+        let watchOrigin = origin()
+        var appended = 0
+        let journal = store(origin: watchOrigin, append: { _, _ in appended += 1 })
+        let firstPayload = UUID(), lastPayload = UUID()
+        let longest = LibreWatchCallbackTiming(kind: .value, startedAt: now,
+            workSeconds: 0.5, diagnosticFlushSeconds: 0.125,
+            workBreakdown: .init(decodedPayloadID: firstPayload, stages: [
+                .init(stage: .deliveryEvidence, elapsedSeconds: 0.25, calls: 2),
+                .init(stage: .outboxPersistence, elapsedSeconds: 0.125, calls: 1),
+                .init(stage: .other, elapsedSeconds: 0.125, calls: 0)
+            ]))
+        var event = LibreWatchDiagnosticEvent(kind: .frameProgress, watchTimestamp: now)
+        event.completedCallbackTiming = .init(completedCount: 1, last: longest, longest: longest)
+        journal.recordCollectorDiagnostic(event)
+
+        now += 60
+        uptime += 60
+        let last = LibreWatchCallbackTiming(kind: .value, startedAt: now,
+            workSeconds: 0.125, diagnosticFlushSeconds: 0,
+            workBreakdown: .init(decodedPayloadID: lastPayload,
+                stages: [.init(stage: .transport, elapsedSeconds: 0.125, calls: 1)]))
+        event = LibreWatchDiagnosticEvent(kind: .frameProgress, watchTimestamp: now)
+        let summary = LibreWatchCallbackTimingSummary(completedCount: 2, last: last, longest: longest)
+        event.completedCallbackTiming = summary
+        journal.recordCollectorDiagnostic(event)
+
+        // Reopen without snapshotting the original store: only the existing periodic
+        // metadata checkpoint can make the completed callback available to this process.
+        let reopened = store(origin: origin())
+        let exported = try JSONDecoder().decode(WatchDeliveryEvidenceSnapshot.self, from: reopened.snapshotData())
+        XCTAssertEqual(exported.lastCallbackTiming?.origin, watchOrigin)
+        XCTAssertEqual(exported.lastCallbackTiming?.summary, summary)
+        XCTAssertEqual(exported.lastCallbackTiming?.summary.longest.workBreakdown?.decodedPayloadID, firstPayload)
+        XCTAssertEqual(exported.lastCallbackTiming?.summary.last.workBreakdown?.decodedPayloadID, lastPayload)
+        XCTAssertEqual(appended, 0)
+        XCTAssertTrue(exported.events.isEmpty, "Profiling must not add per-callback journal traffic")
+    }
+
     func testFrameGapShowsNoInterveningNotificationsAndPersistsExecutionContext() throws {
         var tracker = LibreWatchFrameGapTracker()
         let before = frameState(runtime: true, phase: "receiving")

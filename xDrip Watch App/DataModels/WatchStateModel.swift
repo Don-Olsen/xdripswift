@@ -829,9 +829,11 @@ final class WatchStateModel: NSObject, ObservableObject {
                         ? "notRetainedByOutbox" : "atomicOutboxWriteFailed"
                 )
                 if durable { evidenceConfirmedOutboxIDs.insert(reading.id) }
-                applyLibreWatchReadingLocally(reading)
-                if let glucose = snapshot.displayedGlucose(for: reading) {
-                    localAlarms.acceptedDirectReading(reading, glucose: glucose)
+                LibreWatchCallbackWorkProfiler.shared.measure(.localPublication) {
+                    applyLibreWatchReadingLocally(reading)
+                    if let glucose = snapshot.displayedGlucose(for: reading) {
+                        localAlarms.acceptedDirectReading(reading, glucose: glucose)
+                    }
                 }
             }
         )
@@ -1483,8 +1485,10 @@ final class WatchStateModel: NSObject, ObservableObject {
     /// Reuse only this validated delegate call, including partial/duplicate frames. Do not
     /// grant timer execution, retry a handoff, or synchronize alarm settings from here.
     func retryPendingLibreReadingsAfterBLENotification(at date: Date) {
-        retryWatchConnectivityOutbox(at: date,
-            opportunity: .validatedBLENotification(ownership: libreWatchOwnership))
+        LibreWatchCallbackWorkProfiler.shared.measure(.transport) {
+            retryWatchConnectivityOutbox(at: date,
+                opportunity: .validatedBLENotification(ownership: libreWatchOwnership))
+        }
     }
 
     private func retryWatchConnectivityOutbox(at date: Date, opportunity: LibreWatchOutboxDeliveryOpportunity) {
@@ -1578,6 +1582,12 @@ final class WatchStateModel: NSObject, ObservableObject {
     }
 
     private func flushWatchConnectivityOutbox() {
+        LibreWatchCallbackWorkProfiler.shared.measure(.transport) {
+            performWatchConnectivityOutboxFlush()
+        }
+    }
+
+    private func performWatchConnectivityOutboxFlush() {
         guard outboxSendGate.isIdle else { return }
         // A journal entry is persisted before its outbox item. Reconcile that crash/eviction
         // window on every activation/reachability opportunity, not only at process launch.

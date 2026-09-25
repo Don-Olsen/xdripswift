@@ -3340,6 +3340,209 @@ final class LibreWatchValuePipelineTests: XCTestCase {
         XCTAssertEqual(tracker.summary?.last.elapsedSeconds, 0.25)
     }
 
+    func testCallbackWorkBreakdownChargesNestedOperationsExclusivelyAndKeepsUnattributedTime() throws {
+        var now: TimeInterval = 100
+        let profiler = LibreWatchCallbackWorkProfiler(clock: { now }, isOwnerThread: { true })
+        profiler.begin(at: now)
+        now = 101
+        let result = profiler.measure(.transport) {
+            now = 102
+            profiler.measure(.deliveryEvidence) {
+                profiler.begin(at: 102.5) // A nested callback shares the outer sample.
+                now = 104
+            }
+            now = 105
+            profiler.measure(.outboxPersistence) { now = 106 }
+            now = 108
+            return 42
+        }
+        let breakdown = try XCTUnwrap(profiler.finish(at: 110))
+        let stages = Dictionary(uniqueKeysWithValues: breakdown.stages.map { ($0.stage, $0) })
+        XCTAssertEqual(result, 42)
+        XCTAssertEqual(breakdown.totalSeconds, 10)
+        XCTAssertTrue(breakdown.isValid)
+        XCTAssertEqual(stages[.transport]?.elapsedSeconds, 4)
+        XCTAssertEqual(stages[.deliveryEvidence]?.elapsedSeconds, 2)
+        XCTAssertEqual(stages[.outboxPersistence]?.elapsedSeconds, 1)
+        XCTAssertEqual(stages[.other]?.elapsedSeconds, 3)
+        XCTAssertEqual(stages[.transport]?.calls, 1)
+        XCTAssertEqual(stages[.deliveryEvidence]?.calls, 1)
+        XCTAssertEqual(stages[.outboxPersistence]?.calls, 1)
+        XCTAssertEqual(stages[.localPublication]?.calls, 0)
+    }
+
+    func testCallbackWorkProfilerPreservesThrownErrorAndRestoresOuterAttribution() throws {
+        enum Failure: Error { case expected }
+        var now: TimeInterval = 0
+        var bodyCalls = 0
+        let profiler = LibreWatchCallbackWorkProfiler(clock: { now }, isOwnerThread: { true })
+        profiler.begin(at: now)
+        now = 1
+        XCTAssertThrowsError(try profiler.measure(.localPublication) {
+            bodyCalls += 1
+            now = 2
+            throw Failure.expected
+        }) { error in
+            guard case Failure.expected = error else { return XCTFail("The original error must escape") }
+        }
+        now = 3
+        profiler.measure(.deliveryEvidence) { now = 4 }
+        let breakdown = try XCTUnwrap(profiler.finish(at: 5))
+        let stages = Dictionary(uniqueKeysWithValues: breakdown.stages.map { ($0.stage, $0) })
+        XCTAssertEqual(bodyCalls, 1)
+        XCTAssertEqual(stages[.localPublication]?.elapsedSeconds, 1)
+        XCTAssertEqual(stages[.deliveryEvidence]?.elapsedSeconds, 1)
+        XCTAssertEqual(stages[.other]?.elapsedSeconds, 3)
+        XCTAssertEqual(breakdown.totalSeconds, 5)
+    }
+
+    func testCallbackWorkProfilerInactiveAndOtherThreadPathsDoNotReadTheClockOrChangeTheSample() throws {
+        var now: TimeInterval = 100
+        var owner = true
+        var clockReads = 0
+        var bodyCalls = 0
+        let profiler = LibreWatchCallbackWorkProfiler(clock: { clockReads += 1; return now },
+            isOwnerThread: { owner })
+        XCTAssertEqual(profiler.measure(.transport) { bodyCalls += 1; return 7 }, 7)
+        XCTAssertEqual(clockReads, 0, "Inactive operations must take the cheap path")
+        owner = false
+        profiler.begin(at: 50)
+        XCTAssertNil(profiler.finish(at: 60))
+        owner = true
+        profiler.begin(at: now)
+        let payloadID = UUID()
+        profiler.correlate(decodedPayloadID: payloadID)
+        now = 101
+        profiler.measure(.transport) {
+            owner = false
+            profiler.measure(.deliveryEvidence) { bodyCalls += 1; now = 104 }
+            profiler.begin(at: 102)
+            profiler.correlate(decodedPayloadID: UUID())
+            XCTAssertNil(profiler.finish(at: 104))
+            XCTAssertEqual(clockReads, 1, "Other queues must not inspect the active sample's clock")
+            owner = true
+            now = 105
+        }
+        let breakdown = try XCTUnwrap(profiler.finish(at: 106))
+        XCTAssertEqual(bodyCalls, 2)
+        XCTAssertEqual(clockReads, 2)
+        XCTAssertEqual(breakdown.decodedPayloadID, payloadID)
+        XCTAssertEqual(breakdown.totalSeconds, 6)
+        XCTAssertEqual(breakdown.stages.first { $0.stage == .transport }?.elapsedSeconds, 4)
+        XCTAssertEqual(breakdown.stages.first { $0.stage == .deliveryEvidence }?.calls, 0)
+    }
+
+    func testCallbackWorkBreakdownCorrelationResetsAndLastLongestSnapshotsRemainFrozen() throws {
+        var now: TimeInterval = 10
+        let profiler = LibreWatchCallbackWorkProfiler(clock: { now }, isOwnerThread: { true })
+        var tracker = LibreWatchCallbackTimingTracker()
+        let payloadID = UUID()
+        profiler.begin(at: now)
+        tracker.begin(.value, at: receivedAt, uptime: now)
+        profiler.correlate(decodedPayloadID: payloadID)
+        now = 11
+        profiler.measure(.deliveryEvidence) { now = 12 }
+        let firstBreakdown = try XCTUnwrap(profiler.finish(at: 13))
+        tracker.finish(workFinishedAt: 13, flushFinishedAt: 14, workBreakdown: firstBreakdown)
+        let frozen = try XCTUnwrap(tracker.summary)
+
+        now = 20
+        profiler.begin(at: now)
+        tracker.begin(.value, at: receivedAt.addingTimeInterval(10), uptime: now)
+        now = 21
+        profiler.measure(.outboxPersistence) { now = 22 }
+        let secondBreakdown = try XCTUnwrap(profiler.finish(at: 23))
+        tracker.finish(workFinishedAt: 23, flushFinishedAt: 23.5, workBreakdown: secondBreakdown)
+        XCTAssertNil(secondBreakdown.decodedPayloadID)
+        XCTAssertEqual(tracker.summary?.last.workBreakdown, secondBreakdown)
+        XCTAssertEqual(tracker.summary?.longest, frozen.last)
+        XCTAssertEqual(frozen.last.workBreakdown?.decodedPayloadID, payloadID)
+        XCTAssertEqual(frozen.last.workBreakdown, firstBreakdown)
+        XCTAssertEqual(frozen.completedCount, 1)
+        XCTAssertEqual(tracker.summary?.completedCount, 2)
+        XCTAssertTrue(try XCTUnwrap(tracker.summary).isValid)
+    }
+
+    func testCallbackWorkProfilerDropsInvalidClockSamplesAndRecoversForTheNextCallback() throws {
+        var now: TimeInterval = 0
+        var bodyCalls = 0
+        let profiler = LibreWatchCallbackWorkProfiler(clock: { now }, isOwnerThread: { true })
+        for invalid in [TimeInterval.nan, .infinity, 9] {
+            profiler.begin(at: 10)
+            now = invalid
+            profiler.measure(.transport) { bodyCalls += 1 }
+            XCTAssertNil(profiler.finish(at: 11))
+        }
+        profiler.begin(at: 20)
+        now = 21
+        profiler.measure(.deliveryEvidence) { now = 22 }
+        XCTAssertNil(profiler.finish(at: 21), "A regressed finish cannot export fabricated durations")
+        profiler.begin(at: 30)
+        now = 31
+        profiler.measure(.outboxPersistence) { now = 32 }
+        let recovered = try XCTUnwrap(profiler.finish(at: 33))
+        XCTAssertEqual(bodyCalls, 3, "Profiling failure cannot skip or retry the real work")
+        XCTAssertEqual(recovered.totalSeconds, 3)
+        XCTAssertEqual(recovered.stages.first { $0.stage == .outboxPersistence }?.elapsedSeconds, 1)
+        XCTAssertEqual(recovered.stages.first { $0.stage == .deliveryEvidence }?.calls, 0)
+    }
+
+    func testReentrantProfilerFinishCannotChargeItsDeferredExitToANewCallback() throws {
+        var now: TimeInterval = 0
+        let profiler = LibreWatchCallbackWorkProfiler(clock: { now }, isOwnerThread: { true })
+        profiler.begin(at: now)
+        now = 1
+        profiler.measure(.transport) {
+            XCTAssertNotNil(profiler.finish(at: 2))
+            profiler.begin(at: 10)
+            now = 11
+            profiler.measure(.deliveryEvidence) { now = 12 }
+            now = 13
+        }
+        let next = try XCTUnwrap(profiler.finish(at: 14))
+        XCTAssertEqual(next.totalSeconds, 4)
+        XCTAssertEqual(next.stages.first { $0.stage == .deliveryEvidence }?.elapsedSeconds, 1)
+        XCTAssertEqual(next.stages.first { $0.stage == .transport }?.calls, 0)
+        XCTAssertEqual(next.stages.first { $0.stage == .other }?.elapsedSeconds, 3)
+    }
+
+    func testCallbackTimingDecodesLegacySampleAndRejectsMalformedOrExcessWorkBreakdown() throws {
+        let legacy = Data(#"{"kind":"value","startedAt":0,"workSeconds":0.25,"diagnosticFlushSeconds":0.5}"#.utf8)
+        let timing = try JSONDecoder().decode(LibreWatchCallbackTiming.self, from: legacy)
+        XCTAssertNil(timing.workBreakdown)
+        XCTAssertTrue(timing.isValid)
+        let invalidStages: [[LibreWatchCallbackWorkStageTiming]] = [
+            [],
+            [.init(stage: .other, elapsedSeconds: -.leastNonzeroMagnitude, calls: 0)],
+            [.init(stage: .other, elapsedSeconds: .infinity, calls: 0)],
+            [.init(stage: .transport, elapsedSeconds: 0, calls: -1)],
+            [.init(stage: .transport, elapsedSeconds: 0, calls: LibreWatchCallbackWorkStageTiming.maximumCalls + 1)],
+            [.init(stage: .transport, elapsedSeconds: 0.1, calls: 1),
+             .init(stage: .transport, elapsedSeconds: 0.1, calls: 1)]
+        ]
+        for stages in invalidStages {
+            XCTAssertFalse(LibreWatchCallbackWorkBreakdown(decodedPayloadID: nil, stages: stages).isValid)
+        }
+        func withBreakdown(seconds: TimeInterval) -> LibreWatchCallbackTiming {
+            LibreWatchCallbackTiming(kind: .value, startedAt: receivedAt, workSeconds: 0.25,
+                diagnosticFlushSeconds: 0.5,
+                workBreakdown: .init(decodedPayloadID: nil,
+                    stages: [.init(stage: .other, elapsedSeconds: seconds, calls: 0)]))
+        }
+        XCTAssertTrue(withBreakdown(seconds: 0.2500001).isValid, "Allow insignificant floating-point rounding")
+        XCTAssertFalse(withBreakdown(seconds: 0.251).isValid)
+        let valid = withBreakdown(seconds: 0.25)
+        XCTAssertEqual(try JSONDecoder().decode(LibreWatchCallbackTiming.self, from: JSONEncoder().encode(valid)), valid)
+        var tracker = LibreWatchCallbackTimingTracker()
+        tracker.begin(.value, at: receivedAt, uptime: 10)
+        tracker.finish(workFinishedAt: 10.25, flushFinishedAt: 10.75,
+            workBreakdown: withBreakdown(seconds: 0.251).workBreakdown)
+        XCTAssertNil(tracker.summary, "An invalid sample must not become the longest completed callback")
+        tracker.begin(.value, at: receivedAt, uptime: 11)
+        tracker.finish(workFinishedAt: 11.25, flushFinishedAt: 11.75, workBreakdown: valid.workBreakdown)
+        XCTAssertEqual(tracker.summary?.completedCount, 1)
+    }
+
     func testCoreBluetoothDiagnosticSnapshotsStayBufferedUntilCallbackWorkCompletes() {
         let connectionID = UUID()
         let entered = LibreWatchDiagnosticEvent(

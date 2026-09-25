@@ -2123,7 +2123,7 @@ struct TroubleshootingLogReportBuilder {
         lines.append("Received Watch journal entries retained: \(receivedWatchEntryCount). Only events received by this iPhone and still retained are included; undelivered Watch events are not included and their coverage is unknown.")
         lines.append("Watch watchTime/build/SHA describe the original Watch event; receiptTime is the iPhone receipt time, not the export time above. Delayed Watch events may originate before the phone retention window.")
         lines.append("journalRotated counts total local Watch journal rotation, not necessarily missing phone history. unacknowledgedRotated counts known Watch journal losses before phone storage acknowledgement; it is not a total of all undelivered events. Missing counters are unknown.")
-        lines.append("Callback timings measure monotonic elapsed time inside delivered Watch callbacks, not CPU time or prior system delivery delay. Completed/longest callback summaries cover this collector lifetime and exclude the current callback. runtimeExpires is the session's reported expiration, not guaranteed execution time.")
+        lines.append("Callback timings measure monotonic elapsed time inside delivered Watch callbacks, not CPU time or prior system delivery delay. Completed/longest callback summaries cover this collector lifetime and exclude the current callback. Optional WorkStages split work time exclusively, including waits; stage counts are operations, not physical writes. DecodedPayload identifies the frame decoded in that callback; transport may retry older payloads. runtimeExpires is the session's reported expiration, not guaranteed execution time.")
         return lines
     }
 
@@ -2198,6 +2198,15 @@ struct TroubleshootingLogReportBuilder {
                 let last = timing.last
                 let longest = timing.longest
                 fields.append("completedCallbacks=\(timing.completedCount) lastCallback=\(last.kind.rawValue) lastCallbackAt=\(time(last.startedAt)) lastWork=\(String(format: "%.1f", last.workSeconds * 1_000))ms lastDiagnosticFlush=\(String(format: "%.1f", last.diagnosticFlushSeconds * 1_000))ms longestCallback=\(longest.kind.rawValue) longestCallbackAt=\(time(longest.startedAt)) longestWork=\(String(format: "%.1f", longest.workSeconds * 1_000))ms longestDiagnosticFlush=\(String(format: "%.1f", longest.diagnosticFlushSeconds * 1_000))ms")
+            }
+            if let timing = event.completedCallbackTiming {
+                for (prefix, sample) in [("last", timing.last), ("longest", timing.longest)] {
+                    guard let breakdown = sample.workBreakdown else { continue }
+                    let stages = breakdown.stages.map {
+                        "\($0.stage.rawValue)=\(String(format: "%.1f", $0.elapsedSeconds * 1_000))ms/\($0.calls)"
+                    }.joined(separator: ",")
+                    fields.append("\(prefix)WorkStages=[\(stages)] \(prefix)DecodedPayload=\(breakdown.decodedPayloadID?.uuidString ?? "unknown")")
+                }
             }
             if let classification = event.bluetoothErrorClassification { fields.append("bluetoothErrorClass=\(classification)") }
             if let reason = event.reason { fields.append("reason=\(reason)") }

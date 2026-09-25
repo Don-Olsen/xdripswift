@@ -8,6 +8,45 @@
 - Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
 <!-- testflight-7.1.1-4271:end -->
 
+## Afgrænset måling af Watch-modtagelsesarbejde efter 4271
+
+4271-testen den 25. september kl. 16:05–16:55 viste tre uplanlagte
+linkafbrydelser og 44 af 49 sensor-minutter. Alle 44 dekodede målinger blev
+gemt på Watch og senere varigt kvitteret af iPhone. Den sidste periode
+kl. 16:37–16:54 havde 18/18 minutter. Retur til telefonen afsluttedes
+kl. 16:55:06 uden et ekstra minut-hul. Telefonens Bluetooth og Wi-Fi var
+tændt i begyndelsen og blev ifølge brugeren slukket omtrent en halv time
+inde i testen; det præcise tidspunkt er ukendt. Resultatet er derfor ikke
+en hel times kontrol uden telefonforbindelse og beviser ikke, at 4271 har
+løst BLE-udfaldene. De originale testfiler og den detaljerede optælling
+er bevaret lokalt uden for Git.
+
+Den længste afsluttede `value`-callback havde cirka 1,239 sekunders work og
+næsten ingen efterfølgende collector-diagnostic-flush. Work omfatter også
+synkrone leveringsdiagnoser, den varige målingskø, lokale opdateringer og
+transport/genforsøg. Kodegennemgangen fandt ikke en dokumenteret fejl, der
+forklarer linkbruddene. Identiske, allerede gemte køer undgår allerede
+gentagne filwrites, og OS-overførsler med samme ID beskyttes mod genindlevering.
+
+Den nye kandidat tilføjer derfor en lille tidsopdeling i hukommelsen i
+den eksisterende callbackopsummering: leveringsdiagnostik, kølagring,
+lokal visning/komplikation/alarmer, transport/genforsøg og øvrigt arbejde.
+Indlejrede trin tælles eksklusivt, så eksempelvis journalarbejde under
+afsendelse ikke tælles to gange. Den dekodede frames eksisterende payload-ID
+knytter opsummeringen til leveringsloggen; transporttrinnet kan desuden
+genforsøge ældre payloads. Trintællerne er operationer, ikke antal disk-writes.
+Varighederne er monoton forløbstid inklusive ventetid, ikke CPU-tid eller
+isoleret disk-/radiotid. Arbejde uden for en aktiv callback tilskrives ikke
+callbacken. Den afsluttende collector-diagnostic-flush måles fortsat separat.
+
+Felterne er valgfrie i JSON og aktivitetslog, så ældre logs bevarer ukendt
+som ukendt. Målingerne følger de eksisterende diagnose- og checkpointmuligheder;
+der tilføjes ingen timer eller journalpost pr. måletrin. Varig kølagring,
+lokal alarmbehandling, sensorprotokol, runtime og genopkoblingspolitik
+ændres ikke. Dette er målrettet diagnostik, **ikke en eftervist BLE-rettelse**.
+Næste fysiske kontrol skal vise, hvilket arbejde der fylder i callbacken,
+mens telefonen er utilgængelig, og tælle de faktiske sensor-minutter særskilt.
+
 De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
 
 <!-- testflight-7.1.1-4270:start -->

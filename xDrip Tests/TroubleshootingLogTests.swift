@@ -82,6 +82,50 @@ extension TroubleshootingLogTests {
         }
     }
 
+    func testCallbackStageExportKeepsLastAndLongestPayloadsSeparateAcrossDelayedReceipt() throws {
+        let payloadID = UUID()
+        let longest = LibreWatchCallbackTiming(kind: .value, startedAt: referenceDate.addingTimeInterval(-60),
+            workSeconds: 0.5, diagnosticFlushSeconds: 0.125,
+            workBreakdown: .init(decodedPayloadID: payloadID, stages: [
+                .init(stage: .deliveryEvidence, elapsedSeconds: 0.25, calls: 2),
+                .init(stage: .outboxPersistence, elapsedSeconds: 0.125, calls: 1),
+                .init(stage: .other, elapsedSeconds: 0.125, calls: 0)
+            ]))
+        let last = LibreWatchCallbackTiming(kind: .value, startedAt: referenceDate,
+            workSeconds: 0.125, diagnosticFlushSeconds: 0,
+            workBreakdown: .init(decodedPayloadID: nil,
+                stages: [.init(stage: .transport, elapsedSeconds: 0.125, calls: 1)]))
+        var event = LibreWatchDiagnosticEvent(kind: .frameProgress, watchTimestamp: referenceDate)
+        event.completedCallbackTiming = .init(completedCount: 2, last: last, longest: longest)
+        let entry = TroubleshootingLogEntry.detailed(.watchDiagnostic(TroubleshootingWatchDiagnostic(event)),
+            timestamp: referenceDate.addingTimeInterval(600))
+        let restored = try JSONDecoder().decode(TroubleshootingLogEntry.self, from: JSONEncoder().encode(entry))
+        XCTAssertEqual(restored, entry)
+        let report = makeReport(entries: [restored]).reportText
+        XCTAssertTrue(report.contains("lastWorkStages=[transport=125.0ms/1] lastDecodedPayload=unknown"))
+        XCTAssertTrue(report.contains("longestWorkStages=[deliveryEvidence=250.0ms/2,outboxPersistence=125.0ms/1,other=125.0ms/0] longestDecodedPayload=\(payloadID.uuidString)"))
+        XCTAssertTrue(report.contains("longestCallbackAt=07:59:00"))
+        XCTAssertTrue(report.contains("stage counts are operations, not physical writes"))
+    }
+
+    func testLegacyCallbackSummaryExportsMeasuredWorkWithoutInventingStageZeros() throws {
+        let timing = LibreWatchCallbackTiming(kind: .value, startedAt: referenceDate,
+            workSeconds: 0.125, diagnosticFlushSeconds: 0.25)
+        var event = LibreWatchDiagnosticEvent(kind: .frameProgress, watchTimestamp: referenceDate)
+        event.completedCallbackTiming = .init(completedCount: 1, last: timing, longest: timing)
+        let data = try JSONEncoder().encode(TroubleshootingWatchDiagnostic(event))
+        XCTAssertFalse(String(decoding: data, as: UTF8.self).contains("workBreakdown"))
+        let restored = try JSONDecoder().decode(TroubleshootingWatchDiagnostic.self, from: data)
+        XCTAssertNil(restored.completedCallbackTiming?.last.workBreakdown)
+        XCTAssertNil(restored.completedCallbackTiming?.longest.workBreakdown)
+        let report = makeReport(entries: [.detailed(.watchDiagnostic(restored), timestamp: referenceDate)]).reportText
+        XCTAssertTrue(report.contains("lastWork=125.0ms lastDiagnosticFlush=250.0ms"))
+        XCTAssertFalse(report.contains("lastWorkStages="))
+        XCTAssertFalse(report.contains("longestWorkStages="))
+        XCTAssertFalse(report.contains("lastDecodedPayload="))
+        XCTAssertFalse(report.contains("longestDecodedPayload="))
+    }
+
     func testNormalTraceAttachmentIncludesSafePhoneAndReceivedWatchHistoryWithOriginalClocksAndBuild() throws {
         let fixture = makeStore()
         defer { removeFixture(fixture.directory) }

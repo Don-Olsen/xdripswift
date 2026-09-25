@@ -341,6 +341,138 @@ enum LibreWatchCallbackKind: String, Codable, Equatable {
     case notifications, unlock, value
 }
 
+enum LibreWatchCallbackWorkStage: String, Codable, CaseIterable {
+    case deliveryEvidence, outboxPersistence, localPublication, transport, other
+
+    fileprivate var index: Int {
+        switch self {
+        case .deliveryEvidence: return 0
+        case .outboxPersistence: return 1
+        case .localPublication: return 2
+        case .transport: return 3
+        case .other: return 4
+        }
+    }
+}
+
+struct LibreWatchCallbackWorkStageTiming: Codable, Equatable {
+    let stage: LibreWatchCallbackWorkStage
+    let elapsedSeconds: TimeInterval
+    /// Calls to the measured operation, not a count of physical writes or deliveries.
+    let calls: Int
+
+    static let maximumCalls = 1_000_000
+
+    var isValid: Bool {
+        elapsedSeconds.isFinite && elapsedSeconds >= 0 && calls >= 0 && calls <= Self.maximumCalls
+    }
+}
+
+struct LibreWatchCallbackWorkBreakdown: Codable, Equatable {
+    let decodedPayloadID: UUID?
+    let stages: [LibreWatchCallbackWorkStageTiming]
+
+    var totalSeconds: TimeInterval { stages.reduce(0) { $0 + $1.elapsedSeconds } }
+    var isValid: Bool {
+        !stages.isEmpty && stages.count <= LibreWatchCallbackWorkStage.allCases.count &&
+            Set(stages.map(\.stage)).count == stages.count && stages.allSatisfy(\.isValid) &&
+            totalSeconds.isFinite
+    }
+}
+
+/// Only the owning main-thread callback may use this fixed-size accumulator. Nested
+/// operations are exclusive: evidence written inside transport is charged to evidence.
+/// No I/O, timers or per-stage diagnostic events are introduced by the measurements.
+final class LibreWatchCallbackWorkProfiler {
+    static let shared = LibreWatchCallbackWorkProfiler()
+
+    private final class Sample {
+        var lastUptime: TimeInterval
+        var stageIndex = LibreWatchCallbackWorkStage.other.index
+        var elapsed = Array(repeating: TimeInterval(0), count: LibreWatchCallbackWorkStage.allCases.count)
+        var calls = Array(repeating: 0, count: LibreWatchCallbackWorkStage.allCases.count)
+        var decodedPayloadID: UUID?
+        var invalid = false
+
+        init(at uptime: TimeInterval) {
+            lastUptime = uptime
+        }
+
+        func advance(to uptime: TimeInterval) -> Bool {
+            guard !invalid, uptime.isFinite, uptime >= lastUptime else {
+                invalid = true
+                return false
+            }
+            let updated = elapsed[stageIndex] + (uptime - lastUptime)
+            guard updated.isFinite, updated >= 0 else {
+                invalid = true
+                return false
+            }
+            elapsed[stageIndex] = updated
+            lastUptime = uptime
+            return true
+        }
+    }
+
+    private let clock: () -> TimeInterval
+    private let isOwnerThread: () -> Bool
+    private var active: Sample?
+
+    init(clock: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+         isOwnerThread: @escaping () -> Bool = { Thread.isMainThread }) {
+        self.clock = clock
+        self.isOwnerThread = isOwnerThread
+    }
+
+    func begin(at uptime: TimeInterval) {
+        guard isOwnerThread() else { return }
+        guard active == nil, uptime.isFinite, uptime >= 0 else { return }
+        active = Sample(at: uptime)
+    }
+
+    func measure<T>(_ stage: LibreWatchCallbackWorkStage, _ body: () throws -> T) rethrows -> T {
+        // The thread check must precede even reading `active`: other WCSession queues
+        // share the instrumented store but must neither race nor affect this sample.
+        guard isOwnerThread() else { return try body() }
+        guard let sample = active, !sample.invalid else { return try body() }
+        guard sample.advance(to: clock()) else { return try body() }
+        let index = stage.index
+        guard sample.calls[index] < LibreWatchCallbackWorkStageTiming.maximumCalls else {
+            sample.invalid = true
+            return try body()
+        }
+        let previousStage = sample.stageIndex
+        sample.calls[index] += 1
+        sample.stageIndex = index
+        defer {
+            // Identity fences a finish/reset performed by a reentrant body. Its defer
+            // must never add time to a newly begun callback.
+            if isOwnerThread(), active === sample, !sample.invalid {
+                _ = sample.advance(to: clock())
+                sample.stageIndex = previousStage
+            }
+        }
+        return try body()
+    }
+
+    func correlate(decodedPayloadID: UUID) {
+        guard isOwnerThread() else { return }
+        active?.decodedPayloadID = decodedPayloadID
+    }
+
+    func finish(at uptime: TimeInterval) -> LibreWatchCallbackWorkBreakdown? {
+        guard isOwnerThread() else { return nil }
+        defer { active = nil }
+        guard let sample = active, sample.advance(to: uptime) else { return nil }
+        let result = LibreWatchCallbackWorkBreakdown(decodedPayloadID: sample.decodedPayloadID,
+            stages: LibreWatchCallbackWorkStage.allCases.map {
+                LibreWatchCallbackWorkStageTiming(stage: $0, elapsedSeconds: sample.elapsed[$0.index],
+                    calls: sample.calls[$0.index])
+            })
+        return result.isValid ? result : nil
+    }
+}
+
 /// Monotonic elapsed time inside a delivered delegate callback, not CPU time or time spent
 /// waiting for watchOS to deliver it. No timer or additional diagnostic event is required.
 struct LibreWatchCallbackTiming: Codable, Equatable {
@@ -348,11 +480,22 @@ struct LibreWatchCallbackTiming: Codable, Equatable {
     let startedAt: Date
     let workSeconds: TimeInterval
     let diagnosticFlushSeconds: TimeInterval
+    let workBreakdown: LibreWatchCallbackWorkBreakdown?
+
+    init(kind: LibreWatchCallbackKind, startedAt: Date, workSeconds: TimeInterval,
+         diagnosticFlushSeconds: TimeInterval, workBreakdown: LibreWatchCallbackWorkBreakdown? = nil) {
+        self.kind = kind
+        self.startedAt = startedAt
+        self.workSeconds = workSeconds
+        self.diagnosticFlushSeconds = diagnosticFlushSeconds
+        self.workBreakdown = workBreakdown
+    }
 
     var elapsedSeconds: TimeInterval { workSeconds + diagnosticFlushSeconds }
     var isValid: Bool {
         workSeconds.isFinite && workSeconds >= 0 &&
-            diagnosticFlushSeconds.isFinite && diagnosticFlushSeconds >= 0 && elapsedSeconds.isFinite
+            diagnosticFlushSeconds.isFinite && diagnosticFlushSeconds >= 0 && elapsedSeconds.isFinite &&
+            (workBreakdown.map { $0.isValid && $0.totalSeconds - workSeconds <= 0.000001 } ?? true)
     }
 }
 
@@ -380,14 +523,16 @@ struct LibreWatchCallbackTimingTracker {
         return uptime - active.uptime
     }
 
-    mutating func finish(workFinishedAt: TimeInterval, flushFinishedAt: TimeInterval) {
+    mutating func finish(workFinishedAt: TimeInterval, flushFinishedAt: TimeInterval,
+                         workBreakdown: LibreWatchCallbackWorkBreakdown? = nil) {
         defer { active = nil }
         guard let active,
               workFinishedAt.isFinite, flushFinishedAt.isFinite,
               workFinishedAt >= active.uptime, flushFinishedAt >= workFinishedAt else { return }
         let timing = LibreWatchCallbackTiming(kind: active.kind, startedAt: active.date,
             workSeconds: workFinishedAt - active.uptime,
-            diagnosticFlushSeconds: flushFinishedAt - workFinishedAt)
+            diagnosticFlushSeconds: flushFinishedAt - workFinishedAt,
+            workBreakdown: workBreakdown)
         guard timing.isValid else { return }
         let longest = summary.map { $0.longest.elapsedSeconds >= timing.elapsedSeconds ? $0.longest : timing } ?? timing
         summary = LibreWatchCallbackTimingSummary(completedCount: (summary?.completedCount ?? 0) + 1,
@@ -3311,13 +3456,15 @@ enum LibreWatchSessionStore {
     ) -> Bool {
         #if os(watchOS)
         if defaults === UserDefaults.standard {
-            do {
-                try outboxFileStore.save(outbox)
-                outboxPersistenceFailureLogged = false
-                return true
-            } catch {
-                reportOutboxPersistenceFailure(error)
-                return false
+            return LibreWatchCallbackWorkProfiler.shared.measure(.outboxPersistence) {
+                do {
+                    try outboxFileStore.save(outbox)
+                    outboxPersistenceFailureLogged = false
+                    return true
+                } catch {
+                    reportOutboxPersistenceFailure(error)
+                    return false
+                }
             }
         }
         #endif
@@ -3331,13 +3478,15 @@ enum LibreWatchSessionStore {
     static func prepareOutboxForDelivery(_ outbox: inout LibreWatchConnectivityOutbox,
                                         sessionID: UUID?, at date: Date = Date()) -> Bool {
         #if os(watchOS)
-        do {
-            try outboxFileStore.prepareForDelivery(&outbox, sessionID: sessionID, at: date)
-            outboxPersistenceFailureLogged = false
-            return true
-        } catch {
-            reportOutboxPersistenceFailure(error)
-            return false
+        return LibreWatchCallbackWorkProfiler.shared.measure(.outboxPersistence) {
+            do {
+                try outboxFileStore.prepareForDelivery(&outbox, sessionID: sessionID, at: date)
+                outboxPersistenceFailureLogged = false
+                return true
+            } catch {
+                reportOutboxPersistenceFailure(error)
+                return false
+            }
         }
         #else
         return saveOutbox(outbox)

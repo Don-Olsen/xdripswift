@@ -1634,19 +1634,25 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
 
     private func beginCoreBluetoothCallbackDiagnostics(_ kind: LibreWatchCallbackKind) -> Bool {
         let owner = callbackDiagnosticBuffer.begin()
-        if owner { callbackTiming.begin(kind, at: Date(), uptime: monotonicNow) }
+        if owner {
+            let uptime = monotonicNow
+            callbackTiming.begin(kind, at: Date(), uptime: uptime)
+            LibreWatchCallbackWorkProfiler.shared.begin(at: uptime)
+        }
         return owner
     }
 
     private func finishCoreBluetoothCallbackDiagnostics(owner: Bool) {
         guard owner else { return }
         let workFinishedAt = monotonicNow
+        let workBreakdown = LibreWatchCallbackWorkProfiler.shared.finish(at: workFinishedAt)
         let capturedEvents = callbackDiagnosticBuffer.finish(owner: owner)
         // Bluetooth state transitions and issued GATT calls have completed. Persist each entry
         // snapshot now, before returning from the system callback, so suspension cannot leave
         // progress dependent on a later main-queue work item.
         watchState?.reportLibreWatchDiagnostics(capturedEvents)
-        callbackTiming.finish(workFinishedAt: workFinishedAt, flushFinishedAt: monotonicNow)
+        callbackTiming.finish(workFinishedAt: workFinishedAt, flushFinishedAt: monotonicNow,
+                              workBreakdown: workBreakdown)
     }
 
     private func reportReturnDiagnostic(
@@ -2683,6 +2689,7 @@ extension LibreWatchDirectCollector: CBPeripheralDelegate {
                 receivedAt: now
             )
             let payloadID = UUID()
+            LibreWatchCallbackWorkProfiler.shared.correlate(decodedPayloadID: payloadID)
             if let gap = frameGapTracker.decoded(
                 minute: reading.sensorTimeInMinutes,
                 at: now,
