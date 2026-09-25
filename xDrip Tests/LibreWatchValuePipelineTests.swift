@@ -6723,6 +6723,178 @@ extension LibreWatchValuePipelineTests {
         XCTAssertEqual(restartedOutbox.items.map(\.id), [firstID, secondID])
     }
 
+    func testDiagnosticJournalValidationCacheDoesNotPersistOrHideExpiryAfterRestart() throws {
+        var journal = LibreWatchDiagnosticJournal()
+        let expiringID = UUID()
+        let retainedID = UUID()
+        let earlier = receivedAt.addingTimeInterval(-LibreWatchDiagnosticJournal.maximumAge + 1)
+        _ = journal.append(LibreWatchDiagnosticEvent(eventID: expiringID,
+            kind: .disconnected, watchTimestamp: earlier, sessionID: session.id), at: earlier)
+        _ = journal.append(LibreWatchDiagnosticEvent(eventID: retainedID,
+            kind: .recoverySucceeded, watchTimestamp: receivedAt, sessionID: session.id), at: receivedAt)
+        journal.prune(at: receivedAt)
+
+        let data = try JSONEncoder().encode(journal)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertNil(object["encodedSizeIsValidated"])
+        var restarted = try JSONDecoder().decode(LibreWatchDiagnosticJournal.self, from: data)
+        XCTAssertEqual(restarted, journal, "Execution-only validation state does not change stored evidence equality")
+        restarted.prune(at: receivedAt)
+        XCTAssertEqual(restarted, journal)
+        restarted.prune(at: receivedAt.addingTimeInterval(2))
+        XCTAssertEqual(restarted.entries.compactMap { $0.event.eventID }, [retainedID])
+        XCTAssertEqual(restarted.droppedCount, journal.droppedCount + 1)
+        XCTAssertEqual(restarted.unacknowledgedDropCount, 1)
+    }
+
+    func testDiagnosticJournalRevalidatesLegacyDecodeAndAllDeliveryMetadataGrowth() throws {
+        var journal = LibreWatchDiagnosticJournal()
+        for index in 0..<180 {
+            let result = journal.append(LibreWatchDiagnosticEvent(kind: .coreBluetoothCallback,
+                watchTimestamp: receivedAt, trigger: "didConnect", sessionID: session.id,
+                actionReason: String(repeating: "x", count: 500)), at: receivedAt)
+            XCTAssertTrue(result.inserted)
+            XCTAssertEqual(result.event.journalDroppedCount, journal.droppedCount)
+            XCTAssertEqual(result.event.journalUnacknowledgedDropCount, journal.unacknowledgedDropCount ?? 0)
+            XCTAssertLessThanOrEqual(try JSONEncoder().encode(journal).count,
+                LibreWatchDiagnosticJournal.maximumEncodedBytes, "Append \(index) includes its final rotation counters")
+        }
+        let droppedBeforeMetadata = journal.droppedCount
+        let ids = journal.entries.compactMap { $0.event.eventID }
+        for id in ids {
+            journal.markHandedToWatchConnectivity(eventID: id, at: receivedAt.addingTimeInterval(1))
+            XCTAssertLessThanOrEqual(try JSONEncoder().encode(journal).count,
+                LibreWatchDiagnosticJournal.maximumEncodedBytes)
+            journal.markAcknowledgedByPhone(eventID: id, outcome: String(repeating: "a", count: 64),
+                at: receivedAt.addingTimeInterval(2))
+            XCTAssertLessThanOrEqual(try JSONEncoder().encode(journal).count,
+                LibreWatchDiagnosticJournal.maximumEncodedBytes)
+        }
+        XCTAssertGreaterThan(journal.droppedCount, droppedBeforeMetadata,
+            "Acknowledgement and handoff fields must be included in the byte limit")
+
+        let encoded = try JSONEncoder().encode(journal)
+        var legacy = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        let entry = try XCTUnwrap((legacy["entries"] as? [[String: Any]])?.last)
+        legacy["entries"] = Array(repeating: entry, count: 256)
+        legacy.removeValue(forKey: "unacknowledgedDropCount")
+        legacy["encodedSizeIsValidated"] = true // Unknown external keys cannot bypass fresh validation.
+        let oversized = try JSONSerialization.data(withJSONObject: legacy)
+        XCTAssertGreaterThan(oversized.count, LibreWatchDiagnosticJournal.maximumEncodedBytes)
+        var restored = try JSONDecoder().decode(LibreWatchDiagnosticJournal.self, from: oversized)
+        XCTAssertNil(restored.unacknowledgedDropCount)
+        restored.prune(at: receivedAt.addingTimeInterval(3))
+        XCTAssertLessThanOrEqual(try JSONEncoder().encode(restored).count,
+            LibreWatchDiagnosticJournal.maximumEncodedBytes)
+    }
+
+    func testDiagnosticReplayRetainsExistingPayloadAndRetryBackoff() throws {
+        let ids = [UUID(), UUID(), UUID()]
+        let events = ids.map { LibreWatchDiagnosticEvent(eventID: $0, kind: .coreBluetoothCallback,
+            watchTimestamp: receivedAt, trigger: "didConnect", sessionID: session.id) }
+        var journal = LibreWatchDiagnosticJournal()
+        var outbox = LibreWatchConnectivityOutbox()
+        XCTAssertEqual(LibreWatchDiagnosticBatch.stage(events, fallbackSessionID: session.id,
+            journal: &journal, outbox: &outbox, at: receivedAt), ids)
+        outbox.markSubmitted(id: ids[0], at: receivedAt)
+        outbox.markSubmitted(id: ids[2], at: receivedAt)
+        let first = try XCTUnwrap(outbox.items.first { $0.id == ids[0] })
+        outbox.remove(id: ids[1]) // Journal-first commit followed by an incomplete outbox snapshot.
+        let replayAt = receivedAt.addingTimeInterval(2)
+        XCTAssertEqual(LibreWatchDiagnosticBatch.replayPending(journal: journal,
+            outbox: &outbox, at: replayAt), [ids[1]])
+        XCTAssertEqual(outbox.items.first { $0.id == ids[0] }, first)
+        XCTAssertEqual(outbox.lastSubmittedAt?[ids[0]], receivedAt)
+        XCTAssertEqual(Set(outbox.items.map(\.id)), Set(ids))
+        XCTAssertEqual(LibreWatchDiagnosticBatch.replayPending(journal: journal,
+            outbox: &outbox, at: replayAt), [])
+        outbox.markSubmitted(id: ids[1], at: replayAt)
+        XCTAssertNil(outbox.nextEligible(at: receivedAt.addingTimeInterval(59)))
+        XCTAssertEqual(outbox.nextEligible(at: receivedAt.addingTimeInterval(60))?.id, ids[0])
+    }
+
+    func testDiagnosticDeliveryCoalescesUntilItsScheduledOpportunityRuns() {
+        var scheduled: [() -> Void] = []
+        var deliveries = 0
+        let scheduler = LibreWatchDiagnosticDeliveryScheduler(schedule: { scheduled.append($0) })
+        for _ in 0..<10 { scheduler.request { deliveries += 1 } }
+        XCTAssertEqual(scheduled.count, 1)
+        XCTAssertEqual(deliveries, 0)
+        scheduled.removeFirst()()
+        XCTAssertEqual(deliveries, 1)
+        scheduler.request { deliveries += 1 }
+        XCTAssertEqual(scheduled.count, 1)
+        scheduled.removeFirst()()
+        XCTAssertEqual(deliveries, 2)
+    }
+
+    func testDiagnosticDeliveryReentrantRequestGetsTheNextOpportunity() {
+        var scheduled: [() -> Void] = []
+        var deliveries = 0
+        let scheduler = LibreWatchDiagnosticDeliveryScheduler(schedule: { scheduled.append($0) })
+        scheduler.request {
+            deliveries += 1
+            scheduler.request { deliveries += 1 }
+        }
+        scheduled.removeFirst()()
+        XCTAssertEqual(deliveries, 1)
+        XCTAssertEqual(scheduled.count, 1)
+        scheduled.removeFirst()()
+        XCTAssertEqual(deliveries, 2)
+    }
+
+    func testDiagnosticDeliveryMayWaitWhileCommittedBatchSurvivesRestart() throws {
+        let fixture = try outboxFileFixture()
+        let store = LibreWatchOutboxFileStore(fileURL: fixture.fileURL, defaults: fixture.defaults)
+        var outbox = try store.load(at: receivedAt)
+        var journal = LibreWatchDiagnosticJournal()
+        let event = LibreWatchDiagnosticEvent(kind: .disconnected, watchTimestamp: receivedAt,
+            sessionID: session.id)
+        let ids = LibreWatchDiagnosticBatch.stage([event], fallbackSessionID: session.id,
+            journal: &journal, outbox: &outbox, at: receivedAt)
+        LibreWatchSessionStore.saveDiagnosticJournal(journal, defaults: fixture.defaults, at: receivedAt)
+        try store.save(outbox)
+        var scheduled: [() -> Void] = []
+        var deliveries = 0
+        let scheduler = LibreWatchDiagnosticDeliveryScheduler(schedule: { scheduled.append($0) })
+        scheduler.request { deliveries += 1 }
+
+        // Do not execute the queued closure: model suspension immediately after the callback.
+        XCTAssertEqual(deliveries, 0)
+        XCTAssertEqual(scheduled.count, 1)
+        let restoredJournal = LibreWatchSessionStore.loadDiagnosticJournal(
+            defaults: fixture.defaults, at: receivedAt.addingTimeInterval(1))
+        let restoredOutbox = try LibreWatchOutboxFileStore(fileURL: fixture.fileURL,
+            defaults: fixture.defaults).load(at: receivedAt.addingTimeInterval(1))
+        XCTAssertEqual(restoredJournal.pendingEvents().compactMap(\.eventID), ids)
+        XCTAssertEqual(restoredOutbox.items.map(\.id), ids)
+    }
+
+    func testDiagnosticRepeatedPruneAndReplayPreservesSyntheticPendingBatch() {
+        var journal = LibreWatchDiagnosticJournal()
+        var outbox = LibreWatchConnectivityOutbox()
+        let events = (0..<64).map { index in
+            LibreWatchDiagnosticEvent(kind: .coreBluetoothCallback, watchTimestamp: receivedAt,
+                trigger: "syntheticCallback\(index)", sessionID: session.id, appBuild: "synthetic")
+        }
+        XCTAssertEqual(LibreWatchDiagnosticBatch.stage(events, fallbackSessionID: session.id,
+            journal: &journal, outbox: &outbox, at: receivedAt).count, 64)
+        let originalJournal = journal
+        let originalOutbox = outbox
+        let started = ProcessInfo.processInfo.systemUptime
+        var replayedCount = 0
+        for _ in 0..<100 {
+            journal.prune(at: receivedAt)
+            replayedCount += LibreWatchDiagnosticBatch.replayPending(journal: journal,
+                outbox: &outbox, at: receivedAt).count
+        }
+        let elapsed = ProcessInfo.processInfo.systemUptime - started
+        print("Synthetic diagnostic benchmark: 64 pending events, 100 prune/replay passes, \(elapsed) seconds")
+        XCTAssertEqual(replayedCount, 0)
+        XCTAssertEqual(journal, originalJournal)
+        XCTAssertEqual(outbox, originalOutbox)
+    }
+
     func testFileOutboxFailedReplacementPreservesPreviousFileAndDoesNotAdvanceCache() throws {
         let fixture = try outboxFileFixture()
         var shouldFail = false

@@ -180,6 +180,9 @@ final class WatchStateModel: NSObject, ObservableObject {
     private var connectivityOutbox = LibreWatchSessionStore.loadOutbox()
     private var evidenceConfirmedOutboxIDs = Set<UUID>()
     private var diagnosticJournal = LibreWatchSessionStore.loadDiagnosticJournal()
+    private let diagnosticDelivery = LibreWatchDiagnosticDeliveryScheduler(schedule: {
+        DispatchQueue.main.async(execute: $0)
+    })
     private var outboxSendGate = LibreWatchConnectivitySendAttemptGate()
     private var pendingPhoneReturn = LibreWatchSessionStore.loadPhoneReturn()
     private var phoneReturnSendToken: UUID?
@@ -1065,6 +1068,8 @@ final class WatchStateModel: NSObject, ObservableObject {
     /// Persists one Core Bluetooth callback's immutable snapshots with one journal write and
     /// one outbox write. The journal remains first so a process exit between the two stores is
     /// repaired by `restorePendingDiagnosticJournalToOutbox` on the next execution opportunity.
+    /// Only transport is deferred: suspension before that work runs leaves the local snapshots
+    /// available for replay. Reading acceptance and its immediate delivery path are unchanged.
     func reportLibreWatchDiagnostics(_ events: [LibreWatchDiagnosticEvent]) {
         for event in events { WatchDeliveryEvidenceStore.shared.recordCollectorDiagnostic(event) }
         guard !events.isEmpty else { return }
@@ -1099,7 +1104,7 @@ final class WatchStateModel: NSObject, ObservableObject {
         )
         LibreWatchSessionStore.saveDiagnosticJournal(diagnosticJournal)
         LibreWatchSessionStore.saveOutbox(connectivityOutbox)
-        flushWatchConnectivityOutbox()
+        diagnosticDelivery.request { [weak self] in self?.flushWatchConnectivityOutbox() }
     }
 
     private func acceptLibreWatchCalibration(_ snapshot: LibreWatchCalibrationSnapshot) {

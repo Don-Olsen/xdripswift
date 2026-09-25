@@ -1177,6 +1177,18 @@ struct LibreWatchDiagnosticJournal: Codable, Equatable {
     private(set) var nextSequenceNumber: UInt64 = 1
     private(set) var droppedCount: UInt64 = 0
     private(set) var unacknowledgedDropCount: UInt64?
+    // Repeated prune/save/replay opportunities must not re-encode an unchanged journal
+    // merely to validate its size. This is local execution state, never persisted evidence.
+    private var encodedSizeIsValidated = false
+    private enum CodingKeys: String, CodingKey {
+        case entries, nextSequenceNumber, droppedCount, unacknowledgedDropCount
+    }
+    init() {}
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.entries == rhs.entries && lhs.nextSequenceNumber == rhs.nextSequenceNumber &&
+            lhs.droppedCount == rhs.droppedCount &&
+            lhs.unacknowledgedDropCount == rhs.unacknowledgedDropCount
+    }
 
     mutating func append(
         _ sourceEvent: LibreWatchDiagnosticEvent,
@@ -1194,6 +1206,7 @@ struct LibreWatchDiagnosticJournal: Codable, Equatable {
         if event.eventID == nil { event.eventID = UUID() }
         event.sequenceNumber = nextSequenceNumber
         nextSequenceNumber &+= 1
+        encodedSizeIsValidated = false
 
         if entries.count >= Self.maximumEntries {
             let removalCount = entries.count - Self.maximumEntries + 1
@@ -1209,13 +1222,20 @@ struct LibreWatchDiagnosticJournal: Codable, Equatable {
             handedToWatchConnectivityAt: nil
         ))
         trimToEncodedSize()
-        let inserted = entries.last?.event.eventID == event.eventID
-        if inserted, var appended = entries.last {
+        // Rotation changes the counters embedded in the final event. Those updated digits
+        // also consume bytes, so validate again until the retained event reports final counts.
+        while var appended = entries.last, appended.event.eventID == event.eventID {
+            guard appended.event.journalDroppedCount != droppedCount ||
+                    appended.event.journalUnacknowledgedDropCount != (unacknowledgedDropCount ?? 0)
+            else { break }
             appended.event.journalDroppedCount = droppedCount
             appended.event.journalUnacknowledgedDropCount = unacknowledgedDropCount ?? 0
             entries[entries.count - 1] = appended
-            event = appended.event
+            encodedSizeIsValidated = false
+            trimToEncodedSize()
         }
+        let inserted = entries.last?.event.eventID == event.eventID
+        if inserted, let appended = entries.last { event = appended.event }
         return AppendResult(
             event: event,
             rotated: droppedCount != droppedBeforeAppend,
@@ -1227,7 +1247,12 @@ struct LibreWatchDiagnosticJournal: Codable, Equatable {
         guard let eventID,
               let index = entries.firstIndex(where: { $0.event.eventID == eventID })
         else { return }
+        guard entries[index].handedToWatchConnectivityAt != date else {
+            trimToEncodedSize()
+            return
+        }
         entries[index].handedToWatchConnectivityAt = date
+        encodedSizeIsValidated = false
         trimToEncodedSize()
     }
 
@@ -1235,8 +1260,15 @@ struct LibreWatchDiagnosticJournal: Codable, Equatable {
         guard let eventID,
               let index = entries.firstIndex(where: { $0.event.eventID == eventID })
         else { return }
+        let boundedOutcome = String(outcome.prefix(64))
+        guard entries[index].acknowledgedByPhoneAt != date ||
+                entries[index].terminalDeliveryOutcome != boundedOutcome else {
+            trimToEncodedSize()
+            return
+        }
         entries[index].acknowledgedByPhoneAt = date
-        entries[index].terminalDeliveryOutcome = String(outcome.prefix(64))
+        entries[index].terminalDeliveryOutcome = boundedOutcome
+        encodedSizeIsValidated = false
         trimToEncodedSize()
     }
 
@@ -1250,33 +1282,52 @@ struct LibreWatchDiagnosticJournal: Codable, Equatable {
     }
 
     mutating func prune(at date: Date = Date()) {
+        // Preserve the existing first-prune normalization of older journals.
+        if unacknowledgedDropCount == nil {
+            unacknowledgedDropCount = 0
+            encodedSizeIsValidated = false
+        }
         let retained = entries.filter {
             let timestamp = $0.recordedAt ?? $0.event.watchTimestamp ?? date
             return date.timeIntervalSince(timestamp) <= Self.maximumAge
         }
         let removed = entries.count - retained.count
-        let retainedIDs = Set(retained.compactMap { $0.event.eventID })
-        recordDropped(entries.filter { !($0.event.eventID.map(retainedIDs.contains) ?? false) })
-        entries = retained
-        if removed > 0 { droppedCount &+= UInt64(removed) }
-        if let highest = entries.compactMap({ $0.event.sequenceNumber }).max() {
-            nextSequenceNumber = max(nextSequenceNumber, highest &+ 1)
+        if removed > 0 {
+            recordDropped(entries.filter {
+                let timestamp = $0.recordedAt ?? $0.event.watchTimestamp ?? date
+                return date.timeIntervalSince(timestamp) > Self.maximumAge
+            })
+            entries = retained
+            droppedCount &+= UInt64(removed)
+            encodedSizeIsValidated = false
+        }
+        if let highest = entries.compactMap({ $0.event.sequenceNumber }).max(),
+           highest &+ 1 > nextSequenceNumber {
+            nextSequenceNumber = highest &+ 1
+            encodedSizeIsValidated = false
         }
         trimToEncodedSize()
     }
 
     private mutating func trimToEncodedSize() {
-        while !entries.isEmpty,
-              (try? JSONEncoder().encode(self).count).map({ $0 > Self.maximumEncodedBytes }) == true {
+        guard !encodedSizeIsValidated else { return }
+        while !entries.isEmpty {
+            guard let byteCount = try? JSONEncoder().encode(self).count else { return }
+            if byteCount <= Self.maximumEncodedBytes {
+                encodedSizeIsValidated = true
+                return
+            }
             recordDropped(entries.prefix(1))
             entries.removeFirst()
             droppedCount &+= 1
         }
+        encodedSizeIsValidated = true
     }
 
     private mutating func recordDropped<S: Sequence>(_ removed: S) where S.Element == Entry {
         let unconfirmed = removed.filter { $0.acknowledgedByPhoneAt == nil }.count
         unacknowledgedDropCount = (unacknowledgedDropCount ?? 0) &+ UInt64(unconfirmed)
+        encodedSizeIsValidated = false
     }
 }
 
@@ -1322,13 +1373,14 @@ struct LibreWatchDiagnosticBatch {
     ) -> [UUID] {
         outbox.prune(at: date)
         var replayedIDs: [UUID] = []
+        var queuedIDs = Set(outbox.items.map(\.id))
         for (index, event) in journal.pendingEvents().enumerated() {
             guard let eventID = event.eventID,
                   let sessionID = event.sessionID,
-                  let encoded = try? JSONEncoder().encode(event)
+                  !queuedIDs.contains(eventID)
             else { continue }
-            if outbox.items.contains(where: { $0.id == eventID }) { continue }
             guard outbox.items.count < LibreWatchConnectivityOutbox.maximumItems else { break }
+            guard let encoded = try? JSONEncoder().encode(event) else { continue }
             let admitted = outbox.enqueue(.command(
                 .reportDiagnostic,
                 sessionID: sessionID,
@@ -1337,9 +1389,31 @@ struct LibreWatchDiagnosticBatch {
                 createdAt: date.addingTimeInterval(-1 + Double(index) / 1_000)
             ), now: date)
             if !admitted { break }
+            queuedIDs.insert(eventID)
             replayedIDs.append(eventID)
         }
         return replayedIDs
+    }
+}
+
+/// Main-context transport scheduling only. Callers commit journal and outbox synchronously
+/// before requesting delivery; suspension may defer transport without deferring persistence.
+final class LibreWatchDiagnosticDeliveryScheduler {
+    private let schedule: (@escaping () -> Void) -> Void
+    private var isPending = false
+
+    init(schedule: @escaping (@escaping () -> Void) -> Void) {
+        self.schedule = schedule
+    }
+
+    func request(_ deliver: @escaping () -> Void) {
+        guard !isPending else { return }
+        isPending = true
+        schedule { [weak self] in
+            guard let self else { return }
+            self.isPending = false
+            deliver()
+        }
     }
 }
 

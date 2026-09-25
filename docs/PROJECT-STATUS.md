@@ -8,6 +8,159 @@
 - Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
 <!-- testflight-7.1.1-4270:end -->
 
+## Mindre diagnostikarbejde under Watch-modtagelse
+
+7.1.1-kandidaten, som Apple-allokeringen har nummereret **4271**, reducerer arbejdet i Bluetooth-callbacks uden at
+ændre sensorprotokol, system-autoreconnect, runtime-politik eller beregning
+af glukose. Diagnosesnapshots lagres fortsat synkront i journal og outbox.
+Kun den efterfølgende transportafsendelse flyttes til en samlet opgave på
+main-køen. Hvis watchOS suspenderer før afsendelsen, kan diagnoserne leveres
+senere fra de gemte poster. Den direkte målings-, alarm-, unlock- og
+overdragelsesvej beholder sin eksisterende afsendelse og lokale lagring.
+
+Uændrede journaler genserialiseres ikke længere blot for at kontrollere
+størrelsesgrænsen. Valideringen glemmes efter genstart og ugyldiggøres ved
+ændringer, herunder kvitteringsfelter og rotationstællere. Allerede køede
+journalposter genkodes ikke ved replay; deres payload og genforsøgsfrist
+bevares. Journalens bytegrænse kontrolleres også efter opdatering af
+rotationstællerne i den nyeste post.
+
+En isoleret syntetisk Mac-måling med samme optimerede Swift-compiler og
+64 allerede køede diagnostikposter viste cirka **47 ms før og 4,4 ms efter**
+for 100 prune/replay-gentagelser. Begge varianter bevarede 64 ID'er,
+25.983 journalbytes og samme kø/backoff. Målingen isolerer genbehandling af
+uændrede poster; den omfatter ikke disk, WatchConnectivity eller fysisk
+Watch-hardware og dokumenterer ikke forbedret BLE-stabilitet.
+
+Syv nye regressionstests dækker udløb/genstart, størrelsesgrænser og metadata,
+replay/backoff, samlet afsendelse, ny afsendelse under callbackbehandling og
+lokal lagring ved suspension før transport. En syntetisk test på 64 poster
+med 100 gentagelser rapporterer tid uden en ustabil tidsgrænse. De afsluttede
+releasekontroller og Apple-status registreres i den automatiske releaseblok.
+
+**Fysisk efterprøvning:** dette er en konkret reduktion af diagnosebelastning,
+men ikke en eftervist løsning på de observerede BLE-linkbrud. Efter samme nye
+build er installeret på begge enheder, sammenlignes én times Watch-ejerskab
+med telefonens Bluetooth/Wi-Fi slukket med 4270-resultatet på 47/60 minutter.
+Lad urets skærm være i hvile det meste af tiden. Efter retur eksporteres både
+lokal Watch-leveringslog og telefonlog. Vurder manglende sensor-minutter,
+linkafbrydelser, callbackarbejde og diagnoseflush særskilt; flyttet transport
+kan sænke callbacktiden uden i sig selv at bevise bedre BLE-modtagelse.
+
+## Standalone 4270-test, 25. september 2026 kl. 13:54–14:57
+
+Brugerens hovedmål er stabil direkte sensormodtagelse på Watch uden telefonen.
+Under denne test blev telefonens Bluetooth og Wi-Fi slået fra efter overdragelsen.
+Watch-ejerskab er logget kl. 13:54:13, første dekodede måling kl. 13:55:15,
+og den manuelle retur til telefonen kl. 14:56:35. Første efterfølgende
+telefonmåling kl. 14:57:15 introducerer ikke et ekstra minut-hul.
+
+Den bevarede lokale Watch-snapshot er eksporteret kl. 14:57:32 og dækker
+forløbet, selv om den efterfølgende hentestatus siger, at en helt frisk
+snapshot ikke kunne hentes. Optællingen er afgrænset til build 4270 og den
+aktuelle Watch-proces. De 266 lokale testposter har sammenhængende sekvensnumre.
+
+- **47/60 sensor-minutter** kl. 13:55–14:54. Hele perioden kl. 13:55–14:56
+  indeholder **49/62**, altså 13 manglende minutter fordelt på ni frame-gap-poster.
+- Det længste interval mellem dekodede målinger er cirka **240 sekunder**
+  (kl. 14:07–14:11). Alle ni huller registrerer linkafbrydelse; ingen af dem
+  registrerer samlings-, dekodnings- eller notification-fejl. De ti
+  linkafbrydelser i disse hulposter er ikke en total for alle testens afbrydelser.
+- Alle **49 dekodede målinger** er accepteret og bekræftet skrevet i urets
+  lokale kø; alle 49 er senere lagret og varigt kvitteret af telefonen.
+  Efterlevering, mens telefonen igen er tilgængelig, må ikke forveksles med
+  de minutter, som uret slet ikke dekodede.
+- Telefonens bevarede Watch-journal dokumenterer ni uplanlagte afbrydelser
+  med efterfølgende vellykket genopkobling. Journalen har sekvenshuller omkring
+  kl. 14:37–14:49; lokal frame-gap-evidens viser yderligere linkafbrydelser i
+  dette tidsrum. Der kan ikke udledes et fuldstændigt disconnect-forløb alene
+  fra telefonens journal.
+- Runtime startede kl. 13:54:13 og stoppede kl. 14:04:14. Der blev dekodet
+  40 målinger efter stoppet; første manglende minut er kl. 14:08. Tidsfølgen
+  beviser ikke, at runtime-stop forårsager afbrydelserne. Sceneaktivering under
+  testen betyder også, at fuldt uovervåget genopkobling ikke er eftervist.
+- Længste afsluttede callback i testen kl. 14:46:18 tog cirka **893 ms**,
+  heraf **545 ms** til efterfølgende diagnostikarbejde. Det er monoton
+  forløbstid, ikke CPU-tid eller bevis for årsagen til linkbruddene.
+
+**Nuværende udviklingsfokus:** reducer konkret, gentaget diagnostikarbejde i
+Bluetooth-callbacks, mens synkron lokal lagring af målinger og diagnoser
+bevares. En uafhængig kodegennemgang fandt ingen begrundet ændring af
+system-autoreconnect, generationer eller runtime-politik: de dokumenterede
+forløb genopkobler allerede uden parallelle app-initierede forbindelsesforsøg.
+En performanceændring skal testes som sådan; forbedret fysisk BLE-stabilitet
+skal eftervises i næste test og må ikke påstås på baggrund af simulatorchecks.
+Denne prioritet erstatter leveringsfokus fra den tidligere test med telefonen
+i nærheden. Historikken nedenfor bevares.
+
+## Fysisk 4270-test, 25. september 2026 kl. 12:29–13:13
+
+Brugeren afsluttede den planlagte time cirka 16 minutter tidligere. Det
+tilgængelige forløb er tilstrækkeligt til den aftalte 30-minutters kontrol.
+Telefonloggen er eksporteret kl. 13:14:15; den lokale Watch-snapshot er fra
+kl. 13:14:09 og leveringsfilen fra kl. 13:14:54. Begge enheder identificerer
+4270 og taggets kildecommit. Optællingen nedenfor bruger kun den aktuelle
+Watch-proces/build og entydige målings-ID'er; historiske rotationstællere,
+ældre builds og den blandede døgnprocent indgår ikke.
+
+- **43/44 sensor-minutter** fra kl. 12:29 til og med 13:12; kun kl. 12:41
+  mangler. Alle 43 er dekodet, accepteret og bekræftet skrevet lokalt på uret.
+- Én uplanlagt BLE-afbrydelse kl. 12:41:14 (`CBErrorDomain/7`), efterfulgt af
+  første gyldige frame kl. 12:42:15. Frame-gap-sporet tæller ét manglende
+  sensor-minut og én linkafbrydelse, uden registrerede samlings-,
+  dekodnings- eller notification-fejl i dette hul. De næste **31/31**
+  sensor-minutter kl. 12:42–13:12 er til stede.
+- Retur til iPhone anmodet kl. 13:12:46 og afsluttet kl. 13:12:47. Denne
+  manuelle afbrydelse tælles særskilt. Første efterfølgende iPhone-måling
+  er kl. 13:13:14; overdragelsen introducerer ikke et ekstra målehul.
+- **43/43** entydige Watch-målinger er lagret og varigt kvitteret af iPhone.
+  Leveringen er dog forsinket: 13 når telefonlagring inden for tre minutter,
+  30 senere. Medianen er cirka 7 minutter, maksimum cirka **27 minutter**
+  (12:45:13 til 13:12:16). Det er forskelle mellem enhedernes vægure, ikke
+  en synkroniseret transportmåling. Den store efterlevering begynder før
+  den manuelle retur; returen er derfor ikke dokumenteret som dens årsag.
+- Der er 177 læsningsforsøg/-modtagelser for de 43 ID'er, heraf 176 via
+  `transferUserInfo` og ét via `sendMessage`. Telefonen klassificerer 134
+  som dubletter. Koden kontrollerer allerede igangværende OS-overførsler
+  med samme ID og beholder målingen til varig kvittering; antallet beviser
+  ikke i sig selv en fejl i afsendelseslåsen eller tab af målinger.
+
+Den ekstra runtime startede kl. 12:27:52, havde oplyst udløb kl. 12:37:52
+og blev invalideret kl. 12:37:53. Tiden svarer til projektets `self-care`-
+session på ti minutter. Stopposten indeholder dog reason `-1`, fejlobjekt,
+kode `1` og det sanitiserede domæne `other`; den præcise fejl kan derfor
+ikke klassificeres ud fra koden alene. Uret dekodede **34 målinger efter
+stoppet**. Dette forløb underbygger ikke, at runtime-stop alene stopper BLE.
+Den længste afsluttede Bluetooth-callback i sammendraget er cirka 469 ms,
+heraf 448 ms til diagnostiklagring. Det er forløbstid, ikke CPU-forbrug,
+og dokumenterer hverken en CPU-kvoteoverskridelse eller årsagen til linkbruddet.
+
+**Vurdering og næste fokus:** BLE-resultatet er bedre end 4269-kontrollens
+47/60 minutter og 13 uplanlagte afbrydelser, men én kortere test af en
+diagnostikændring beviser ikke en stabilitetsrettelse. Undersøg nu den
+forsinkede Watch→iPhone-levering og omkostningen ved diagnostiklagring.
+Brugeren har efterfølgende bekræftet, at telefonen lå forholdsvis tæt på
+uret under en lur, mens uret ejede sensoren. Forløbet skal derfor undersøges
+som baggrundslevering med en telefon i nærheden; fysisk nærhed alene beviser
+ikke, at WatchConnectivity rapporterede live-reachability.
+
+En opfølgende optælling af de 43 ID'er afgrænser forsinkelsen: Fra Watch-
+accept til første indlevering til transport gik højst **1,204 sekunder**
+(median 0,117). Fra telefonens første `transportReceived` til `phoneStored`
+gik højst **2,569 sekunder** (median 2,519). Telefonens transportpost skrives
+i WCSession-delegatevejen **før** `DispatchQueue.main.async` til modtagerens
+behandling. Den lange ventetid ligger dermed før denne registrerede
+modtagelse, ikke i den efterfølgende databasebehandling. Logs adskiller ikke
+OS-transportventetid, radiosituation og ventetid før delegatelevering.
+
+Næste kodeundersøgelse skal fokusere på WatchConnectivity-baggrundslevering,
+afsendelsesprioritet og genforsøg/kvitteringer. Den eksisterende kø sender
+allerede nye målinger hurtigt og beskytter mod genindlevering af samme ID,
+mens OS rapporterer overførslen som igangværende; denne beskyttelse må ikke
+fjernes i et forsøg på at gøre leveringen hurtigere. Den konkrete test skal
+ikke gentages alene for at nå en time. Ingen appkode eller ny TestFlight-
+upload er ændret som led i denne loganalyse.
+
 De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
 
 <!-- testflight-7.1.1-4269:start -->
