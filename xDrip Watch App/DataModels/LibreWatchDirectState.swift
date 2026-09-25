@@ -1,31 +1,5 @@
 import Foundation
 
-enum LibreWatchDirectStage: String, Equatable {
-    case unavailable
-    case ready
-    case handingOff
-    case scanning
-    case connecting
-    case reconnecting
-    case receiving
-    case failed
-    case returningToPhone
-
-    var displayText: String {
-        switch self {
-        case .unavailable: return "Set up Libre on iPhone"
-        case .ready: return "Ready for Watch takeover"
-        case .handingOff: return "iPhone is releasing Libre"
-        case .scanning: return "Looking for your Libre"
-        case .connecting: return "Connecting to your Libre"
-        case .reconnecting: return "Reconnecting to your Libre"
-        case .receiving: return "Watch receives directly"
-        case .failed: return "Direct reception needs attention"
-        case .returningToPhone: return "Returning Libre to iPhone"
-        }
-    }
-}
-
 enum LibreWatchDirectFailure: String, Equatable {
     case noSession = "No prepared Libre session"
     case phoneUnavailable = "Keep iPhone nearby for takeover"

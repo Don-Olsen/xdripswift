@@ -105,36 +105,40 @@ struct BigNumberView: View {
                 }
             }
             
-            HStack(alignment: .center, spacing: 3) {
-                Image(systemName: ConstantsAppleWatch.requestingDataIconSFSymbolName)
-                    .font(.system(size: ConstantsAppleWatch.requestingDataIconFontSize, weight: .heavy))
-                    .foregroundStyle(watchState.requestingDataIconColor)
-                    .padding(.top, 4)
-                    .padding(.trailing, 2)
-                
-                Text(watchState.lastUpdatedMinsAgoString(at: displayDate))
-                    .font(.system(size: isSmallScreen ? 20 : 22))
-                    .foregroundStyle(minsAgoTextColor)
-                    .animation(.easeOut(duration: 0.3), value: minsAgoTextColor)
-                    .onChange(of: watchState.lastUpdatedMinsAgoString()) { oldState, newState in
-                        animateTextColor()
-                    }
-            }
-            .padding(.top, 15)
-            .padding(.bottom, watchState.libreWatchOwnership == .watch ? 0 : -20)
+            if watchState.libreWatchOwnership == .watch {
+                let presentation = watchState.directLibrePresentation(stage: libreDirectCollector.state.stage, at: displayDate)
+                VStack(spacing: 2) {
+                    Text(Texts_WatchApp.directConnectionTitle(presentation))
+                        .font(.system(size: isSmallScreen ? 12 : 14, weight: .semibold))
+                        .foregroundStyle(presentation.statusColor)
+                        .lineLimit(2)
+                    Text(Texts_WatchApp.directReadingAge(presentation))
+                        .font(.system(size: isSmallScreen ? 14 : 16))
+                        .foregroundStyle(presentation.reading == .stale ? Color.orange : Color.secondary)
+                        .lineLimit(2)
+                }
+                .multilineTextAlignment(.center)
+                .minimumScaleFactor(0.8)
+                .padding(.top, 8)
+                .accessibilityElement(children: .combine)
+            } else {
+                HStack(alignment: .center, spacing: 3) {
+                    Image(systemName: ConstantsAppleWatch.requestingDataIconSFSymbolName)
+                        .font(.system(size: ConstantsAppleWatch.requestingDataIconFontSize, weight: .heavy))
+                        .foregroundStyle(watchState.requestingDataIconColor)
+                        .padding(.top, 4)
+                        .padding(.trailing, 2)
 
-            let connectionIsRecovering = libreDirectCollector.state.stage != .receiving
-            let directReadingIsStale = watchState.libreWatchOwnership == .watch &&
-                !watchState.directLibreReadingIsCurrent(at: displayDate)
-            if let directStatus = watchState.directLibreStatus(
-                connectionIsRecovering: connectionIsRecovering,
-                at: displayDate
-            ) {
-                Text(directStatus)
-                    .font(.caption2.bold())
-                    .foregroundStyle(connectionIsRecovering || directReadingIsStale ? Color.orange : Color.green)
-                    .padding(.top, 2)
-                    .padding(.bottom, -18)
+                    Text(watchState.lastUpdatedMinsAgoString(at: displayDate))
+                        .font(.system(size: isSmallScreen ? 20 : 22))
+                        .foregroundStyle(minsAgoTextColor)
+                        .animation(.easeOut(duration: 0.3), value: minsAgoTextColor)
+                        .onChange(of: watchState.lastUpdatedMinsAgoString()) { oldState, newState in
+                            animateTextColor()
+                        }
+                }
+                .padding(.top, 15)
+                .padding(.bottom, -20)
             }
         }
         .onAppear {

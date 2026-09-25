@@ -2470,7 +2470,7 @@ final class LibreWatchValuePipelineTests: XCTestCase {
         ))
     }
 
-    func testDocumentedBackgroundConnectingEpisodeStartsPausedAndDoesNotCancelOnWake() throws {
+    func testBackgroundConnectingEpisodePreservesExecutionBudgetOnWake() throws {
         var timing = LibreWatchConnectionTiming()
         let observedConnectingAt = receivedAt
         timing.beginConnection(
@@ -2498,6 +2498,173 @@ final class LibreWatchValuePipelineTests: XCTestCase {
             cancelling: false,
             at: foregroundWake
         ))
+    }
+
+    private func pendingReconnectIsOverdue(
+        _ timing: LibreWatchConnectionTiming,
+        at uptime: TimeInterval,
+        generation: UUID? = nil,
+        state: LibreWatchObservedPeripheralState = .connecting,
+        ownership: LibreWatchOwnership = .watch,
+        executionIsAvailable: Bool = true,
+        cancelling: Bool = false
+    ) -> Bool {
+        timing.pendingConnectionIsOverdue(
+            generation: generation ?? timing.generation,
+            peripheralState: state,
+            ownership: ownership,
+            executionIsAvailable: executionIsAvailable,
+            cancellationIsActive: cancelling,
+            monotonicTime: uptime
+        )
+    }
+
+    func testPendingReconnectAgeExpiresAtThreeMinutesDespitePausedExecutionBudget() throws {
+        var timing = LibreWatchConnectionTiming()
+        timing.beginConnection(at: receivedAt, applicationIsActive: false,
+                               executionIsAvailable: false, monotonicTime: 1_000)
+
+        XCTAssertFalse(pendingReconnectIsOverdue(timing, at: 1_179.999))
+        XCTAssertTrue(pendingReconnectIsOverdue(timing, at: 1_180))
+        XCTAssertNil(timing.deadline, "Age eligibility must not fabricate background timer runtime")
+        XCTAssertEqual(try XCTUnwrap(timing.remainingExecutionTime(
+            at: receivedAt.addingTimeInterval(180), monotonicTime: 1_180
+        )), 90, accuracy: 0.001, "The separate execution budget is still paused")
+    }
+
+    func test4272ReconnectIsEligibleAtWakeAfterFourMinutesWith87SecondsBudgetLeft() throws {
+        var timing = LibreWatchConnectionTiming()
+        timing.beginConnection(at: receivedAt, applicationIsActive: false,
+                               executionIsAvailable: false, monotonicTime: 1_000)
+        let generation = timing.generation
+        timing.setExecutionAvailable(true, at: receivedAt.addingTimeInterval(8), monotonicTime: 1_008)
+        timing.setExecutionAvailable(false, at: receivedAt.addingTimeInterval(10.9), monotonicTime: 1_010.9)
+        XCTAssertFalse(pendingReconnectIsOverdue(timing, at: 1_263, executionIsAvailable: false))
+
+        timing.setExecutionAvailable(true, at: receivedAt.addingTimeInterval(263), monotonicTime: 1_263)
+        XCTAssertEqual(timing.generation, generation)
+        XCTAssertEqual(try XCTUnwrap(timing.remainingExecutionTime(
+            at: receivedAt.addingTimeInterval(263), monotonicTime: 1_263
+        )), 87.1, accuracy: 0.001)
+        XCTAssertTrue(pendingReconnectIsOverdue(timing, at: 1_263))
+    }
+
+    func testRepeatedShortWakesAndConnectingObservationsDoNotRestartPendingAge() throws {
+        var timing = LibreWatchConnectionTiming()
+        timing.beginConnection(at: receivedAt, applicationIsActive: false,
+                               executionIsAvailable: false, monotonicTime: 500)
+        let generation = timing.generation
+        for elapsed in [30.0, 60, 90, 120, 150] {
+            let date = receivedAt.addingTimeInterval(elapsed)
+            timing.setExecutionAvailable(true, at: date, monotonicTime: 500 + elapsed)
+            timing.beginConnection(at: date, applicationIsActive: true,
+                                   executionIsAvailable: true, monotonicTime: 500 + elapsed)
+            XCTAssertFalse(timing.observeLink(
+                connected: false, connecting: true, hasReceptionState: false,
+                at: date, applicationIsActive: true, monotonicTime: 500 + elapsed
+            ))
+            timing.setExecutionAvailable(false, at: date.addingTimeInterval(1),
+                                         monotonicTime: 501 + elapsed)
+        }
+        XCTAssertEqual(timing.generation, generation)
+        XCTAssertEqual(try XCTUnwrap(timing.pendingConnectionAge(monotonicTime: 680)), 180)
+        XCTAssertTrue(pendingReconnectIsOverdue(timing, at: 680))
+    }
+
+    func testOldPendingReconnectCannotActForOtherOwnerOrWithoutExecution() {
+        var timing = LibreWatchConnectionTiming()
+        timing.beginConnection(at: receivedAt, applicationIsActive: false,
+                               executionIsAvailable: false, monotonicTime: 100)
+        for owner: LibreWatchOwnership in [.iphone, .releasingToWatch, .releasingToPhone, .recovery] {
+            XCTAssertFalse(pendingReconnectIsOverdue(timing, at: 10_000, ownership: owner))
+        }
+        XCTAssertFalse(pendingReconnectIsOverdue(timing, at: 10_000, executionIsAvailable: false))
+        XCTAssertFalse(pendingReconnectIsOverdue(timing, at: 10_000, cancelling: true))
+        XCTAssertFalse(pendingReconnectIsOverdue(timing, at: 10_000, generation: UUID()))
+        XCTAssertTrue(pendingReconnectIsOverdue(timing, at: 10_000))
+    }
+
+    func testJustConnectedNativeStateTakesPrecedenceOverOldPendingReconnectAge() {
+        var timing = LibreWatchConnectionTiming()
+        timing.beginConnection(at: receivedAt, applicationIsActive: false,
+                               executionIsAvailable: false, monotonicTime: 100)
+        for nativeState: LibreWatchObservedPeripheralState in [.connected, .disconnected, .disconnecting, .unknown] {
+            XCTAssertFalse(pendingReconnectIsOverdue(timing, at: 1_000, state: nativeState),
+                           "Age recovery is only for the unchanged native connecting state: \(nativeState)")
+        }
+        XCTAssertTrue(pendingReconnectIsOverdue(timing, at: 1_000, state: .connecting))
+    }
+
+    func testConnectionProgressClearsPendingAgeAndPreservesSetupBudget() throws {
+        var timing = LibreWatchConnectionTiming()
+        timing.beginConnection(at: receivedAt, applicationIsActive: false,
+                               executionIsAvailable: false, monotonicTime: 100)
+        let connectedAt = receivedAt.addingTimeInterval(179)
+        timing.beginSetup(at: connectedAt, executionIsAvailable: true, monotonicTime: 279)
+        XCTAssertNil(timing.pendingConnectionAge(monotonicTime: 1_000))
+        XCTAssertFalse(pendingReconnectIsOverdue(timing, at: 1_000))
+        XCTAssertEqual(try XCTUnwrap(timing.remainingExecutionTime(
+            at: connectedAt, monotonicTime: 279
+        )), 60, accuracy: 0.001)
+    }
+
+    func testReceivingProgressCannotBeCancelledByOldPendingConnectionAge() throws {
+        var timing = LibreWatchConnectionTiming()
+        timing.beginConnection(at: receivedAt, applicationIsActive: false,
+                               executionIsAvailable: false, monotonicTime: 100)
+        timing.receivedPacketOrEnabledNotifications(at: receivedAt.addingTimeInterval(1))
+        timing.recordReceivingProgress(at: receivedAt.addingTimeInterval(1), timeout: 180,
+                                       executionIsAvailable: false, monotonicTime: 101)
+        XCTAssertNil(timing.pendingConnectionAge(monotonicTime: 10_000))
+        XCTAssertFalse(pendingReconnectIsOverdue(timing, at: 10_000))
+        XCTAssertEqual(try XCTUnwrap(timing.remainingExecutionTime(
+            at: receivedAt.addingTimeInterval(9_900), monotonicTime: 10_000
+        )), 180, accuracy: 0.001)
+    }
+
+    func testPendingAgeRecoveryBecomesIneligibleAsSoonAsCancellationBegins() throws {
+        var timing = LibreWatchConnectionTiming()
+        timing.beginConnection(at: receivedAt, applicationIsActive: false,
+                               executionIsAvailable: false, monotonicTime: 100)
+        XCTAssertTrue(pendingReconnectIsOverdue(timing, at: 280))
+        timing.beginCancellation(at: receivedAt.addingTimeInterval(180))
+        let cancellation = try XCTUnwrap(timing.cancellationDeadline)
+        XCTAssertNil(timing.pendingConnectionAge(monotonicTime: 281))
+        XCTAssertFalse(pendingReconnectIsOverdue(timing, at: 281))
+        timing.beginCancellation(at: receivedAt.addingTimeInterval(181))
+        XCTAssertEqual(timing.cancellationDeadline, cancellation, "Do not restart an in-flight cancellation")
+        XCTAssertEqual(timing.finishCancellation(
+            cancellation, ownership: .watch, returningToPhone: true,
+            peripheralIsDisconnected: false, at: cancellation.expiresAt
+        ), .awaitConfirmedDisconnection, "An age timeout never authorizes early iPhone ownership")
+    }
+
+    func testRetiredPendingGenerationCannotCancelNewConnectionAttempt() throws {
+        var timing = LibreWatchConnectionTiming()
+        timing.beginConnection(at: receivedAt, applicationIsActive: false,
+                               executionIsAvailable: false, monotonicTime: 100)
+        let retiredGeneration = timing.generation
+        timing.invalidate()
+        XCTAssertNil(timing.pendingConnectionAge(monotonicTime: 1_000))
+        timing.beginConnection(at: receivedAt.addingTimeInterval(900), applicationIsActive: false,
+                               executionIsAvailable: false, monotonicTime: 1_000)
+        XCTAssertNotEqual(timing.generation, retiredGeneration)
+        XCTAssertFalse(pendingReconnectIsOverdue(timing, at: 1_001))
+        XCTAssertFalse(pendingReconnectIsOverdue(timing, at: 1_180, generation: retiredGeneration))
+        XCTAssertTrue(pendingReconnectIsOverdue(timing, at: 1_180))
+    }
+
+    func testPendingReconnectAgeIgnoresForwardAndBackwardWallClockChanges() throws {
+        for clockShift in [-86_400.0, 86_400] {
+            var timing = LibreWatchConnectionTiming()
+            timing.beginConnection(at: receivedAt, applicationIsActive: false,
+                                   executionIsAvailable: false, monotonicTime: 100)
+            timing.setExecutionAvailable(true, at: receivedAt.addingTimeInterval(clockShift),
+                                         monotonicTime: 279)
+            XCTAssertFalse(pendingReconnectIsOverdue(timing, at: 279))
+            XCTAssertTrue(pendingReconnectIsOverdue(timing, at: 280))
+            XCTAssertEqual(try XCTUnwrap(timing.pendingConnectionAge(monotonicTime: 280)), 180)
+        }
     }
 
     func testOnlyCoreBluetoothCallbacksGrantEventDrivenBluetoothActions() {

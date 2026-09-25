@@ -2308,6 +2308,61 @@ extension TroubleshootingLogTests {
         XCTAssertEqual(restored.timestamp, referenceDate.addingTimeInterval(600))
     }
 
+    func testPendingConnectionAgeCancellationSurvivesExportWithOriginalAttemptClock() throws {
+        let generation = UUID()
+        let attemptID = UUID()
+        let attemptStarted = referenceDate.addingTimeInterval(-508)
+        let event = LibreWatchDiagnosticEvent(
+            kind: .bluetoothAction,
+            watchTimestamp: referenceDate, trigger: "pendingConnectionAge",
+            peripheralState: "connecting", connectionPhase: "cancelling",
+            generation: generation, attemptID: attemptID, attemptStartedAt: attemptStarted,
+            sessionID: UUID(), applicationState: .active,
+            bluetoothAction: "cancel", actionReason: "pendingConnectionAge", ownership: .watch)
+        let projection = TroubleshootingWatchDiagnostic(event)
+        XCTAssertEqual(projection.trigger, "pendingConnectionAge")
+        XCTAssertEqual(projection.reason, "pendingConnectionAge")
+        XCTAssertEqual(projection.attemptStarted, attemptStarted)
+        let entry = TroubleshootingLogEntry.detailed(.watchDiagnostic(projection),
+            timestamp: referenceDate.addingTimeInterval(600))
+        let encoded = try JSONEncoder().encode(entry)
+        let restored = try JSONDecoder().decode(TroubleshootingLogEntry.self, from: encoded)
+        XCTAssertEqual(restored, entry)
+        let report = makeReport(entries: [restored]).reportText
+        for field in [
+            "trigger=pendingConnectionAge", "reason=pendingConnectionAge", "action=cancel",
+            "generation=\(generation.uuidString)", "attempt=\(attemptID.uuidString)",
+            "started=07:51:32", "watchTime=08:00:00", "receiptTime=08:10:00"
+        ] {
+            XCTAssertTrue(report.contains(field), "Missing pending-connection export field: \(field)")
+        }
+    }
+
+    func testPendingConnectionAgeAllowlistRejectsFreeTextAndSecretSuffixes() throws {
+        let secret = "secret=https://user:password@example.invalid"
+        for untrustedCause in [
+            "pendingConnectionAge " + secret,
+            "pendingConnectionAge elapsedSeconds=508 limitSeconds=180",
+            secret
+        ] {
+            let event = LibreWatchDiagnosticEvent(kind: .bluetoothAction,
+                watchTimestamp: referenceDate, trigger: untrustedCause,
+                sensorIdentity: secret, runtimeError: secret,
+                bluetoothAction: "cancel", actionReason: untrustedCause)
+            let projection = TroubleshootingWatchDiagnostic(event)
+            XCTAssertNil(projection.trigger)
+            XCTAssertNil(projection.reason)
+            let entry = TroubleshootingLogEntry.detailed(.watchDiagnostic(projection), timestamp: referenceDate)
+            let encoded = String(decoding: try JSONEncoder().encode(entry), as: UTF8.self)
+            let report = makeReport(entries: [entry]).reportText
+            for text in [encoded, report] {
+                XCTAssertFalse(text.contains(untrustedCause))
+                XCTAssertFalse(text.contains("password"))
+                XCTAssertFalse(text.contains("example.invalid"))
+            }
+        }
+    }
+
     func testDeferredDiscoveryDiagnosticsSurviveExportWithoutAllowingSensorSecrets() throws {
         let secret = "secret=https://user:password@example.invalid"
         for trigger in ["didDiscoverDeferredSensor", "didDiscoverResumedSensor", "pendingDiscovery"] {

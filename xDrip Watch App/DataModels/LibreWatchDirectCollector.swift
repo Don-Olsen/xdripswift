@@ -1066,6 +1066,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         guard let deadline = connectionTiming.deadline, let preparedSession else { return }
         let generation = connectionTiming.generation
         let restorationToken = restorationState?.token
+        let scheduledSource = currentReconcileSource
         let now = Date()
         let uptime = monotonicNow
         let remainingBudget = connectionTiming.remainingExecutionTime(
@@ -1079,6 +1080,13 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
             extendedRuntimeIsRunning: extendedRuntimeIsRunning,
             ownership: watchState?.libreWatchOwnership ?? .iphone
         )
+        // Reuse the existing one-shot while execution is permitted. Suspension still pauses
+        // phase budgets, but an unchanged pending connection must not wait indefinitely
+        // across brief wakes. A connected link or any GATT progress is outside this age policy.
+        let remainingPendingAge = peripheral.state == .connecting
+            ? connectionTiming.pendingConnectionAge(monotonicTime: uptime).map {
+                max(0, LibreWatchConnectionTiming.pendingConnectionMaximumAge - $0)
+            } : nil
         let remaining: TimeInterval
         switch action {
         case .noAdditionalWork:
@@ -1086,7 +1094,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         case .restartConfirmedSensorScan:
             remaining = 0
         case let .wait(delay):
-            remaining = delay
+            remaining = min(delay, remainingPendingAge ?? delay)
         }
         // Always enqueue: a current didConnect/GATT callback already on main wins first.
         let workItem = DispatchWorkItem { [weak self] in
@@ -1101,12 +1109,31 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
                       currentPeripheral === peripheral,
                       self.connectionTiming.generation == generation,
                       self.identityAndOwnershipAreConfirmed(for: currentPeripheral),
-                      self.connectionTiming.timeoutIsCurrent(
-                          deadline, ownership: self.watchState?.libreWatchOwnership ?? .iphone,
-                          cancelling: self.scanAfterReconnectCancellation, at: Date(),
-                          monotonicTime: self.monotonicNow
-                      )
+                      self.connectionTiming.deadline == deadline
                 else { return }
+                let currentUptime = self.monotonicNow
+                if self.connectionTiming.pendingConnectionIsOverdue(
+                    generation: generation,
+                    peripheralState: self.observedState(of: currentPeripheral),
+                    ownership: self.watchState?.libreWatchOwnership ?? .iphone,
+                    executionIsAvailable: self.timedRecoveryIsAllowed,
+                    cancellationIsActive: self.scanAfterReconnectCancellation,
+                    monotonicTime: currentUptime
+                ) {
+                    self.currentReconcileSource = scheduledSource
+                    self.beginControlledSensorRecovery(
+                        for: currentPeripheral,
+                        error: "Pending reconnect made no progress; returning to the NFC-confirmed sensor scan",
+                        trigger: "pendingConnectionAge",
+                        cancellationReason: "pendingConnectionAge"
+                    )
+                    return
+                }
+                guard self.connectionTiming.timeoutIsCurrent(
+                    deadline, ownership: self.watchState?.libreWatchOwnership ?? .iphone,
+                    cancelling: self.scanAfterReconnectCancellation, at: Date(),
+                    monotonicTime: currentUptime
+                ) else { return }
                 self.currentReconcileSource = .executionBudgetExpired
                 if deadline.phase == .notifications,
                    self.attemptRestoredUnlockAfterEvidenceTimeout(
@@ -1152,7 +1179,8 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
 
     /// Cancels the one existing connection attempt before returning to the exact-sensor scan.
     private func beginControlledSensorRecovery(for peripheral: CBPeripheral, error: String,
-                                               trigger: String = "phaseDeadline") {
+                                               trigger: String = "phaseDeadline",
+                                               cancellationReason: String? = nil) {
         // Timer callers already require active/runtime execution. An explicit invalid-frame
         // callback may cancel its own broken notification stream whenever Watch owns it.
         guard eventDrivenRecoveryIsAllowed,
@@ -1168,7 +1196,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         centralManager?.stopScan()
         state.reconnecting(error: error)
         scanAfterReconnectCancellation = true
-        beginCancellation(of: peripheral)
+        beginCancellation(of: peripheral, diagnosticReason: cancellationReason)
     }
 
     private func finishReconnectCancellationAndScan(allowsEventDrivenStart: Bool = false) {
@@ -1250,7 +1278,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         return sensorPeripheral
     }
 
-    private func beginCancellation(of peripheral: CBPeripheral) {
+    private func beginCancellation(of peripheral: CBPeripheral, diagnosticReason: String? = nil) {
         guard peripheral === sensorPeripheral else { return }
         discoveryHandoff.invalidate()
         cancelReconnectFallback()
@@ -1265,9 +1293,9 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         receiveCharacteristic = nil
         resetFrameAssembler()
         prepareForExpectedDisconnectCallback()
-        reportBluetoothAction("cancel", reason: scanAfterReconnectCancellation
+        reportBluetoothAction("cancel", reason: diagnosticReason ?? (scanAfterReconnectCancellation
             ? "controlledRecovery"
-            : (deliberatelyDisconnecting ? "returnToPhone" : "ownershipStopped"))
+            : (deliberatelyDisconnecting ? "returnToPhone" : "ownershipStopped")))
         if returnAfterDisconnect != nil, let attempt = pendingReturnDiagnosticAttempt {
             reportReturnDiagnostic(attempt, stage: .disconnectRequested)
         }

@@ -958,11 +958,10 @@ final class WatchStateModel: NSObject, ObservableObject {
         }
     }
 
-    func directLibreStatus(connectionIsRecovering: Bool, at date: Date = Date()) -> String? {
-        guard libreWatchOwnership == .watch else { return nil }
-        return connectionIsRecovering || !isShowingDirectLibreReading || !directLibreReadingIsCurrent(at: date)
-            ? "Forbinder igen"
-            : "Direkte fra Libre"
+    func directLibrePresentation(stage: LibreWatchDirectStage, at date: Date) -> LibreWatchConnectionPresentation {
+        LibreWatchConnectionPresentation(ownership: libreWatchOwnership, stage: stage,
+            directReadingAt: isShowingDirectLibreReading ? bgReadingDate() : nil,
+            directReadingIsCurrent: directLibreReadingIsCurrent(at: date), at: date)
     }
 
     func directLibreReadingIsCurrent(at date: Date = Date()) -> Bool {

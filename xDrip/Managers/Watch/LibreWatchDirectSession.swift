@@ -1910,6 +1910,7 @@ struct LibreWatchConnectionTiming {
     private(set) var executionBudget: ExecutionBudget?
     private(set) var cancellationDeadline: Deadline?
     private(set) var dataExpectedSince: Date?
+    private(set) var connectionStartedAtMonotonic: TimeInterval?
     private(set) var generation = UUID()
     private(set) var cancellationWatchdogDidFire = false
 
@@ -1926,6 +1927,33 @@ struct LibreWatchConnectionTiming {
 
     // One bounded cancellation observation, using the collector's existing one-shot work item.
     static let cancellationTimeout: TimeInterval = 5
+
+    /// An unchanged native `.connecting` attempt may outlive its paused execution budget.
+    /// This age is checked only when foreground/runtime execution is available; it does not
+    /// request background execution or change receiving/GATT liveness budgets.
+    static let pendingConnectionMaximumAge: TimeInterval = 3 * 60
+
+    func pendingConnectionAge(monotonicTime: TimeInterval) -> TimeInterval? {
+        guard phase == .connection, let connectionStartedAtMonotonic,
+              connectionStartedAtMonotonic.isFinite, monotonicTime.isFinite,
+              monotonicTime >= connectionStartedAtMonotonic else { return nil }
+        let age = monotonicTime - connectionStartedAtMonotonic
+        return age.isFinite ? age : nil
+    }
+
+    func pendingConnectionIsOverdue(
+        generation: UUID,
+        peripheralState: LibreWatchObservedPeripheralState,
+        ownership: LibreWatchOwnership,
+        executionIsAvailable: Bool,
+        cancellationIsActive: Bool,
+        monotonicTime: TimeInterval
+    ) -> Bool {
+        guard self.generation == generation, ownership == .watch,
+              executionIsAvailable, !cancellationIsActive, peripheralState == .connecting,
+              let age = pendingConnectionAge(monotonicTime: monotonicTime) else { return false }
+        return age >= Self.pendingConnectionMaximumAge
+    }
 
     var setupInProgress: Bool {
         switch phase {
@@ -1945,6 +1973,7 @@ struct LibreWatchConnectionTiming {
         // Retries belong to the same logical generation until it is explicitly retired.
         guard phase == nil else { return }
         generation = UUID()
+        connectionStartedAtMonotonic = monotonicTime ?? date.timeIntervalSinceReferenceDate
         dataExpectedSince = nil
         cancellationDeadline = nil
         cancellationWatchdogDidFire = false
@@ -1994,6 +2023,7 @@ struct LibreWatchConnectionTiming {
             return
         }
         if retiringCurrentGeneration { invalidate() }
+        connectionStartedAtMonotonic = nil
         executionBudget = nil
         cancellationDeadline = nil
         dataExpectedSince = nil
@@ -2036,6 +2066,7 @@ struct LibreWatchConnectionTiming {
 
     mutating func receivedPacketOrEnabledNotifications(at date: Date) {
         guard phase != .cancelling else { return }
+        connectionStartedAtMonotonic = nil
         executionBudget = nil
         cancellationDeadline = nil
         phase = .receiving
@@ -2159,6 +2190,7 @@ struct LibreWatchConnectionTiming {
 
     mutating func beginCancellation(at date: Date) {
         guard phase != .cancelling else { return }
+        connectionStartedAtMonotonic = nil
         dataExpectedSince = nil
         executionBudget = nil
         phase = .cancelling
@@ -2189,6 +2221,7 @@ struct LibreWatchConnectionTiming {
 
     mutating func invalidate() {
         phase = nil
+        connectionStartedAtMonotonic = nil
         executionBudget = nil
         cancellationDeadline = nil
         dataExpectedSince = nil

@@ -1,3 +1,48 @@
+## Afgrænset genoprettelse af fastlåst Watch-forbindelse efter 4272
+
+4272-testen den 25. september kl. 18:22–18:53 dokumenterede fire uplanlagte
+Bluetooth-afbrydelser. Watch afkodede 20 af 31 forventede minutpladser frem
+til den manuelle retur. Alle 20 blev lagret lokalt og senere varigt kvitteret
+af telefonen. Den afsluttende pause begyndte efter sidste Watch-måling kl.
+18:44:17; samme system-genforbindelse ventede fra kl. 18:44:23 til returen
+kl. 18:52:51. Den fulde lokale analyse og originalfilerne er bevaret uden
+for Git; telefonens præcise radioskiftetid er ikke dokumenteret.
+
+Kode og log viser, at det eksisterende 90-sekunders eksekveringsbudget blev
+sat på pause ved inaktiv app uden udvidet runtime. Der var stadig 66,6
+sekunder tilbage efter over otte faktiske minutter. Dette er en begrænsning
+i genoprettelsespolitikken, ikke en nulstilling af budgettet. De nye
+callbackmålinger viste højst cirka 423 ms for en afsluttet callback og
+forklarer ikke den lange ventetid som en tilsvarende blokering i callbacken.
+
+Den efterfølgende ændring tilføjer en separat grænse på 180 sekunders
+monoton forløbstid for samme uændrede, native `connecting`-forsøg.
+Den eksisterende engangsopgave vælger den tidligste grænse: det gamle
+eksekveringsbudget eller forbindelsesforsøgets alder. Alder vurderes kun,
+når aktiv app eller gyldig runtime giver den eksisterende politik lov til
+genoprettelse. En kølagt forbindelse/opsætningscallback får stadig forrang,
+og session, sensoridentitet, generation, native tilstand og ejerskab
+kontrolleres igen før kontrolleret afbrydelse. Afbrydelsesbevis og den
+eksisterende afskærmning af pensionerede peripherals bevares. Rask modtagelse
+og GATT-opsætning beholder deres eksekveringsbudgetter. Der oprettes ingen
+ny periodisk timer, runtime-forlængelse eller alternativ sensoridentitet.
+
+Watch-visningen adskiller nu genforbindelse fra en forbindelse, der afventer
+en måling eller mangler friske målinger. Sidste direkte målings alder vises
+med en tydelig tekst. En gemt Watch-måling beskriver ikke iPhones forbindelse,
+når telefonen har ejerskabet. Glukoseberegning, alarmer og iPhone-grafens
+layout ændres ikke som del af dette arbejde.
+
+**Afgrænsning og fysisk test:** Ændringen håndterer en dokumenteret fastlåsning;
+den beviser ikke, at årsagen til de oprindelige radioafbrydelser er løst.
+Den kan ikke vække en suspenderet Watch-app ved treminuttersgrænsen. Næste
+fysiske kontrol skal ske med samme nye build på begge enheder, telefonen
+utilgængelig og urets skærm i hvile det meste af tiden. Mål de faktisk
+afkodede sensor-minutter, genoprettelsestid, udløsningsårsag og behov for
+manuel åbning særskilt. Fuldt uovervåget modtagelse er fortsat et åbent mål.
+Den automatiske releaseblok registrerer testresultater og faktisk Apple-status,
+når releasekontrollerne er afsluttet.
+
 <!-- testflight-7.1.1-4272:start -->
 ### TestFlight 7.1.1 (4272)
 

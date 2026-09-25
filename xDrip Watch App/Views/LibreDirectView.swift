@@ -3,6 +3,7 @@ import SwiftUI
 
 struct LibreDirectView: View {
     @EnvironmentObject private var watchState: WatchStateModel
+    @Environment(\.scenePhase) private var scenePhase
     @ObservedObject var collector: LibreWatchDirectCollector
     @State private var displayDate = Date()
 
@@ -15,7 +16,7 @@ struct LibreDirectView: View {
                     .font(.title2)
                     .foregroundStyle(statusColor)
 
-                Text(collector.state.stage.displayText)
+                Text(Texts_WatchApp.directConnectionTitle(presentation))
                     .font(.headline)
                     .multilineTextAlignment(.center)
                     .foregroundStyle(statusColor)
@@ -26,17 +27,11 @@ struct LibreDirectView: View {
                     let isRecovering = collector.state.connectionRecoveryIsInProgress
                     let hasFinalReading = watchState.isShowingDirectLibreReading
                     let showsLiveReading = hasFinalReading && isCurrent && !isRecovering && collector.state.stage == .receiving
-                    let readingStatus: String = {
-                        if !hasFinalReading { return "WAITING FOR MATCHING CALIBRATION" }
-                        if !isCurrent { return "STALE LAST DIRECT READING" }
-                        if isRecovering { return "RECONNECTING — LAST DIRECT READING" }
-                        if collector.state.stage != .receiving { return "LAST DIRECT READING" }
-                        return "DIRECT FROM SENSOR"
-                    }()
-
-                    Text(readingStatus)
-                        .font(.caption.bold())
-                        .foregroundStyle(showsLiveReading ? Color.green : Color.orange)
+                    if !hasFinalReading {
+                        Text("WAITING FOR MATCHING CALIBRATION")
+                            .font(.caption.bold())
+                            .foregroundStyle(Color.orange)
+                    }
 
                     if hasFinalReading {
                         HStack(alignment: .firstTextBaseline, spacing: 4) {
@@ -61,7 +56,7 @@ struct LibreDirectView: View {
                     }
 
                     if hasFinalReading {
-                        Text("Last direct reading: \(watchState.lastUpdatedMinsAgoString(at: displayDate))")
+                        Text(Texts_WatchApp.directReadingAge(presentation))
                             .font(.caption2)
                             .foregroundStyle(showsLiveReading ? Color.secondary : Color.orange)
                     }
@@ -112,6 +107,10 @@ struct LibreDirectView: View {
             .padding(.horizontal, 5)
         }
         .navigationTitle("Libre")
+        .onAppear { displayDate = Date() }
+        .onChange(of: scenePhase) { phase in
+            if phase == .active { displayDate = Date() }
+        }
         .onReceive(displayTimer) { date in
             displayDate = date
             watchState.refreshDirectLibreReadingFreshness(at: date)
@@ -160,10 +159,22 @@ struct LibreDirectView: View {
     }
 
     private var statusColor: Color {
-        if collector.state.failure != nil { return .red }
-        if collector.state.connectionRecoveryIsInProgress { return .orange }
-        if watchState.libreWatchOwnership == .watch { return .green }
-        return .primary
+        presentation.statusColor
+    }
+
+    private var presentation: LibreWatchConnectionPresentation {
+        watchState.directLibrePresentation(stage: collector.state.stage, at: displayDate)
+    }
+}
+
+extension LibreWatchConnectionPresentation {
+    var statusColor: Color {
+        switch emphasis {
+        case .neutral: return .primary
+        case .healthy: return .green
+        case .attention: return .orange
+        case .failure: return .red
+        }
     }
 }
 
