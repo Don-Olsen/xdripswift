@@ -326,6 +326,75 @@ struct LibreWatchRecoveryAttemptState: Codable, Equatable {
     }
 }
 
+/// Captured from the actual runtime session before the collector releases it. These are
+/// observations, not a promise of execution time; an absent error differs from an old event.
+struct LibreWatchRuntimeDiagnostic: Codable, Equatable {
+    let state: Int
+    let startedAt: Date?
+    let expiresAt: Date?
+    let errorPresent: Bool?
+}
+
+enum LibreWatchCallbackKind: String, Codable, Equatable {
+    case centralState, restoration, discovery, connect, failedConnect
+    case disconnectLegacy, disconnectModern, modifiedServices, services, characteristics
+    case notifications, unlock, value
+}
+
+/// Monotonic elapsed time inside a delivered delegate callback, not CPU time or time spent
+/// waiting for watchOS to deliver it. No timer or additional diagnostic event is required.
+struct LibreWatchCallbackTiming: Codable, Equatable {
+    let kind: LibreWatchCallbackKind
+    let startedAt: Date
+    let workSeconds: TimeInterval
+    let diagnosticFlushSeconds: TimeInterval
+
+    var elapsedSeconds: TimeInterval { workSeconds + diagnosticFlushSeconds }
+    var isValid: Bool {
+        workSeconds.isFinite && workSeconds >= 0 &&
+            diagnosticFlushSeconds.isFinite && diagnosticFlushSeconds >= 0 && elapsedSeconds.isFinite
+    }
+}
+
+struct LibreWatchCallbackTimingSummary: Codable, Equatable {
+    let completedCount: UInt64
+    let last: LibreWatchCallbackTiming
+    let longest: LibreWatchCallbackTiming
+
+    var isValid: Bool {
+        completedCount > 0 && last.isValid && longest.isValid && longest.elapsedSeconds >= last.elapsedSeconds
+    }
+}
+
+struct LibreWatchCallbackTimingTracker {
+    private var active: (kind: LibreWatchCallbackKind, date: Date, uptime: TimeInterval)?
+    private(set) var summary: LibreWatchCallbackTimingSummary?
+
+    mutating func begin(_ kind: LibreWatchCallbackKind, at date: Date, uptime: TimeInterval) {
+        guard active == nil, uptime.isFinite else { return }
+        active = (kind, date, uptime)
+    }
+
+    func elapsed(at uptime: TimeInterval) -> TimeInterval? {
+        guard let active, uptime.isFinite, uptime >= active.uptime else { return nil }
+        return uptime - active.uptime
+    }
+
+    mutating func finish(workFinishedAt: TimeInterval, flushFinishedAt: TimeInterval) {
+        defer { active = nil }
+        guard let active,
+              workFinishedAt.isFinite, flushFinishedAt.isFinite,
+              workFinishedAt >= active.uptime, flushFinishedAt >= workFinishedAt else { return }
+        let timing = LibreWatchCallbackTiming(kind: active.kind, startedAt: active.date,
+            workSeconds: workFinishedAt - active.uptime,
+            diagnosticFlushSeconds: flushFinishedAt - workFinishedAt)
+        guard timing.isValid else { return }
+        let longest = summary.map { $0.longest.elapsedSeconds >= timing.elapsedSeconds ? $0.longest : timing } ?? timing
+        summary = LibreWatchCallbackTimingSummary(completedCount: (summary?.completedCount ?? 0) + 1,
+            last: timing, longest: longest)
+    }
+}
+
 /// A bounded, privacy-safe Watch diagnostic. Sensor identity is derived on iPhone from
 /// the validated session and never crosses as a raw peripheral identifier.
 struct LibreWatchDiagnosticEvent: Codable, Equatable {
@@ -382,6 +451,9 @@ struct LibreWatchDiagnosticEvent: Codable, Equatable {
     var alarmNotificationsAuthorized: Bool?
     var alarmDelegatedToWatch: Bool?
     var returnAttempt: LibreWatchReturnDiagnostic?
+    var runtimeDiagnostic: LibreWatchRuntimeDiagnostic?
+    var callbackElapsedSeconds: TimeInterval?
+    var completedCallbackTiming: LibreWatchCallbackTimingSummary?
 
     init(
         eventID: UUID? = UUID(),

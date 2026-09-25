@@ -1066,6 +1066,7 @@ final class WatchStateModel: NSObject, ObservableObject {
     /// one outbox write. The journal remains first so a process exit between the two stores is
     /// repaired by `restorePendingDiagnosticJournalToOutbox` on the next execution opportunity.
     func reportLibreWatchDiagnostics(_ events: [LibreWatchDiagnosticEvent]) {
+        for event in events { WatchDeliveryEvidenceStore.shared.recordCollectorDiagnostic(event) }
         guard !events.isEmpty else { return }
         var preparedEvents: [LibreWatchDiagnosticEvent] = []
 

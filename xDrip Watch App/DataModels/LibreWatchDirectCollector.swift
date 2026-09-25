@@ -43,6 +43,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
     private var systemAutoReconnectIsActive = false
     private var applicationState: LibreWatchApplicationState = .background
     private var extendedRuntimeSession: WKExtendedRuntimeSession?
+    private var extendedRuntimeStartedAt: Date?
     private var extendedRuntimeIsRunning = false
     private var userInitiatedRuntimeStart = false
     private var disconnectGate = LibreWatchDisconnectGate()
@@ -50,6 +51,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
     private var scanAfterReconnectCancellation = false
     private var recoveryAttemptState = LibreWatchSessionStore.loadRecoveryAttempt()
     private var callbackDiagnosticBuffer = LibreWatchCallbackDiagnosticBuffer()
+    private var callbackTiming = LibreWatchCallbackTimingTracker()
     private var pendingRecoveryDiagnostic: (trigger: String, startedAt: Date)?
     private var currentReconcileSource: LibreWatchRecoveryReconcileSource = .initialPreparation
     private var lastFrameProgressDiagnosticAt: Date?
@@ -401,6 +403,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
 
         let session = WKExtendedRuntimeSession()
         session.delegate = self
+        extendedRuntimeStartedAt = nil
         extendedRuntimeSession = session
         session.start()
     }
@@ -411,6 +414,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
 
         guard let session = extendedRuntimeSession else { return }
         extendedRuntimeSession = nil
+        extendedRuntimeStartedAt = nil
         if session.state != .invalid {
             session.invalidate()
         }
@@ -1549,7 +1553,8 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         reconnectObservationSource: LibreWatchReconnectObservationSource? = nil,
         attempt: LibreWatchRecoveryAttemptContext? = nil,
         reconcileSource: LibreWatchRecoveryReconcileSource? = nil,
-        returnContext: (attempt: LibreWatchReturnAttempt, event: LibreWatchReturnDiagnostic)? = nil
+        returnContext: (attempt: LibreWatchReturnAttempt, event: LibreWatchReturnDiagnostic)? = nil,
+        runtimeDiagnostic: LibreWatchRuntimeDiagnostic? = nil
     ) {
         let attempt = attempt ?? recoveryAttemptState.context
         let eventSessionID = returnContext != nil ? returnContext?.attempt.sessionID
@@ -1609,22 +1614,39 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
             reconnectObservationSource: reconnectObservationSource
         )
         event.returnAttempt = returnContext?.event
+        event.runtimeDiagnostic = runtimeDiagnostic ?? extendedRuntimeSession.map {
+            LibreWatchRuntimeDiagnostic(state: $0.state.rawValue, startedAt: extendedRuntimeStartedAt,
+                expiresAt: $0.expirationDate, errorPresent: nil)
+        }
+        event.callbackElapsedSeconds = callbackTiming.elapsed(at: monotonicNow)
+        // Include completed callbacks only. Keep healthy notifications cheap and retain the
+        // worst completed callback for this collector lifetime, even across recovery episodes.
+        switch kind {
+        case .disconnected, .recoverySucceeded, .recoveryFailed, .extendedRuntimeInvalidated, .frameProgress:
+            event.completedCallbackTiming = callbackTiming.summary
+        default:
+            break
+        }
         let capturedEvent = event
         if callbackDiagnosticBuffer.capture(capturedEvent) { return }
         watchState?.reportLibreWatchDiagnostic(capturedEvent)
     }
 
-    private func beginCoreBluetoothCallbackDiagnostics() -> Bool {
-        callbackDiagnosticBuffer.begin()
+    private func beginCoreBluetoothCallbackDiagnostics(_ kind: LibreWatchCallbackKind) -> Bool {
+        let owner = callbackDiagnosticBuffer.begin()
+        if owner { callbackTiming.begin(kind, at: Date(), uptime: monotonicNow) }
+        return owner
     }
 
     private func finishCoreBluetoothCallbackDiagnostics(owner: Bool) {
+        guard owner else { return }
+        let workFinishedAt = monotonicNow
         let capturedEvents = callbackDiagnosticBuffer.finish(owner: owner)
-        guard let watchState else { return }
         // Bluetooth state transitions and issued GATT calls have completed. Persist each entry
         // snapshot now, before returning from the system callback, so suspension cannot leave
         // progress dependent on a later main-queue work item.
-        watchState.reportLibreWatchDiagnostics(capturedEvents)
+        watchState?.reportLibreWatchDiagnostics(capturedEvents)
+        callbackTiming.finish(workFinishedAt: workFinishedAt, flushFinishedAt: monotonicNow)
     }
 
     private func reportReturnDiagnostic(
@@ -1833,6 +1855,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
 extension LibreWatchDirectCollector: WKExtendedRuntimeSessionDelegate {
     func extendedRuntimeSessionDidStart(_ extendedRuntimeSession: WKExtendedRuntimeSession) {
         guard self.extendedRuntimeSession === extendedRuntimeSession else { return }
+        extendedRuntimeStartedAt = Date()
         extendedRuntimeIsRunning = true
         reconcileRecoveryState(at: Date(), source: .extendedRuntimeStarted)
     }
@@ -1851,7 +1874,15 @@ extension LibreWatchDirectCollector: WKExtendedRuntimeSessionDelegate {
         error: Error?
     ) {
         guard self.extendedRuntimeSession === extendedRuntimeSession else { return }
+        let runtimeDiagnostic = LibreWatchRuntimeDiagnostic(state: extendedRuntimeSession.state.rawValue,
+            startedAt: extendedRuntimeStartedAt, expiresAt: extendedRuntimeSession.expirationDate,
+            errorPresent: error != nil)
+        let nsError = error.map { $0 as NSError }
+        let errorDomain = nsError.map {
+            $0.domain == WKExtendedRuntimeSessionErrorDomain ? "WKExtendedRuntimeSessionErrorDomain" : $0.domain
+        }
         self.extendedRuntimeSession = nil
+        extendedRuntimeStartedAt = nil
         extendedRuntimeIsRunning = false
         frameGapTracker.runtimeDidInvalidate()
         userInitiatedRuntimeStart = false
@@ -1859,8 +1890,11 @@ extension LibreWatchDirectCollector: WKExtendedRuntimeSessionDelegate {
         reportDiagnostic(
             .extendedRuntimeInvalidated,
             trigger: "extendedRuntimeInvalidated",
+            errorDomain: errorDomain,
+            errorCode: nsError?.code,
             runtimeInvalidationReason: reason.rawValue,
-            runtimeError: error?.localizedDescription
+            runtimeError: error?.localizedDescription,
+            runtimeDiagnostic: runtimeDiagnostic
         )
         reconcileRecoveryState(at: Date(), source: .extendedRuntimeInvalidated)
     }
@@ -1868,7 +1902,7 @@ extension LibreWatchDirectCollector: WKExtendedRuntimeSessionDelegate {
 
 extension LibreWatchDirectCollector: CBCentralManagerDelegate {
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
-        let ownsDiagnostics = beginCoreBluetoothCallbackDiagnostics()
+        let ownsDiagnostics = beginCoreBluetoothCallbackDiagnostics(.centralState)
         defer { finishCoreBluetoothCallbackDiagnostics(owner: ownsDiagnostics) }
         currentReconcileSource = .centralStateUpdate
         if central === centralManager, central.state != .poweredOn { discoveryHandoff.invalidate() }
@@ -1904,7 +1938,7 @@ extension LibreWatchDirectCollector: CBCentralManagerDelegate {
     }
 
     func centralManager(_ central: CBCentralManager, willRestoreState dict: [String: Any]) {
-        let ownsDiagnostics = beginCoreBluetoothCallbackDiagnostics()
+        let ownsDiagnostics = beginCoreBluetoothCallbackDiagnostics(.restoration)
         defer { finishCoreBluetoothCallbackDiagnostics(owner: ownsDiagnostics) }
         currentReconcileSource = .stateRestoration
         discoveryHandoff.invalidate()
@@ -2020,7 +2054,7 @@ extension LibreWatchDirectCollector: CBCentralManagerDelegate {
         advertisementData: [String: Any],
         rssi RSSI: NSNumber
     ) {
-        let ownsDiagnostics = beginCoreBluetoothCallbackDiagnostics()
+        let ownsDiagnostics = beginCoreBluetoothCallbackDiagnostics(.discovery)
         defer { finishCoreBluetoothCallbackDiagnostics(owner: ownsDiagnostics) }
         guard central === centralManager else { return }
         let retiredIsReleased = releaseRetiredPeripheralIfDisconnected()
@@ -2050,7 +2084,7 @@ extension LibreWatchDirectCollector: CBCentralManagerDelegate {
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
-        let ownsDiagnostics = beginCoreBluetoothCallbackDiagnostics()
+        let ownsDiagnostics = beginCoreBluetoothCallbackDiagnostics(.connect)
         defer { finishCoreBluetoothCallbackDiagnostics(owner: ownsDiagnostics) }
         let connectedAt = Date()
         let callbackIsCurrent = peripheral === sensorPeripheral
@@ -2132,7 +2166,7 @@ extension LibreWatchDirectCollector: CBCentralManagerDelegate {
         didFailToConnect peripheral: CBPeripheral,
         error: Error?
     ) {
-        let ownsDiagnostics = beginCoreBluetoothCallbackDiagnostics()
+        let ownsDiagnostics = beginCoreBluetoothCallbackDiagnostics(.failedConnect)
         defer { finishCoreBluetoothCallbackDiagnostics(owner: ownsDiagnostics) }
         currentReconcileSource = .didFailToConnect
         let callbackIsCurrent = peripheral === sensorPeripheral
@@ -2194,7 +2228,7 @@ extension LibreWatchDirectCollector: CBCentralManagerDelegate {
         didDisconnectPeripheral peripheral: CBPeripheral,
         error: Error?
     ) {
-        let ownsDiagnostics = beginCoreBluetoothCallbackDiagnostics()
+        let ownsDiagnostics = beginCoreBluetoothCallbackDiagnostics(.disconnectLegacy)
         defer { finishCoreBluetoothCallbackDiagnostics(owner: ownsDiagnostics) }
         let observedState = observedState(of: peripheral)
         let callbackIsCurrent = peripheral === sensorPeripheral && peripheral !== retiredPeripheral
@@ -2252,7 +2286,7 @@ extension LibreWatchDirectCollector: CBCentralManagerDelegate {
         isReconnecting: Bool,
         error: Error?
     ) {
-        let ownsDiagnostics = beginCoreBluetoothCallbackDiagnostics()
+        let ownsDiagnostics = beginCoreBluetoothCallbackDiagnostics(.disconnectModern)
         defer { finishCoreBluetoothCallbackDiagnostics(owner: ownsDiagnostics) }
         let disconnectedAt = Date(timeIntervalSinceReferenceDate: timestamp)
         let observedState = observedState(of: peripheral)
@@ -2309,7 +2343,7 @@ extension LibreWatchDirectCollector: CBCentralManagerDelegate {
 
 extension LibreWatchDirectCollector: CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral, didModifyServices invalidatedServices: [CBService]) {
-        let ownsDiagnostics = beginCoreBluetoothCallbackDiagnostics()
+        let ownsDiagnostics = beginCoreBluetoothCallbackDiagnostics(.modifiedServices)
         defer { finishCoreBluetoothCallbackDiagnostics(owner: ownsDiagnostics) }
         currentReconcileSource = .gattCallback
         reportCoreBluetoothCallback(
@@ -2366,7 +2400,7 @@ extension LibreWatchDirectCollector: CBPeripheralDelegate {
     }
 
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
-        let ownsDiagnostics = beginCoreBluetoothCallbackDiagnostics()
+        let ownsDiagnostics = beginCoreBluetoothCallbackDiagnostics(.services)
         defer { finishCoreBluetoothCallbackDiagnostics(owner: ownsDiagnostics) }
         currentReconcileSource = .gattCallback
         reportCoreBluetoothCallback(
@@ -2434,7 +2468,7 @@ extension LibreWatchDirectCollector: CBPeripheralDelegate {
         didDiscoverCharacteristicsFor service: CBService,
         error: Error?
     ) {
-        let ownsDiagnostics = beginCoreBluetoothCallbackDiagnostics()
+        let ownsDiagnostics = beginCoreBluetoothCallbackDiagnostics(.characteristics)
         defer { finishCoreBluetoothCallbackDiagnostics(owner: ownsDiagnostics) }
         currentReconcileSource = .gattCallback
         reportCoreBluetoothCallback(
@@ -2480,7 +2514,7 @@ extension LibreWatchDirectCollector: CBPeripheralDelegate {
         didUpdateNotificationStateFor characteristic: CBCharacteristic,
         error: Error?
     ) {
-        let ownsDiagnostics = beginCoreBluetoothCallbackDiagnostics()
+        let ownsDiagnostics = beginCoreBluetoothCallbackDiagnostics(.notifications)
         defer { finishCoreBluetoothCallbackDiagnostics(owner: ownsDiagnostics) }
         currentReconcileSource = .gattCallback
         reportCoreBluetoothCallback(
@@ -2524,7 +2558,7 @@ extension LibreWatchDirectCollector: CBPeripheralDelegate {
         didWriteValueFor characteristic: CBCharacteristic,
         error: Error?
     ) {
-        let ownsDiagnostics = beginCoreBluetoothCallbackDiagnostics()
+        let ownsDiagnostics = beginCoreBluetoothCallbackDiagnostics(.unlock)
         defer { finishCoreBluetoothCallbackDiagnostics(owner: ownsDiagnostics) }
         currentReconcileSource = .gattCallback
         reportCoreBluetoothCallback(
@@ -2569,7 +2603,7 @@ extension LibreWatchDirectCollector: CBPeripheralDelegate {
         didUpdateValueFor characteristic: CBCharacteristic,
         error: Error?
     ) {
-        let ownsDiagnostics = beginCoreBluetoothCallbackDiagnostics()
+        let ownsDiagnostics = beginCoreBluetoothCallbackDiagnostics(.value)
         defer { finishCoreBluetoothCallbackDiagnostics(owner: ownsDiagnostics) }
         currentReconcileSource = .bleNotification
         guard characteristic.uuid == CBUUID(string: Libre2WatchDirectConstants.receiveCharacteristicUUIDString),

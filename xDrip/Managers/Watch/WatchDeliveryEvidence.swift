@@ -170,6 +170,23 @@ struct WatchDeliveryEvidenceEvent: Codable, Equatable {
     let frameGap: WatchDeliveryEvidenceFrameGap?
 }
 
+/// A retained local runtime stop survives rotation of the small WC diagnostic journal.
+/// Keep its original provenance when another process later exports the evidence file.
+struct WatchDeliveryEvidenceRuntimeStop: Codable, Equatable {
+    let origin: WatchDeliveryEvidenceOrigin
+    let at: Date
+    let context: LibreWatchRuntimeDiagnostic?
+    let reason: Int?
+    let errorDomain: String?
+    let errorCode: Int?
+}
+
+struct WatchDeliveryEvidenceCallbackTiming: Codable, Equatable {
+    let origin: WatchDeliveryEvidenceOrigin
+    let at: Date
+    let summary: LibreWatchCallbackTimingSummary
+}
+
 struct WatchDeliveryEvidenceSnapshot: Codable {
     let version: Int
     let exportedAt: Date
@@ -191,6 +208,8 @@ struct WatchDeliveryEvidenceSnapshot: Codable {
     let events: [WatchDeliveryEvidenceEvent]
     let clockNote: String
     let coverageNote: String
+    var lastRuntimeStop: WatchDeliveryEvidenceRuntimeStop? = nil
+    var lastCallbackTiming: WatchDeliveryEvidenceCallbackTiming? = nil
 }
 
 /// Independent diagnostic journal. Append one bounded line per meaningful delivery stage;
@@ -218,6 +237,8 @@ final class WatchDeliveryEvidenceStore {
         var counterWindowStartedAt = Date()
         var counters: [String: UInt64] = [:]
         var alarmReadiness: [String: String]?
+        var lastRuntimeStop: WatchDeliveryEvidenceRuntimeStop?
+        var lastCallbackTiming: WatchDeliveryEvidenceCallbackTiming?
     }
 
     private let queue = DispatchQueue(label: "xdrip.watch.delivery-evidence")
@@ -346,13 +367,36 @@ final class WatchDeliveryEvidenceStore {
         }
     }
 
+    func recordCollectorDiagnostic(_ event: LibreWatchDiagnosticEvent) {
+        let isRuntimeStop = event.kind == .extendedRuntimeInvalidated
+        let timing = event.completedCallbackTiming.flatMap { $0.isValid ? $0 : nil }
+        guard isRuntimeStop || timing != nil else { return }
+        queue.sync {
+            let at = event.watchTimestamp ?? clock()
+            if isRuntimeStop {
+                let domain = event.errorDomain.map {
+                    ["WKExtendedRuntimeSessionErrorDomain", "WKErrorDomain"].contains($0) ? $0 : "other"
+                }
+                metadata.lastRuntimeStop = WatchDeliveryEvidenceRuntimeStop(origin: origin, at: at,
+                    context: event.runtimeDiagnostic, reason: event.runtimeInvalidationReason,
+                    errorDomain: domain, errorCode: event.errorCode)
+            }
+            if let timing {
+                metadata.lastCallbackTiming = WatchDeliveryEvidenceCallbackTiming(origin: origin, at: at, summary: timing)
+            }
+            // Rare runtime stops are persisted immediately. Timing summaries share the existing
+            // once-a-minute checkpoint; they never add per-notification journal or WC traffic.
+            if isRuntimeStop { checkpoint(force: true) } else { checkpointIfDue() }
+        }
+    }
+
     func snapshot() -> WatchDeliveryEvidenceSnapshot {
         queue.sync {
             let now = clock()
             prune(at: now)
             checkpoint(force: true)
             let visible = records.filter { $0.event.at >= now.addingTimeInterval(-limits.age) }
-            return WatchDeliveryEvidenceSnapshot(version: 1, exportedAt: now, origin: origin,
+            var snapshot = WatchDeliveryEvidenceSnapshot(version: 1, exportedAt: now, origin: origin,
                 firstRetainedAt: visible.first?.event.at, lastRetainedAt: visible.last?.event.at,
                 maximumAge: limits.age, maximumEvents: limits.events, maximumBytes: limits.bytes,
                 rotatedEvents: metadata.rotated, writeFailures: metadata.writeFailures,
@@ -360,8 +404,11 @@ final class WatchDeliveryEvidenceStore {
                 preservedRepairSourceBytes: metadata.preservedRepairSourceBytes,
                 counterWindowStartedAt: metadata.counterWindowStartedAt,
                 transportCounters: metadata.counters, lastAlarmReadinessEvidence: metadata.alarmReadiness, events: visible.map(\.event),
-                clockNote: "at is origin device wall clock; uptime is monotonic within origin.process only. Cross-device clock offset is unknown. watchReceivedAt is the existing Watch reception timestamp. sensorTime is unknown when absent; elapsed sensor minutes are not a wall-clock timestamp.",
+                clockNote: "at is origin device wall clock; uptime is monotonic within origin.process only. Cross-device clock offset is unknown. watchReceivedAt is the existing Watch reception timestamp. sensorTime is unknown when absent; elapsed sensor minutes are not a wall-clock timestamp. Callback timings are monotonic elapsed time, not CPU time or prior system delivery delay; the retained summary covers completed callbacks in its original collector lifetime. Runtime startedAt is the observed start callback; expiresAt is reported expiration, not guaranteed execution time.",
                 coverageNote: "Only retained successfully appended events are included. Rotation is diagnostic retention, not lost glucose. Counters may omit the final 60 seconds after abrupt termination. No events from before this instrumentation are reconstructed. An event's localWriteConfirmed refers to the existing atomic outbox save, not this journal. recoveredLegacyEvents counts valid existing JSON events successfully rewritten without the known old delimiter padding; historical unreadableLines is not reduced. Before repair, the first bounded raw source is retained locally as delivery-events-v1.pre-repair.jsonl, not included in this export. Later damaged raw sources are not archived; unreadable lines remain counted.")
+            snapshot.lastRuntimeStop = metadata.lastRuntimeStop.flatMap { $0.at >= now.addingTimeInterval(-limits.age) ? $0 : nil }
+            snapshot.lastCallbackTiming = metadata.lastCallbackTiming.flatMap { $0.at >= now.addingTimeInterval(-limits.age) ? $0 : nil }
+            return snapshot
         }
     }
 

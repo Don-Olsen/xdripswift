@@ -10,6 +10,78 @@ import XCTest
 @testable import xdrip
 
 extension TroubleshootingLogTests {
+    func testRuntimeFailureExportsCodeAndSessionExpirationWithoutPrivateErrorText() throws {
+        let secret = "https://user:password@example.invalid/private"
+        var event = LibreWatchDiagnosticEvent(kind: .extendedRuntimeInvalidated, errorCode: 5,
+            watchTimestamp: referenceDate, runtimeInvalidationReason: -1, runtimeError: secret,
+            errorDomain: "WKExtendedRuntimeSessionErrorDomain")
+        event.runtimeDiagnostic = LibreWatchRuntimeDiagnostic(state: 3,
+            startedAt: referenceDate.addingTimeInterval(-590),
+            expiresAt: referenceDate.addingTimeInterval(10), errorPresent: true)
+        let entry = TroubleshootingLogEntry.detailed(.watchDiagnostic(TroubleshootingWatchDiagnostic(event)),
+            timestamp: referenceDate.addingTimeInterval(120))
+        let encoded = try JSONEncoder().encode(entry)
+        let restored = try JSONDecoder().decode(TroubleshootingLogEntry.self, from: encoded)
+        XCTAssertEqual(restored, entry)
+        let report = makeReport(entries: [restored]).reportText
+        XCTAssertTrue(report.contains("runtimeInvalidationReason=-1"))
+        XCTAssertTrue(report.contains("error=WKExtendedRuntimeSessionErrorDomain/5"))
+        XCTAssertTrue(report.contains("runtimeState=3 runtimeStarted=07:50:10 runtimeExpires=08:00:10 runtimeErrorPresent=true"))
+        XCTAssertFalse(report.contains("password"))
+        XCTAssertFalse(report.contains("example.invalid"))
+        XCTAssertFalse(String(decoding: encoded, as: UTF8.self).contains(secret))
+    }
+
+    func testRuntimeDiagnosticDistinguishesAbsentErrorFromLegacyUnknown() throws {
+        let legacy = LibreWatchDiagnosticEvent(kind: .extendedRuntimeInvalidated,
+            watchTimestamp: referenceDate, runtimeInvalidationReason: -1)
+        let legacyProjection = TroubleshootingWatchDiagnostic(legacy)
+        let restored = try JSONDecoder().decode(TroubleshootingWatchDiagnostic.self,
+            from: JSONEncoder().encode(legacyProjection))
+        XCTAssertNil(restored.runtimeDiagnostic)
+        XCTAssertNil(restored.callbackElapsedSeconds)
+        XCTAssertNil(restored.completedCallbackTiming)
+        var current = legacy
+        current.runtimeDiagnostic = LibreWatchRuntimeDiagnostic(state: 3,
+            startedAt: nil, expiresAt: nil, errorPresent: false)
+        let report = makeReport(entries: [.detailed(.watchDiagnostic(TroubleshootingWatchDiagnostic(current)),
+            timestamp: referenceDate)]).reportText
+        XCTAssertTrue(report.contains("runtimeStarted=unknown runtimeExpires=unknown runtimeErrorPresent=false"))
+        XCTAssertFalse(report.contains("error=unknown/"))
+        XCTAssertFalse(makeReport(entries: [.detailed(.watchDiagnostic(restored), timestamp: referenceDate)])
+            .reportText.contains("runtimeErrorPresent=false"))
+    }
+
+    func testCallbackTimingExportPreservesElapsedWorkSeparatelyFromPhoneReceiptDelay() throws {
+        var event = LibreWatchDiagnosticEvent(kind: .disconnected, watchTimestamp: referenceDate)
+        let timing = LibreWatchCallbackTiming(kind: .value, startedAt: referenceDate.addingTimeInterval(-60),
+            workSeconds: 0.125, diagnosticFlushSeconds: 0.25)
+        event.callbackElapsedSeconds = 0.002
+        event.completedCallbackTiming = LibreWatchCallbackTimingSummary(completedCount: 3, last: timing, longest: timing)
+        let projection = TroubleshootingWatchDiagnostic(event)
+        XCTAssertEqual(projection.completedCallbackTiming, event.completedCallbackTiming)
+        let entry = TroubleshootingLogEntry.detailed(.watchDiagnostic(projection), timestamp: referenceDate.addingTimeInterval(600))
+        let restored = try JSONDecoder().decode(TroubleshootingLogEntry.self, from: JSONEncoder().encode(entry))
+        XCTAssertEqual(restored, entry)
+        let report = makeReport(entries: [restored]).reportText
+        XCTAssertTrue(report.contains("callbackElapsed=2.0ms"))
+        XCTAssertTrue(report.contains("completedCallbacks=3 lastCallback=value lastCallbackAt=07:59:00 lastWork=125.0ms lastDiagnosticFlush=250.0ms"))
+        XCTAssertTrue(report.contains("exclude the current callback"))
+    }
+
+    func testCallbackTimingExportRejectsInvalidDurations() {
+        for duration in [-1.0, .infinity, .nan] {
+            var event = LibreWatchDiagnosticEvent(kind: .frameProgress)
+            event.callbackElapsedSeconds = duration
+            let timing = LibreWatchCallbackTiming(kind: .value, startedAt: referenceDate,
+                workSeconds: duration, diagnosticFlushSeconds: 0)
+            event.completedCallbackTiming = LibreWatchCallbackTimingSummary(completedCount: 1, last: timing, longest: timing)
+            let projection = TroubleshootingWatchDiagnostic(event)
+            XCTAssertNil(projection.callbackElapsedSeconds)
+            XCTAssertNil(projection.completedCallbackTiming)
+        }
+    }
+
     func testNormalTraceAttachmentIncludesSafePhoneAndReceivedWatchHistoryWithOriginalClocksAndBuild() throws {
         let fixture = makeStore()
         defer { removeFixture(fixture.directory) }

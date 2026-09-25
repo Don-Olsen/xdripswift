@@ -889,6 +889,9 @@ struct TroubleshootingWatchDiagnostic: Codable, Equatable {
     let scene: LibreWatchApplicationState?
     let runtime: Bool?
     let runtimeInvalidationReason: Int?
+    let runtimeDiagnostic: LibreWatchRuntimeDiagnostic?
+    let callbackElapsedSeconds: TimeInterval?
+    let completedCallbackTiming: LibreWatchCallbackTimingSummary?
     let bluetoothErrorClassification: String?
     let source: LibreWatchRecoveryReconcileSource?
     let reconnectObservationSource: LibreWatchReconnectObservationSource?
@@ -940,6 +943,9 @@ struct TroubleshootingWatchDiagnostic: Codable, Equatable {
         scene = event.applicationState
         runtime = event.extendedRuntimeIsRunning
         runtimeInvalidationReason = event.runtimeInvalidationReason
+        runtimeDiagnostic = event.runtimeDiagnostic
+        callbackElapsedSeconds = event.callbackElapsedSeconds.flatMap { $0.isFinite && $0 >= 0 ? $0 : nil }
+        completedCallbackTiming = event.completedCallbackTiming.flatMap { $0.isValid ? $0 : nil }
         bluetoothErrorClassification = Self.allow(event.bluetoothErrorClassification,
             in: ["backgroundBudgetNear", "backgroundBudgetExceeded", "recoverBluetoothLink"])
         source = event.reconcileSource
@@ -954,7 +960,7 @@ struct TroubleshootingWatchDiagnostic: Codable, Equatable {
         attempt = event.attemptID
         attemptStarted = event.attemptStartedAt
         isReconnecting = event.isReconnecting
-        errorDomain = event.errorDomain.map { ["CBErrorDomain", "CBATTErrorDomain", "WKErrorDomain", "WCErrorDomain"].contains($0) ? $0 : "other" }
+        errorDomain = event.errorDomain.map { ["CBErrorDomain", "CBATTErrorDomain", "WKErrorDomain", "WCErrorDomain", "WKExtendedRuntimeSessionErrorDomain"].contains($0) ? $0 : "other" }
         errorCode = event.errorCode
         unlockCounter = event.unlockCounter
         technicalFrameAt = event.technicalFrameAt
@@ -2117,6 +2123,7 @@ struct TroubleshootingLogReportBuilder {
         lines.append("Received Watch journal entries retained: \(receivedWatchEntryCount). Only events received by this iPhone and still retained are included; undelivered Watch events are not included and their coverage is unknown.")
         lines.append("Watch watchTime/build/SHA describe the original Watch event; receiptTime is the iPhone receipt time, not the export time above. Delayed Watch events may originate before the phone retention window.")
         lines.append("journalRotated counts total local Watch journal rotation, not necessarily missing phone history. unacknowledgedRotated counts known Watch journal losses before phone storage acknowledgement; it is not a total of all undelivered events. Missing counters are unknown.")
+        lines.append("Callback timings measure monotonic elapsed time inside delivered Watch callbacks, not CPU time or prior system delivery delay. Completed/longest callback summaries cover this collector lifetime and exclude the current callback. runtimeExpires is the session's reported expiration, not guaranteed execution time.")
         return lines
     }
 
@@ -2181,6 +2188,17 @@ struct TroubleshootingLogReportBuilder {
             if let action = event.action { fields.append("action=\(action)") }
             if let watchOS = event.watchOS { fields.append("watchOS=\(watchOS)") }
             if let reason = event.runtimeInvalidationReason { fields.append("runtimeInvalidationReason=\(reason)") }
+            if let context = event.runtimeDiagnostic {
+                fields.append("runtimeState=\(context.state) runtimeStarted=\(time(context.startedAt)) runtimeExpires=\(time(context.expiresAt)) runtimeErrorPresent=\(context.errorPresent.map(String.init) ?? "unknown")")
+            }
+            if let elapsed = event.callbackElapsedSeconds {
+                fields.append("callbackElapsed=\(String(format: "%.1f", elapsed * 1_000))ms")
+            }
+            if let timing = event.completedCallbackTiming {
+                let last = timing.last
+                let longest = timing.longest
+                fields.append("completedCallbacks=\(timing.completedCount) lastCallback=\(last.kind.rawValue) lastCallbackAt=\(time(last.startedAt)) lastWork=\(String(format: "%.1f", last.workSeconds * 1_000))ms lastDiagnosticFlush=\(String(format: "%.1f", last.diagnosticFlushSeconds * 1_000))ms longestCallback=\(longest.kind.rawValue) longestCallbackAt=\(time(longest.startedAt)) longestWork=\(String(format: "%.1f", longest.workSeconds * 1_000))ms longestDiagnosticFlush=\(String(format: "%.1f", longest.diagnosticFlushSeconds * 1_000))ms")
+            }
             if let classification = event.bluetoothErrorClassification { fields.append("bluetoothErrorClass=\(classification)") }
             if let reason = event.reason { fields.append("reason=\(reason)") }
             if let generation = event.generation { fields.append("generation=\(generation.uuidString)") }

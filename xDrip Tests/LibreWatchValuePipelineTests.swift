@@ -3295,6 +3295,49 @@ final class LibreWatchValuePipelineTests: XCTestCase {
         XCTAssertNil(event.connectionInstanceID)
         XCTAssertNil(event.reconnectObservationSource)
         XCTAssertNil(event.returnAttempt)
+        XCTAssertNil(event.runtimeDiagnostic)
+        XCTAssertNil(event.callbackElapsedSeconds)
+        XCTAssertNil(event.completedCallbackTiming)
+    }
+
+    func testCallbackTimingMeasuresWorkAndFlushWithoutLosingLongestCompletedCallback() {
+        var tracker = LibreWatchCallbackTimingTracker()
+        tracker.begin(.value, at: receivedAt, uptime: 100)
+        tracker.begin(.services, at: receivedAt.addingTimeInterval(1), uptime: 100.1)
+        XCTAssertNil(tracker.summary, "the current callback is not a completed sample")
+        XCTAssertEqual(tracker.elapsed(at: 100.25), 0.25)
+        tracker.finish(workFinishedAt: 100.25, flushFinishedAt: 100.75)
+        let first = tracker.summary
+        XCTAssertEqual(first?.completedCount, 1)
+        XCTAssertEqual(first?.last.kind, .value, "nested work belongs to the outer callback")
+        XCTAssertEqual(first?.last.workSeconds, 0.25)
+        XCTAssertEqual(first?.last.diagnosticFlushSeconds, 0.5)
+        XCTAssertNil(tracker.elapsed(at: 101))
+
+        // A wall-clock correction cannot change the monotonic callback duration.
+        tracker.begin(.disconnectLegacy, at: receivedAt.addingTimeInterval(-60), uptime: 160)
+        tracker.finish(workFinishedAt: 160.125, flushFinishedAt: 160.25)
+        XCTAssertEqual(tracker.summary?.completedCount, 2)
+        XCTAssertEqual(tracker.summary?.last.kind, .disconnectLegacy)
+        XCTAssertEqual(tracker.summary?.last.elapsedSeconds, 0.25)
+        XCTAssertEqual(tracker.summary?.longest, first?.last)
+        XCTAssertEqual(first?.completedCount, 1, "captured diagnostic snapshots remain immutable")
+    }
+
+    func testInvalidCallbackClockSampleCannotFabricateACompletedCallbackOrPoisonNextSample() {
+        var tracker = LibreWatchCallbackTimingTracker()
+        tracker.begin(.connect, at: receivedAt, uptime: 50)
+        XCTAssertNil(tracker.elapsed(at: 49))
+        XCTAssertNil(tracker.elapsed(at: .infinity))
+        tracker.finish(workFinishedAt: 49, flushFinishedAt: 51)
+        XCTAssertNil(tracker.summary)
+        tracker.begin(.connect, at: receivedAt, uptime: 60)
+        tracker.finish(workFinishedAt: 61, flushFinishedAt: .nan)
+        XCTAssertNil(tracker.summary)
+        tracker.begin(.value, at: receivedAt, uptime: 70)
+        tracker.finish(workFinishedAt: 70.125, flushFinishedAt: 70.25)
+        XCTAssertEqual(tracker.summary?.completedCount, 1)
+        XCTAssertEqual(tracker.summary?.last.elapsedSeconds, 0.25)
     }
 
     func testCoreBluetoothDiagnosticSnapshotsStayBufferedUntilCallbackWorkCompletes() {

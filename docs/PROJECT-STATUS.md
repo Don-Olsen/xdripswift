@@ -8,6 +8,83 @@
 - Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
 <!-- testflight-7.1.1-4269:end -->
 
+## Målrettet Watch-diagnostik efter den fysiske sammenligning
+
+25. september 2026 er næste 7.1.1-kandidat klar til release-kontroller.
+Kodegennemgangen fandt, at runtime-invalideringens frie fejltekst ikke indgår
+i den delbare log af hensyn til privatliv, mens den strukturerede fejlkode
+slet ikke blev udfyldt. Den tidligere manglende tekst beviser derfor ikke,
+at watchOS leverede en tom fejl.
+
+Kandidaten eksporterer nu tilladt fejldomæne og kode, om et fejlobjekt var
+til stede, sessionens tilstand og oplyste udløbstid samt tidspunktet for
+appens modtagelse af runtime-startcallbacken. Den seneste runtime-stoppost
+gemmes straks lokalt med sin oprindelige build-/proceskontekst og følger
+Watch-leveringsloggen, også hvis telefonens journaloverførsel forsinkes.
+Fri fejltekst og userInfo tilføjes ikke til den delbare log.
+
+Et afgrænset sammendrag måler desuden monoton forløbstid i leverede
+Bluetooth-callbacks, opdelt i callbackarbejde og efterfølgende lagring af
+diagnostik. Det er ikke CPU-tid eller ventetid før watchOS leverer callbacken.
+Sammendraget beholder sidste og længste afsluttede callback for collectorens
+levetid; der oprettes ingen ekstra timer eller logpost pr. notification.
+Lokale sammendrag følger den eksisterende checkpointfrekvens. Nye felter er
+valgfrie, så ældre logs fortsat kan læses uden at gøre ukendt til nul.
+
+De otte fokuserede suites har foreløbigt kørt **502 tests uden fejl**; den
+endelige releasekvittering kræver stadig hele suiten, begge simulatorbuilds
+og kontrol af det af Apple valgte buildnummer. Den automatiske releaseblok
+ovenfor registrerer de faktisk afsluttede kontroller og Apple-status.
+
+**Dette er diagnostik, ikke en eftervist BLE-stabilitetsrettelse.** Efter
+installation af samme nye build på iPhone og Watch er næste fysiske kontrol
+én 30-minutters Watch Direct-test med skærmen i hvile det meste af tiden.
+Notér start og retur til telefonen, og eksportér både den friske lokale
+Watch-leveringslog og telefonens aktivitetslog. Kontroller især runtime-fejl,
+callbacktider og sensor-minutter før/efter runtime-stop. En ny lang
+telefonkontrol er ikke nødvendig. BLE-genforbindelse, runtime-politik,
+alarmer og glukoseberegning er ikke ændret af denne kandidat.
+
+## Fysisk Watch-/iPhone-sammenligning, 25. september 2026
+
+4269-loggen eksporteret kl. 11:44:56 afslutter telefonkontrollen efter
+brugerens overdragelse **fra Watch tilbage til iPhone** kl. 08:47.
+Kontrollen er optalt efter målingstid og entydige minutintervaller, ikke efter
+telefonens modtagelsestid eller den blandede 24-timers dækningsprocent:
+
+- Watch kl. 07:48–08:47: **47/60** forventede minutmålinger.
+- iPhone kl. 08:48–09:47: **60/60** forventede minutmålinger.
+- Hele iPhone-kontrollen kl. 08:48–11:44: **177/177**, ingen manglende
+  minutintervaller, højst to sekunder mellem målingstid og logregistrering.
+  Der er ingen loggede telefon-Bluetooth-fejl eller appstarter i intervallet.
+- Watch-returen blev anmodet kl. 08:47:23 og afsluttet kl. 08:47:25
+  (iPhone-modtagelse kl. 08:47:26). Sidste Watch-måling og første
+  iPhone-måling ligger i på hinanden følgende minutter; overdragelsen
+  introducerede ikke et ekstra målehul.
+
+Den tilhørende lokale Watch-leveringslog viste **55/55** dekodede/accepterede
+målinger lagret og kvitteret af iPhone i det fulde Watch-forløb. Ti frame-gap-
+hændelser omfattede 13 manglende sensor-minutter og hver en linkafbrydelse;
+ingen samlings-/dekodningsfejl var registreret i disse huller. Den senere
+telefonlog indeholder fortsat de samme 13 manglende minutter.
+
+Der var 13 uplanlagte Watch-disconnects: ti `CBErrorDomain/7` og tre `/6`.
+Alle skete med `scene=inactive`, `runtime=false`, og alle fulgtes af
+`recoverySucceeded`. Samme proces og central fortsatte. Ingen app-iværksat
+annullering er logget før den udtrykkelige retur. Den ekstra runtime blev
+invalideret kl. 07:49:55 med reason `-1`, uden eksporteret runtime-fejltekst.
+Det er en tidsmæssig sammenhæng, ikke bevis for normal udløbstid,
+baggrundskvote, sensorfejl eller en bestemt watchOS-fejl.
+
+**Næste udviklingsfokus:** Watch-modtagelse og genforbindelse efter
+runtime-invalidering. Telefonkontrollen skal ikke gentages uden en ny
+hypotese eller kodeændring. Kodegennemgangen har endnu ikke eftervist en
+konkret fejl, der forklarer disse afbrydelser; en ny runtime-kæde,
+baggrundsopgave-handler eller kortere timeout er derfor ikke en dokumenteret
+rettelse. Afklar først callback-eksekvering og runtime-fejlen; eventuel ekstra
+diagnostik skal beskrives som diagnostik. Ingen appkode, signering eller
+TestFlight-upload er ændret som led i denne loganalyse.
+
 De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
 
 <!-- testflight-7.1.1-4268:start -->

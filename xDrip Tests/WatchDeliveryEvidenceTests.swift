@@ -47,6 +47,57 @@ final class WatchDeliveryEvidenceTests: XCTestCase {
               connectionGeneration: generation)
     }
 
+    func testRuntimeStopSurvivesLocalReloadAndKeepsOriginWithoutFreeErrorText() throws {
+        let watchOrigin = origin()
+        let journal = store(origin: watchOrigin)
+        let secret = "https://user:password@example.invalid/private"
+        var event = LibreWatchDiagnosticEvent(kind: .extendedRuntimeInvalidated, errorCode: 5,
+            watchTimestamp: now, runtimeInvalidationReason: -1, runtimeError: secret,
+            errorDomain: "WKExtendedRuntimeSessionErrorDomain")
+        event.runtimeDiagnostic = LibreWatchRuntimeDiagnostic(state: 3,
+            startedAt: now.addingTimeInterval(-600), expiresAt: now, errorPresent: true)
+        journal.recordCollectorDiagnostic(event)
+        // Reopen before requesting a snapshot: the runtime-stop checkpoint must already exist.
+        let laterProcess = store(origin: origin())
+        let exported = try laterProcess.snapshotData()
+        let restored = try JSONDecoder().decode(WatchDeliveryEvidenceSnapshot.self, from: exported)
+        XCTAssertEqual(restored.lastRuntimeStop?.origin, watchOrigin)
+        XCTAssertEqual(restored.lastRuntimeStop?.errorCode, 5)
+        XCTAssertEqual(restored.lastRuntimeStop?.reason, -1)
+        XCTAssertEqual(restored.lastRuntimeStop?.context, event.runtimeDiagnostic)
+        XCTAssertFalse(String(decoding: exported, as: UTF8.self).contains(secret))
+        XCTAssertEqual(restored.events.count, 0, "runtime metadata adds no per-reading journal entries")
+        now += 24 * 60 * 60 + 1
+        XCTAssertNil(laterProcess.snapshot().lastRuntimeStop)
+    }
+
+    func testLocalCollectorTimingRemainsBoundedAndUnknownRuntimeDomainIsRedacted() throws {
+        let journal = store()
+        var event = LibreWatchDiagnosticEvent(kind: .extendedRuntimeInvalidated,
+            watchTimestamp: now, errorDomain: "https://private.example.invalid")
+        let timing = LibreWatchCallbackTiming(kind: .value, startedAt: now,
+            workSeconds: 0.125, diagnosticFlushSeconds: 0.25)
+        event.completedCallbackTiming = LibreWatchCallbackTimingSummary(completedCount: 2, last: timing, longest: timing)
+        journal.recordCollectorDiagnostic(event)
+        var snapshot = journal.snapshot()
+        XCTAssertEqual(snapshot.lastRuntimeStop?.errorDomain, "other")
+        XCTAssertEqual(snapshot.lastCallbackTiming?.summary, event.completedCallbackTiming)
+        var ordinary = LibreWatchDiagnosticEvent(kind: .frameProgress, watchTimestamp: now)
+        ordinary.completedCallbackTiming = event.completedCallbackTiming
+        for _ in 0 ..< 100 { journal.recordCollectorDiagnostic(ordinary) }
+        snapshot = journal.snapshot()
+        XCTAssertEqual(snapshot.events.count, 0)
+        XCTAssertEqual(snapshot.lastCallbackTiming?.summary.completedCount, 2)
+        let encoded = try JSONEncoder().encode(snapshot)
+        var old = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        old.removeValue(forKey: "lastRuntimeStop")
+        old.removeValue(forKey: "lastCallbackTiming")
+        let legacy = try JSONDecoder().decode(WatchDeliveryEvidenceSnapshot.self,
+            from: JSONSerialization.data(withJSONObject: old))
+        XCTAssertNil(legacy.lastRuntimeStop)
+        XCTAssertNil(legacy.lastCallbackTiming)
+    }
+
     func testFrameGapShowsNoInterveningNotificationsAndPersistsExecutionContext() throws {
         var tracker = LibreWatchFrameGapTracker()
         let before = frameState(runtime: true, phase: "receiving")
