@@ -42,6 +42,21 @@ testforløb og verifikation. Den næste fysiske kontrol
 skal især måle sensor-minutter og linkbrud efter runtime-udløb med telefonen
 utilgængelig og urets skærm i hvile.
 
+Arkivforsøg for 7.1.1 (4274) den 26. september bestod den præcise
+release-kildes 1055/1055 XCTest-tests, begge simulatorbuilds og
+checkpoint/push/tag (`031a3e40f6d0a5e5307aff50ad5e621814666298` /
+`testflight-7.1.1-4274`). Arkiveringen stoppede før IPA og upload:
+File Provider satte `com.apple.FinderInfo` og
+`com.apple.fileprovider.fpfs#P` på den genererede Watch-komplikation, og
+`codesign` afviste dens ressourceattributter. Den fejlede buildmappe,
+testresultaterne og tagget bevares. Fejlen siger ikke noget om BLE-stabilitet.
+
+Release-scriptet kan nu lade den ignorerede `build/…/build` pege på en ny,
+lokal, vedvarende mappe uden for File Provider via
+`XDRIP_SIGNING_OUTPUT_ROOT`. Kilde-, test-, signatur- og uploadkontroller
+er uændrede. Da procesændringen er ny kildekode efter det uforanderlige
+4274-tag, skal et senere build allokeres og testes fuldt igen.
+
 De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
 
 ## Afgrænset genoprettelse af fastlåst Watch-forbindelse efter 4272

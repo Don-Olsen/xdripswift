@@ -171,6 +171,53 @@ class ReleaseGuardTests(unittest.TestCase):
         self.assertEqual(passed["XDRIP_XCODE_AUTH_KEY_ISSUER_ID"], "synthetic-issuer")
         self.assertNotIn("PRIVATE KEY", repr(passed))
 
+    def test_build_can_sign_outside_file_provider_without_changing_release_paths(self):
+        root = self.root / "build/release"
+        root.mkdir(parents=True)
+        allocation = root / "allocation.json"
+        allocation.write_text("{}", encoding="utf-8")
+        state = {"step": "tagged", "tag": "testflight-7.0.0-4265",
+                 "version": "7.0.0", "build": "4265", "allocationPath": str(allocation),
+                 "allocationSha256": release.sha256_file(allocation)}
+        client = mock.Mock(issuer_id=None)
+        pending = {"id": "synthetic-xcode-reservation", "version": "7.0.0",
+                   "build": "4265", "state": "AWAITING_UPLOAD"}
+        client.snapshot.side_effect = [self.snapshot(), self.snapshot(uploads=[pending])]
+
+        with tempfile.TemporaryDirectory() as outside:
+            target = Path(outside) / "signed-products"
+
+            def synthetic_archive(args, *, env):
+                self.assertEqual(env["XDRIP_OUTPUT_ROOT"], str(root / "build"))
+                exported = root / "build/export"
+                exported.mkdir(parents=True)
+                (exported / "xdrip.ipa").write_bytes(b"synthetic IPA")
+
+            with mock.patch.dict(os.environ, {"XDRIP_SIGNING_OUTPUT_ROOT": str(target)}):
+                with mock.patch.object(release, "ensure_published"):
+                    with mock.patch.object(release, "apple_client", return_value=client):
+                        with mock.patch.object(release, "run", side_effect=synthetic_archive):
+                            release.build(root, root / "release-state.json", state)
+
+            self.assertTrue((root / "build").is_symlink())
+            self.assertEqual((root / "build").resolve(), target.resolve())
+            self.assertEqual(state["signingOutputRoot"], str(target.resolve()))
+            self.assertEqual(state["ipa"], str(root / "build/export/xdrip.ipa"))
+            self.assertEqual(state["exportUploadID"], pending["id"])
+
+    def test_external_signing_output_must_be_absolute_and_outside_worktree(self):
+        root = self.root / "build/release"
+        root.mkdir(parents=True)
+        state = {"step": "tagged"}
+        with tempfile.TemporaryDirectory() as already_present:
+            with mock.patch.object(release, "ensure_published"):
+                for invalid in ("relative/path", str(self.root / "outside"), already_present):
+                    with self.subTest(path=invalid):
+                        with mock.patch.dict(os.environ, {"XDRIP_SIGNING_OUTPUT_ROOT": invalid}):
+                            with self.assertRaises(SystemExit):
+                                release.build(root, root / "release-state.json", state)
+        self.assertFalse((root / "build").exists())
+
     def test_upload_accepts_only_xcodes_recorded_empty_export_slot(self):
         root, _, _, state = self.artifacts()
         pending = {"id": "synthetic-xcode-reservation", "version": "7.0.0",

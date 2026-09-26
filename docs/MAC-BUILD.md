@@ -46,6 +46,16 @@ Ingen buildnummer- eller Apple-statusvariabler udfyldes manuelt. `release`
 genoptager det registrerede forløb og kører selv prepare, checkpoint, publish,
 build, verify, upload, processing-kontrol og status. Ved en afsluttet release
 og nye kildeændringer vælges et nyt nummer; uændret kode gen-uploades ikke.
+
+Når worktree ligger i en macOS File Provider-mappe, kan den tilføje
+`com.apple.FinderInfo` til genererede app-bundles og få `codesign` til at
+afvise arkivet. Sæt i så fald `XDRIP_SIGNING_OUTPUT_ROOT` til en **ny, absolut
+sti på lokal disk uden for worktree**, f.eks. under
+`~/Library/Application Support/xDrip4iOS/TestFlight/`. Release-scriptet
+opretter et link fra det ignorerede `build/testflight-…/build` til denne sti.
+Testkvittering, kilde-tag, arkivkontrol, IPA-hash og upload-gates er de samme.
+Den eksterne mappe må ikke allerede eksistere og skal bevares sammen med
+releaseartefakterne; en afbrudt arkivering overskrives ikke automatisk.
 En anden marketingversion kræver sin egen brugerautorisation og matchende
 `XDRIP_GO_UPLOAD_VERSION`.
 

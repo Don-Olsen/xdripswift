@@ -446,8 +446,20 @@ def build(root, path, state):
     require_step(state, "tagged")
     ensure_published(state)
     output = root / "build"
-    if output.exists():
+    if output.exists() or output.is_symlink():
         fail("build output already exists; inspect it instead of overwriting it")
+    external_output = os.environ.get("XDRIP_SIGNING_OUTPUT_ROOT")
+    target = None
+    if external_output:
+        requested = Path(external_output).expanduser()
+        if not requested.is_absolute():
+            fail("XDRIP_SIGNING_OUTPUT_ROOT must be an absolute path")
+        target = requested.resolve()
+        worktree = ROOT.resolve()
+        if target == worktree or worktree in target.parents:
+            fail("XDRIP_SIGNING_OUTPUT_ROOT must be outside the Git worktree")
+        if target.exists() or target.is_symlink():
+            fail("external signing output already exists; inspect it instead of overwriting it")
     env = os.environ.copy()
     env.update(XDRIP_OUTPUT_ROOT=str(output), XDRIP_RELEASE_TAG=state["tag"],
                XDRIP_RELEASE_STATE_PATH=str(path), XDRIP_BUILD_NUMBER=state["build"],
@@ -464,6 +476,11 @@ def build(root, path, state):
     before = apple_snapshot(client, state["version"], root / "apple-before-export.json")
     if number_in_use(before, state["build"]):
         raise SlotOccupied("Apple occupied the build number before Xcode export")
+    if target is not None:
+        # File Provider folders can attach FinderInfo to generated app bundles, which
+        # codesign rejects. Keep the release path stable while signing on local storage.
+        target.mkdir(mode=0o700, parents=True)
+        output.symlink_to(target, target_is_directory=True)
     run([str(ROOT / "scripts/local-build.sh"), "archive"], env=env)
     ipa_files = list((output / "export").glob("*.ipa"))
     if len(ipa_files) != 1:
@@ -471,7 +488,8 @@ def build(root, path, state):
     after = apple_snapshot(client, state["version"], root / "apple-after-export.json")
     pending_id = export_pending_id(after, state["version"], state["build"])
     state.update(step="built", archive=str(output / "archive/xdrip.xcarchive"),
-                 ipa=str(ipa_files[0]), exportUploadID=pending_id, builtAt=utc_now())
+                 ipa=str(ipa_files[0]), exportUploadID=pending_id, builtAt=utc_now(),
+                 signingOutputRoot=str(target) if target is not None else None)
     save_state(path, state)
 
 
