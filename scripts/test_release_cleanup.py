@@ -89,6 +89,16 @@ class CleanupTests(unittest.TestCase):
         self.assertEqual(result["gitBefore"],result["gitAfter"])
         self.assertEqual(self.git("rev-parse","HEAD").strip(),self.head)
 
+    def test_finder_metadata_does_not_block_or_get_deleted(self):
+        finder = self.old / "test/DerivedData/.DS_Store"
+        finder.write_bytes(b"finder")
+        nested = self.old / "test/DerivedData/all-tests/.DS_Store"
+        nested.write_bytes(b"finder")
+        result = c.cleanup(self.root, self.client, True)
+        self.assertEqual(result["deletedFiles"], 3)
+        self.assertEqual(finder.read_bytes(), b"finder")
+        self.assertEqual(nested.read_bytes(), b"finder")
+
     def test_dry_run_never_removes(self):
         before=self.manifest(self.old)
         self.assertEqual(c.cleanup(self.root,self.client)["status"],"dry-run")

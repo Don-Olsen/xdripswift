@@ -139,6 +139,10 @@ def scan_derived(dd):
     require(dd.is_dir() and not dd.is_symlink(), "Unknown DerivedData root")
     files = []
     for instance in sorted(dd.iterdir()):
+        # Finder may create this metadata file while inspecting DerivedData.
+        # It is neither a build instance nor a deletion target.
+        if instance.name == ".DS_Store" and instance.is_file() and not instance.is_symlink():
+            continue
         require(instance.is_dir() and not instance.is_symlink(), "Unknown DerivedData instance")
         def error(e):
             raise e
@@ -256,6 +260,9 @@ def preservation_inventory(root, deletions):
                 dirs.sort()
                 links = [d for d in dirs if (Path(parent) / d).is_symlink()]
                 for name in sorted(names + links):
+                    # Finder owns this volatile metadata, not the release.
+                    if name == ".DS_Store":
+                        continue
                     p = Path(parent) / name
                     if str(p) in deletions:
                         continue
