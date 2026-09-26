@@ -1,3 +1,19 @@
+## Afgrænset intern test af Watch-runtime
+
+Næste TestFlight-build ændrer kun Watch-appens `WKBackgroundModes` fra
+`self-care` til `physical-therapy` i den installerede app. Signerings- og
+arkivkontrollerne forventer samme ene værdi. Der tilføjes ingen batterilog,
+træningsfunktion, automatisk forlængelse, trend-backfill eller BLE-ændring.
+Formålet er en personlig diagnose af, om længere udvidet runtime forbedrer
+Libre-forbindelsen, når iPhone er utilgængelig. Det er endnu ikke en påvist
+varig løsning.
+
+4275 bevares komplet som sammenligningsbuild under denne release. Efter
+installation testes Watch som sensorejer i cirka 70–75 minutter med iPhone
+utilgængelig. Vi sammenligner minutmålinger, uplanlagte BLE-afbrydelser og
+runtime-udløb før og efter 60-minuttersgrænsen. Testen afgør ikke alene
+forbindelsens stabilitet ved alle fremtidige forhold.
+
 ## Selektiv release-cacheoprydning, 26. september 2026
 
 Build 4275 blev frisk bekræftet via Apples officielle API som VALID,

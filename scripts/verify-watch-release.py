@@ -95,7 +95,7 @@ def main(archive, destination):
     require(first['build'] == second['build'], 'Phone/Watch build mismatch')
     require(first['version'] == second['version'], 'Phone/Watch version mismatch')
     require('bluetooth-central' in second['publicBackgroundModes'], 'Missing Watch Bluetooth mode')
-    require(second['extendedRuntimeModes'] == ['self-care'], 'Unexpected Watch runtime mode')
+    require(second['extendedRuntimeModes'] == ['physical-therapy'], 'Unexpected Watch runtime mode')
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(json.dumps(manifest, indent=2), encoding='utf-8')
     print(json.dumps(manifest, indent=2))

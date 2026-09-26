@@ -556,7 +556,7 @@ if watch_info.get("WKRunsIndependentlyOfCompanionApp") is not False:
     raise SystemExit("unexpected independent Watch app setting")
 if "bluetooth-central" not in watch_info.get("UIBackgroundModes", []):
     raise SystemExit("Watch app is missing Bluetooth background mode")
-if watch_info.get("WKBackgroundModes") != ["self-care"]:
+if watch_info.get("WKBackgroundModes") != ["physical-therapy"]:
     raise SystemExit("unexpected Watch extended runtime mode")
 
 destination = Path(os.environ["MANIFEST_PATH"])

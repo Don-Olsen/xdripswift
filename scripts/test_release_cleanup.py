@@ -30,7 +30,8 @@ class CleanupTests(unittest.TestCase):
         self.git("add", ".")
         self.git("commit", "-qm", "fixture")
         self.head = self.git("rev-parse", "HEAD").strip()
-        self.old = self.make_release("100")
+        self.old = self.make_release("99")
+        self.previous = self.make_release("100")
         self.current = self.make_release("101")
         self.write(self.root / "build/release-automation/active.json", {"version":"7.1.1", "build":"101"})
         self.patches = [mock.patch.object(c, "idle"), mock.patch.object(c, "ensure_unopened"),
@@ -88,6 +89,14 @@ class CleanupTests(unittest.TestCase):
         self.assertTrue(all(before[n]==v for n,v in after.items()))
         self.assertEqual(result["gitBefore"],result["gitAfter"])
         self.assertEqual(self.git("rev-parse","HEAD").strip(),self.head)
+
+    def test_latest_previous_verified_build_is_complete_and_untouched(self):
+        before = self.manifest(self.previous)
+        result = c.cleanup(self.root, self.client, True)
+        self.assertEqual(self.manifest(self.previous), before)
+        self.assertTrue(any(item["path"] == str(self.previous)
+                            and item["reason"] == "latest previous verified build"
+                            for item in result["kept"]))
 
     def test_finder_metadata_does_not_block_or_get_deleted(self):
         finder = self.old / "test/DerivedData/.DS_Store"

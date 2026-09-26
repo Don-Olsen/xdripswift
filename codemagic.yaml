@@ -293,7 +293,7 @@ workflows:
           expected_commit="$(git rev-parse HEAD)"
           test "$(/usr/libexec/PlistBuddy -c 'Print :XDripSourceCommit' "$watch_app/Info.plist")" = "$expected_commit"
           test "$(/usr/libexec/PlistBuddy -c 'Print :XDripSourceCommit' "$CM_BUILD_DIR/build/ios/xcarchive/xdrip.xcarchive/Products/Applications/xdrip.app/Info.plist")" = "$expected_commit"
-          test "$(/usr/libexec/PlistBuddy -c 'Print :WKBackgroundModes:0' "$watch_app/Info.plist")" = "self-care"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :WKBackgroundModes:0' "$watch_app/Info.plist")" = "physical-therapy"
           test "$(/usr/libexec/PlistBuddy -c 'Print :UIBackgroundModes:0' "$watch_app/Info.plist")" = "bluetooth-central"
           codesign --verify --deep --strict "$watch_app"
           watch_signing_info="$(codesign -dv --verbose=4 "$watch_app" 2>&1)"

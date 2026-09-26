@@ -169,15 +169,32 @@ def scan_derived(dd):
 
 def release_candidates(root, current):
     candidates, kept = [], []
+    completed_prior = []
+    for folder in (root / "build").glob("testflight-*"):
+        match = re.fullmatch(r"testflight-(\d+(?:\.\d+)+)-(\d+)", folder.name)
+        if not match or match[1] != current["version"] or int(match[2]) >= int(current["build"]):
+            continue
+        try:
+            state = read_json(folder / "release-state.json")
+        except (CleanupBlocked, OSError, ValueError, KeyError):
+            continue
+        if (state.get("version"), state.get("build")) == (match[1], match[2]) and (
+                state.get("step") == "status-recorded" and state.get("appleStatus") == "internal-testing"
+                and state.get("tests", {}).get("verificationPassed") is True):
+            completed_prior.append(int(match[2]))
+    latest_prior = max(completed_prior, default=None)
     protected = []
     for folder in (root / "build").glob("testflight-*"):
         match = re.fullmatch(r"testflight-(\d+(?:\.\d+)+)-(\d+)", folder.name)
-        if not match or int(match[2]) >= int(current["build"]):
+        if not match or int(match[2]) >= int(current["build"]) or (
+                match[1] == current["version"] and int(match[2]) == latest_prior):
             protected.extend((folder.resolve(), (folder / "build").resolve(), (folder / "test").resolve()))
     for folder in sorted((root / "build").glob("testflight-*")):
         m = re.fullmatch(r"testflight-(\d+(?:\.\d+)+)-(\d+)", folder.name)
-        if not m or int(m[2]) >= int(current["build"]):
-            kept.append({"path": str(folder), "reason": "current/newer/unknown build"})
+        if not m or int(m[2]) >= int(current["build"]) or (
+                m[1] == current["version"] and int(m[2]) == latest_prior):
+            reason = "latest previous verified build" if m and int(m[2]) == latest_prior else "current/newer/unknown build"
+            kept.append({"path": str(folder), "reason": reason})
             continue
         try:
             require(not folder.is_symlink(), "Symlinked release root")
