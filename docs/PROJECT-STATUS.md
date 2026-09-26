@@ -1,3 +1,15 @@
+<!-- testflight-7.1.1-4276:start -->
+### TestFlight 7.1.1 (4276)
+
+- Kildecommit og tag: `d559492dd82bf107f9fb48d121f3594ce0d74a40` / `testflight-7.1.1-4276`.
+- Tests: 1055/1055 bestået; 0 fejlet; 0 skipped. iPhone- og Watch-simulatorbuilds bestod.
+- Apple-status (2026-09-26T16:56:30.768485+00:00): [Internal / Testing](https://appstoreconnect.apple.com/apps/6795645396/testflight/ios/59fdbc59-c502-427e-81a6-e61ee0c40943).
+- Eksisterende intern gruppe: Ole Internal er bekræftet tilknyttet.
+- Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
+<!-- testflight-7.1.1-4276:end -->
+
+De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
+
 ## Afgrænset intern test af Watch-runtime
 
 Næste TestFlight-build ændrer kun Watch-appens `WKBackgroundModes` fra
