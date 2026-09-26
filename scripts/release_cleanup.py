@@ -34,7 +34,10 @@ def read_json(p):
 
 def fingerprint(p):
     s = p.lstat()
-    return [s.st_dev, s.st_ino, s.st_mode, s.st_size, s.st_mtime_ns, s.st_ctime_ns]
+    # File Provider may hydrate an old cache file and change ctime while
+    # identity, type, size and mtime stay stable. Keep those checks;
+    # hard links are checked again immediately before deletion.
+    return [s.st_dev, s.st_ino, s.st_mode, s.st_size, s.st_mtime_ns]
 
 def hash_file(p):
     h = hashlib.sha256()
@@ -231,8 +234,9 @@ def safe_unlink(item):
             os.close(fd)
             fd = new
         s = os.stat(p.name, dir_fd=fd, follow_symlinks=False)
-        now = [s.st_dev, s.st_ino, s.st_mode, s.st_size, s.st_mtime_ns, s.st_ctime_ns]
-        require(now == item["fingerprint"] and stat.S_ISREG(s.st_mode), "Cache changed since plan")
+        now = [s.st_dev, s.st_ino, s.st_mode, s.st_size, s.st_mtime_ns]
+        require(now == item["fingerprint"] and stat.S_ISREG(s.st_mode) and s.st_nlink == 1,
+                "Cache changed since plan")
         os.unlink(p.name, dir_fd=fd)
     finally:
         os.close(fd)

@@ -1,29 +1,33 @@
 ## Selektiv release-cacheoprydning, 26. september 2026
 
 Build 4275 blev frisk bekræftet via Apples officielle API som VALID,
-INTERNAL_ONLY og IN_BETA_TESTING med Ole Internal-tilknytning kl. 08:36 UTC.
-Den autoriserede oprydningskommando afviste derefter sletning, fordi Xcode
-og SWBBuildService stadig kørte. **Ingen projekt-/releasefiler blev slettet;
-frigivet plads er 0 byte.** En skrivebeskyttet optælling fandt cirka 11,7 GiB
-kendte cachefiler i de afsluttede builds 4266, 4268–4273. Hele 4275 og det
-ufuldendte 4274-forsøg samt øvrige uklare/historiske mapper er bevaret.
-Detaljer, præcise stier og valideringslog ligger i den ignorerede lokale mappe
-`build/release-automation/cleanup/20260926-safety-review/`.
+INTERNAL_ONLY og IN_BETA_TESTING med Ole Internal-tilknytning kl. 09:37 UTC.
+Den sikkerhedskontrollerede oprydning fjernede 88.845 gendannelige cachefiler
+fra afsluttede builds 4266 og 4268–4273. Filernes rapporterede allokerede
+størrelse var 12.561.162.240 byte (11,70 GiB); den målte stigning i ledig
+plads på disken var 2.359.599.104 byte (2,20 GiB). APFS/File Provider kan
+dele eller håndtere disse blokke anderledes end filernes summerede størrelse.
 
-Release-automationen forsøger nu selektiv oprydning efter en fuldført
+Finder holdt kortvarigt en cachemappe åben under første gennemløb, så den
+løbende kontrol standsede efter 61.741 filer. Et nyt, idempotent gennemløb
+bestod alle kontroller og fjernede de resterende 27.104 filer. Rapporterne
+ligger i de ignorerede lokale mapper
+`build/release-automation/cleanup/20260926T093551.019829Z/` og
+`build/release-automation/cleanup/20260926T093801.092191Z/`.
+Den afsluttende rapport bekræfter uændret Git-tilstand og uændrede bevarede
+releasefiler. Hele 4275, det ufuldendte 4274-forsøg, arkiver, IPA, dSYM,
+XCResult, logs, JSON, Apple-status og øvrige uklare mapper er bevaret.
+
+Release-automationen forsøger fortsat selektiv oprydning efter en fuldført
 Internal / Testing-statuscommit/push. Den kræver frisk Apple-status,
-bevarede arkiver/IPA/testresultater, proces- og åben-filkontrol samt fælles
-værtslås med buildscriptet. Hele DerivedData slettes aldrig: logs, JSON,
-dSYM, produkter, testmateriale og ukendte filer bevares. Git og bevarede
-releasefiler kontrolleres før/efter; hver slettet cachefil registreres.
-Se den fulde regel og genoptagelseskommando i MAC-BUILD.md.
-
-26 isolerede oprydnings-/låse-/proceskontroller, 28 release-tests,
-12 processing-tests og 40 Apple-klienttests samt de eksisterende
-self-tests bestod. Intet Xcode-/TestFlight-build eller upload blev startet.
-Dette ændrer kun lokal release-automatisering, ikke den installerede 4275-app.
-Oprydningen afventer lukning af Xcode; kør derefter `cleanup --apply`,
-ikke en ny `release`, for at gentage alle kontroller og frigive cachepladsen.
+bevarede releaseartefakter, proces- og åben-filkontrol samt fælles værtslås
+med buildscriptet. Hele DerivedData slettes aldrig; se MAC-BUILD.md.
+File Provider-hydrering ændrede metadata-ctime uden observeret ændring af
+filidentitet, størrelse eller mtime. Cacheidentiteten kontrolleres nu via
+filsystem, inode, type, størrelse og
+mtime, mens hardlink-antallet også kontrolleres umiddelbart før sletning.
+29 isolerede oprydningstests og 28 release-tests bestod efter rettelsen.
+Intet nyt Xcode-/TestFlight-build eller upload blev startet.
 
 <!-- testflight-7.1.1-4275:start -->
 ### TestFlight 7.1.1 (4275)

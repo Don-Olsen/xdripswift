@@ -192,6 +192,25 @@ class CleanupTests(unittest.TestCase):
         with self.assertRaises(c.CleanupBlocked):c.safe_unlink(item)
         self.assertTrue(p.exists())
 
+    def test_safe_unlink_allows_metadata_only_ctime_change(self):
+        p = self.cache()
+        item = {"path": str(p), "fingerprint": c.fingerprint(p)}
+        st = p.stat()
+        os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns))
+        self.assertEqual(c.fingerprint(p), item["fingerprint"])
+        c.safe_unlink(item)
+        self.assertFalse(p.exists())
+
+    def test_safe_unlink_rejects_hardlink_added_after_plan(self):
+        p = self.cache()
+        item = {"path": str(p), "fingerprint": c.fingerprint(p)}
+        other = self.root / "other-cache-link"
+        os.link(p, other)
+        with self.assertRaises(c.CleanupBlocked):
+            c.safe_unlink(item)
+        self.assertTrue(p.exists())
+        self.assertTrue(other.exists())
+
     def test_safe_unlink_rejects_parent_replaced_with_link(self):
         p=self.cache();item={'path':str(p),'fingerprint':c.fingerprint(p)}
         parent=p.parent;parent.rename(parent.with_name('hold'));parent.symlink_to(parent.with_name('hold'))

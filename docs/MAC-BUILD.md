@@ -160,6 +160,11 @@ diagnosefiler, plist, databaser, `TestResults`, `Build/Products`, dSYM, IPA,
 XCArchive, XCResult og øvrige ukendte filer bliver liggende. Produktlinks
 følges ikke; links i kandidatcache, hardlinks eller uklare stier afviser den
 pågældende release. Derfor forsvinder DerivedData-mappen ikke nødvendigvis.
+Filidentitet, type, størrelse og ændringstid kontrolleres før sletning;
+linkantallet kontrolleres igen ved hver fil. macOS File Provider kan ændre
+cachefilers metadata-ctime ved hydrering uden observeret ændring af
+filidentitet, størrelse eller mtime, så ctime alene
+er ikke et afvisningskriterium.
 
 Før første sletning kræves en frisk, skrivebeskyttet officiel Apple-kontrol af
 aktuelt build og Ole Internal. Et nyere/ukendt Apple-build eller upload,
