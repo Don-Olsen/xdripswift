@@ -8,6 +8,40 @@
 - Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
 <!-- testflight-7.1.1-4273:end -->
 
+## Målrettet runtime-diagnostik efter den fysiske 4273-test
+
+Den selvstændige Watch-test den 26. september kl. 06:19–07:21 gav 52 af 62
+sensor-minutnumre. Ni uplanlagte Core Bluetooth-afbrydelser genoprettedes;
+alle 52 dekodede målinger blev gemt lokalt på Watch og senere varigt lagret
+på iPhone. De otte registrerede målehuller havde ingen afkodnings-,
+framesamlings- eller notification-fejl. Den nye grænse for et uændret native
+forbindelsesforsøg blev ikke udløst. Den bevarede detaljerede analyse og
+originale testfiler ligger uden for Git. Dette forløb dokumenterer derfor
+fortsat ustabil sensormodtagelse efter runtime-udløb, men ikke en bestemt
+kodefejl eller et tab i Watch-til-iPhone-leveringen.
+
+Ved udløbet af den udvidede Watch-runtime eksporterede 4273 kun
+`error=other/1`. Fejldomænet blev bevidst erstattet med `other` i begge
+eksportveje, så det rå domæne ikke kan genskabes fra denne test. Den nye
+ændring lader de eksisterende sikre domæner og et kort, syntaktisk
+begrænset `com.apple.*`-runtime-domæne følge med i både lokal Watch-evidens
+og iPhones aktivitetslog. Den eksporterer fortsat hverken fri fejltekst eller
+sensoridentitet. Ukendte eller mistænkelige domæner forbliver `other`, og
+andre hændelsestyper får ikke udvidet domænelisten. Der tilføjes ingen
+Bluetooth-operationer, timere, journalposter eller ændring i genopkoblingen.
+Det er diagnostik og **ikke en eftervist rettelse af de ni radioafbrydelser**.
+
+De to berørte XCTest-suiter og det færdige XCResult bekræfter 132/132
+bestået, 0 fejl og 0 skipped. Xcode ventede efter selve testene på en
+separat `simctl diagnose`-indsamling med 600 sekunders timeout; ved andet
+testforsøg blev netop den indsamling stoppet, hvorefter xcodebuild
+afsluttede med exit 0 og skrev en gyldig XCResult-pakke. Separate
+usignerede iPhone- og Watch-simulatorbuilds afsluttede med exit 0.
+En ny TestFlight-build kræver fortsat den præcise release-kildes fulde
+testforløb og verifikation. Den næste fysiske kontrol
+skal især måle sensor-minutter og linkbrud efter runtime-udløb med telefonen
+utilgængelig og urets skærm i hvile.
+
 De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
 
 ## Afgrænset genoprettelse af fastlåst Watch-forbindelse efter 4272

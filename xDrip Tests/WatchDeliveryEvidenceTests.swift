@@ -53,7 +53,7 @@ final class WatchDeliveryEvidenceTests: XCTestCase {
         let secret = "https://user:password@example.invalid/private"
         var event = LibreWatchDiagnosticEvent(kind: .extendedRuntimeInvalidated, errorCode: 5,
             watchTimestamp: now, runtimeInvalidationReason: -1, runtimeError: secret,
-            errorDomain: "WKExtendedRuntimeSessionErrorDomain")
+            errorDomain: "com.apple.watchkit.runtime")
         event.runtimeDiagnostic = LibreWatchRuntimeDiagnostic(state: 3,
             startedAt: now.addingTimeInterval(-600), expiresAt: now, errorPresent: true)
         journal.recordCollectorDiagnostic(event)
@@ -63,6 +63,7 @@ final class WatchDeliveryEvidenceTests: XCTestCase {
         let restored = try JSONDecoder().decode(WatchDeliveryEvidenceSnapshot.self, from: exported)
         XCTAssertEqual(restored.lastRuntimeStop?.origin, watchOrigin)
         XCTAssertEqual(restored.lastRuntimeStop?.errorCode, 5)
+        XCTAssertEqual(restored.lastRuntimeStop?.errorDomain, "com.apple.watchkit.runtime")
         XCTAssertEqual(restored.lastRuntimeStop?.reason, -1)
         XCTAssertEqual(restored.lastRuntimeStop?.context, event.runtimeDiagnostic)
         XCTAssertFalse(String(decoding: exported, as: UTF8.self).contains(secret))

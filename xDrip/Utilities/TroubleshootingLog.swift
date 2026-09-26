@@ -960,7 +960,7 @@ struct TroubleshootingWatchDiagnostic: Codable, Equatable {
         attempt = event.attemptID
         attemptStarted = event.attemptStartedAt
         isReconnecting = event.isReconnecting
-        errorDomain = event.errorDomain.map { ["CBErrorDomain", "CBATTErrorDomain", "WKErrorDomain", "WCErrorDomain", "WKExtendedRuntimeSessionErrorDomain"].contains($0) ? $0 : "other" }
+        errorDomain = LibreWatchDiagnosticErrorDomain.export(event.errorDomain, for: event.kind)
         errorCode = event.errorCode
         unlockCounter = event.unlockCounter
         technicalFrameAt = event.technicalFrameAt

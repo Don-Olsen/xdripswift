@@ -14,7 +14,7 @@ extension TroubleshootingLogTests {
         let secret = "https://user:password@example.invalid/private"
         var event = LibreWatchDiagnosticEvent(kind: .extendedRuntimeInvalidated, errorCode: 5,
             watchTimestamp: referenceDate, runtimeInvalidationReason: -1, runtimeError: secret,
-            errorDomain: "WKExtendedRuntimeSessionErrorDomain")
+            errorDomain: "com.apple.watchkit.runtime")
         event.runtimeDiagnostic = LibreWatchRuntimeDiagnostic(state: 3,
             startedAt: referenceDate.addingTimeInterval(-590),
             expiresAt: referenceDate.addingTimeInterval(10), errorPresent: true)
@@ -25,11 +25,17 @@ extension TroubleshootingLogTests {
         XCTAssertEqual(restored, entry)
         let report = makeReport(entries: [restored]).reportText
         XCTAssertTrue(report.contains("runtimeInvalidationReason=-1"))
-        XCTAssertTrue(report.contains("error=WKExtendedRuntimeSessionErrorDomain/5"))
+        XCTAssertTrue(report.contains("error=com.apple.watchkit.runtime/5"))
         XCTAssertTrue(report.contains("runtimeState=3 runtimeStarted=07:50:10 runtimeExpires=08:00:10 runtimeErrorPresent=true"))
         XCTAssertFalse(report.contains("password"))
         XCTAssertFalse(report.contains("example.invalid"))
         XCTAssertFalse(String(decoding: encoded, as: UTF8.self).contains(secret))
+        let unrelated = LibreWatchDiagnosticEvent(kind: .disconnected,
+            errorCode: 1, errorDomain: "com.apple.watchkit.runtime")
+        XCTAssertEqual(TroubleshootingWatchDiagnostic(unrelated).errorDomain, "other")
+        let injected = LibreWatchDiagnosticEvent(kind: .extendedRuntimeInvalidated,
+            errorCode: 1, errorDomain: "com.apple.https://user:password@example.invalid")
+        XCTAssertEqual(TroubleshootingWatchDiagnostic(injected).errorDomain, "other")
     }
 
     func testRuntimeDiagnosticDistinguishesAbsentErrorFromLegacyUnknown() throws {

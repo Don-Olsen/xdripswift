@@ -382,9 +382,7 @@ final class WatchDeliveryEvidenceStore {
             queue.sync {
                 let at = event.watchTimestamp ?? clock()
                 if isRuntimeStop {
-                    let domain = event.errorDomain.map {
-                        ["WKExtendedRuntimeSessionErrorDomain", "WKErrorDomain"].contains($0) ? $0 : "other"
-                    }
+                    let domain = LibreWatchDiagnosticErrorDomain.export(event.errorDomain, for: event.kind)
                     metadata.lastRuntimeStop = WatchDeliveryEvidenceRuntimeStop(origin: origin, at: at,
                         context: event.runtimeDiagnostic, reason: event.runtimeInvalidationReason,
                         errorDomain: domain, errorCode: event.errorCode)

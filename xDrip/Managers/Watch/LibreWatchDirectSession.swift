@@ -138,6 +138,33 @@ enum LibreWatchDiagnosticEventKind: String, Codable, Equatable {
     case journalRotated
 }
 
+/// Preserve a bounded Apple system error domain in runtime diagnostics without exporting
+/// free-form NSError descriptions or accepting arbitrary strings from another process.
+enum LibreWatchDiagnosticErrorDomain {
+    private static let known: Set<String> = [
+        "CBErrorDomain", "CBATTErrorDomain", "WKErrorDomain", "WCErrorDomain",
+        "WKExtendedRuntimeSessionErrorDomain"
+    ]
+    private static let runtimeFoundationDomains: Set<String> = [
+        "NSCocoaErrorDomain", "NSPOSIXErrorDomain", "NSOSStatusErrorDomain"
+    ]
+    private static let systemDomainCharacters = CharacterSet(
+        charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-"
+    )
+
+    static func export(_ domain: String?, for kind: LibreWatchDiagnosticEventKind) -> String? {
+        guard let domain else { return nil }
+        if known.contains(domain) { return domain }
+        guard kind == .extendedRuntimeInvalidated else { return "other" }
+        if runtimeFoundationDomains.contains(domain) { return domain }
+        guard domain.hasPrefix("com.apple."), domain.utf8.count <= 128,
+              domain.count > "com.apple.".count,
+              domain.unicodeScalars.allSatisfy({ systemDomainCharacters.contains($0) })
+        else { return "other" }
+        return domain
+    }
+}
+
 /// Return diagnostics are not BLE recovery attempts. Keep the wire event kind compatible
 /// with older phones; this optional, typed context adds no ownership or transport authority.
 struct LibreWatchReturnDiagnostic: Codable, Equatable {
