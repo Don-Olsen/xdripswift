@@ -138,6 +138,71 @@ En processing-timeout registreres som faktisk modtaget/behandles, ikke som
 mislykket upload. `status` gemmer Apples observerede status i PROJECT-STATUS.md
 og laver/pusher en separat dokumentationscommit uden at flytte release-tagget.
 
+## Automatisk og selektiv oprydning efter TestFlight
+
+Efter en fuldført statuscommit/push med `Internal / Testing` forsøger
+`release-testflight.py` automatisk oprydning. Den installerede app ændres ikke.
+Det aktuelle build bevares fuldstændigt, også DerivedData, den eksterne lokale
+signeringsmappe og verifikationsudpakningen. Nyere lokale builds bevares også.
+
+Oprydningen omfatter kun dette worktrees `build/testflight-<version>-<nummer>`
+med lavere nummer end det aktive build, en afsluttet `status-recorded` /
+`internal-testing`-kvittering, korrekt Git-tag, verificeret IPA-hash, eksisterende
+XCArchive/dSYMs, XCResult og Apple-status. Fejlede, uafsluttede, ukendte og
+historiske lokale buildmapper samt andre worktrees og globale Xcode-caches
+ryddes ikke automatisk. Et tidligere eksternt signeringsoutput accepteres kun,
+når build-linket matcher den registrerede sti og ikke overlapper et beskyttet build.
+
+Der slettes **kun enkelte gendannelige cachefiler**, aldrig hele DerivedData:
+compiler-/SDK-moduler, indeks- og compilercache samt objekt-, dependency- og
+Swift-modulfiler under `Build/Intermediates.noindex`. Logs, JSON, kildefiler,
+diagnosefiler, plist, databaser, `TestResults`, `Build/Products`, dSYM, IPA,
+XCArchive, XCResult og øvrige ukendte filer bliver liggende. Produktlinks
+følges ikke; links i kandidatcache, hardlinks eller uklare stier afviser den
+pågældende release. Derfor forsvinder DerivedData-mappen ikke nødvendigvis.
+
+Før første sletning kræves en frisk, skrivebeskyttet officiel Apple-kontrol af
+aktuelt build og Ole Internal. Et nyere/ukendt Apple-build eller upload,
+API-fejl, åbent Xcode, build/test/signering/uploadproces, åbne filer i kandidatens
+DerivedData eller uklar proces-/filkontrol stopper uden sletning. Hele planen
+kontrolleres før første unlink. Processer kontrolleres igen under oprydningen;
+opstår en blokering senere, stoppes yderligere sletning, og allerede slettede
+cachefiler fremgår af rapporten. En ekstern manuelt startet Xcode-proces kan
+ikke låses af Python; luk derfor Xcode og undlad manuelle builds under oprydning.
+
+`local-build.sh`, release-scriptet og oprydningen deler en eksklusiv værtslås
+(`/private/tmp/xdrip-build-cleanup-<uid>.lock`). Underprocesser arver den åbne lås.
+Et nyt forløb kan ikke starte gennem disse scripts, mens et andet forløb holder
+låsen. Låsefilen må ikke slettes for at omgå et aktivt forløb. En kernel-lås
+frigives, når sidste proces med den åbne lås afslutter.
+
+Git-status, HEAD, index og refs for alle registrerede worktrees kontrolleres før
+og efter. Flyttede historiske worktrees inspiceres via deres eksisterende
+Git-administration uden at reparere eller prune metadata. Alle bevarede
+releasefiler får desuden en før/efter-metadatafingerprint; IPA-indhold verificeres
+særskilt for sletningskandidater. Hver kørsel gemmer `report.json` med den præcise
+plan og en `deleted.jsonl` med faktisk slettede stier under
+`build/release-automation/cleanup/`. Rapporter indeholder både slettede filers
+allokerede byteantal og den observerede ændring i ledig diskplads. APFS-snapshots,
+kloner og andet diskforbrug kan få tallene til at afvige.
+
+En afvist automatisk oprydning registreres som `blocked-*.json`; den ændrer ikke
+den færdige release og starter aldrig upload igen. Efter årsagen er afklaret:
+
+```sh
+# Plan og kontroller; ingen sletning eller nyt build:
+python3 -B scripts/release-testflight.py cleanup
+# Udfør samme kontroller igen og slet de godkendte cachefiler:
+python3 -B scripts/release-testflight.py cleanup --apply
+```
+
+Offline validering uden TestFlight-build: `scripts/local-build.sh python`.
+Oprydningstests bruger udelukkende syntetiske midlertidige mapper og mocked Apple;
+de tester bevaring, proces-/API-spærrer, manglende artefakter, forkert IPA,
+symlinks, hardlinks, ændrede filer, lås, gentagen kørsel og automatisk release-hook.
+Arkiver, IPA og diagnosehistorik vil fortsat vokse over tid. Flytning til et
+verificeret eksternt arkiv kræver en særskilt aftale og udføres ikke af denne regel.
+
 ## App Store Connect API-adgang
 
 Apples offentlige REST API kræver en Apple-udstedt ES256 `.p8`-nøgle; der findes ikke en understøttet

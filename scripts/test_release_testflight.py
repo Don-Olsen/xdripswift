@@ -73,6 +73,14 @@ class ReleaseGuardTests(unittest.TestCase):
         self.client = mock.Mock()
         self.client.snapshot.return_value = self.snapshot()
         self.client.upload_auth_args.return_value = ["--apiKey", "SYNTHETIC", "--apiIssuer", "synthetic-issuer"]
+        # Cleanup is exercised separately on synthetic trees, never real host data/API.
+        patch = mock.patch.object(release, "cleanup")
+        self.cleanup_mock = patch.start()
+        self.addCleanup(patch.stop)
+        api_patch = mock.patch.object(release, "apple_client", return_value=self.client)
+        api_patch.start()
+        self.addCleanup(api_patch.stop)
+
 
     def git(self, *args):
         return subprocess.check_output(["git", *args], cwd=self.root,
@@ -643,6 +651,27 @@ class ReleaseGuardTests(unittest.TestCase):
         self.assertIn("Internal / Testing", document)
         self.assertIn("Ole Internal er bekræftet tilknyttet", document)
         self.assertEqual(state["appleStatus"], "internal-testing")
+        self.cleanup_mock.assert_called_with(self.root, self.client, apply=True)
+
+    def test_cleanup_hook_only_runs_after_completed_internal_release(self):
+        for state in ({"step":"uploaded", "appleStatus":"internal-testing"},
+                      {"step":"status-recorded", "appleStatus":"processing"}):
+            release.cleanup_after_release(state)
+        self.cleanup_mock.assert_not_called()
+        release.cleanup_after_release({"step":"status-recorded","appleStatus":"internal-testing","build":"4264"})
+        self.cleanup_mock.assert_called_once_with(self.root,self.client,apply=True)
+
+    def test_cleanup_refusal_records_block_without_changing_release_or_uploading(self):
+        state={"step":"status-recorded","appleStatus":"internal-testing","build":"4264"}
+        original=dict(state)
+        self.cleanup_mock.side_effect=release.CleanupBlocked("Xcode is open")
+        with mock.patch.object(release,"upload") as upload:
+            release.cleanup_after_release(state)
+            upload.assert_not_called()
+        self.assertEqual(state,original)
+        reports=list((self.root/"build/release-automation/cleanup").glob("blocked-*.json"))
+        self.assertEqual(json.loads(reports[0].read_text())["status"],"blocked")
+
 
 
 if __name__ == "__main__":

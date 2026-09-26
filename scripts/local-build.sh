@@ -4,6 +4,15 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
+# Re-exec under the host-wide lock. A release parent passes the same open lock.
+if [[ -z "${XDRIP_BUILD_LOCK_FD:-}" ]]; then
+  exec python3 -B "$repo_root/scripts/build_lock.py" /bin/bash "$0" "$@"
+fi
+python3 -B -c 'import sys; sys.path.insert(0, "scripts"); from build_lock import inherited_fd; inherited_fd()'
+# The waiting shell retains the lock; long-lived Xcode helpers do not inherit it.
+xcodebuild() { python3 -B "$repo_root/scripts/build_lock.py" --child xcodebuild "$@"; }
+xcrun() { python3 -B "$repo_root/scripts/build_lock.py" --child xcrun "$@"; }
+
 
 team_id="GFZ896KN66"
 main_bundle_id="com.GFZ896KN66.xdripswift"
@@ -112,6 +121,8 @@ show_status() {
 }
 
 run_python_checks() {
+  python3 -B scripts/test_release_cleanup.py 2>&1 \
+    | tee "$logs_dir/python-release-cleanup.log"
   set -o pipefail
   python3 -B scripts/test-check-apple-processing.py 2>&1 \
     | tee "$logs_dir/python-check-apple-processing.log"

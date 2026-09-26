@@ -1,3 +1,30 @@
+## Selektiv release-cacheoprydning, 26. september 2026
+
+Build 4275 blev frisk bekræftet via Apples officielle API som VALID,
+INTERNAL_ONLY og IN_BETA_TESTING med Ole Internal-tilknytning kl. 08:36 UTC.
+Den autoriserede oprydningskommando afviste derefter sletning, fordi Xcode
+og SWBBuildService stadig kørte. **Ingen projekt-/releasefiler blev slettet;
+frigivet plads er 0 byte.** En skrivebeskyttet optælling fandt cirka 11,7 GiB
+kendte cachefiler i de afsluttede builds 4266, 4268–4273. Hele 4275 og det
+ufuldendte 4274-forsøg samt øvrige uklare/historiske mapper er bevaret.
+Detaljer, præcise stier og valideringslog ligger i den ignorerede lokale mappe
+`build/release-automation/cleanup/20260926-safety-review/`.
+
+Release-automationen forsøger nu selektiv oprydning efter en fuldført
+Internal / Testing-statuscommit/push. Den kræver frisk Apple-status,
+bevarede arkiver/IPA/testresultater, proces- og åben-filkontrol samt fælles
+værtslås med buildscriptet. Hele DerivedData slettes aldrig: logs, JSON,
+dSYM, produkter, testmateriale og ukendte filer bevares. Git og bevarede
+releasefiler kontrolleres før/efter; hver slettet cachefil registreres.
+Se den fulde regel og genoptagelseskommando i MAC-BUILD.md.
+
+26 isolerede oprydnings-/låse-/proceskontroller, 28 release-tests,
+12 processing-tests og 40 Apple-klienttests samt de eksisterende
+self-tests bestod. Intet Xcode-/TestFlight-build eller upload blev startet.
+Dette ændrer kun lokal release-automatisering, ikke den installerede 4275-app.
+Oprydningen afventer lukning af Xcode; kør derefter `cleanup --apply`,
+ikke en ny `release`, for at gentage alle kontroller og frigive cachepladsen.
+
 <!-- testflight-7.1.1-4275:start -->
 ### TestFlight 7.1.1 (4275)
 

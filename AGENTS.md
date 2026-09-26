@@ -34,3 +34,11 @@ status commits and verify push/tag workflow triggers remain inactive.
 7.0.0 (4263) predates this rule and was built from local integration changes.
 Never retroactively describe it as tag-built. Its permanent checkpoint is
 `checkpoint/post-testflight-4263`; leave it untouched.
+
+After a completed Internal / Testing status commit/push, the release script
+automatically attempts selective older-release cache cleanup. See MAC-BUILD.md.
+Keep the current build in full; preserve all release/test/diagnostic artifacts.
+Use `release-testflight.py cleanup` for a dry-run, `cleanup --apply` to execute.
+Never bypass the shared build lock, process/open-file checks or Apple checks.
+An uncertain or blocked cleanup does not imply an upload failure; never restart
+a release to retry cleanup. Historical/unknown build directories stay untouched.

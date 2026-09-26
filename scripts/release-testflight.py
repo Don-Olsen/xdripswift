@@ -19,6 +19,8 @@ import tempfile
 import time
 
 from apple_release import AppleClient, AppleError
+from build_lock import build_lock, pass_fds
+from release_cleanup import cleanup, CleanupBlocked
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -41,12 +43,12 @@ def run(args, *, output=False, env=None, log=None):
     if log is None:
         result = subprocess.run(args, cwd=ROOT, env=env, text=True,
                                 stdout=subprocess.PIPE if output else None,
-                                check=True)
+                                pass_fds=pass_fds(), check=True)
         return result.stdout.strip() if output else ""
     log.parent.mkdir(parents=True, exist_ok=True)
     with log.open("w", encoding="utf-8") as stream:
         return subprocess.run(args, cwd=ROOT, env=env, text=True,
-                              stdout=stream, stderr=subprocess.STDOUT).returncode
+                              stdout=stream, stderr=subprocess.STDOUT, pass_fds=pass_fds()).returncode
 
 
 def git(*args):
@@ -717,6 +719,7 @@ def status(root, path, state, observation=None):
                  statusCommit=git("rev-parse", "HEAD"))
     save_state(path, state)
     print("Recorded Apple status without moving the TestFlight tag:", labels[value])
+    cleanup_after_release(state)
 
 
 def release_all():
@@ -763,12 +766,31 @@ def release_all():
     fail("repeated concurrent Apple build collisions; no further automatic upload attempts")
 
 
+def cleanup_after_release(state):
+    if state.get("step") != "status-recorded" or state.get("appleStatus") != "internal-testing":
+        return
+    try:
+        cleanup(ROOT, apple_client(), apply=True)
+    except (CleanupBlocked, AppleError, OSError, ValueError, KeyError, RuntimeError) as error:
+        # A cleanup refusal must never re-run an upload or misreport release failure.
+        print("Cleanup stopped; release remains completed: " + str(error), flush=True)
+        report = ROOT / "build/release-automation/cleanup" / ("blocked-" + str(time.time_ns()) + ".json")
+        save_state(report, {"status": "blocked", "observedAt": utc_now(),
+                            "reason": str(error), "currentBuild": state["build"]})
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("check", "apple-status", "prepare", "release", "checkpoint", "publish", "build", "verify", "upload", "status"))
+    parser.add_argument("command", choices=("check", "apple-status", "prepare", "release", "checkpoint", "publish", "build", "verify", "upload", "status", "cleanup"))
+    parser.add_argument("--apply", action="store_true", help="Apply cleanup; cleanup defaults to dry-run")
     args = parser.parse_args()
+    if args.apply and args.command != "cleanup":
+        parser.error("--apply is only valid for cleanup")
     os.chdir(ROOT)
     ensure_origin()
+    if args.command == "cleanup":
+        cleanup(ROOT, apple_client(), apply=args.apply)
+        return
     if args.command == "release":
         release_all()
         return
@@ -804,8 +826,9 @@ def main():
 
 if __name__ == "__main__":
     try:
-        main()
+        with build_lock():
+            main()
     except subprocess.CalledProcessError as exc:
         fail(f"command failed ({exc.returncode}): {' '.join(map(str, exc.cmd))}")
-    except (AppleError, SlotOccupied) as exc:
+    except (AppleError, SlotOccupied, CleanupBlocked, RuntimeError) as exc:
         fail(str(exc))
