@@ -201,6 +201,8 @@ class ReleaseGuardTests(unittest.TestCase):
 
             self.assertTrue((root / "build").is_symlink())
             self.assertEqual((root / "build").resolve(), target.resolve())
+            self.assertTrue((root / "verify").is_symlink())
+            self.assertEqual((root / "verify").resolve(), (target / "verification").resolve())
             self.assertEqual(state["signingOutputRoot"], str(target.resolve()))
             self.assertEqual(state["ipa"], str(root / "build/export/xdrip.ipa"))
             self.assertEqual(state["exportUploadID"], pending["id"])
@@ -217,6 +219,7 @@ class ReleaseGuardTests(unittest.TestCase):
                             with self.assertRaises(SystemExit):
                                 release.build(root, root / "release-state.json", state)
         self.assertFalse((root / "build").exists())
+        self.assertFalse((root / "verify").exists())
 
     def test_upload_accepts_only_xcodes_recorded_empty_export_slot(self):
         root, _, _, state = self.artifacts()

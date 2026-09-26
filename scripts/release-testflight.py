@@ -450,7 +450,10 @@ def build(root, path, state):
         fail("build output already exists; inspect it instead of overwriting it")
     external_output = os.environ.get("XDRIP_SIGNING_OUTPUT_ROOT")
     target = None
+    verify_output = root / "verify"
     if external_output:
+        if verify_output.exists() or verify_output.is_symlink():
+            fail("verification output already exists; inspect it instead of overwriting it")
         requested = Path(external_output).expanduser()
         if not requested.is_absolute():
             fail("XDRIP_SIGNING_OUTPUT_ROOT must be an absolute path")
@@ -480,7 +483,10 @@ def build(root, path, state):
         # File Provider folders can attach FinderInfo to generated app bundles, which
         # codesign rejects. Keep the release path stable while signing on local storage.
         target.mkdir(mode=0o700, parents=True)
+        verification_target = target / "verification"
+        verification_target.mkdir(mode=0o700)
         output.symlink_to(target, target_is_directory=True)
+        verify_output.symlink_to(verification_target, target_is_directory=True)
     run([str(ROOT / "scripts/local-build.sh"), "archive"], env=env)
     ipa_files = list((output / "export").glob("*.ipa"))
     if len(ipa_files) != 1:

@@ -69,6 +69,14 @@ lokal, vedvarende mappe uden for File Provider via
 er uændrede. Da procesændringen er ny kildekode efter det uforanderlige
 4274-tag, skal et senere build allokeres og testes fuldt igen.
 
+Build 4275 blev arkiveret og eksporteret fra den lokale mappe, men den første
+udpakning til den afsluttende `codesign --verify` skete stadig i File Provider
+og fik igen `FinderInfo`. Den fejlede udpakning er bevaret; et link til en ny
+lokal verifikationsmappe gjorde det muligt at gennemføre den uændrede
+release-verifikation og upload. Efter 4275-tagget er release-scriptet rettet,
+så fremtidige builds opretter både build- og verify-link automatisk. Dette er
+kun release-automatisering; den installerede 4275-app er uændret.
+
 De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
 
 ## Afgrænset genoprettelse af fastlåst Watch-forbindelse efter 4272
