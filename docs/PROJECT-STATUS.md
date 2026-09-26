@@ -8,6 +8,21 @@
 - Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
 <!-- testflight-7.1.1-4276:end -->
 
+## Lokal Watch-genopkobling efter 4276-testen
+
+Testen viste 56 af 62 sensor-minutter og to uplanlagte afbrydelser under
+aktiv udvidet runtime. Alle 56 indsamlede målinger nåede iPhone. Den lokale
+rettelse giver efter bekræftet cancellation én ekstra, tidsbegrænset
+forbindelsesrunde til den tidligere frame-bekræftede sensor, før scan bruges
+som fallback. Der ændres ikke runtime-type, timeoutgrænser eller databehandling.
+
+Før release bestod 1067/1067 lokale tests samt iPhone- og
+Watch-simulatorbuilds. Den efterfølgende releasekvittering står øverst i
+dokumentet. Fysisk forbedring er endnu ikke påvist; næste Watch-test bør
+vare 80–90 minutter med den nye version. Se
+[analyse, sikkerhedsgrænser og validering](WATCH-RECONNECT-4276-REVIEW.md).
+
+
 De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
 
 ## Afgrænset intern test af Watch-runtime

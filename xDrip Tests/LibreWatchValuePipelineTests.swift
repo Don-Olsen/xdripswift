@@ -1302,6 +1302,247 @@ extension LibreWatchValuePipelineTests {
     }
 }
 
+private final class LibreWatchKnownPeripheralTestDriver {
+    typealias Recovery = LibreWatchKnownPeripheralRecovery<LibreWatchDiscoveryTestPeripheral>
+    let recovery = Recovery()
+    let peripheral = LibreWatchDiscoveryTestPeripheral()
+    var session: LibreWatchDirectSession
+    var centralInstanceID = UUID()
+    var generation = UUID()
+    var ownership: LibreWatchOwnership = .watch
+    var poweredOn = true
+    var recoveryIsAllowed = true
+    var retiredPeripheralIsReleased = true
+
+    init(session: LibreWatchDirectSession) { self.session = session }
+
+    var context: Recovery.Context {
+        .init(session: session, centralInstanceID: centralInstanceID, generation: generation,
+              ownership: ownership, bluetoothIsPoweredOn: poweredOn, recoveryIsAllowed: recoveryIsAllowed)
+    }
+
+    func frame() {
+        recovery.recordValidFrame(from: peripheral, observedName: session.expectedPeripheralName, context: context)
+    }
+
+    @discardableResult
+    func prepare(phase: LibreWatchConnectionTiming.Phase? = .connection,
+                 systemReconnect: Bool = true) -> Bool {
+        recovery.prepareForCancellation(of: peripheral, context: context,
+                                        phase: phase, systemReconnectIsActive: systemReconnect)
+    }
+
+    func consume(_ outcome: LibreWatchConnectionTiming.CancellationResult = .confirmedDisconnected)
+        -> Recovery.Candidate? {
+        recovery.consumeAfterCancellation(of: peripheral, context: context, outcome: outcome,
+            peripheralIsDisconnected: peripheral.isDisconnected,
+            retiredPeripheralIsReleased: retiredPeripheralIsReleased)
+    }
+}
+
+extension LibreWatchValuePipelineTests {
+    func test4276StalledSystemReconnectsCanRetryKnownSensorBeforeAnotherAdvertisement() throws {
+        // Replay the two stalled system attempts; the scan in 4276 discovered the sensor
+        // 130 and 97 seconds after cancellation. Do not simulate a successful radio link.
+        for scanDelay: TimeInterval in [130, 97] {
+            let driver = LibreWatchKnownPeripheralTestDriver(session: session)
+            var timing = LibreWatchConnectionTiming()
+            driver.frame()
+            let receivingGeneration = driver.generation
+            timing.beginConnection(at: receivedAt, applicationIsActive: false,
+                executionIsAvailable: true, monotonicTime: 1_000)
+            driver.generation = timing.generation
+            XCTAssertNotEqual(driver.generation, receivingGeneration)
+            let deadline = try XCTUnwrap(timing.deadline)
+            XCTAssertEqual(deadline.expiresAt.timeIntervalSince(receivedAt), 90)
+            XCTAssertTrue(timing.timeoutIsCurrent(deadline, ownership: .watch, cancelling: false,
+                at: receivedAt.addingTimeInterval(90), monotonicTime: 1_090))
+            XCTAssertTrue(driver.prepare())
+            timing.beginCancellation(at: receivedAt.addingTimeInterval(90))
+            let cancellation = try XCTUnwrap(timing.deadline)
+            let confirmedAt = receivedAt.addingTimeInterval(91)
+            let outcome = try XCTUnwrap(timing.finishCancellation(cancellation, ownership: .watch,
+                returningToPhone: false, peripheralIsDisconnected: true, at: confirmedAt))
+            XCTAssertEqual(outcome, .confirmedDisconnected)
+            // As in the collector, driver.context still represents the cancelled generation.
+            let candidate = try XCTUnwrap(driver.consume(outcome))
+            XCTAssertTrue(candidate.peripheral === driver.peripheral)
+            XCTAssertEqual(candidate.observedName, session.expectedPeripheralName)
+            timing.beginConnection(at: confirmedAt, applicationIsActive: false,
+                executionIsAvailable: true, monotonicTime: 1_091)
+            XCTAssertTrue(timing.canConnect(at: confirmedAt, peripheralIsDisconnected: true,
+                retiredPeripheralIsReleased: true, monotonicTime: 1_091))
+            XCTAssertLessThan(confirmedAt, receivedAt.addingTimeInterval(90 + scanDelay))
+            XCTAssertEqual(timing.phase, .connection) // not receiving until real GATT/frame evidence
+            XCTAssertEqual(timing.executionBudget?.remaining, 90)
+        }
+    }
+
+    func testKnownPeripheralRetryIsConsumedOnceAndOnlyValidFrameReplenishesIt() throws {
+        let driver = LibreWatchKnownPeripheralTestDriver(session: session)
+        driver.frame()
+        XCTAssertTrue(driver.prepare())
+        XCTAssertNotNil(driver.consume())
+        XCTAssertNil(driver.consume()) // duplicate legacy/modern cancellation callback
+        driver.generation = UUID()
+        // didConnect, setup, and a later stalled system reconnect without a new valid frame
+        // must not create an unlimited cancel/connect cycle.
+        XCTAssertFalse(driver.prepare())
+        XCTAssertNil(driver.consume())
+        driver.frame()
+        XCTAssertTrue(driver.prepare())
+        XCTAssertNotNil(driver.consume())
+    }
+
+    func testKnownPeripheralRetryRequiresAValidFrameAndAnObservedMatchingName() {
+        let driver = LibreWatchKnownPeripheralTestDriver(session: session)
+        XCTAssertFalse(driver.prepare())
+        for name: String? in [nil, "001122334455"] {
+            driver.recovery.recordValidFrame(from: driver.peripheral, observedName: name, context: driver.context)
+            XCTAssertFalse(driver.prepare())
+            XCTAssertNil(driver.consume())
+        }
+        driver.recovery.recordValidFrame(from: driver.peripheral,
+            observedName: session.expectedPeripheralName.lowercased(), context: driver.context)
+        XCTAssertTrue(driver.prepare())
+        XCTAssertEqual(driver.consume()?.observedName, session.expectedPeripheralName.lowercased())
+    }
+
+    func testFirstConnectionGATTAndLivenessRecoveryRetainExistingScanFallback() {
+        let driver = LibreWatchKnownPeripheralTestDriver(session: session)
+        for phase: LibreWatchConnectionTiming.Phase? in [nil, .services, .characteristics,
+                .notifications, .unlock, .receiving, .cancelling] {
+            driver.frame()
+            XCTAssertFalse(driver.prepare(phase: phase))
+            XCTAssertNil(driver.consume())
+        }
+        driver.frame()
+        XCTAssertFalse(driver.prepare(systemReconnect: false))
+        XCTAssertNil(driver.consume())
+    }
+
+    func testKnownPeripheralRetryNeverUsesUnconfirmedCancellationOrOutstandingRetirement() {
+        for outcome in [LibreWatchConnectionTiming.CancellationResult.retireForScan, .awaitConfirmedDisconnection] {
+            let driver = LibreWatchKnownPeripheralTestDriver(session: session)
+            driver.frame()
+            XCTAssertTrue(driver.prepare())
+            XCTAssertNil(driver.consume(outcome))
+            XCTAssertNil(driver.consume()) // late proof cannot resurrect a retired ticket
+        }
+        for nativeStillConnected in [false, true] {
+            let driver = LibreWatchKnownPeripheralTestDriver(session: session)
+            driver.frame()
+            XCTAssertTrue(driver.prepare())
+            driver.peripheral.isDisconnected = !nativeStillConnected
+            driver.retiredPeripheralIsReleased = nativeStillConnected
+            XCTAssertNil(driver.consume())
+            driver.peripheral.isDisconnected = true
+            driver.retiredPeripheralIsReleased = true
+            XCTAssertNil(driver.consume())
+        }
+    }
+
+    func testKnownPeripheralRetryRejectsEveryNonWatchOwnerIncludingPhoneReturn() {
+        for owner in [LibreWatchOwnership.iphone, .releasingToPhone, .releasingToWatch, .recovery] {
+            let driver = LibreWatchKnownPeripheralTestDriver(session: session)
+            driver.frame()
+            XCTAssertTrue(driver.prepare())
+            driver.ownership = owner
+            XCTAssertNil(driver.consume())
+            driver.ownership = .watch
+            XCTAssertNil(driver.consume())
+            XCTAssertFalse(driver.prepare())
+        }
+    }
+
+    func testKnownPeripheralRetryRejectsChangedSessionSensorCentralAndCancellationGeneration() {
+        for change in 0..<4 {
+            let driver = LibreWatchKnownPeripheralTestDriver(session: session)
+            driver.frame()
+            XCTAssertTrue(driver.prepare())
+            if change < 2 {
+                driver.session = LibreWatchDirectSession(
+                    id: change == 0 ? UUID() : session.id, createdAt: session.createdAt,
+                    sensorUID: change == 1 ? Data(repeating: 9, count: 8) : session.sensorUID,
+                    patchInfo: session.patchInfo, sensorSerialNumber: session.sensorSerialNumber,
+                    sensorTypeRawValue: session.sensorTypeRawValue,
+                    expectedPeripheralName: session.expectedPeripheralName, unlockCode: session.unlockCode,
+                    unlockCount: session.unlockCount, algorithmParameters: session.algorithmParameters)
+            } else if change == 2 {
+                driver.centralInstanceID = UUID()
+            } else {
+                driver.generation = UUID()
+            }
+            XCTAssertNil(driver.consume())
+            XCTAssertFalse(driver.prepare())
+        }
+    }
+
+    func testKnownPeripheralRetryRejectsDifferentNativeObjectEvenWithSameSensorName() {
+        let driver = LibreWatchKnownPeripheralTestDriver(session: session)
+        let replacement = LibreWatchDiscoveryTestPeripheral()
+        driver.frame()
+        XCTAssertFalse(driver.recovery.prepareForCancellation(of: replacement, context: driver.context,
+            phase: .connection, systemReconnectIsActive: true))
+        driver.frame()
+        XCTAssertTrue(driver.prepare())
+        XCTAssertNil(driver.recovery.consumeAfterCancellation(of: replacement, context: driver.context,
+            outcome: .confirmedDisconnected, peripheralIsDisconnected: true, retiredPeripheralIsReleased: true))
+        XCTAssertNil(driver.consume())
+    }
+
+    func testKnownPeripheralRetryRejectsPowerLossOrNoExecutionOpportunity() {
+        for losesPower in [false, true] {
+            let driver = LibreWatchKnownPeripheralTestDriver(session: session)
+            driver.frame()
+            XCTAssertTrue(driver.prepare())
+            if losesPower { driver.poweredOn = false } else { driver.recoveryIsAllowed = false }
+            XCTAssertNil(driver.consume())
+            driver.poweredOn = true
+            driver.recoveryIsAllowed = true
+            XCTAssertNil(driver.consume())
+        }
+    }
+
+    func testKnownPeripheralRetryCannotCarryFrameEvidenceAcrossCentralChangeBeforeCancellation() {
+        let driver = LibreWatchKnownPeripheralTestDriver(session: session)
+        driver.frame()
+        driver.centralInstanceID = UUID()
+        XCTAssertFalse(driver.prepare())
+        XCTAssertNil(driver.consume())
+    }
+
+    func testKnownPeripheralRetryInvalidationClearsBothFrameEvidenceAndPreparedRetry() {
+        let driver = LibreWatchKnownPeripheralTestDriver(session: session)
+        driver.frame()
+        driver.recovery.invalidate()
+        XCTAssertFalse(driver.prepare())
+        driver.frame()
+        XCTAssertTrue(driver.prepare())
+        driver.recovery.invalidate()
+        XCTAssertNil(driver.consume())
+    }
+
+    func testKnownPeripheralRetryAllowsUnlockCounterRefreshButKeepsNormalRetryDeadline() throws {
+        let driver = LibreWatchKnownPeripheralTestDriver(session: session)
+        driver.frame()
+        driver.session.unlockCount += 1
+        XCTAssertTrue(driver.prepare())
+        XCTAssertNotNil(driver.consume())
+        var timing = LibreWatchConnectionTiming()
+        timing.beginConnection(at: receivedAt, applicationIsActive: false,
+            executionIsAvailable: true, monotonicTime: 100)
+        let deadline = try XCTUnwrap(timing.deadline)
+        // An immediate failed-connect callback stays within the same 90-second budget.
+        timing.beginConnection(at: receivedAt.addingTimeInterval(60), applicationIsActive: false,
+            executionIsAvailable: true, monotonicTime: 160)
+        XCTAssertEqual(timing.deadline, deadline)
+        XCTAssertEqual(timing.failedConnectionAction(at: receivedAt.addingTimeInterval(90),
+            bluetoothIsPoweredOn: true, monotonicTime: 190), .scanConfirmedSensor)
+        XCTAssertFalse(driver.prepare())
+    }
+}
+
 final class LibreWatchValuePipelineTests: XCTestCase {
     private let receivedAt = Date(timeIntervalSince1970: 1_788_333_200)
 

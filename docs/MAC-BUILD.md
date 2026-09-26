@@ -153,13 +153,17 @@ historiske lokale buildmapper samt andre worktrees og globale Xcode-caches
 ryddes ikke automatisk. Et tidligere eksternt signeringsoutput accepteres kun,
 når build-linket matcher den registrerede sti og ikke overlapper et beskyttet build.
 
-Der slettes **kun enkelte gendannelige cachefiler**, aldrig hele DerivedData:
-compiler-/SDK-moduler, indeks- og compilercache samt objekt-, dependency- og
-Swift-modulfiler under `Build/Intermediates.noindex`. Logs, JSON, kildefiler,
-diagnosefiler, plist, databaser, `TestResults`, `Build/Products`, dSYM, IPA,
-XCArchive, XCResult og øvrige ukendte filer bliver liggende. Produktlinks
-følges ikke; links i kandidatcache, hardlinks eller uklare stier afviser den
-pågældende release. Derfor forsvinder DerivedData-mappen ikke nødvendigvis.
+Der slettes kun navngivne, gendannelige filer fra **ældre afsluttede** builds,
+aldrig hele DerivedData: compiler-/SDK-moduler, indeks- og compilercache samt
+objekt-, dependency- og Swift-modulfiler under `Build/Intermediates.noindex`.
+Desuden må genererede filer under `Build/Products` ryddes, mens kilde-, log-,
+JSON-, plist-, database- og releaseartefakter bevares. Udvidede kopier af en IPA
+under `build/export-verification` eller `verify/ipa-*` må kun ryddes, hvis hver
+fil er byteidentisk med en fil i den bevarede, SHA-256-verificerede IPA, og der
+ikke findes ekstra filer. Derved bevares IPA, XCArchive, dSYM, XCResult, logs,
+JSON/status, kildekode og ukendte filer. Links, hardlinks og uklare stier afviser
+den pågældende release. Det aktuelle, nyere og uafsluttede build er urørt.
+Derfor forsvinder DerivedData-mappen ikke nødvendigvis.
 Filidentitet, type, størrelse og ændringstid kontrolleres før sletning;
 linkantallet kontrolleres igen ved hver fil. macOS File Provider kan ændre
 cachefilers metadata-ctime ved hydrering uden observeret ændring af
@@ -190,6 +194,26 @@ plan og en `deleted.jsonl` med faktisk slettede stier under
 `build/release-automation/cleanup/`. Rapporter indeholder både slettede filers
 allokerede byteantal og den observerede ændring i ledig diskplads. APFS-snapshots,
 kloner og andet diskforbrug kan få tallene til at afvige.
+
+Oprydningen forsøges efter hver verificeret Internal / Testing-release, også
+når buildområderne samlet er over 15 GiB. Rapporten måler buildområderne i
+alle registrerede worktrees og kendte eksterne signeringsmapper samt det
+centrale lokale buildområde. Hvis 15 GiB ikke kan nås med de godkendte
+sletteregler, rapporteres overskridelsen; der slettes ikke mere aggressivt.
+Den seneste tidligere verificerede release beholder IPA, XCArchive/dSYM,
+XCResult, logs og status. Ældre afsluttede releases beholder foreløbig også
+disse artefakter, da arkiver og testresultater endnu ikke er klassificeret som
+sikre at undvære ved symbolikering, geneksport og fejlsøgning.
+
+Nye almindelige lokale runs bruger som standard
+`~/DeveloperBuildData/xDrip/local-runs/<worktree>/<tidspunkt>/` til logs og
+resultater samt én genbrugt cache under
+`~/DeveloperBuildData/xDrip/DerivedData/<worktree>/`. Dermed dannes ikke en
+ny stor DerivedData for hvert lokalt run. `XDRIP_OUTPUT_ROOT` bevarer sin
+eksisterende betydning: når den er sat, ligger logs, resultater og DerivedData
+under den valgte sti, så TestFlight-flowet fortsat bruger samme layout.
+Signeringsoutput kan fortsat styres med `XDRIP_SIGNING_OUTPUT_ROOT`. Den
+centrale placering er på den interne disk og er ikke et eksternt backup-arkiv.
 
 En afvist automatisk oprydning registreres som `blocked-*.json`; den ændrer ikke
 den færdige release og starter aldrig upload igen. Efter årsagen er afklaret:

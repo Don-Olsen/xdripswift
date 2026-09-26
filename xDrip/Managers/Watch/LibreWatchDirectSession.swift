@@ -1841,6 +1841,83 @@ final class LibreWatchDiscoveryHandoff<Peripheral: AnyObject> {
     }
 }
 
+/// Allows one fresh attempt to the last frame-validated native peripheral after a stalled
+/// system reconnect has been cancelled and its disconnection confirmed. A failed attempt
+/// cannot replenish this opportunity; only another valid Libre frame can do that.
+final class LibreWatchKnownPeripheralRecovery<Peripheral: AnyObject> {
+    struct Context {
+        let session: LibreWatchDirectSession
+        let centralInstanceID: UUID
+        let generation: UUID
+        let ownership: LibreWatchOwnership
+        let bluetoothIsPoweredOn: Bool
+        let recoveryIsAllowed: Bool
+
+        fileprivate var isEligible: Bool {
+            ownership == .watch && bluetoothIsPoweredOn && recoveryIsAllowed && session.isValid
+        }
+    }
+
+    struct Candidate {
+        let peripheral: Peripheral
+        let observedName: String
+        fileprivate let context: Context
+    }
+
+    private var validated: Candidate?
+    private var pending: (candidate: Candidate, cancellationGeneration: UUID)?
+
+    func recordValidFrame(from peripheral: Peripheral, observedName: String?, context: Context?) {
+        invalidate()
+        guard let context, context.isEligible, let observedName,
+              context.session.matches(candidateName: observedName) else { return }
+        validated = Candidate(peripheral: peripheral, observedName: observedName, context: context)
+    }
+
+    @discardableResult
+    func prepareForCancellation(of peripheral: Peripheral, context: Context?,
+                                phase: LibreWatchConnectionTiming.Phase?,
+                                systemReconnectIsActive: Bool) -> Bool {
+        let candidate = validated
+        invalidate()
+        guard phase == .connection, systemReconnectIsActive,
+              let candidate, let context, context.isEligible,
+              candidate.peripheral === peripheral, belongsToSensor(candidate, context) else { return false }
+        // Recovery intentionally has a different generation from the last receiving phase.
+        // The cancellation itself must then finish within this exact new generation.
+        pending = (candidate, context.generation)
+        return true
+    }
+
+    func consumeAfterCancellation(of peripheral: Peripheral, context: Context?,
+                                  outcome: LibreWatchConnectionTiming.CancellationResult,
+                                  peripheralIsDisconnected: Bool,
+                                  retiredPeripheralIsReleased: Bool) -> Candidate? {
+        let attempt = pending
+        invalidate()
+        guard outcome == .confirmedDisconnected, peripheralIsDisconnected, retiredPeripheralIsReleased,
+              let attempt, let context, context.isEligible,
+              attempt.cancellationGeneration == context.generation,
+              attempt.candidate.peripheral === peripheral,
+              belongsToSensor(attempt.candidate, context) else { return nil }
+        // Consume before the collector performs any side effect. A duplicate cancel callback
+        // cannot start another connection or manufacture a fresh retry budget.
+        return attempt.candidate
+    }
+
+    func invalidate() {
+        validated = nil
+        pending = nil
+    }
+
+    private func belongsToSensor(_ candidate: Candidate, _ context: Context) -> Bool {
+        candidate.context.centralInstanceID == context.centralInstanceID &&
+            candidate.context.session.id == context.session.id &&
+            candidate.context.session.representsSameSensor(as: context.session) &&
+            context.session.matches(candidateName: candidate.observedName)
+    }
+}
+
 /// Connection/setup/technical-liveness timing; Bluetooth operations remain in the collector.
 struct LibreWatchConnectionTiming {
     enum Phase: String, Equatable {

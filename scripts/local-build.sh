@@ -18,10 +18,19 @@ team_id="GFZ896KN66"
 main_bundle_id="com.GFZ896KN66.xdripswift"
 workspace="$repo_root/xdrip.xcworkspace"
 run_stamp="$(date -u +%Y%m%dT%H%M%SZ)"
-output_root="${XDRIP_OUTPUT_ROOT:-$repo_root/build/local/$run_stamp}"
+if [[ -n "${XDRIP_OUTPUT_ROOT:-}" ]]; then
+  # Release jobs supply their own output root; preserve that layout exactly.
+  output_root="$XDRIP_OUTPUT_ROOT"
+  derived_data="$output_root/DerivedData"
+else
+  # Local runs share one cache per worktree instead of duplicating it per run.
+  worktree_key="$(basename "$repo_root")"
+  central_build_root="${HOME}/DeveloperBuildData/xDrip"
+  output_root="$central_build_root/local-runs/$worktree_key/$run_stamp"
+  derived_data="$central_build_root/DerivedData/$worktree_key"
+fi
 logs_dir="$output_root/logs"
 results_dir="$output_root/results"
-derived_data="$output_root/DerivedData"
 xcode_auth_args=(-allowProvisioningUpdates)
 
 mkdir -p "$logs_dir" "$results_dir" "$derived_data"
@@ -739,3 +748,4 @@ case "${1:-}" in
 esac
 
 echo "Artifacts: $output_root"
+echo "DerivedData: $derived_data"

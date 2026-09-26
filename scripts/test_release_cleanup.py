@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import zipfile
 from unittest import mock
 
 import release_cleanup as c
@@ -80,12 +81,13 @@ class CleanupTests(unittest.TestCase):
     def test_apply_removes_only_cache_and_preserves_current_and_evidence(self):
         current=self.manifest(self.current); before=self.manifest(self.old)
         result=c.cleanup(self.root,self.client,True)
-        self.assertEqual(result["deletedFiles"],3)
+        self.assertEqual(result["deletedFiles"],4)
         self.assertFalse(self.cache().exists())
         self.assertEqual(self.manifest(self.current),current)
         after=self.manifest(self.old)
         removed=set(before)-set(after)
-        self.assertTrue(all(c.disposable(Path(n).relative_to("test/DerivedData/all-tests")) for n in removed))
+        self.assertTrue(all(c.disposable(Path(n).relative_to("test/DerivedData/all-tests"))
+                            or n.endswith("Build/Products/app.app/binary") for n in removed))
         self.assertTrue(all(before[n]==v for n,v in after.items()))
         self.assertEqual(result["gitBefore"],result["gitAfter"])
         self.assertEqual(self.git("rev-parse","HEAD").strip(),self.head)
@@ -98,13 +100,49 @@ class CleanupTests(unittest.TestCase):
                             and item["reason"] == "latest previous verified build"
                             for item in result["kept"]))
 
+    def test_exact_ipa_extractions_are_reclaimed_but_ipa_and_archive_remain(self):
+        ipa = self.old / "build/export/xdrip.ipa"
+        with zipfile.ZipFile(ipa, "w") as package:
+            package.writestr("Payload/xdrip.app/xdrip", b"signed binary")
+            package.writestr("Payload/xdrip.app/Info.plist", b"signed plist")
+        state_path = self.old / "release-state.json"
+        state = json.loads(state_path.read_text())
+        state["ipaSha256"] = c.hash_file(ipa)
+        self.write(state_path, state)
+        for root in (self.old / "build/export-verification", self.old / "verify/ipa-fixture"):
+            (root / "Payload/xdrip.app").mkdir(parents=True)
+            (root / "Payload/xdrip.app/xdrip").write_bytes(b"signed binary")
+            (root / "Payload/xdrip.app/Info.plist").write_bytes(b"signed plist")
+        result = c.cleanup(self.root, self.client, True)
+        self.assertEqual(result["deletedFiles"], 8)
+        self.assertTrue(ipa.is_file())
+        self.assertTrue((self.old / "build/archive/xdrip.xcarchive/dSYMs").is_dir())
+        self.assertFalse((self.old / "verify/ipa-fixture/Payload/xdrip.app/xdrip").exists())
+        self.assertEqual(c.cleanup(self.root, self.client, True)["deletedFiles"], 0)
+        self.assertTrue(all("reason" in json.loads(line) for line in
+                            (Path(result["reportPath"]).parent / "deleted.jsonl").read_text().splitlines()))
+
+    def test_mismatched_ipa_copy_preserves_entire_old_release(self):
+        ipa = self.old / "build/export/xdrip.ipa"
+        with zipfile.ZipFile(ipa, "w") as package:
+            package.writestr("Payload/xdrip.app/xdrip", b"original")
+        state_path = self.old / "release-state.json"
+        state = json.loads(state_path.read_text()); state["ipaSha256"] = c.hash_file(ipa)
+        self.write(state_path, state)
+        copy = self.old / "build/export-verification/Payload/xdrip.app/xdrip"
+        copy.parent.mkdir(parents=True); copy.write_bytes(b"different")
+        result = c.cleanup(self.root, self.client, True)
+        self.assertEqual(result["deletedFiles"], 0)
+        self.assertTrue(copy.exists())
+        self.assertTrue(self.cache().exists())
+
     def test_finder_metadata_does_not_block_or_get_deleted(self):
         finder = self.old / "test/DerivedData/.DS_Store"
         finder.write_bytes(b"finder")
         nested = self.old / "test/DerivedData/all-tests/.DS_Store"
         nested.write_bytes(b"finder")
         result = c.cleanup(self.root, self.client, True)
-        self.assertEqual(result["deletedFiles"], 3)
+        self.assertEqual(result["deletedFiles"], 4)
         self.assertEqual(finder.read_bytes(), b"finder")
         self.assertEqual(nested.read_bytes(), b"finder")
 
@@ -116,6 +154,23 @@ class CleanupTests(unittest.TestCase):
     def test_second_apply_is_idempotent(self):
         c.cleanup(self.root,self.client,True)
         self.assertEqual(c.cleanup(self.root,self.client,True)["deletedFiles"],0)
+
+    def test_space_limit_reports_protected_residue_without_extra_deletion(self):
+        current = self.manifest(self.current)
+        with mock.patch.object(c, "BUILD_AREA_LIMIT_BYTES", 1):
+            result = c.cleanup(self.root, self.client, True)
+        self.assertGreater(result["buildAreaAfter"]["overLimitBytes"], 0)
+        self.assertIn("limit-unmet", result["spaceLimitResult"])
+        self.assertEqual(self.manifest(self.current), current)
+        self.assertEqual(result["deletedFiles"], 4)
+
+    def test_product_link_blocks_that_release_without_following_it(self):
+        link = self.old / "test/DerivedData/all-tests/Build/Products/app.app/external"
+        link.symlink_to(self.root / "source.swift")
+        result = c.cleanup(self.root, self.client, True)
+        self.assertEqual(result["deletedFiles"], 0)
+        self.assertTrue(self.cache().exists())
+        self.assertEqual((self.root / "source.swift").read_text(), "source")
 
     def test_busy_before_planning_removes_nothing(self):
         with mock.patch.object(c,"idle",side_effect=c.CleanupBlocked("Xcode")):
@@ -175,7 +230,7 @@ class CleanupTests(unittest.TestCase):
         p=self.old/'test/DerivedData/all-tests/Build/Intermediates.noindex/BuildProductsPath'
         p.symlink_to(self.current,target_is_directory=True)
         current=self.manifest(self.current)
-        self.assertEqual(c.cleanup(self.root,self.client,True)['deletedFiles'],3)
+        self.assertEqual(c.cleanup(self.root,self.client,True)['deletedFiles'],4)
         self.assertTrue(p.is_symlink());self.assertEqual(self.manifest(self.current),current)
 
     def test_current_newer_and_unrecognized_local_builds_preserved(self):

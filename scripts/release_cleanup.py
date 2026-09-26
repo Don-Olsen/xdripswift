@@ -1,7 +1,7 @@
-"""Fail-closed, selective cleanup of older completed TestFlight compiler caches.
+"""Fail-closed retention for reproducible files of completed TestFlight builds.
 
-Never remove a DerivedData tree: logs, JSON, dSYMs, products and unknown files
-stay in place. No Apple mutations. Run through release-testflight.py cleanup.
+Current, newer and incomplete releases are untouched. IPA, XCArchive, dSYM,
+XCResult, logs and status remain. No Apple mutations. Use release-testflight.py.
 """
 from datetime import datetime, timezone
 import hashlib
@@ -12,6 +12,7 @@ import re
 import shutil
 import stat
 import subprocess
+import zipfile
 
 from build_lock import build_lock
 
@@ -167,6 +168,77 @@ def scan_derived(dd):
                                   "allocatedBytes": s.st_blocks * 512, "logicalBytes": s.st_size})
     return files
 
+PRODUCT_PROTECTED_SUFFIXES = {".dsym", ".xcresult", ".xcarchive", ".ipa", ".swift", ".h",
+                              ".m", ".mm", ".c", ".cpp", ".json", ".jsonl", ".log",
+                              ".xcactivitylog", ".plist", ".yaml", ".yml", ".p8",
+                              ".mobileprovision", ".md", ".txt", ".sqlite", ".db"}
+
+def scan_generated_products(dd):
+    """Select only generated product leaves, never release evidence or source."""
+    files = []
+    for instance in sorted(dd.iterdir()):
+        if instance.name == ".DS_Store" and instance.is_file() and not instance.is_symlink():
+            continue
+        require(instance.is_dir() and not instance.is_symlink(), "Unknown DerivedData instance")
+        products = instance / "Build/Products"
+        if not products.exists():
+            continue
+        require(products.is_dir() and not products.is_symlink(), "Unknown product root")
+        for base, dirs, names in os.walk(products, followlinks=False):
+            for name in dirs + names:
+                require(not (Path(base) / name).is_symlink(), "Symlink in generated products")
+            dirs[:] = [d for d in dirs if Path(d).suffix.lower() not in PRODUCT_PROTECTED_SUFFIXES
+                       and d not in {".git", "Logs", "TestResults", "SourcePackages"}]
+            for name in names:
+                p = Path(base) / name
+                require(p.is_file(), "Special file in generated products")
+                if p.suffix.lower() in PRODUCT_PROTECTED_SUFFIXES:
+                    continue
+                st = p.stat()
+                require(st.st_nlink == 1, "Hardlinked generated product")
+                files.append({"path": str(p), "fingerprint": fingerprint(p),
+                              "allocatedBytes": st.st_blocks * 512, "logicalBytes": st.st_size,
+                              "reason": "rebuildable Xcode product of a completed release"})
+    return files
+
+def verified_extraction(extracted, ipa):
+    """Only remove exact, byte-identical expanded copies of the checked IPA."""
+    require(extracted.is_dir() and not extracted.is_symlink(), "Unknown IPA extraction")
+    actual = {}
+    for base, dirs, names in os.walk(extracted, followlinks=False):
+        for name in dirs + names:
+            require(not (Path(base) / name).is_symlink(), "Link in IPA extraction")
+        for name in names:
+            p = Path(base) / name
+            require(p.is_file() and p.stat().st_nlink == 1, "Special or hardlinked IPA copy")
+            relative = p.relative_to(extracted).as_posix()
+            require(relative not in actual, "Duplicate IPA extraction path")
+            actual[relative] = p
+    # A prior successful run leaves only empty directory containers.
+    if not actual:
+        return []
+    with zipfile.ZipFile(ipa) as package:
+        members = {i.filename: i for i in package.infolist() if not i.is_dir()}
+        require(len(members) == sum(not i.is_dir() for i in package.infolist()),
+                "Duplicate IPA member")
+        require(set(actual) == set(members), "IPA extraction differs from archive")
+        files = []
+        for name, p in sorted(actual.items()):
+            info = members[name]
+            require(name.startswith(("Payload/", "Symbols/")) and ".." not in Path(name).parts,
+                    "Unexpected IPA path")
+            require(p.stat().st_size == info.file_size, "IPA copy size differs")
+            digest = hashlib.sha256()
+            with package.open(info) as stream:
+                for block in iter(lambda: stream.read(1048576), b""):
+                    digest.update(block)
+            require(hash_file(p) == digest.hexdigest(), "IPA copy content differs")
+            st = p.stat()
+            files.append({"path": str(p), "fingerprint": fingerprint(p),
+                          "allocatedBytes": st.st_blocks * 512, "logicalBytes": st.st_size,
+                          "reason": "byte-identical expanded copy of retained IPA"})
+    return files
+
 def release_candidates(root, current):
     candidates, kept = [], []
     completed_prior = []
@@ -228,9 +300,25 @@ def release_candidates(root, current):
                 require(real.parent == dd.parent.resolve(), "Unexpected DerivedData target")
                 require(not any(real == p or p in real.parents or real in p.parents for p in protected),
                         "DerivedData overlaps a protected build")
-                local.append({"build": s["build"], "path": str(real), "files": scan_derived(real)})
+                local.append({"build": s["build"], "path": str(real),
+                              "files": scan_derived(real) + scan_generated_products(real)})
+            extraction_roots = [out / "export-verification"]
+            verify_root = folder / "verify"
+            if verify_root.exists():
+                require(verify_root.is_dir() and not verify_root.is_symlink(), "Unknown verify root")
+                extraction_roots += sorted(verify_root.glob("ipa-*"))
+            for extracted in extraction_roots:
+                if not extracted.exists():
+                    continue
+                real = extracted.resolve()
+                require(real == extracted.parent.resolve() / extracted.name,
+                        "Unexpected IPA extraction link")
+                require(not any(real == p or p in real.parents or real in p.parents for p in protected),
+                        "IPA extraction overlaps protected build")
+                local.append({"build": s["build"], "path": str(real),
+                              "files": verified_extraction(real, ipa)})
             candidates.extend(local)
-        except (CleanupBlocked, OSError, ValueError, KeyError) as e:
+        except (CleanupBlocked, OSError, ValueError, KeyError, zipfile.BadZipFile) as e:
             kept.append({"path": str(folder), "reason": str(e)})
     return candidates, kept
 
@@ -297,6 +385,35 @@ def preservation_inventory(root, deletions):
     return result
 
 
+BUILD_AREA_LIMIT_BYTES = 15 * 1024 ** 3
+
+def build_area_usage(root, snapshot):
+    """Count worktree build areas and external signed output without following links twice."""
+    paths = set()
+    works = [Path(p) for p in snapshot if p != "refs"]
+    for work in works:
+        candidate = work / "build"
+        if candidate.exists():
+            require(candidate.is_dir() and not candidate.is_symlink(), "Unknown worktree build root")
+            paths.add(candidate.resolve())
+    for folder in (root / "build").glob("testflight-*"):
+        out = folder / "build"
+        if out.is_symlink():
+            target = out.resolve()
+            require(target.is_dir(), "Broken signing output link")
+            if not any(target == work or work in target.parents for work in works):
+                paths.add(target)
+    central = Path.home() / "DeveloperBuildData/xDrip"
+    if central.exists():
+        require(central.is_dir() and not central.is_symlink(), "Unknown central build root")
+        paths.add(central.resolve())
+    result = {}
+    for path in sorted(paths):
+        result[str(path)] = int(command(["du", "-sk", str(path)]).split()[0]) * 1024
+    return {"paths": result, "totalBytes": sum(result.values()),
+            "limitBytes": BUILD_AREA_LIMIT_BYTES,
+            "overLimitBytes": max(0, sum(result.values()) - BUILD_AREA_LIMIT_BYTES)}
+
 def cleanup(root, client, apply=False):
     root = root.resolve()
     with build_lock():
@@ -313,6 +430,7 @@ def cleanup(root, client, apply=False):
                 "Active release identity mismatch")
         apple = confirm_apple(client, current)
         before = git_snapshot(root)
+        usage_before = build_area_usage(root, before)
         candidates, kept = release_candidates(root, current)
         files = [f for c in candidates for f in c["files"]]
         tracked = command(["git", "ls-files", "-z", "--", "build"], root).split("\0")
@@ -331,9 +449,11 @@ def cleanup(root, client, apply=False):
         report_dir.mkdir(parents=True, exist_ok=False)
         report = {"apply": apply, "currentBuildPreserved": current["build"], "apple": apple,
                   "gitBefore": before, "retainedBefore": retained, "candidates": candidates, "kept": kept,
+                  "buildAreaBefore": usage_before,
                   "plannedAllocatedBytes": sum(f["allocatedBytes"] for f in files),
                   "deletedAllocatedBytes": 0, "deletedFiles": 0, "status": "planned"}
         report_path = report_dir / "report.json"
+        report["reportPath"] = str(report_path)
         report_path.write_text(json.dumps(report, indent=2) + "\n")
         free_before = shutil.disk_usage(root).free
         try:
@@ -349,7 +469,8 @@ def cleanup(root, client, apply=False):
                             if i % 1000 == 0:
                                 idle()
                             safe_unlink(f)
-                            journal.write(json.dumps({"path": f["path"], "allocatedBytes": f["allocatedBytes"]}) + "\n")
+                            journal.write(json.dumps({"path": f["path"], "allocatedBytes": f["allocatedBytes"],
+                                                      "reason": f.get("reason", "rebuildable compiler cache")}) + "\n")
                             report["deletedAllocatedBytes"] += f["allocatedBytes"]
                             report["deletedFiles"] += 1
                         journal.flush()
@@ -358,6 +479,9 @@ def cleanup(root, client, apply=False):
             require(report["retainedAfter"] == retained, "Retained release files changed; inspect report")
             report["gitAfter"] = git_snapshot(root)
             require(report["gitAfter"] == before, "Git changed during cleanup; inspect report")
+            report["buildAreaAfter"] = build_area_usage(root, before)
+            report["spaceLimitResult"] = ("within-limit" if not report["buildAreaAfter"]["overLimitBytes"]
+                                          else "limit-unmet; only protected or unclassified data remain")
             report["status"] = "completed" if apply else "dry-run"
         except Exception as e:
             report["status"] = "stopped"
