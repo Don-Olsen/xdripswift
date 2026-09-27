@@ -1,3 +1,15 @@
+<!-- testflight-7.1.1-4279:start -->
+### TestFlight 7.1.1 (4279)
+
+- Kildecommit og tag: `5dd3ac9b23ee59bfc8ccd44a2bea73aae0c295ca` / `testflight-7.1.1-4279`.
+- Tests: 1096/1096 bestået; 0 fejlet; 0 skipped. iPhone- og Watch-simulatorbuilds bestod.
+- Apple-status (2026-09-27T17:27:16.077433+00:00): [Internal / Testing](https://appstoreconnect.apple.com/apps/6795645396/testflight/ios/9c25d000-4250-46a7-b41b-8953386fa3d2).
+- Eksisterende intern gruppe: Ole Internal er bekræftet tilknyttet.
+- Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
+<!-- testflight-7.1.1-4279:end -->
+
+De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
+
 ## Diagnoseforløb efter 4278
 
 Apple Watch-sysdiagnose er verificeret fra en prøve kl. 18:45 den 27. september:
