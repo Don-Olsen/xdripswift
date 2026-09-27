@@ -1,3 +1,15 @@
+<!-- testflight-7.1.1-4280:start -->
+### TestFlight 7.1.1 (4280)
+
+- Kildecommit og tag: `f1a4d29a7aa3ce299031f5d2b3188bd6992bbdc4` / `testflight-7.1.1-4280`.
+- Tests: 1104/1104 bestået; 0 fejlet; 0 skipped. iPhone- og Watch-simulatorbuilds bestod.
+- Apple-status (2026-09-27T20:12:25.005363+00:00): [Internal / Testing](https://appstoreconnect.apple.com/apps/6795645396/testflight/ios/9657eca6-acc5-426c-bd0a-16473c1a7430).
+- Eksisterende intern gruppe: Ole Internal er bekræftet tilknyttet.
+- Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
+<!-- testflight-7.1.1-4280:end -->
+
+De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
+
 ## Alarmrettelse efter den fysiske 4279-test
 
 Næste release retter kun afrundingen af Watch-notifikationers baseline.
