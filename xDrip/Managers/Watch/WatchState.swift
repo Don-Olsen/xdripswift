@@ -344,6 +344,16 @@ struct LibreWatchAlarmState: Codable, Equatable {
             (scheduledMissedConfirmed != true || (scheduledMissedAt ?? .distantPast) > now)
     }
 
+    /// Match the representation written to notification userInfo. Converting between
+    /// Date's reference epoch and Unix seconds can round a fractional timestamp.
+    /// Compare finite Unix seconds on both sides, without accepting a stale baseline.
+    func matchesMissedNotificationBaseline(_ baseline: Date?) -> Bool {
+        guard let baseline, let expected = missedReadingBaseline else { return false }
+        let receivedSeconds = baseline.timeIntervalSince1970
+        let expectedSeconds = expected.timeIntervalSince1970
+        return receivedSeconds.isFinite && expectedSeconds.isFinite && receivedSeconds == expectedSeconds
+    }
+
     func notificationMayBePresented(
         kind: LibreWatchAlarmKind, notificationSessionID: String, notificationReadingID: UUID?,
         settings: LibreWatchAlarmSettings?, delegation: LibreWatchAlarmDelegation?,
@@ -360,7 +370,7 @@ struct LibreWatchAlarmState: Codable, Equatable {
         if kind == .missed {
             // New first-packet watchdogs carry a baseline, never a fabricated reading ID.
             if let notificationMissedBaseline {
-                guard notificationMissedBaseline == missedReadingBaseline else { return false }
+                guard matchesMissedNotificationBaseline(notificationMissedBaseline) else { return false }
             } else {
                 guard let notificationReadingID, notificationReadingID == lastReadingID else { return false }
             }
@@ -517,7 +527,7 @@ struct LibreWatchAlarmReadiness: Equatable {
         guard state.scheduledMissedConfirmed == true, pendingQueryCompleted else { return result(.checkingSchedule) }
         guard let pendingRequest, pendingRequest.identifier == identifier,
               pendingRequest.kind == .missed, pendingRequest.sessionID == settings.sessionID.uuidString,
-              pendingRequest.baseline == state.missedReadingBaseline, !pendingRequest.repeats,
+              state.matchesMissedNotificationBaseline(pendingRequest.baseline), !pendingRequest.repeats,
               let fireDate = pendingRequest.fireDate, fireDate > now,
               abs(fireDate.timeIntervalSince(scheduledAt)) <= 5,
               let expected = state.nextMissedAlarm(settings: settings, delegation: configuration.delegation,

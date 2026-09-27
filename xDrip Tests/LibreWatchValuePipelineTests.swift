@@ -8268,3 +8268,181 @@ extension LibreWatchValuePipelineTests {
         XCTAssertFalse(fixture.state.claimTakeoverReadinessFeedback(evaluateAlarmReadiness(fixture)))
     }
 }
+
+extension LibreWatchValuePipelineTests {
+    // Synthetic values exercise both signs of the 2001 -> 1970 -> 2001 rounding error.
+    private var fractionalAlarmBaselines: [Date] {
+        [800_000_000.0000001, 800_000_000.0000004].map(Date.init(timeIntervalSinceReferenceDate:))
+    }
+
+    private func notificationBaselineRoundTrip(_ date: Date) throws -> Date {
+        let info: [String: Any] = ["libreWatchAlarmBaseline": date.timeIntervalSince1970]
+        let data = try PropertyListSerialization.data(fromPropertyList: info, format: .binary, options: 0)
+        let restored = try XCTUnwrap(PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any])
+        return Date(timeIntervalSince1970: try XCTUnwrap(restored["libreWatchAlarmBaseline"] as? Double))
+    }
+
+    private func fractionalAlarmFixture(_ baseline: Date, hasReading: Bool) throws -> AlarmReadinessFixture {
+        var fixture = try alarmReadinessFixture()
+        fixture.state.ownershipStartedAt = baseline.addingTimeInterval(hasReading ? -60 : 0)
+        fixture.state.lastReadingID = hasReading ? UUID() : nil
+        fixture.state.lastReadingAt = hasReading ? baseline : nil
+        let settings = try XCTUnwrap(fixture.configuration.settings)
+        fixture.state.scheduledMissedID = fixture.state.missedNotificationIdentifier(settings: settings)
+        fixture.state.scheduledMissedAt = baseline.addingTimeInterval(300)
+        fixture.pending = LibreWatchAlarmPendingRequest(identifier: try XCTUnwrap(fixture.state.scheduledMissedID),
+            kind: .missed, sessionID: settings.sessionID.uuidString,
+            baseline: try notificationBaselineRoundTrip(baseline),
+            fireDate: fixture.state.scheduledMissedAt, repeats: false)
+        return fixture
+    }
+
+    func testMissedReadinessAcceptsFractionalBaselineAfterNotificationSerialization() throws {
+        for baseline in fractionalAlarmBaselines {
+            let restored = try notificationBaselineRoundTrip(baseline)
+            XCTAssertNotEqual(restored, baseline, "The fixture must reproduce the actual Date conversion failure")
+            for hasReading in [false, true] {
+                let fixture = try fractionalAlarmFixture(baseline, hasReading: hasReading)
+                let before = fixture
+                XCTAssertEqual(evaluateAlarmReadiness(fixture, at: baseline.addingTimeInterval(1)).status, .readyScheduled)
+                XCTAssertEqual(fixture.state, before.state)
+                XCTAssertEqual(fixture.configuration, before.configuration)
+            }
+        }
+    }
+
+    func testMissedPresentationAcceptsFractionalBaselineBeforeAndAfterFirstReading() throws {
+        for baseline in fractionalAlarmBaselines {
+            for hasReading in [false, true] {
+                let fixture = try fractionalAlarmFixture(baseline, hasReading: hasReading)
+                let settings = try XCTUnwrap(fixture.configuration.settings)
+                XCTAssertTrue(fixture.state.notificationMayBePresented(kind: .missed,
+                    notificationSessionID: settings.sessionID.uuidString,
+                    notificationReadingID: fixture.state.lastReadingID, settings: settings,
+                    delegation: alarmDelegation(settings), watchOwnsSensor: true, notificationsAuthorized: true,
+                    at: baseline.addingTimeInterval(301), notificationMissedBaseline: fixture.pending?.baseline))
+            }
+        }
+    }
+
+    func testMissedSerializedBaselineStillRejectsOtherInstantsAndInvalidEvidence() throws {
+        let baseline = fractionalAlarmBaselines[0]
+        let original = try fractionalAlarmFixture(baseline, hasReading: true)
+        let settings = try XCTUnwrap(original.configuration.settings)
+        let pending = try XCTUnwrap(original.pending)
+        // Even a microsecond is a different wire timestamp; do not add an arbitrary tolerance.
+        let invalid: [Date?] = [nil, baseline.addingTimeInterval(-60), baseline.addingTimeInterval(60),
+            baseline.addingTimeInterval(0.000001), Date(timeIntervalSince1970: .nan),
+            Date(timeIntervalSince1970: .infinity)]
+        for date in invalid {
+            var fixture = original
+            fixture.pending = LibreWatchAlarmPendingRequest(identifier: pending.identifier, kind: pending.kind,
+                sessionID: pending.sessionID, baseline: date, fireDate: pending.fireDate, repeats: false)
+            XCTAssertEqual(evaluateAlarmReadiness(fixture, at: baseline).status, .notScheduled)
+            XCTAssertFalse(fixture.state.notificationMayBePresented(kind: .missed,
+                notificationSessionID: settings.sessionID.uuidString, notificationReadingID: nil,
+                settings: settings, delegation: alarmDelegation(settings), watchOwnsSensor: true,
+                notificationsAuthorized: true, at: baseline.addingTimeInterval(301), notificationMissedBaseline: date))
+        }
+        var newer = original
+        newer.state.lastReadingAt = baseline.addingTimeInterval(60)
+        newer.state.lastReadingID = UUID()
+        XCTAssertEqual(evaluateAlarmReadiness(newer, at: baseline.addingTimeInterval(60)).status, .notScheduled)
+        XCTAssertFalse(newer.state.notificationMayBePresented(kind: .missed,
+            notificationSessionID: settings.sessionID.uuidString, notificationReadingID: original.state.lastReadingID,
+            settings: settings, delegation: alarmDelegation(settings), watchOwnsSensor: true,
+            notificationsAuthorized: true, at: baseline.addingTimeInterval(301), notificationMissedBaseline: pending.baseline))
+    }
+
+    func testFractionalAlarmReadinessPreservesConfiguredDelayDisabledRuleAndSnoozes() throws {
+        let baseline = fractionalAlarmBaselines[0]
+        for minutes in [5.0, 11.0, 30.0] {
+            var fixture = try fractionalAlarmFixture(baseline, hasReading: true)
+            let base = try XCTUnwrap(fixture.configuration.settings)
+            let settings = LibreWatchAlarmSettings(sessionID: base.sessionID, sensorIdentity: base.sensorIdentity,
+                revision: base.revision, generatedAt: base.generatedAt, isMgDl: base.isMgDl,
+                rules: base.rules.map { rule in
+                    LibreWatchAlarmRule(kind: rule.kind, startMinute: rule.startMinute,
+                        value: rule.kind == .missed ? minutes : rule.value, enabled: rule.enabled,
+                        snoozeMinutes: rule.snoozeMinutes, allowsSnooze: rule.allowsSnooze,
+                        soundEnabled: rule.soundEnabled, vibrate: rule.vibrate, title: rule.title)
+                }, snoozes: [], snoozeAllUntil: nil)
+            fixture.configuration = LibreWatchAlarmConfiguration(settings: settings, delegation: alarmDelegation(settings))
+            fixture.state.scheduledMissedID = fixture.state.missedNotificationIdentifier(settings: settings)
+            fixture.state.scheduledMissedAt = baseline.addingTimeInterval(minutes * 60)
+            fixture.pending = LibreWatchAlarmPendingRequest(identifier: try XCTUnwrap(fixture.state.scheduledMissedID),
+                kind: .missed, sessionID: settings.sessionID.uuidString,
+                baseline: try notificationBaselineRoundTrip(baseline), fireDate: fixture.state.scheduledMissedAt, repeats: false)
+            let ready = evaluateAlarmReadiness(fixture, at: baseline)
+            XCTAssertEqual(ready.status, .readyScheduled)
+            XCTAssertEqual(ready.missedMinutes, minutes)
+            XCTAssertEqual(fixture.configuration.settings, settings)
+            fixture.state.snooze(.missed, until: baseline.addingTimeInterval(600))
+            XCTAssertEqual(evaluateAlarmReadiness(fixture, at: baseline).status, .snoozed)
+            XCTAssertNotNil(evaluateAlarmReadiness(fixture, at: baseline).warning)
+        }
+        var disabled = try alarmReadinessFixture(enabled: false)
+        disabled.state.ownershipStartedAt = baseline
+        XCTAssertEqual(evaluateAlarmReadiness(disabled, at: baseline).status, .missedRuleDisabled)
+        XCTAssertNotNil(evaluateAlarmReadiness(disabled, at: baseline).warning)
+    }
+
+    private func verifyFractionalGlucoseAlarm(_ kind: LibreWatchAlarmKind, glucose: Double) throws {
+        let baseline = fractionalAlarmBaselines[0]
+        let settings = alarmSettings()
+        let readingID = UUID()
+        var state = LibreWatchAlarmState()
+        state.use(settings)
+        let rule = try XCTUnwrap(state.accept(id: readingID, measuredAt: baseline, glucose: glucose,
+            settings: settings, delegation: alarmDelegation(settings), watchOwnsSensor: true, now: baseline))
+        XCTAssertEqual(rule.kind, kind)
+        XCTAssertTrue(state.glucoseNotificationIsCurrent(readingID: readingID, rule: rule,
+            submittedSettings: settings, currentSettings: settings, delegation: alarmDelegation(settings),
+            watchOwnsSensor: true, notificationsAuthorized: true, now: baseline))
+        state.recordAutomaticThrottle(kind, readingID: readingID, until: baseline.addingTimeInterval(300))
+        let restored = try JSONDecoder().decode(LibreWatchAlarmState.self, from: JSONEncoder().encode(state))
+        // Low/high notifications already use a UUID, rather than a timestamp, for identity.
+        let info: [String: Any] = ["libreWatchAlarmSession": settings.sessionID.uuidString,
+                                  "libreWatchAlarmReading": readingID.uuidString,
+                                  "libreWatchAlarmKind": kind.rawValue]
+        let data = try PropertyListSerialization.data(fromPropertyList: info, format: .binary, options: 0)
+        let payload = try XCTUnwrap(PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any])
+        func permitted(_ candidate: LibreWatchAlarmState, settings current: LibreWatchAlarmSettings? = nil,
+                       owner: Bool = true, authorized: Bool = true) -> Bool {
+            let current = current ?? settings
+            return candidate.notificationMayBePresented(kind: LibreWatchAlarmKind(rawValue: payload["libreWatchAlarmKind"] as! Int)!,
+                notificationSessionID: payload["libreWatchAlarmSession"] as! String,
+                notificationReadingID: UUID(uuidString: payload["libreWatchAlarmReading"] as! String),
+                settings: current, delegation: alarmDelegation(current), watchOwnsSensor: owner,
+                notificationsAuthorized: authorized, at: baseline.addingTimeInterval(60))
+        }
+        XCTAssertTrue(permitted(restored))
+        XCTAssertFalse(permitted(restored, owner: false))
+        XCTAssertFalse(permitted(restored, authorized: false))
+        XCTAssertFalse(permitted(restored, settings: alarmSettings(enabled: false)))
+        XCTAssertFalse(permitted(restored, settings: alarmSettings(snoozeAllUntil: baseline.addingTimeInterval(600))))
+        var changed = restored
+        changed.snooze(kind, until: baseline.addingTimeInterval(300))
+        XCTAssertFalse(permitted(changed), "Explicit snooze must still suppress its own automatic throttle")
+        changed = restored
+        changed.lastReadingID = UUID()
+        changed.lastReadingAt = baseline.addingTimeInterval(60)
+        XCTAssertFalse(permitted(changed))
+        changed = restored
+        changed.sessionID = UUID()
+        XCTAssertFalse(permitted(changed))
+    }
+
+    func testVeryLowWatchAlarmSurvivesFractionalTimestampAndSerialization() throws {
+        try verifyFractionalGlucoseAlarm(.veryLow, glucose: 40)
+    }
+    func testLowWatchAlarmSurvivesFractionalTimestampAndSerialization() throws {
+        try verifyFractionalGlucoseAlarm(.low, glucose: 70)
+    }
+    func testHighWatchAlarmSurvivesFractionalTimestampAndSerialization() throws {
+        try verifyFractionalGlucoseAlarm(.high, glucose: 200)
+    }
+    func testVeryHighWatchAlarmSurvivesFractionalTimestampAndSerialization() throws {
+        try verifyFractionalGlucoseAlarm(.veryHigh, glucose: 280)
+    }
+}

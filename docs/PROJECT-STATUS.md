@@ -1,3 +1,12 @@
+## Alarmrettelse efter den fysiske 4279-test
+
+Næste release retter kun afrundingen af Watch-notifikationers baseline.
+Alle fem alarmtyper er gennemgået; otte nye tests reproducerer fejlen og
+beskytter blandt andet snooze, ejerskab og telefonens valgte alarmforsinkelse.
+Bluetooth, runtime, målebehandling og levering bevares.
+Se [rettelse og RSSI-analyse](WATCH-ALARM-TIMESTAMP-REVIEW.md).
+Trendudfyldning er kun en [plan til en senere diagnosebuild](WATCH-TREND-SHADOW-PLAN.md).
+
 <!-- testflight-7.1.1-4279:start -->
 ### TestFlight 7.1.1 (4279)
 
