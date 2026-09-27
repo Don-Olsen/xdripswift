@@ -10,6 +10,10 @@
 	<string>$(MAIN_APP_BUNDLE_IDENTIFIER)</string>
 	<key>NSBluetoothAlwaysUsageDescription</key>
 	<string>Connects directly to your NFC-confirmed Libre sensor when you explicitly hand sensor control to Apple Watch.</string>
+	<key>NSHealthShareUsageDescription</key>
+	<string>HealthKit requires this description for the Watch session. xDrip does not request read access to your Health data.</string>
+	<key>NSHealthUpdateUsageDescription</key>
+	<string>Allows xDrip to keep the Watch app active while it owns your Libre sensor. The workout record is discarded, but watchOS records activity samples in Health.</string>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>bluetooth-central</string>
@@ -17,6 +21,7 @@
 	<key>WKBackgroundModes</key>
 	<array>
 		<string>physical-therapy</string>
+		<string>workout-processing</string>
 	</array>
 </dict>
 </plist>

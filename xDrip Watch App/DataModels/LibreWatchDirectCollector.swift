@@ -1,12 +1,27 @@
 import Combine
 import CoreBluetooth
 import Foundation
+import HealthKit
 import WatchKit
 
 /// Maintains the direct Libre connection while Watch owns the sensor.
 /// Ownership is explicit and persistent; leaving the view does not stop reception.
 final class LibreWatchDirectCollector: NSObject, ObservableObject {
     private static let processID = UUID()
+    private static weak var recoveryCollector: LibreWatchDirectCollector?
+    private static let workoutRecoveryStore = HKHealthStore()
+    private static var pendingWorkoutRecovery: (session: HKWorkoutSession?, error: Error?)?
+
+    static func requestActiveWorkoutRecovery() {
+        // Apple requires this request from handleActiveWorkoutRecovery. Keep the
+        // result until the collector has restored ownership and sensor identity.
+        workoutRecoveryStore.recoverActiveWorkoutSession { session, error in
+            DispatchQueue.main.async {
+                pendingWorkoutRecovery = (session, error)
+                recoveryCollector?.recoverActiveWorkoutIfRequested()
+            }
+        }
+    }
 
     @Published private(set) var state = LibreWatchDirectState()
     @Published private(set) var bluetoothStateText = "UNKNOWN"
@@ -43,10 +58,22 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
     private var reconnectFallbackWorkItem: DispatchWorkItem?
     private var systemAutoReconnectIsActive = false
     private var applicationState: LibreWatchApplicationState = .background
+    private let healthStore = HKHealthStore()
+    private var workoutSession: HKWorkoutSession?
+    private var workoutIdentity: (sessionID: UUID, sensorUID: Data)?
+    private var workoutStoppingReason: String?
+    private var workoutNonRunningSinceUptime: TimeInterval?
+    private var workoutStartFailed = false
+    private var competingWorkoutStarted = false
+    private var workoutRestartPending = false
+    private var extendedInvalidationForWorkoutRestartPending = false
+    private var runtimeKind: LibreWatchRuntimePolicy.RuntimeKind = .none
     private var extendedRuntimeSession: WKExtendedRuntimeSession?
     private var extendedRuntimeStartedAt: Date?
-    private var extendedRuntimeIsRunning = false
     private var userInitiatedRuntimeStart = false
+    private var lastBatteryLogAt: Date?
+    private var healthTickWindowStartedAt: Date?
+    private var healthTicksInWindow = 0
     private var disconnectGate = LibreWatchDisconnectGate()
     private var serviceDiscoveryFence = LibreWatchServiceDiscoveryFence()
     private var scanAfterReconnectCancellation = false
@@ -59,6 +86,9 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
 
     private var applicationIsActive: Bool { applicationState.applicationIsActive }
     private var monotonicNow: TimeInterval { ProcessInfo.processInfo.systemUptime }
+    private var runtimeIsRunning: Bool {
+        LibreWatchRuntimePolicy.executionIsAvailable(kind: runtimeKind)
+    }
 
     private func observedState(of peripheral: CBPeripheral) -> LibreWatchObservedPeripheralState {
         switch peripheral.state {
@@ -77,7 +107,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
     private var timedRecoveryIsAllowed: Bool {
         LibreWatchLifecyclePolicy.recoveryIsAllowed(
             applicationState: applicationState,
-            extendedRuntimeIsRunning: extendedRuntimeIsRunning,
+            extendedRuntimeIsRunning: runtimeIsRunning,
             ownership: watchState?.libreWatchOwnership ?? .iphone
         )
     }
@@ -89,6 +119,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
     }
 
     func prepare(with watchState: WatchStateModel) {
+        Self.recoveryCollector = self
         if self.watchState !== watchState {
             self.watchState = watchState
             watchStateObservers.removeAll()
@@ -108,6 +139,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
 
         updateSession(watchState.libreWatchDirectSession)
         startHealthMonitoring()
+        recoverActiveWorkoutIfRequested()
 
         if centralManager == nil {
             centralInstanceID = UUID()
@@ -170,13 +202,16 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
             sensorChanged = false
         }
 
-        let watchSessionEnded = resolvedSession == nil
-        if LibreWatchLifecyclePolicy.shouldStopExtendedRuntime(
+        let sessionChanged = previousSessionID != nil && previousSessionID != resolvedSession?.id
+        let watchSessionEnded = resolvedSession == nil || sessionChanged
+        if LibreWatchRuntimePolicy.shouldStop(
             ownership: watchState?.libreWatchOwnership ?? .iphone,
             sensorChanged: sensorChanged,
             watchSessionEnded: watchSessionEnded
         ) {
-            stopExtendedRuntime()
+            stopRuntime(reason: sensorChanged ? "sensorChanged" :
+                (sessionChanged ? "sessionChanged" :
+                    (watchSessionEnded ? "sessionEnded" : "ownershipChanged")))
         }
 
         if sensorChanged, watchState?.libreWatchOwnership == .watch {
@@ -202,7 +237,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         case .watch:
             reconcileRecoveryState(at: Date(), source: .initialPreparation)
         case .iphone:
-            stopExtendedRuntime()
+            stopRuntime(reason: "returnedToPhone")
             deliberatelyDisconnecting = true
             scanAfterReconnectCancellation = false
             systemAutoReconnectIsActive = false
@@ -221,7 +256,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         case .releasingToWatch:
             break
         case .releasingToPhone, .recovery:
-            stopExtendedRuntime()
+            stopRuntime(reason: "ownershipTransition")
             cancelReconnectFallback()
             connectionTiming.invalidate()
             invalidateRestoration()
@@ -242,6 +277,13 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
             return
         }
 
+        requestWorkoutAuthorizationIfNeeded { [weak self] in
+            self?.beginUserInitiatedTakeover()
+        }
+    }
+
+    private func beginUserInitiatedTakeover() {
+        guard watchState?.libreWatchOwnership == .iphone, preparedSession?.isValid == true else { return }
         state.beginHandoff()
         watchState?.requestLibreWatchOwnership { [weak self] success, error in
             guard let self else { return }
@@ -254,7 +296,15 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
                 return
             }
             self.userInitiatedRuntimeStart = true
-            self.startExtendedRuntimeIfEligible()
+            self.workoutStartFailed = false
+            self.competingWorkoutStarted = false
+            self.workoutRestartPending = false
+            self.healthTickWindowStartedAt = Date()
+            self.healthTicksInWindow = 0
+            self.logBattery(reason: "watchTakeover")
+            self.reportDiagnostic(.lifecycleChanged, trigger: "healthKitWorkoutAuthorization",
+                                  actionReason: self.workoutIsAuthorized ? "granted" : "notGranted")
+            self.startPreferredRuntimeIfEligible()
             self.reconcileRecoveryState(at: Date(), source: .initialPreparation)
         }
     }
@@ -318,7 +368,8 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         state.beginReturn()
         deliberatelyDisconnecting = true
         scanAfterReconnectCancellation = false
-        stopExtendedRuntime()
+        logBattery(reason: "returnToPhone")
+        stopRuntime(reason: "returnToPhone")
         cancelReconnectFallback()
         connectionTiming.invalidate()
         invalidateRestoration()
@@ -396,7 +447,197 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         return String(format: "%.1f", reading.nativeGlucoseMGDL / ConstantsBloodGlucose.mmollToMgdl)
     }
 
+    private static let workoutSessionIDKey = "libreWatchWorkoutSessionID"
+    private static let workoutSensorUIDKey = "libreWatchWorkoutSensorUID"
+
+    private func requestWorkoutAuthorizationIfNeeded(completion: @escaping () -> Void) {
+        guard HKHealthStore.isHealthDataAvailable(),
+              healthStore.authorizationStatus(for: HKObjectType.workoutType()) == .notDetermined
+        else {
+            completion()
+            return
+        }
+        healthStore.requestAuthorization(toShare: [HKObjectType.workoutType()], read: []) { [weak self] _, error in
+            DispatchQueue.main.async {
+                if let error {
+                    self?.reportDiagnostic(.lifecycleChanged, trigger: "workoutAuthorizationFailed",
+                                           errorDomain: (error as NSError).domain,
+                                           errorCode: (error as NSError).code)
+                }
+                completion()
+            }
+        }
+    }
+
+    private var workoutIsAuthorized: Bool {
+        HKHealthStore.isHealthDataAvailable() &&
+            healthStore.authorizationStatus(for: HKObjectType.workoutType()) == .sharingAuthorized
+    }
+
+    private func setRuntimeKind(_ next: LibreWatchRuntimePolicy.RuntimeKind, reason: String) {
+        guard runtimeKind != next else { return }
+        let previous = runtimeKind
+        runtimeKind = next
+        reportDiagnostic(.lifecycleChanged, trigger: "runtimeTransition",
+                         actionReason: "\(previous.rawValue)>\(next.rawValue):\(reason)")
+    }
+
+    private func startPreferredRuntimeIfEligible() {
+        guard !workoutRestartPending else { return }
+        let action = LibreWatchRuntimePolicy.preferredStart(
+            userInitiatedTakeover: userInitiatedRuntimeStart,
+            applicationIsActive: applicationIsActive,
+            ownership: watchState?.libreWatchOwnership ?? .iphone,
+            healthKitAuthorized: workoutIsAuthorized,
+            workoutFailed: workoutStartFailed || competingWorkoutStarted,
+            hasWorkout: workoutSession != nil,
+            hasExtended: extendedRuntimeSession != nil
+        )
+        switch action {
+        case .none: break
+        case .workout: startWorkout()
+        case .extended: startExtendedRuntimeIfEligible()
+        }
+    }
+
+    private func startWorkout() {
+        guard workoutSession == nil, extendedRuntimeSession == nil,
+              applicationIsActive, watchState?.libreWatchOwnership == .watch,
+              let preparedSession, preparedSession.isValid else { return }
+        let configuration = HKWorkoutConfiguration()
+        configuration.activityType = .other
+        configuration.locationType = .indoor
+        do {
+            let session = try HKWorkoutSession(healthStore: healthStore, configuration: configuration)
+            session.delegate = self
+            workoutIdentity = (preparedSession.id, preparedSession.sensorUID)
+            UserDefaults.standard.set(preparedSession.id.uuidString, forKey: Self.workoutSessionIDKey)
+            UserDefaults.standard.set(preparedSession.sensorUID.base64EncodedString(),
+                                      forKey: Self.workoutSensorUIDKey)
+            workoutSession = session
+            workoutStoppingReason = nil
+            workoutNonRunningSinceUptime = monotonicNow
+            workoutRestartPending = false
+            setRuntimeKind(.startingWorkout, reason: "watchTakeover")
+            reportDiagnostic(.lifecycleChanged, trigger: "workoutStartRequested")
+            session.startActivity(with: Date())
+        } catch {
+            let nsError = error as NSError
+            workoutStartFailed = true
+            if nsError.domain == HKErrorDomain &&
+                nsError.code == HKError.Code.errorAnotherWorkoutSessionStarted.rawValue {
+                competingWorkoutStarted = true
+            }
+            reportDiagnostic(.lifecycleChanged, trigger: "workoutStartFailed",
+                             errorDomain: nsError.domain, errorCode: nsError.code)
+            startExtendedRuntimeIfEligible()
+        }
+    }
+
+    private func clearWorkoutIdentity() {
+        workoutIdentity = nil
+        UserDefaults.standard.removeObject(forKey: Self.workoutSessionIDKey)
+        UserDefaults.standard.removeObject(forKey: Self.workoutSensorUIDKey)
+    }
+
+    private func stopWorkout(reason: String) {
+        guard let session = workoutSession else { return }
+        guard workoutStoppingReason == nil else { return }
+        workoutStoppingReason = reason
+        reportDiagnostic(.lifecycleChanged, trigger: "workoutEndRequested", actionReason: reason)
+        if session.state == .ended {
+            finishWorkout(session, reason: reason)
+        } else {
+            session.end()
+        }
+    }
+
+    private func finishWorkout(_ session: HKWorkoutSession, reason: String) {
+        guard workoutSession === session else { return }
+        // No collection is started and finishWorkout() is never called. Discard the
+        // workout record; Apple still records system-created activity samples.
+        session.associatedWorkoutBuilder().discardWorkout()
+        workoutSession = nil
+        workoutStoppingReason = nil
+        workoutNonRunningSinceUptime = nil
+        clearWorkoutIdentity()
+        setRuntimeKind(.none, reason: reason)
+        reportDiagnostic(.lifecycleChanged, trigger: "workoutEnded", actionReason: reason)
+        if reason == "anotherWorkoutStarted" {
+            competingWorkoutStarted = true
+            workoutStartFailed = true
+        } else if ["unexpectedEnd", "workoutFailed", "workoutUnavailable", "unexpectedStop"].contains(reason) {
+            workoutStartFailed = true
+            workoutRestartPending = true
+        }
+        if ["unexpectedEnd", "workoutFailed", "workoutUnavailable",
+            "unexpectedStop", "anotherWorkoutStarted"].contains(reason) {
+            userInitiatedRuntimeStart = true
+            startExtendedRuntimeIfEligible()
+            userInitiatedRuntimeStart = false
+        }
+        reconcileRecoveryState(at: Date(), source: .extendedRuntimeInvalidated)
+    }
+
+    private func stopRuntime(reason: String) {
+        userInitiatedRuntimeStart = false
+        workoutRestartPending = false
+        extendedInvalidationForWorkoutRestartPending = false
+        flushHealthTimerWindow(reason: reason)
+        stopWorkout(reason: reason)
+        stopExtendedRuntime()
+    }
+
+    private func recoverActiveWorkoutIfRequested() {
+        guard let recovery = Self.pendingWorkoutRecovery, watchState != nil,
+              workoutSession == nil else { return }
+        Self.pendingWorkoutRecovery = nil
+        let expectedSessionID = UserDefaults.standard.string(forKey: Self.workoutSessionIDKey)
+        let expectedSensorUID = UserDefaults.standard.string(forKey: Self.workoutSensorUIDKey)
+        let matches = expectedSessionID != nil && expectedSensorUID != nil &&
+            watchState?.libreWatchOwnership == .watch &&
+            preparedSession?.id.uuidString == expectedSessionID &&
+            preparedSession?.sensorUID.base64EncodedString() == expectedSensorUID
+        guard let recovered = recovery.session, matches, let current = preparedSession else {
+            if let recovered = recovery.session {
+                recovered.end()
+                recovered.associatedWorkoutBuilder().discardWorkout()
+            }
+            let nsError = recovery.error as NSError?
+            reportDiagnostic(.lifecycleChanged, trigger: "workoutRecoveryUnavailable",
+                             errorDomain: nsError?.domain, errorCode: nsError?.code)
+            clearWorkoutIdentity()
+            if expectedSessionID != nil, watchState?.libreWatchOwnership == .watch {
+                workoutStartFailed = true
+                userInitiatedRuntimeStart = true
+                startPreferredRuntimeIfEligible()
+            }
+            return
+        }
+        recovered.delegate = self
+        workoutSession = recovered
+        workoutIdentity = (current.id, current.sensorUID)
+        workoutNonRunningSinceUptime = recovered.state == .running ? nil : monotonicNow
+        if recovered.state == .ended {
+            finishWorkout(recovered, reason: "unexpectedEnd")
+            return
+        }
+        setRuntimeKind(recovered.state == .running ? .workout :
+            (recovered.state == .paused ? .pausedWorkout : .startingWorkout),
+                       reason: "crashRecovery")
+        reportDiagnostic(.lifecycleChanged, trigger: "workoutRecovered",
+                         actionReason: String(describing: recovered.state))
+        if recovered.state == .paused {
+            recovered.resume()
+        } else if recovered.state == .stopped {
+            stopWorkout(reason: "unexpectedStop")
+        }
+        reconcileRecoveryState(at: Date(), source: .sceneActivation)
+        resumeDirectReceptionIfOwned(allowsEventDrivenStart: true)
+    }
+
     private func startExtendedRuntimeIfEligible() {
+        guard workoutSession == nil else { return }
         guard LibreWatchLifecyclePolicy.shouldStartExtendedRuntime(
             userInitiatedTakeover: userInitiatedRuntimeStart,
             applicationIsActive: applicationIsActive,
@@ -408,16 +649,15 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         session.delegate = self
         extendedRuntimeStartedAt = nil
         extendedRuntimeSession = session
+        setRuntimeKind(.startingExtended, reason: "physicalTherapyFallback")
         session.start()
     }
 
     private func stopExtendedRuntime() {
-        userInitiatedRuntimeStart = false
-        extendedRuntimeIsRunning = false
-
         guard let session = extendedRuntimeSession else { return }
         extendedRuntimeSession = nil
         extendedRuntimeStartedAt = nil
+        setRuntimeKind(.none, reason: "physicalTherapyStopped")
         if session.state != .invalid {
             session.invalidate()
         }
@@ -426,7 +666,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
     private var receivingExecutionBudget: TimeInterval {
         LibreWatchLifecyclePolicy.receivingExecutionBudget(
             applicationState: applicationState,
-            extendedRuntimeIsRunning: extendedRuntimeIsRunning
+            extendedRuntimeIsRunning: runtimeIsRunning
         )
     }
 
@@ -438,7 +678,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
     private func frameGapState(for peripheral: CBPeripheral) -> WatchDeliveryEvidenceFrameState {
         WatchDeliveryEvidenceFrameState(
             applicationState: applicationState.rawValue,
-            runtimeRunning: extendedRuntimeIsRunning,
+            runtimeRunning: runtimeIsRunning,
             connectionPhase: connectionTiming.phase?.rawValue ?? "idle",
             peripheralState: observedState(of: peripheral).rawValue,
             connectionGeneration: connectionTiming.generation
@@ -452,7 +692,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         source: LibreWatchRecoveryReconcileSource
     ) {
         currentReconcileSource = source
-        startExtendedRuntimeIfEligible()
+        startPreferredRuntimeIfEligible()
         let executionIsAvailable = timedRecoveryIsAllowed
         let uptime = monotonicNow
         let budgetChanged = connectionTiming.setExecutionAvailable(
@@ -611,6 +851,27 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
 
     func applicationActivityDidChange(_ state: LibreWatchApplicationState) {
         applicationState = state
+        if state == .active, workoutRestartPending,
+           LibreWatchRuntimePolicy.mayRestartWorkout(
+               afterCompetingWorkout: competingWorkoutStarted,
+               applicationIsActive: true,
+               ownership: watchState?.libreWatchOwnership ?? .iphone
+           ) {
+            if let extendedRuntimeSession {
+                // Wait for WatchKit's invalidation callback before requesting
+                // another HealthKit session; the two runtimes never overlap.
+                if !extendedInvalidationForWorkoutRestartPending {
+                    extendedInvalidationForWorkoutRestartPending = true
+                    reportDiagnostic(.lifecycleChanged, trigger: "workoutRestartWaitingForFallback")
+                    extendedRuntimeSession.invalidate()
+                }
+            } else {
+                workoutRestartPending = false
+                workoutStartFailed = false
+                userInitiatedRuntimeStart = true
+                reportDiagnostic(.lifecycleChanged, trigger: "workoutRestartOnActivation")
+            }
+        }
         let source: LibreWatchRecoveryReconcileSource
         switch state {
         case .active: source = .sceneActivation
@@ -1081,14 +1342,14 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
             deadline: now.addingTimeInterval(remainingBudget),
             now: now,
             applicationIsActive: applicationIsActive,
-            extendedRuntimeIsRunning: extendedRuntimeIsRunning,
+            extendedRuntimeIsRunning: runtimeIsRunning,
             ownership: watchState?.libreWatchOwnership ?? .iphone
         )
         // Reuse the existing one-shot while execution is permitted. Suspension still pauses
         // phase budgets, but an unchanged pending connection must not wait indefinitely
         // across brief wakes. A connected link or any GATT progress is outside this age policy.
         let remainingPendingAge = peripheral.state == .connecting
-            ? connectionTiming.pendingConnectionAge(monotonicTime: uptime).map {
+            ? connectionTiming.pendingConnectionAge().map {
                 max(0, LibreWatchConnectionTiming.pendingConnectionMaximumAge - $0)
             } : nil
         let remaining: TimeInterval
@@ -1122,7 +1383,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
                     ownership: self.watchState?.libreWatchOwnership ?? .iphone,
                     executionIsAvailable: self.timedRecoveryIsAllowed,
                     cancellationIsActive: self.scanAfterReconnectCancellation,
-                    monotonicTime: currentUptime
+                    continuousNow: .now
                 ) {
                     self.currentReconcileSource = scheduledSource
                     self.beginControlledSensorRecovery(
@@ -1626,7 +1887,9 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         attempt: LibreWatchRecoveryAttemptContext? = nil,
         reconcileSource: LibreWatchRecoveryReconcileSource? = nil,
         returnContext: (attempt: LibreWatchReturnAttempt, event: LibreWatchReturnDiagnostic)? = nil,
-        runtimeDiagnostic: LibreWatchRuntimeDiagnostic? = nil
+        runtimeDiagnostic: LibreWatchRuntimeDiagnostic? = nil,
+        batteryLevel: Double? = nil,
+        healthTimerTicks: Int? = nil
     ) {
         let attempt = attempt ?? recoveryAttemptState.context
         let eventSessionID = returnContext != nil ? returnContext?.attempt.sessionID
@@ -1645,7 +1908,10 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
             watchTimestamp: date,
             trigger: belongsToRecoveryAttempt ? (attempt?.originalTrigger ?? trigger) : trigger,
             applicationIsActive: applicationIsActive,
-            extendedRuntimeIsRunning: extendedRuntimeIsRunning,
+            extendedRuntimeIsRunning: runtimeIsRunning,
+            runtimeKind: runtimeKind.rawValue,
+            batteryLevel: batteryLevel,
+            healthTimerTicks: healthTimerTicks,
             peripheralState: peripheralStateOverride?.rawValue
                 ?? sensorPeripheral.map { observedState(of: $0).rawValue },
             connectionPhase: connectionTiming.phase?.rawValue ?? "idle",
@@ -1878,18 +2144,87 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         guard healthTimer == nil else { return }
 
         let timer = Timer(timeInterval: 30, repeats: true) { [weak self] _ in
-            self?.evaluateConnectionHealth(at: Date())
+            self?.evaluateConnectionHealth(at: Date(), fromTimer: true)
         }
         RunLoop.main.add(timer, forMode: .common)
         healthTimer = timer
     }
 
-    private func evaluateConnectionHealth(at date: Date) {
+    private func batteryLevel() -> Double? {
+        let device = WKInterfaceDevice.current()
+        device.isBatteryMonitoringEnabled = true
+        let value = Double(device.batteryLevel)
+        return value >= 0 && value <= 1 ? value : nil
+    }
+
+    private func logBattery(reason: String, at date: Date = Date()) {
+        let level = batteryLevel()
+        lastBatteryLogAt = date
+        reportDiagnostic(.lifecycleChanged, trigger: "watchBattery", at: date,
+                         actionReason: reason, batteryLevel: level)
+    }
+
+    private func recordHealthTimerTick(at date: Date) {
+        guard watchState?.libreWatchOwnership == .watch else { return }
+        if healthTickWindowStartedAt == nil { healthTickWindowStartedAt = date }
+        while let startedAt = healthTickWindowStartedAt,
+              date.timeIntervalSince(startedAt) >= 10 * 60 {
+            let windowEnd = startedAt.addingTimeInterval(10 * 60)
+            reportDiagnostic(.lifecycleChanged, trigger: "healthTimerWindow",
+                             at: windowEnd, healthTimerTicks: healthTicksInWindow)
+            healthTickWindowStartedAt = windowEnd
+            healthTicksInWindow = 0
+        }
+        healthTicksInWindow += 1
+        if lastBatteryLogAt.map({ date.timeIntervalSince($0) >= 15 * 60 }) ?? true {
+            logBattery(reason: "quarterHour", at: date)
+        }
+        if workoutSession != nil, let level = batteryLevel(),
+           LibreWatchRuntimePolicy.shouldStop(ownership: .watch, batteryLevel: level) {
+            reportDiagnostic(.lifecycleChanged, trigger: "workoutLowBattery",
+                             at: date, batteryLevel: level)
+            userInitiatedRuntimeStart = false
+            workoutRestartPending = false
+            stopWorkout(reason: "lowBattery")
+        }
+    }
+
+    private func checkWorkoutAvailability(at date: Date) {
+        guard let session = workoutSession, workoutStoppingReason == nil,
+              LibreWatchRuntimePolicy.workoutNonRunningIsOverdue(
+                  sinceUptime: workoutNonRunningSinceUptime, nowUptime: monotonicNow
+              ) else { return }
+        if session.state == .running {
+            // HealthKit may have changed state before its delegate callback arrived.
+            workoutNonRunningSinceUptime = nil
+            setRuntimeKind(.workout, reason: "runningStateObserved")
+            reportDiagnostic(.lifecycleChanged, trigger: "workoutRunningWithoutCallback", at: date)
+            reconcileRecoveryState(at: date, source: .sceneActivation)
+            resumeDirectReceptionIfOwned(allowsEventDrivenStart: true)
+        } else {
+            reportDiagnostic(.lifecycleChanged, trigger: "workoutUnavailableTimeout",
+                             at: date, actionReason: String(describing: session.state))
+            stopWorkout(reason: "workoutUnavailable")
+        }
+    }
+
+    private func flushHealthTimerWindow(reason: String) {
+        guard let startedAt = healthTickWindowStartedAt else { return }
+        reportDiagnostic(.lifecycleChanged, trigger: "healthTimerWindow",
+                         actionReason: "partial:\(reason):\(Int(Date().timeIntervalSince(startedAt)))s",
+                         healthTimerTicks: healthTicksInWindow)
+        healthTickWindowStartedAt = nil
+        healthTicksInWindow = 0
+    }
+
+    private func evaluateConnectionHealth(at date: Date, fromTimer: Bool = false) {
+        if fromTimer { recordHealthTimerTick(at: date) }
+        checkWorkoutAvailability(at: date)
         currentReconcileSource = .healthTimer
         // This existing timer also runs while the visible app has returned the sensor.
         // Retry transport independently of BLE ownership, without another timer/outbox.
         watchState?.retryPendingLibreDeliveries(
-            at: date, executionIsAvailable: applicationIsActive || extendedRuntimeIsRunning
+            at: date, executionIsAvailable: applicationIsActive || runtimeIsRunning
         )
         watchState?.refreshDirectLibreReadingFreshness(at: date)
         if connectionTiming.phase == .cancelling {
@@ -1930,11 +2265,65 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
     }
 }
 
+extension LibreWatchDirectCollector: HKWorkoutSessionDelegate {
+    func workoutSession(
+        _ workoutSession: HKWorkoutSession,
+        didChangeTo toState: HKWorkoutSessionState,
+        from fromState: HKWorkoutSessionState,
+        date: Date
+    ) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.workoutSession === workoutSession else { return }
+            self.reportDiagnostic(.lifecycleChanged, trigger: "workoutStateChanged",
+                                  at: date,
+                                  actionReason: "\(fromState.rawValue)>\(toState.rawValue)")
+            if toState == .ended {
+                self.finishWorkout(workoutSession,
+                                   reason: self.workoutStoppingReason ?? "unexpectedEnd")
+            } else if toState == .running, self.workoutStoppingReason == nil {
+                self.workoutNonRunningSinceUptime = nil
+                self.setRuntimeKind(.workout, reason: "workoutRunning")
+                self.reconcileRecoveryState(at: Date(), source: .sceneActivation)
+                self.resumeDirectReceptionIfOwned(allowsEventDrivenStart: true)
+            } else if toState == .paused, self.workoutStoppingReason == nil {
+                self.workoutNonRunningSinceUptime = self.monotonicNow
+                self.setRuntimeKind(.pausedWorkout, reason: "workoutPaused")
+                if self.watchState?.libreWatchOwnership == .watch, !self.competingWorkoutStarted {
+                    workoutSession.resume()
+                }
+            } else if toState == .stopped, self.workoutStoppingReason == nil {
+                self.setRuntimeKind(.startingWorkout, reason: "workoutStopped")
+                self.stopWorkout(reason: "unexpectedStop")
+            }
+        }
+    }
+
+    func workoutSession(_ workoutSession: HKWorkoutSession, didFailWithError error: Error) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.workoutSession === workoutSession else { return }
+            let nsError = error as NSError
+            let otherWorkout = nsError.domain == HKErrorDomain &&
+                nsError.code == HKError.Code.errorAnotherWorkoutSessionStarted.rawValue
+            self.reportDiagnostic(.lifecycleChanged, trigger: "workoutFailed",
+                                  errorDomain: nsError.domain, errorCode: nsError.code,
+                                  actionReason: otherWorkout ? "anotherWorkoutStarted" : "workoutFailed")
+            if otherWorkout { self.competingWorkoutStarted = true }
+            self.stopWorkout(reason: otherWorkout ? "anotherWorkoutStarted" : "workoutFailed")
+            if workoutSession.state == .ended {
+                self.finishWorkout(workoutSession,
+                                   reason: self.workoutStoppingReason ??
+                                       (otherWorkout ? "anotherWorkoutStarted" : "workoutFailed"))
+            }
+        }
+    }
+}
+
 extension LibreWatchDirectCollector: WKExtendedRuntimeSessionDelegate {
     func extendedRuntimeSessionDidStart(_ extendedRuntimeSession: WKExtendedRuntimeSession) {
-        guard self.extendedRuntimeSession === extendedRuntimeSession else { return }
+        guard self.extendedRuntimeSession === extendedRuntimeSession,
+              !extendedInvalidationForWorkoutRestartPending else { return }
         extendedRuntimeStartedAt = Date()
-        extendedRuntimeIsRunning = true
+        setRuntimeKind(.extended, reason: "physicalTherapyStarted")
         reconcileRecoveryState(at: Date(), source: .extendedRuntimeStarted)
     }
 
@@ -1961,7 +2350,15 @@ extension LibreWatchDirectCollector: WKExtendedRuntimeSessionDelegate {
         }
         self.extendedRuntimeSession = nil
         extendedRuntimeStartedAt = nil
-        extendedRuntimeIsRunning = false
+        let restartWorkout = extendedInvalidationForWorkoutRestartPending &&
+            workoutRestartPending &&
+            LibreWatchRuntimePolicy.mayRestartWorkout(
+                afterCompetingWorkout: competingWorkoutStarted,
+                applicationIsActive: applicationIsActive,
+                ownership: watchState?.libreWatchOwnership ?? .iphone
+            )
+        extendedInvalidationForWorkoutRestartPending = false
+        setRuntimeKind(.none, reason: "physicalTherapyInvalidated")
         frameGapTracker.runtimeDidInvalidate()
         userInitiatedRuntimeStart = false
         currentReconcileSource = .extendedRuntimeInvalidated
@@ -1974,6 +2371,12 @@ extension LibreWatchDirectCollector: WKExtendedRuntimeSessionDelegate {
             runtimeError: error?.localizedDescription,
             runtimeDiagnostic: runtimeDiagnostic
         )
+        if restartWorkout {
+            workoutRestartPending = false
+            workoutStartFailed = false
+            userInitiatedRuntimeStart = true
+            reportDiagnostic(.lifecycleChanged, trigger: "workoutRestartAfterFallbackInvalidation")
+        }
         reconcileRecoveryState(at: Date(), source: .extendedRuntimeInvalidated)
     }
 }

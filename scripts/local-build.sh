@@ -192,6 +192,7 @@ run_all_tests() {
     -configuration Debug \
     -destination "platform=iOS Simulator,id=$simulator_id" \
     -parallel-testing-enabled NO \
+    -collect-test-diagnostics never \
     -resultBundlePath "$result_bundle" \
     -derivedDataPath "$derived_data/all-tests" \
     CODE_SIGNING_ALLOWED=NO \
@@ -509,6 +510,9 @@ for bundle, expected_id, expected_groups in bundles:
             raise SystemExit("main app is missing HealthKit entitlement")
         if not signed.get("com.apple.developer.nfc.readersession.formats"):
             raise SystemExit("main app is missing NFC reader entitlement")
+    elif expected_id == main_id + ".watchkitapp":
+        if signed.get("com.apple.developer.healthkit") is not True:
+            raise SystemExit("Watch app is missing HealthKit entitlement")
 
     profile_path = bundle / "embedded.mobileprovision"
     profile = plistlib.loads(subprocess.check_output(
@@ -565,8 +569,13 @@ if watch_info.get("WKRunsIndependentlyOfCompanionApp") is not False:
     raise SystemExit("unexpected independent Watch app setting")
 if "bluetooth-central" not in watch_info.get("UIBackgroundModes", []):
     raise SystemExit("Watch app is missing Bluetooth background mode")
-if watch_info.get("WKBackgroundModes") != ["physical-therapy"]:
-    raise SystemExit("unexpected Watch extended runtime mode")
+watch_modes = watch_info.get("WKBackgroundModes")
+if (not isinstance(watch_modes, list) or len(watch_modes) != 2 or
+        set(watch_modes) != {"physical-therapy", "workout-processing"}):
+    raise SystemExit("unexpected Watch runtime modes")
+for key in ("NSHealthShareUsageDescription", "NSHealthUpdateUsageDescription"):
+    if not isinstance(watch_info.get(key), str) or not watch_info[key].strip():
+        raise SystemExit("Watch app is missing HealthKit usage description: " + key)
 
 destination = Path(os.environ["MANIFEST_PATH"])
 destination.write_text(json.dumps({

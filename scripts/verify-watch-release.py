@@ -11,12 +11,25 @@ import sys
 
 KEYS = ('application-identifier', 'com.apple.developer.team-identifier',
         'com.apple.security.application-groups', 'keychain-access-groups', 'get-task-allow',
-        'com.apple.developer.bluetooth-central-background')
+        'com.apple.developer.bluetooth-central-background', 'com.apple.developer.healthkit')
+
+WATCH_RUNTIME_MODES = {'physical-therapy', 'workout-processing'}
 
 
 def require(condition, message):
     if not condition:
         raise ValueError(message)
+
+
+def verify_watch_runtime(info, signed):
+    require('bluetooth-central' in info.get('UIBackgroundModes', []), 'Missing Watch Bluetooth mode')
+    modes = info.get('WKBackgroundModes')
+    require(isinstance(modes, list) and len(modes) == len(WATCH_RUNTIME_MODES)
+            and set(modes) == WATCH_RUNTIME_MODES, 'Unexpected Watch runtime modes')
+    require(signed.get('com.apple.developer.healthkit') is True, 'Missing Watch HealthKit entitlement')
+    for key in ('NSHealthShareUsageDescription', 'NSHealthUpdateUsageDescription'):
+        require(isinstance(info.get(key), str) and bool(info[key].strip()),
+                'Missing Watch HealthKit usage description: ' + key)
 
 
 def allowed(claim, permission):
@@ -77,6 +90,8 @@ def main(archive, destination):
         require(signed.get('com.apple.developer.team-identifier') == team, 'Unexpected signing team')
         require(signed.get('application-identifier') == team + '.' + bundle_id, 'Unexpected signed App ID')
         require(signed.get('get-task-allow', False) is False, 'Distribution archive permits debugging')
+        if app == watch:
+            verify_watch_runtime(info, signed)
         profile = plistlib.loads(subprocess.check_output(
             ['security', 'cms', '-D', '-i', str(app / 'embedded.mobileprovision')], stderr=subprocess.PIPE))
         approved, expires, verified = verify_profile(signed, profile, team, now)
@@ -94,8 +109,6 @@ def main(archive, destination):
     first, second = manifest['applications']
     require(first['build'] == second['build'], 'Phone/Watch build mismatch')
     require(first['version'] == second['version'], 'Phone/Watch version mismatch')
-    require('bluetooth-central' in second['publicBackgroundModes'], 'Missing Watch Bluetooth mode')
-    require(second['extendedRuntimeModes'] == ['physical-therapy'], 'Unexpected Watch runtime mode')
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(json.dumps(manifest, indent=2), encoding='utf-8')
     print(json.dumps(manifest, indent=2))
@@ -116,6 +129,34 @@ def self_test():
     profile = {'TeamIdentifier': ['TEAM'], 'ExpirationDate': (now + timedelta(days=1)).replace(tzinfo=None),
                'Entitlements': {'application-identifier': 'TEAM.*', 'get-task-allow': False}}
     verify_profile({'application-identifier': 'TEAM.app', 'get-task-allow': False}, profile, 'TEAM', now)
+    watch_info = {
+        'UIBackgroundModes': ['bluetooth-central'],
+        'WKBackgroundModes': ['physical-therapy', 'workout-processing'],
+        'NSHealthShareUsageDescription': 'Read workout permissions.',
+        'NSHealthUpdateUsageDescription': 'Start a workout session.',
+    }
+    watch_signed = {'com.apple.developer.healthkit': True}
+    verify_watch_runtime(watch_info, watch_signed)
+    for invalid_info, invalid_signed in [
+        ({**watch_info, 'WKBackgroundModes': ['physical-therapy']}, watch_signed),
+        ({**watch_info, 'WKBackgroundModes': ['physical-therapy', 'workout-processing', 'other']}, watch_signed),
+        ({**watch_info, 'NSHealthUpdateUsageDescription': ' '}, watch_signed),
+        (watch_info, {}),
+    ]:
+        try:
+            verify_watch_runtime(invalid_info, invalid_signed)
+        except ValueError:
+            pass
+        else:
+            raise ValueError('Synthetic Watch runtime rejection did not fail')
+    watch_profile = dict(profile, Entitlements={**profile['Entitlements'], 'com.apple.developer.healthkit': True})
+    verify_profile(watch_signed, watch_profile, 'TEAM', now)
+    try:
+        verify_profile(watch_signed, profile, 'TEAM', now)
+    except ValueError:
+        pass
+    else:
+        raise ValueError('Synthetic unauthorized Watch HealthKit entitlement was accepted')
     for invalid in [dict(profile, ExpirationDate=now), dict(profile, ExpirationDate=None),
                     dict(profile, TeamIdentifier=['OTHER']), dict(profile, Entitlements={})]:
         try:
@@ -124,7 +165,7 @@ def self_test():
             pass
         else:
             raise ValueError('Synthetic profile rejection did not fail')
-    print(json.dumps({'verification': 'synthetic local Python fixtures only', 'checksPassed': len(cases) + 5}))
+    print(json.dumps({'verification': 'synthetic local Python fixtures only', 'checksPassed': len(cases) + 12}))
 
 
 if __name__ == '__main__':

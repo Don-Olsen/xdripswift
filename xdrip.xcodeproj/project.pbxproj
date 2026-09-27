@@ -4065,6 +4065,11 @@
 					};
 					47A6ABDE2B790CC60047A4BA = {
 						CreatedOnToolsVersion = 15.2;
+						SystemCapabilities = {
+							com.apple.HealthKit = {
+								enabled = 1;
+							};
+						};
 					};
 					47CD64112BE9506C002BDA68 = {
 						CreatedOnToolsVersion = 15.3;

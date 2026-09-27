@@ -579,6 +579,9 @@ struct LibreWatchDiagnosticEvent: Codable, Equatable {
     let trigger: String?
     let applicationIsActive: Bool?
     let extendedRuntimeIsRunning: Bool?
+    let runtimeKind: String?
+    let batteryLevel: Double?
+    let healthTimerTicks: Int?
     let peripheralState: String?
     let connectionPhase: String?
     let deadlinePhase: String?
@@ -636,6 +639,9 @@ struct LibreWatchDiagnosticEvent: Codable, Equatable {
         trigger: String? = nil,
         applicationIsActive: Bool? = nil,
         extendedRuntimeIsRunning: Bool? = nil,
+        runtimeKind: String? = nil,
+        batteryLevel: Double? = nil,
+        healthTimerTicks: Int? = nil,
         peripheralState: String? = nil,
         connectionPhase: String? = nil,
         deadlinePhase: String? = nil,
@@ -682,6 +688,9 @@ struct LibreWatchDiagnosticEvent: Codable, Equatable {
         self.trigger = Self.bounded(trigger)
         self.applicationIsActive = applicationIsActive
         self.extendedRuntimeIsRunning = extendedRuntimeIsRunning
+        self.runtimeKind = Self.bounded(runtimeKind)
+        self.batteryLevel = batteryLevel
+        self.healthTimerTicks = healthTimerTicks
         self.peripheralState = Self.bounded(peripheralState)
         self.connectionPhase = Self.bounded(connectionPhase)
         self.deadlinePhase = Self.bounded(deadlinePhase)
@@ -2014,7 +2023,7 @@ struct LibreWatchConnectionTiming {
     private(set) var executionBudget: ExecutionBudget?
     private(set) var cancellationDeadline: Deadline?
     private(set) var dataExpectedSince: Date?
-    private(set) var connectionStartedAtMonotonic: TimeInterval?
+    private(set) var connectionStartedAtContinuous: ContinuousClock.Instant?
     private(set) var generation = UUID()
     private(set) var cancellationWatchdogDidFire = false
 
@@ -2037,12 +2046,12 @@ struct LibreWatchConnectionTiming {
     /// request background execution or change receiving/GATT liveness budgets.
     static let pendingConnectionMaximumAge: TimeInterval = 3 * 60
 
-    func pendingConnectionAge(monotonicTime: TimeInterval) -> TimeInterval? {
-        guard phase == .connection, let connectionStartedAtMonotonic,
-              connectionStartedAtMonotonic.isFinite, monotonicTime.isFinite,
-              monotonicTime >= connectionStartedAtMonotonic else { return nil }
-        let age = monotonicTime - connectionStartedAtMonotonic
-        return age.isFinite ? age : nil
+    func pendingConnectionAge(continuousNow: ContinuousClock.Instant = .now) -> TimeInterval? {
+        guard phase == .connection, let connectionStartedAtContinuous,
+              continuousNow >= connectionStartedAtContinuous else { return nil }
+        let duration = connectionStartedAtContinuous.duration(to: continuousNow)
+        return Double(duration.components.seconds) +
+            Double(duration.components.attoseconds) / 1_000_000_000_000_000_000
     }
 
     func pendingConnectionIsOverdue(
@@ -2051,11 +2060,11 @@ struct LibreWatchConnectionTiming {
         ownership: LibreWatchOwnership,
         executionIsAvailable: Bool,
         cancellationIsActive: Bool,
-        monotonicTime: TimeInterval
+        continuousNow: ContinuousClock.Instant = .now
     ) -> Bool {
         guard self.generation == generation, ownership == .watch,
               executionIsAvailable, !cancellationIsActive, peripheralState == .connecting,
-              let age = pendingConnectionAge(monotonicTime: monotonicTime) else { return false }
+              let age = pendingConnectionAge(continuousNow: continuousNow) else { return false }
         return age >= Self.pendingConnectionMaximumAge
     }
 
@@ -2072,12 +2081,13 @@ struct LibreWatchConnectionTiming {
         at date: Date,
         applicationIsActive: Bool,
         executionIsAvailable: Bool = true,
-        monotonicTime: TimeInterval? = nil
+        monotonicTime: TimeInterval? = nil,
+        continuousNow: ContinuousClock.Instant = .now
     ) {
         // Retries belong to the same logical generation until it is explicitly retired.
         guard phase == nil else { return }
         generation = UUID()
-        connectionStartedAtMonotonic = monotonicTime ?? date.timeIntervalSinceReferenceDate
+        connectionStartedAtContinuous = continuousNow
         dataExpectedSince = nil
         cancellationDeadline = nil
         cancellationWatchdogDidFire = false
@@ -2127,7 +2137,7 @@ struct LibreWatchConnectionTiming {
             return
         }
         if retiringCurrentGeneration { invalidate() }
-        connectionStartedAtMonotonic = nil
+        connectionStartedAtContinuous = nil
         executionBudget = nil
         cancellationDeadline = nil
         dataExpectedSince = nil
@@ -2170,7 +2180,7 @@ struct LibreWatchConnectionTiming {
 
     mutating func receivedPacketOrEnabledNotifications(at date: Date) {
         guard phase != .cancelling else { return }
-        connectionStartedAtMonotonic = nil
+        connectionStartedAtContinuous = nil
         executionBudget = nil
         cancellationDeadline = nil
         phase = .receiving
@@ -2294,7 +2304,7 @@ struct LibreWatchConnectionTiming {
 
     mutating func beginCancellation(at date: Date) {
         guard phase != .cancelling else { return }
-        connectionStartedAtMonotonic = nil
+        connectionStartedAtContinuous = nil
         dataExpectedSince = nil
         executionBudget = nil
         phase = .cancelling
@@ -2325,7 +2335,7 @@ struct LibreWatchConnectionTiming {
 
     mutating func invalidate() {
         phase = nil
-        connectionStartedAtMonotonic = nil
+        connectionStartedAtContinuous = nil
         executionBudget = nil
         cancellationDeadline = nil
         dataExpectedSince = nil
@@ -2570,6 +2580,66 @@ struct LibreWatchFrameLiveness {
 /// Pure lifecycle policy shared by the Watch collector and deterministic iPhone tests.
 /// Timed recovery requires foreground/runtime execution, while Core Bluetooth delegate events
 /// may finish one already-established operation whenever Watch still owns the sensor.
+/// A single source of truth for the execution granted by a user-initiated
+/// Watch takeover. The physical-therapy session is a fallback, never a peer
+/// running alongside a workout.
+struct LibreWatchRuntimePolicy {
+    enum RuntimeKind: String, Codable, Equatable {
+        case none, startingWorkout, workout, pausedWorkout, startingExtended, extended
+    }
+
+    enum StartAction: Equatable {
+        case none, workout, extended
+    }
+
+    static func preferredStart(
+        userInitiatedTakeover: Bool,
+        applicationIsActive: Bool,
+        ownership: LibreWatchOwnership,
+        healthKitAuthorized: Bool,
+        workoutFailed: Bool,
+        hasWorkout: Bool,
+        hasExtended: Bool
+    ) -> StartAction {
+        guard userInitiatedTakeover, applicationIsActive, ownership == .watch,
+              !hasWorkout, !hasExtended else { return .none }
+        return healthKitAuthorized && !workoutFailed ? .workout : .extended
+    }
+
+    static func executionIsAvailable(kind: RuntimeKind) -> Bool {
+        kind == .workout || kind == .extended
+    }
+
+    static func workoutNonRunningIsOverdue(
+        sinceUptime: TimeInterval?,
+        nowUptime: TimeInterval
+    ) -> Bool {
+        guard let sinceUptime, sinceUptime.isFinite, nowUptime.isFinite,
+              nowUptime >= sinceUptime else { return false }
+        // systemUptime pauses while the Watch sleeps, unlike ContinuousClock.
+        return nowUptime - sinceUptime >= 30
+    }
+
+    static func shouldStop(
+        ownership: LibreWatchOwnership,
+        sensorChanged: Bool = false,
+        watchSessionEnded: Bool = false,
+        batteryLevel: Double? = nil
+    ) -> Bool {
+        ownership != .watch || sensorChanged || watchSessionEnded ||
+            // WKInterfaceDevice reports Float; 0.15 can widen just above 0.15.
+            (batteryLevel.map { $0 >= 0 && $0 <= 0.15 + 0.000_001 } ?? false)
+    }
+
+    static func mayRestartWorkout(
+        afterCompetingWorkout: Bool,
+        applicationIsActive: Bool,
+        ownership: LibreWatchOwnership
+    ) -> Bool {
+        !afterCompetingWorkout && applicationIsActive && ownership == .watch
+    }
+}
+
 struct LibreWatchLifecyclePolicy {
     static let foregroundNoDataRecoveryDelay: TimeInterval = 2 * 60
     static let extendedRuntimeNoDataRecoveryDelay: TimeInterval = 3 * 60

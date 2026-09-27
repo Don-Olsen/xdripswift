@@ -10,10 +10,20 @@ import SwiftUI
 
 #if canImport(WatchKit)
 import WatchKit
+
+private final class WatchWorkoutRecoveryDelegate: NSObject, WKApplicationDelegate {
+    func handleActiveWorkoutRecovery() {
+        LibreWatchDirectCollector.requestActiveWorkoutRecovery()
+    }
+}
 #endif
 
 @main
 struct xDrip_Watch_AppApp: App {
+    #if canImport(WatchKit)
+    @WKApplicationDelegateAdaptor private var appDelegate: WatchWorkoutRecoveryDelegate
+    #endif
+
     @StateObject private var watchState: WatchStateModel
     @StateObject private var libreDirectCollector: LibreWatchDirectCollector
 

@@ -4,6 +4,13 @@ import HealthKit
 import Combine
 @testable import xdrip
 
+// Explicit instants make a sleeping Watch deterministic: ContinuousClock advances while the
+// injected system-uptime values used by the other Bluetooth budgets can remain unchanged.
+private let pendingConnectionTestEpoch = ContinuousClock().now
+private func pendingConnectionTestInstant(_ seconds: TimeInterval) -> ContinuousClock.Instant {
+    pendingConnectionTestEpoch.advanced(by: .milliseconds(Int64((seconds * 1_000).rounded())))
+}
+
 extension LibreWatchValuePipelineTests {
     func testPhoneStatusPreservesIndependentlyConfiguredFiniteChartThresholds() throws {
         let (defaults, suite) = displaySnapshotDefaults()
@@ -68,6 +75,144 @@ extension LibreWatchValuePipelineTests {
             sessionID: retainedWatchSession, allowUnscopedPhoneSession: true, at: now, defaults: watch))
         XCTAssertFalse(WatchPhoneSnapshotStore.accept(previous, stream: .bgReadings,
             sessionID: retainedWatchSession, allowUnscopedPhoneSession: true, at: now, defaults: watch))
+    }
+}
+
+// Runtime decisions are pure so a foreground Watch takeover, authorization failure,
+// and competing workout can be checked without starting HealthKit or WatchKit in XCTest.
+extension LibreWatchValuePipelineTests {
+    private func preferredWatchRuntime(
+        userInitiated: Bool = true,
+        active: Bool = true,
+        owner: LibreWatchOwnership = .watch,
+        authorized: Bool = true,
+        workoutFailed: Bool = false,
+        hasWorkout: Bool = false,
+        hasExtended: Bool = false
+    ) -> LibreWatchRuntimePolicy.StartAction {
+        LibreWatchRuntimePolicy.preferredStart(
+            userInitiatedTakeover: userInitiated,
+            applicationIsActive: active,
+            ownership: owner,
+            healthKitAuthorized: authorized,
+            workoutFailed: workoutFailed,
+            hasWorkout: hasWorkout,
+            hasExtended: hasExtended
+        )
+    }
+
+    func testWatchTakeoverPrefersWorkoutOnlyWhenUserStartedItInForeground() {
+        XCTAssertEqual(preferredWatchRuntime(), .workout)
+        XCTAssertEqual(preferredWatchRuntime(userInitiated: false), .none)
+        XCTAssertEqual(preferredWatchRuntime(active: false), .none)
+        for owner: LibreWatchOwnership in [.iphone, .releasingToWatch, .releasingToPhone, .recovery] {
+            XCTAssertEqual(preferredWatchRuntime(owner: owner), .none)
+        }
+    }
+
+    func testWorkoutPermissionDenialAndStartFailureSelectPhysicalTherapyFallback() {
+        XCTAssertEqual(preferredWatchRuntime(authorized: false), .extended)
+        XCTAssertEqual(preferredWatchRuntime(workoutFailed: true), .extended)
+        XCTAssertEqual(preferredWatchRuntime(authorized: false, workoutFailed: true), .extended)
+        XCTAssertEqual(preferredWatchRuntime(userInitiated: false, authorized: false), .none)
+        XCTAssertEqual(preferredWatchRuntime(active: false, workoutFailed: true), .none)
+    }
+
+    func testRuntimeSelectionNeverStartsASecondSessionWhileOneExists() {
+        XCTAssertEqual(preferredWatchRuntime(hasWorkout: true), .none)
+        XCTAssertEqual(preferredWatchRuntime(hasExtended: true), .none)
+        XCTAssertEqual(preferredWatchRuntime(hasWorkout: true, hasExtended: true), .none)
+        XCTAssertEqual(preferredWatchRuntime(authorized: false, hasWorkout: true), .none)
+        XCTAssertEqual(preferredWatchRuntime(workoutFailed: true, hasExtended: true), .none)
+    }
+
+    func testBothRunningKindsEnableTheSameBackgroundRecoveryAndDeliveryWindow() {
+        for kind: LibreWatchRuntimePolicy.RuntimeKind in [.workout, .extended] {
+            let running = LibreWatchRuntimePolicy.executionIsAvailable(kind: kind)
+            XCTAssertTrue(running)
+            XCTAssertTrue(LibreWatchLifecyclePolicy.recoveryIsAllowed(
+                applicationIsActive: false, extendedRuntimeIsRunning: running, ownership: .watch
+            ))
+            XCTAssertEqual(LibreWatchLifecyclePolicy.receivingExecutionBudget(
+                applicationState: .background, extendedRuntimeIsRunning: running
+            ), 180)
+            XCTAssertEqual(LibreWatchLifecyclePolicy.noDataRecoveryDelay(
+                applicationIsActive: false, extendedRuntimeIsRunning: running, ownership: .watch
+            ), 180)
+            XCTAssertNotEqual(LibreWatchLifecyclePolicy.reconnectFallbackAction(
+                deadline: receivedAt.addingTimeInterval(30), now: receivedAt,
+                applicationIsActive: false, extendedRuntimeIsRunning: running, ownership: .watch
+            ), .noAdditionalWork)
+        }
+        for kind: LibreWatchRuntimePolicy.RuntimeKind in [.none, .startingWorkout, .pausedWorkout, .startingExtended] {
+            XCTAssertFalse(LibreWatchRuntimePolicy.executionIsAvailable(kind: kind))
+        }
+    }
+
+    func testWorkoutStartupTimeoutUsesAwakeTimeAndLeavesRoomForLateRunningState() {
+        XCTAssertFalse(LibreWatchRuntimePolicy.workoutNonRunningIsOverdue(
+            sinceUptime: nil, nowUptime: 130
+        ))
+        XCTAssertFalse(LibreWatchRuntimePolicy.workoutNonRunningIsOverdue(
+            sinceUptime: 100, nowUptime: 129.9
+        ))
+        // A long wall-clock sleep does not advance systemUptime by 30 seconds.
+        XCTAssertFalse(LibreWatchRuntimePolicy.workoutNonRunningIsOverdue(
+            sinceUptime: 100, nowUptime: 105
+        ))
+        XCTAssertTrue(LibreWatchRuntimePolicy.workoutNonRunningIsOverdue(
+            sinceUptime: 100, nowUptime: 130
+        ))
+        XCTAssertFalse(LibreWatchRuntimePolicy.workoutNonRunningIsOverdue(
+            sinceUptime: 100, nowUptime: 99
+        ))
+    }
+
+    func testWorkoutEndsForReturnSensorChangeSessionEndAndAtFifteenPercentBattery() {
+        XCTAssertFalse(LibreWatchRuntimePolicy.shouldStop(
+            ownership: .watch, sensorChanged: false, watchSessionEnded: false, batteryLevel: nil
+        ), "An unavailable battery reading must not terminate the sensor session")
+        XCTAssertFalse(LibreWatchRuntimePolicy.shouldStop(
+            ownership: .watch, sensorChanged: false, watchSessionEnded: false, batteryLevel: 0.1501
+        ))
+        XCTAssertTrue(LibreWatchRuntimePolicy.shouldStop(
+            ownership: .watch, sensorChanged: false, watchSessionEnded: false, batteryLevel: 0.15
+        ))
+        XCTAssertTrue(LibreWatchRuntimePolicy.shouldStop(
+            ownership: .watch, batteryLevel: Double(Float(0.15))
+        ), "The 15% threshold must survive WKInterfaceDevice's Float representation")
+        XCTAssertTrue(LibreWatchRuntimePolicy.shouldStop(
+            ownership: .watch, sensorChanged: false, watchSessionEnded: false, batteryLevel: 0.10
+        ))
+        XCTAssertTrue(LibreWatchRuntimePolicy.shouldStop(
+            ownership: .releasingToPhone, sensorChanged: false, watchSessionEnded: false, batteryLevel: nil
+        ))
+        XCTAssertTrue(LibreWatchRuntimePolicy.shouldStop(
+            ownership: .iphone, sensorChanged: false, watchSessionEnded: false, batteryLevel: nil
+        ))
+        XCTAssertTrue(LibreWatchRuntimePolicy.shouldStop(
+            ownership: .watch, sensorChanged: true, watchSessionEnded: false, batteryLevel: nil
+        ))
+        XCTAssertTrue(LibreWatchRuntimePolicy.shouldStop(
+            ownership: .watch, sensorChanged: false, watchSessionEnded: true, batteryLevel: nil
+        ))
+    }
+
+    func testUnexpectedWorkoutEndCanRetryOnlyOnForegroundAndNeverAfterCompetingWorkout() {
+        XCTAssertTrue(LibreWatchRuntimePolicy.mayRestartWorkout(
+            afterCompetingWorkout: false, applicationIsActive: true, ownership: .watch
+        ))
+        XCTAssertFalse(LibreWatchRuntimePolicy.mayRestartWorkout(
+            afterCompetingWorkout: true, applicationIsActive: true, ownership: .watch
+        ))
+        XCTAssertFalse(LibreWatchRuntimePolicy.mayRestartWorkout(
+            afterCompetingWorkout: false, applicationIsActive: false, ownership: .watch
+        ))
+        for owner: LibreWatchOwnership in [.iphone, .releasingToPhone, .releasingToWatch, .recovery] {
+            XCTAssertFalse(LibreWatchRuntimePolicy.mayRestartWorkout(
+                afterCompetingWorkout: false, applicationIsActive: true, ownership: owner
+            ))
+        }
     }
 }
 
@@ -2743,7 +2888,7 @@ final class LibreWatchValuePipelineTests: XCTestCase {
 
     private func pendingReconnectIsOverdue(
         _ timing: LibreWatchConnectionTiming,
-        at uptime: TimeInterval,
+        at continuousSeconds: TimeInterval,
         generation: UUID? = nil,
         state: LibreWatchObservedPeripheralState = .connecting,
         ownership: LibreWatchOwnership = .watch,
@@ -2756,14 +2901,15 @@ final class LibreWatchValuePipelineTests: XCTestCase {
             ownership: ownership,
             executionIsAvailable: executionIsAvailable,
             cancellationIsActive: cancelling,
-            monotonicTime: uptime
+            continuousNow: pendingConnectionTestInstant(continuousSeconds)
         )
     }
 
     func testPendingReconnectAgeExpiresAtThreeMinutesDespitePausedExecutionBudget() throws {
         var timing = LibreWatchConnectionTiming()
         timing.beginConnection(at: receivedAt, applicationIsActive: false,
-                               executionIsAvailable: false, monotonicTime: 1_000)
+                               executionIsAvailable: false, monotonicTime: 1_000,
+                               continuousNow: pendingConnectionTestInstant(1_000))
 
         XCTAssertFalse(pendingReconnectIsOverdue(timing, at: 1_179.999))
         XCTAssertTrue(pendingReconnectIsOverdue(timing, at: 1_180))
@@ -2776,16 +2922,18 @@ final class LibreWatchValuePipelineTests: XCTestCase {
     func test4272ReconnectIsEligibleAtWakeAfterFourMinutesWith87SecondsBudgetLeft() throws {
         var timing = LibreWatchConnectionTiming()
         timing.beginConnection(at: receivedAt, applicationIsActive: false,
-                               executionIsAvailable: false, monotonicTime: 1_000)
+                               executionIsAvailable: false, monotonicTime: 1_000,
+                               continuousNow: pendingConnectionTestInstant(1_000))
         let generation = timing.generation
         timing.setExecutionAvailable(true, at: receivedAt.addingTimeInterval(8), monotonicTime: 1_008)
         timing.setExecutionAvailable(false, at: receivedAt.addingTimeInterval(10.9), monotonicTime: 1_010.9)
         XCTAssertFalse(pendingReconnectIsOverdue(timing, at: 1_263, executionIsAvailable: false))
 
-        timing.setExecutionAvailable(true, at: receivedAt.addingTimeInterval(263), monotonicTime: 1_263)
+        // While Watch slept, ContinuousClock advanced; the execution budget remained paused.
+        timing.setExecutionAvailable(true, at: receivedAt.addingTimeInterval(263), monotonicTime: 1_010.9)
         XCTAssertEqual(timing.generation, generation)
         XCTAssertEqual(try XCTUnwrap(timing.remainingExecutionTime(
-            at: receivedAt.addingTimeInterval(263), monotonicTime: 1_263
+            at: receivedAt.addingTimeInterval(263), monotonicTime: 1_010.9
         )), 87.1, accuracy: 0.001)
         XCTAssertTrue(pendingReconnectIsOverdue(timing, at: 1_263))
     }
@@ -2793,13 +2941,15 @@ final class LibreWatchValuePipelineTests: XCTestCase {
     func testRepeatedShortWakesAndConnectingObservationsDoNotRestartPendingAge() throws {
         var timing = LibreWatchConnectionTiming()
         timing.beginConnection(at: receivedAt, applicationIsActive: false,
-                               executionIsAvailable: false, monotonicTime: 500)
+                               executionIsAvailable: false, monotonicTime: 500,
+                               continuousNow: pendingConnectionTestInstant(500))
         let generation = timing.generation
         for elapsed in [30.0, 60, 90, 120, 150] {
             let date = receivedAt.addingTimeInterval(elapsed)
             timing.setExecutionAvailable(true, at: date, monotonicTime: 500 + elapsed)
             timing.beginConnection(at: date, applicationIsActive: true,
-                                   executionIsAvailable: true, monotonicTime: 500 + elapsed)
+                                   executionIsAvailable: true, monotonicTime: 500 + elapsed,
+                                   continuousNow: pendingConnectionTestInstant(500 + elapsed))
             XCTAssertFalse(timing.observeLink(
                 connected: false, connecting: true, hasReceptionState: false,
                 at: date, applicationIsActive: true, monotonicTime: 500 + elapsed
@@ -2808,14 +2958,17 @@ final class LibreWatchValuePipelineTests: XCTestCase {
                                          monotonicTime: 501 + elapsed)
         }
         XCTAssertEqual(timing.generation, generation)
-        XCTAssertEqual(try XCTUnwrap(timing.pendingConnectionAge(monotonicTime: 680)), 180)
+        XCTAssertEqual(try XCTUnwrap(timing.pendingConnectionAge(
+            continuousNow: pendingConnectionTestInstant(680)
+        )), 180)
         XCTAssertTrue(pendingReconnectIsOverdue(timing, at: 680))
     }
 
     func testOldPendingReconnectCannotActForOtherOwnerOrWithoutExecution() {
         var timing = LibreWatchConnectionTiming()
         timing.beginConnection(at: receivedAt, applicationIsActive: false,
-                               executionIsAvailable: false, monotonicTime: 100)
+                               executionIsAvailable: false, monotonicTime: 100,
+                               continuousNow: pendingConnectionTestInstant(100))
         for owner: LibreWatchOwnership in [.iphone, .releasingToWatch, .releasingToPhone, .recovery] {
             XCTAssertFalse(pendingReconnectIsOverdue(timing, at: 10_000, ownership: owner))
         }
@@ -2828,7 +2981,8 @@ final class LibreWatchValuePipelineTests: XCTestCase {
     func testJustConnectedNativeStateTakesPrecedenceOverOldPendingReconnectAge() {
         var timing = LibreWatchConnectionTiming()
         timing.beginConnection(at: receivedAt, applicationIsActive: false,
-                               executionIsAvailable: false, monotonicTime: 100)
+                               executionIsAvailable: false, monotonicTime: 100,
+                               continuousNow: pendingConnectionTestInstant(100))
         for nativeState: LibreWatchObservedPeripheralState in [.connected, .disconnected, .disconnecting, .unknown] {
             XCTAssertFalse(pendingReconnectIsOverdue(timing, at: 1_000, state: nativeState),
                            "Age recovery is only for the unchanged native connecting state: \(nativeState)")
@@ -2839,10 +2993,11 @@ final class LibreWatchValuePipelineTests: XCTestCase {
     func testConnectionProgressClearsPendingAgeAndPreservesSetupBudget() throws {
         var timing = LibreWatchConnectionTiming()
         timing.beginConnection(at: receivedAt, applicationIsActive: false,
-                               executionIsAvailable: false, monotonicTime: 100)
+                               executionIsAvailable: false, monotonicTime: 100,
+                               continuousNow: pendingConnectionTestInstant(100))
         let connectedAt = receivedAt.addingTimeInterval(179)
         timing.beginSetup(at: connectedAt, executionIsAvailable: true, monotonicTime: 279)
-        XCTAssertNil(timing.pendingConnectionAge(monotonicTime: 1_000))
+        XCTAssertNil(timing.pendingConnectionAge(continuousNow: pendingConnectionTestInstant(1_000)))
         XCTAssertFalse(pendingReconnectIsOverdue(timing, at: 1_000))
         XCTAssertEqual(try XCTUnwrap(timing.remainingExecutionTime(
             at: connectedAt, monotonicTime: 279
@@ -2852,11 +3007,12 @@ final class LibreWatchValuePipelineTests: XCTestCase {
     func testReceivingProgressCannotBeCancelledByOldPendingConnectionAge() throws {
         var timing = LibreWatchConnectionTiming()
         timing.beginConnection(at: receivedAt, applicationIsActive: false,
-                               executionIsAvailable: false, monotonicTime: 100)
+                               executionIsAvailable: false, monotonicTime: 100,
+                               continuousNow: pendingConnectionTestInstant(100))
         timing.receivedPacketOrEnabledNotifications(at: receivedAt.addingTimeInterval(1))
         timing.recordReceivingProgress(at: receivedAt.addingTimeInterval(1), timeout: 180,
                                        executionIsAvailable: false, monotonicTime: 101)
-        XCTAssertNil(timing.pendingConnectionAge(monotonicTime: 10_000))
+        XCTAssertNil(timing.pendingConnectionAge(continuousNow: pendingConnectionTestInstant(10_000)))
         XCTAssertFalse(pendingReconnectIsOverdue(timing, at: 10_000))
         XCTAssertEqual(try XCTUnwrap(timing.remainingExecutionTime(
             at: receivedAt.addingTimeInterval(9_900), monotonicTime: 10_000
@@ -2866,11 +3022,12 @@ final class LibreWatchValuePipelineTests: XCTestCase {
     func testPendingAgeRecoveryBecomesIneligibleAsSoonAsCancellationBegins() throws {
         var timing = LibreWatchConnectionTiming()
         timing.beginConnection(at: receivedAt, applicationIsActive: false,
-                               executionIsAvailable: false, monotonicTime: 100)
+                               executionIsAvailable: false, monotonicTime: 100,
+                               continuousNow: pendingConnectionTestInstant(100))
         XCTAssertTrue(pendingReconnectIsOverdue(timing, at: 280))
         timing.beginCancellation(at: receivedAt.addingTimeInterval(180))
         let cancellation = try XCTUnwrap(timing.cancellationDeadline)
-        XCTAssertNil(timing.pendingConnectionAge(monotonicTime: 281))
+        XCTAssertNil(timing.pendingConnectionAge(continuousNow: pendingConnectionTestInstant(281)))
         XCTAssertFalse(pendingReconnectIsOverdue(timing, at: 281))
         timing.beginCancellation(at: receivedAt.addingTimeInterval(181))
         XCTAssertEqual(timing.cancellationDeadline, cancellation, "Do not restart an in-flight cancellation")
@@ -2883,12 +3040,14 @@ final class LibreWatchValuePipelineTests: XCTestCase {
     func testRetiredPendingGenerationCannotCancelNewConnectionAttempt() throws {
         var timing = LibreWatchConnectionTiming()
         timing.beginConnection(at: receivedAt, applicationIsActive: false,
-                               executionIsAvailable: false, monotonicTime: 100)
+                               executionIsAvailable: false, monotonicTime: 100,
+                               continuousNow: pendingConnectionTestInstant(100))
         let retiredGeneration = timing.generation
         timing.invalidate()
-        XCTAssertNil(timing.pendingConnectionAge(monotonicTime: 1_000))
+        XCTAssertNil(timing.pendingConnectionAge(continuousNow: pendingConnectionTestInstant(1_000)))
         timing.beginConnection(at: receivedAt.addingTimeInterval(900), applicationIsActive: false,
-                               executionIsAvailable: false, monotonicTime: 1_000)
+                               executionIsAvailable: false, monotonicTime: 1_000,
+                               continuousNow: pendingConnectionTestInstant(1_000))
         XCTAssertNotEqual(timing.generation, retiredGeneration)
         XCTAssertFalse(pendingReconnectIsOverdue(timing, at: 1_001))
         XCTAssertFalse(pendingReconnectIsOverdue(timing, at: 1_180, generation: retiredGeneration))
@@ -2899,12 +3058,15 @@ final class LibreWatchValuePipelineTests: XCTestCase {
         for clockShift in [-86_400.0, 86_400] {
             var timing = LibreWatchConnectionTiming()
             timing.beginConnection(at: receivedAt, applicationIsActive: false,
-                                   executionIsAvailable: false, monotonicTime: 100)
+                                   executionIsAvailable: false, monotonicTime: 100,
+                                   continuousNow: pendingConnectionTestInstant(100))
             timing.setExecutionAvailable(true, at: receivedAt.addingTimeInterval(clockShift),
                                          monotonicTime: 279)
             XCTAssertFalse(pendingReconnectIsOverdue(timing, at: 279))
             XCTAssertTrue(pendingReconnectIsOverdue(timing, at: 280))
-            XCTAssertEqual(try XCTUnwrap(timing.pendingConnectionAge(monotonicTime: 280)), 180)
+            XCTAssertEqual(try XCTUnwrap(timing.pendingConnectionAge(
+                continuousNow: pendingConnectionTestInstant(280)
+            )), 180)
         }
     }
 
