@@ -1,3 +1,13 @@
+## Diagnoseforløb efter 4278
+
+Apple Watch-sysdiagnose er verificeret fra en prøve kl. 18:45 den 27. september:
+trådløs hentning via iPhone, bekræftet Watch-oprindelse og læsbar HCI-log i
+PacketLogger. Prøven dokumenterer ikke årsagen til det tidligere Libre-udfald.
+Den næste diagnoseudgivelse tilføjer kun RSSI og automatisk kontrol af
+alarmberedskab; genopkobling, timeout, runtime og måleflow bevares.
+Se [afgrænsning, logbegrænsninger og 90-minutters test](WATCH-RSSI-ALARM-DIAGNOSTICS.md).
+Faktiske release-tests og Apple-status registreres ved gennemført udgivelse.
+
 <!-- testflight-7.1.1-4278:start -->
 ### TestFlight 7.1.1 (4278)
 

@@ -365,7 +365,7 @@ struct LibreWatchRuntimeDiagnostic: Codable, Equatable {
 enum LibreWatchCallbackKind: String, Codable, Equatable {
     case centralState, restoration, discovery, connect, failedConnect
     case disconnectLegacy, disconnectModern, modifiedServices, services, characteristics
-    case notifications, unlock, value
+    case notifications, unlock, value, rssi
 }
 
 enum LibreWatchCallbackWorkStage: String, Codable, CaseIterable {
@@ -567,6 +567,134 @@ struct LibreWatchCallbackTimingTracker {
     }
 }
 
+/// Diagnostic observations only. Request/callback times are distinct; receipt/export time
+/// must never turn an old radio observation into a fresh sample.
+struct LibreWatchRSSIDiagnostic: Codable, Equatable {
+    enum Source: String, Codable { case discoveryRSSI, connectedRSSI }
+    enum Outcome: String, Codable { case observed, requested, succeeded, failed, unavailable, stale }
+    let source: Source
+    let outcome: Outcome
+    let rssi: Int?
+    let observedAt: Date
+    let observedContinuousSeconds: TimeInterval
+    let requestID: UUID?
+    let requestedAt: Date?
+    let requestElapsedSeconds: TimeInterval?
+    let decodedPayloadID: UUID?
+    let sessionID: UUID
+    let centralInstanceID: UUID
+    let connectionInstanceID: UUID?
+    let generation: UUID
+
+    // Bluetooth Core, Vol 4, Part E, 7.5.4: LE RSSI is -127...+20 dBm;
+    // 127 means unavailable. CoreBluetooth's current discovery header also reserves 127.
+    // https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-54/out/en/host-controller-interface/host-controller-interface-functional-specification.html
+    static func validRSSI(_ value: Int) -> Int? {
+        (-127 ... 20).contains(value) ? value : nil
+    }
+
+    var isValid: Bool {
+        guard observedAt.timeIntervalSinceReferenceDate.isFinite,
+              observedContinuousSeconds.isFinite, observedContinuousSeconds >= 0,
+              rssi.map({ Self.validRSSI($0) != nil }) ?? true,
+              requestedAt.map({ $0.timeIntervalSinceReferenceDate.isFinite }) ?? true,
+              requestElapsedSeconds.map({ $0.isFinite && $0 >= 0 }) ?? true else { return false }
+        switch source {
+        case .discoveryRSSI:
+            return (outcome == .observed || outcome == .unavailable) &&
+                (outcome == .observed) == (rssi != nil) && requestID == nil &&
+                requestedAt == nil && requestElapsedSeconds == nil && decodedPayloadID == nil &&
+                connectionInstanceID == nil
+        case .connectedRSSI:
+            guard requestID != nil, requestedAt != nil, decodedPayloadID != nil,
+                  connectionInstanceID != nil else { return false }
+            switch outcome {
+            case .requested: return rssi == nil && requestElapsedSeconds == nil
+            case .succeeded: return rssi != nil && requestElapsedSeconds.map { $0 <= 60 } == true
+            case .failed, .unavailable: return rssi == nil && requestElapsedSeconds.map { $0 <= 60 } == true
+            case .stale: return requestElapsedSeconds != nil
+            case .observed: return false
+            }
+        }
+    }
+}
+
+/// No timer or recovery effects. A pending native request is retained across link/session
+/// changes until its callback drains: Core Bluetooth supplies no request token, so clearing
+/// it on disconnect could misattribute an old reply to a new request on the same object.
+final class LibreWatchRSSIMonitor<Peripheral: AnyObject> {
+    struct Context: Equatable {
+        let sessionID: UUID
+        let sensorUID: Data // comparison only; never exported
+        let centralInstanceID: UUID
+        let connectionInstanceID: UUID
+        let generation: UUID
+    }
+    private struct Request {
+        let peripheral: Peripheral
+        let context: Context
+        let diagnostic: LibreWatchRSSIDiagnostic
+    }
+    private var pending: Request?
+    private var lastRequestContinuousSeconds: TimeInterval?
+    var hasPendingRequest: Bool { pending != nil }
+
+    func begin(peripheral: Peripheral, context: Context, payloadID: UUID,
+               at: Date, continuousSeconds: TimeInterval) -> LibreWatchRSSIDiagnostic? {
+        guard pending == nil, continuousSeconds.isFinite, continuousSeconds >= 0,
+              lastRequestContinuousSeconds.map({ continuousSeconds - $0 >= 60 }) ?? true else { return nil }
+        let diagnostic = LibreWatchRSSIDiagnostic(source: .connectedRSSI, outcome: .requested,
+            rssi: nil, observedAt: at, observedContinuousSeconds: continuousSeconds, requestID: UUID(), requestedAt: at,
+            requestElapsedSeconds: nil, decodedPayloadID: payloadID, sessionID: context.sessionID,
+            centralInstanceID: context.centralInstanceID, connectionInstanceID: context.connectionInstanceID,
+            generation: context.generation)
+        guard diagnostic.isValid else { return nil }
+        pending = Request(peripheral: peripheral, context: context, diagnostic: diagnostic)
+        lastRequestContinuousSeconds = continuousSeconds
+        return diagnostic
+    }
+
+    func complete(peripheral: Peripheral, currentContext: Context?, rssi: Int,
+                  errorPresent: Bool, at: Date, continuousSeconds: TimeInterval) -> LibreWatchRSSIDiagnostic? {
+        guard let request = pending, request.peripheral === peripheral,
+              continuousSeconds.isFinite, continuousSeconds >= 0 else { return nil }
+        pending = nil
+        let original = request.diagnostic
+        let elapsed = continuousSeconds - original.observedContinuousSeconds
+        let validRSSI = LibreWatchRSSIDiagnostic.validRSSI(rssi)
+        let outcome: LibreWatchRSSIDiagnostic.Outcome
+        if currentContext != request.context || elapsed < 0 || elapsed > 60 {
+            outcome = .stale
+        } else if errorPresent {
+            outcome = .failed
+        } else {
+            outcome = validRSSI == nil ? .unavailable : .succeeded
+        }
+        return LibreWatchRSSIDiagnostic(source: .connectedRSSI, outcome: outcome,
+            rssi: errorPresent ? nil : validRSSI, observedAt: at, observedContinuousSeconds: continuousSeconds,
+            requestID: original.requestID, requestedAt: original.requestedAt,
+            requestElapsedSeconds: max(0, elapsed), decodedPayloadID: original.decodedPayloadID,
+            sessionID: original.sessionID, centralInstanceID: original.centralInstanceID,
+            connectionInstanceID: original.connectionInstanceID, generation: original.generation)
+    }
+
+    static func discovery(rssi: Int, peripheralName: String?, advertisedName: String?,
+                          session: LibreWatchDirectSession?, centralInstanceID: UUID?, generation: UUID,
+                          ownership: LibreWatchOwnership, bluetoothIsPoweredOn: Bool,
+                          at: Date, continuousSeconds: TimeInterval) -> LibreWatchRSSIDiagnostic? {
+        guard let session, session.isValid, let centralInstanceID,
+              ownership == .watch, bluetoothIsPoweredOn,
+              let name = peripheralName ?? advertisedName, session.matches(candidateName: name) else { return nil }
+        let value = LibreWatchRSSIDiagnostic.validRSSI(rssi)
+        let diagnostic = LibreWatchRSSIDiagnostic(source: .discoveryRSSI,
+            outcome: value == nil ? .unavailable : .observed, rssi: value,
+            observedAt: at, observedContinuousSeconds: continuousSeconds, requestID: nil, requestedAt: nil,
+            requestElapsedSeconds: nil, decodedPayloadID: nil, sessionID: session.id,
+            centralInstanceID: centralInstanceID, connectionInstanceID: nil, generation: generation)
+        return diagnostic.isValid ? diagnostic : nil
+    }
+}
+
 /// A bounded, privacy-safe Watch diagnostic. Sensor identity is derived on iPhone from
 /// the validated session and never crosses as a raw peripheral identifier.
 struct LibreWatchDiagnosticEvent: Codable, Equatable {
@@ -629,6 +757,17 @@ struct LibreWatchDiagnosticEvent: Codable, Equatable {
     var runtimeDiagnostic: LibreWatchRuntimeDiagnostic?
     var callbackElapsedSeconds: TimeInterval?
     var completedCallbackTiming: LibreWatchCallbackTimingSummary?
+    var rssiDiagnostic: LibreWatchRSSIDiagnostic?
+
+    var validatedRSSIDiagnostic: LibreWatchRSSIDiagnostic? {
+        guard let rssiDiagnostic, rssiDiagnostic.isValid,
+              sessionID == rssiDiagnostic.sessionID,
+              centralInstanceID == rssiDiagnostic.centralInstanceID,
+              connectionInstanceID == rssiDiagnostic.connectionInstanceID,
+              generation == rssiDiagnostic.generation,
+              watchTimestamp == rssiDiagnostic.observedAt else { return nil }
+        return rssiDiagnostic
+    }
 
     init(
         eventID: UUID? = UUID(),

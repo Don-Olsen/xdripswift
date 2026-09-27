@@ -83,6 +83,16 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
     private var pendingRecoveryDiagnostic: (trigger: String, startedAt: Date)?
     private var currentReconcileSource: LibreWatchRecoveryReconcileSource = .initialPreparation
     private var lastFrameProgressDiagnosticAt: Date?
+    private let rssiMonitor = LibreWatchRSSIMonitor<CBPeripheral>()
+    private var rssiReadIsScheduled = false
+    private let rssiClockEpoch: ContinuousClock.Instant = .now
+    // Unlike systemUptime, this clock includes Watch sleep. A delayed reply must remain
+    // stale after suspension even when the recovery execution-budget clock did not advance.
+    private var rssiMonotonicNow: TimeInterval {
+        let duration = rssiClockEpoch.duration(to: .now)
+        return Double(duration.components.seconds) +
+            Double(duration.components.attoseconds) / 1_000_000_000_000_000_000
+    }
 
     private var applicationIsActive: Bool { applicationState.applicationIsActive }
     private var monotonicNow: TimeInterval { ProcessInfo.processInfo.systemUptime }
@@ -1869,6 +1879,57 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         }
     }
 
+    private func currentRSSIContext(for peripheral: CBPeripheral)
+        -> LibreWatchRSSIMonitor<CBPeripheral>.Context? {
+        guard identityAndOwnershipAreConfirmed(for: peripheral),
+              centralManager?.state == .poweredOn, peripheral.state == .connected,
+              !deliberatelyDisconnecting, !scanAfterReconnectCancellation,
+              let preparedSession, let centralInstanceID, let connectionID = connectionInstance.currentID
+        else { return nil }
+        return .init(sessionID: preparedSession.id, sensorUID: preparedSession.sensorUID,
+            centralInstanceID: centralInstanceID, connectionInstanceID: connectionID,
+            generation: connectionTiming.generation)
+    }
+
+    /// This task is queued only after the exact reading's durable save and existing delivery
+    /// work. It creates no wakeup/timer and never participates in liveness or recovery.
+    private func scheduleRSSIAfterStoredReading(_ payloadID: UUID, peripheral: CBPeripheral) {
+        guard !rssiReadIsScheduled, !rssiMonitor.hasPendingRequest,
+              let context = currentRSSIContext(for: peripheral) else { return }
+        rssiReadIsScheduled = true
+        let queuedAt = rssiMonotonicNow
+        DispatchQueue.main.async { [weak self, weak peripheral] in
+            guard let self else { return }
+            self.rssiReadIsScheduled = false
+            guard let peripheral, self.currentRSSIContext(for: peripheral) == context else { return }
+            let continuousSeconds = self.rssiMonotonicNow
+            guard continuousSeconds - queuedAt >= 0, continuousSeconds - queuedAt <= 60,
+                  let request = self.rssiMonitor.begin(peripheral: peripheral, context: context,
+                    payloadID: payloadID, at: Date(), continuousSeconds: continuousSeconds) else { return }
+            peripheral.readRSSI()
+            self.reportRSSI(request)
+        }
+    }
+
+    private func reportRSSI(_ diagnostic: LibreWatchRSSIDiagnostic, error: Error? = nil) {
+        let nsError = error.map { $0 as NSError }
+        let requested = diagnostic.outcome == .requested
+        var event = LibreWatchDiagnosticEvent(kind: requested ? .bluetoothAction : .coreBluetoothCallback,
+            errorCode: nsError?.code, watchTimestamp: diagnostic.observedAt,
+            trigger: requested ? "storedReadingRSSI" :
+                (diagnostic.source == .discoveryRSSI ? "discoveryRSSI" : "didReadRSSI"),
+            applicationIsActive: applicationIsActive, extendedRuntimeIsRunning: runtimeIsRunning,
+            runtimeKind: runtimeKind.rawValue, generation: diagnostic.generation,
+            sessionID: diagnostic.sessionID, applicationState: applicationState,
+            bluetoothAction: requested ? "readRSSI" : nil, errorDomain: nsError?.domain,
+            ownership: watchState?.libreWatchOwnership, processID: Self.processID,
+            centralInstanceID: diagnostic.centralInstanceID,
+            connectionInstanceID: diagnostic.connectionInstanceID)
+        event.rssiDiagnostic = diagnostic
+        if callbackDiagnosticBuffer.capture(event) { return }
+        watchState?.reportLibreWatchDiagnostic(event)
+    }
+
     private func reportDiagnostic(
         _ kind: LibreWatchDiagnosticEventKind,
         trigger: String,
@@ -2538,6 +2599,17 @@ extension LibreWatchDirectCollector: CBCentralManagerDelegate {
         let ownsDiagnostics = beginCoreBluetoothCallbackDiagnostics(.discovery)
         defer { finishCoreBluetoothCallbackDiagnostics(owner: ownsDiagnostics) }
         guard central === centralManager else { return }
+        // Record the actual matched advertisement before any deferred candidate is released.
+        // This observation is independent of selection/reconnect policy and has no link ID.
+        if let discovery = LibreWatchRSSIMonitor<CBPeripheral>.discovery(rssi: RSSI.intValue,
+            peripheralName: peripheral.name,
+            advertisedName: advertisementData[CBAdvertisementDataLocalNameKey] as? String,
+            session: preparedSession, centralInstanceID: centralInstanceID,
+            generation: connectionTiming.generation,
+            ownership: watchState?.libreWatchOwnership ?? .iphone,
+            bluetoothIsPoweredOn: central.state == .poweredOn, at: Date(), continuousSeconds: rssiMonotonicNow) {
+            reportRSSI(discovery)
+        }
         let retiredIsReleased = releaseRetiredPeripheralIfDisconnected()
         let outcome = discoveryHandoff.didDiscover(
             peripheral,
@@ -2554,7 +2626,7 @@ extension LibreWatchDirectCollector: CBCentralManagerDelegate {
                 self.connectDiscoveredSensor($0, using: central)
             }
         )
-        // Duplicated advertisements do not write another diagnostic record.
+        // Keep the existing selection diagnostics; every confirmed RSSI observation is above.
         if outcome == .deferred {
             reportCoreBluetoothCallback(
                 "didDiscoverDeferredSensor",
@@ -3079,6 +3151,17 @@ extension LibreWatchDirectCollector: CBPeripheralDelegate {
         }
     }
 
+    func peripheral(_ peripheral: CBPeripheral, didReadRSSI RSSI: NSNumber, error: Error?) {
+        let ownsDiagnostics = beginCoreBluetoothCallbackDiagnostics(.rssi)
+        defer { finishCoreBluetoothCallbackDiagnostics(owner: ownsDiagnostics) }
+        guard let result = rssiMonitor.complete(peripheral: peripheral,
+            currentContext: currentRSSIContext(for: peripheral), rssi: RSSI.intValue,
+            errorPresent: error != nil, at: Date(), continuousSeconds: rssiMonotonicNow) else { return }
+        // A failed/stale RSSI request is diagnostic only. In particular, do not call the
+        // notification-error handler or refresh frame/connection execution budgets here.
+        reportRSSI(result, error: error)
+    }
+
     func peripheral(
         _ peripheral: CBPeripheral,
         didUpdateValueFor characteristic: CBCharacteristic,
@@ -3197,7 +3280,11 @@ extension LibreWatchDirectCollector: CBPeripheralDelegate {
             state.notificationsActive()
             reportRecoverySuccessIfNeeded()
             reportFrameProgress(at: now)
-            let wasAccepted = watchState?.submitLibreWatchReading(reading, payloadID: payloadID) == true
+            let wasAccepted = watchState?.submitLibreWatchReading(reading, payloadID: payloadID,
+                afterSubmission: { [weak self, weak peripheral] durable in
+                    guard durable, let self, let peripheral else { return }
+                    self.scheduleRSSIAfterStoredReading(payloadID, peripheral: peripheral)
+                }) == true
             scheduleReconnectFallback(for: peripheral)
             if wasAccepted {
                 state.recordDirectReading(reading)

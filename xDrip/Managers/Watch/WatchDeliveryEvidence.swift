@@ -7,7 +7,7 @@ enum WatchDeliveryEvidenceStream: String, Codable {
 enum WatchDeliveryEvidenceStage: String, Codable {
     case decoded, accepted, rejected, localWriteConfirmed, localWriteFailed
     case sendAttempt, phoneReceived, phoneStored, phoneRejected, acknowledgement
-    case coalesced, suppressed, transportFailed, transportReceived, alarmReadiness, frameGap
+    case coalesced, suppressed, transportFailed, transportReceived, alarmReadiness, frameGap, signalStrength
 }
 
 /// State sampled at a valid frame. It does not assert what watchOS did while suspended.
@@ -168,6 +168,7 @@ struct WatchDeliveryEvidenceEvent: Codable, Equatable {
     let outcome: String?
     /// Optional for compatibility with journals from earlier builds.
     let frameGap: WatchDeliveryEvidenceFrameGap?
+    var rssiDiagnostic: LibreWatchRSSIDiagnostic? = nil
 }
 
 /// A retained local runtime stop survives rotation of the small WC diagnostic journal.
@@ -302,7 +303,8 @@ final class WatchDeliveryEvidenceStore {
     func record(stage: WatchDeliveryEvidenceStage, payloadID: UUID? = nil, sessionID: UUID? = nil,
                 measuredAt: Date? = nil, sensorTime: Date? = nil, sensorElapsedMinutes: UInt16? = nil,
                 outcome: String? = nil, stream: WatchDeliveryEvidenceStream = .reading,
-                frameGap: WatchDeliveryEvidenceFrameGap? = nil) -> Bool {
+                frameGap: WatchDeliveryEvidenceFrameGap? = nil,
+                rssiDiagnostic: LibreWatchRSSIDiagnostic? = nil) -> Bool {
         callbackWorkProfiler.measure(.deliveryEvidence) {
             queue.sync {
                 let now = clock()
@@ -316,7 +318,7 @@ final class WatchDeliveryEvidenceStore {
                     at: now, uptime: uptime(), stream: stream, stage: stage, payloadID: payloadID,
                     sessionID: sessionID, watchReceivedAt: measuredAt, sensorTime: sensorTime,
                     sensorElapsedMinutes: sensorElapsedMinutes, outcome: Self.safeLabel(outcome),
-                    frameGap: frameGap)
+                    frameGap: frameGap, rssiDiagnostic: rssiDiagnostic)
                 if stage == .alarmReadiness, let value = Self.safeLabel(outcome),
                    let component = value.split(separator: ":").first {
                     var readiness = metadata.alarmReadiness ?? [:]
@@ -375,6 +377,12 @@ final class WatchDeliveryEvidenceStore {
     }
 
     func recordCollectorDiagnostic(_ event: LibreWatchDiagnosticEvent) {
+        if let rssi = event.validatedRSSIDiagnostic {
+            // Append every observation/request result, not just the latest sample. This local
+            // evidence survives rotation of the smaller WatchConnectivity diagnostic journal.
+            record(stage: .signalStrength, payloadID: event.eventID, sessionID: rssi.sessionID,
+                outcome: rssi.outcome.rawValue, stream: .diagnostic, rssiDiagnostic: rssi)
+        }
         let isRuntimeStop = event.kind == .extendedRuntimeInvalidated
         let timing = event.completedCallbackTiming.flatMap { $0.isValid ? $0 : nil }
         guard isRuntimeStop || timing != nil else { return }
@@ -411,7 +419,7 @@ final class WatchDeliveryEvidenceStore {
                 preservedRepairSourceBytes: metadata.preservedRepairSourceBytes,
                 counterWindowStartedAt: metadata.counterWindowStartedAt,
                 transportCounters: metadata.counters, lastAlarmReadinessEvidence: metadata.alarmReadiness, events: visible.map(\.event),
-                clockNote: "at is origin device wall clock; uptime is monotonic within origin.process only. Cross-device clock offset is unknown. watchReceivedAt is the existing Watch reception timestamp. sensorTime is unknown when absent; elapsed sensor minutes are not a wall-clock timestamp. Callback timings are monotonic elapsed time, not CPU time or prior system delivery delay; the retained summary covers completed callbacks in its original collector lifetime. Optional workBreakdown stages are exclusive elapsed time within workSeconds, including waits, not isolated disk or CPU time. Calls count measured operations, not physical writes. decodedPayloadID identifies the frame decoded in that callback; transport may also retry older payloads. Runtime startedAt is the observed start callback; expiresAt is reported expiration, not guaranteed execution time.",
+                clockNote: "at is origin device wall clock; uptime is monotonic within origin.process only. Cross-device clock offset is unknown. watchReceivedAt is the existing Watch reception timestamp. sensorTime is unknown when absent; elapsed sensor minutes are not a wall-clock timestamp. Callback timings are monotonic elapsed time, not CPU time or prior system delivery delay; the retained summary covers completed callbacks in its original collector lifetime. Optional workBreakdown stages are exclusive elapsed time within workSeconds, including waits, not isolated disk or CPU time. Calls count measured operations, not physical writes. decodedPayloadID identifies the frame decoded in that callback; transport may also retry older payloads. Runtime startedAt is the observed start callback; expiresAt is reported expiration, not guaranteed execution time. RSSI observedAt is the original discovery or callback time; requestedAt and requestElapsedSeconds identify the connected read. RSSI observedContinuousSeconds is monotonic time since the collector began and includes Watch sleep; it has a separate origin from uptime. RSSI adds readRSSI calls after durable readings, at most once per minute with one pending request; stale results are not current samples.",
                 coverageNote: "Only retained successfully appended events are included. Rotation is diagnostic retention, not lost glucose. Counters may omit the final 60 seconds after abrupt termination. No events from before this instrumentation are reconstructed. An event's localWriteConfirmed refers to the existing atomic outbox save, not this journal. recoveredLegacyEvents counts valid existing JSON events successfully rewritten without the known old delimiter padding; historical unreadableLines is not reduced. Before repair, the first bounded raw source is retained locally as delivery-events-v1.pre-repair.jsonl, not included in this export. Later damaged raw sources are not archived; unreadable lines remain counted.")
             snapshot.lastRuntimeStop = metadata.lastRuntimeStop.flatMap { $0.at >= now.addingTimeInterval(-limits.age) ? $0 : nil }
             snapshot.lastCallbackTiming = metadata.lastCallbackTiming.flatMap { $0.at >= now.addingTimeInterval(-limits.age) ? $0 : nil }

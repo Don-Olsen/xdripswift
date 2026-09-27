@@ -169,6 +169,7 @@ final class WatchStateModel: NSObject, ObservableObject {
     @Published private(set) var directLibreReadingIsStale = false
     @Published private(set) var libreWatchStorageIssue: String?
     @Published private(set) var localAlarmStatus = "Watch-alarmer: venter på iPhone-indstillinger"
+    @Published private(set) var localAlarmReadinessWarning: String?
     private let localAlarms = LibreWatchAlarmController()
 
     /// Original direct values are retained in memory so a newer iPhone calibration can
@@ -240,6 +241,7 @@ final class WatchStateModel: NSObject, ObservableObject {
         updateComplicationData()
         restorePendingDiagnosticJournalToOutbox()
         localAlarms.onStatusChange = { [weak self] status in self?.localAlarmStatus = status }
+        localAlarms.onReadinessWarningChange = { [weak self] warning in self?.localAlarmReadinessWarning = warning }
         localAlarms.onReadinessChange = { [weak self] in self?.synchronizeLocalAlarmState() }
         localAlarms.onSnooze = { [weak self] in self?.synchronizeLocalAlarmState() }
         localAlarms.validate(session: libreWatchDirectSession)
@@ -774,7 +776,11 @@ final class WatchStateModel: NSObject, ObservableObject {
     }
 
     @discardableResult
-    func submitLibreWatchReading(_ directReading: Libre2WatchDirectReading, payloadID: UUID = UUID()) -> Bool {
+    func submitLibreWatchReading(
+        _ directReading: Libre2WatchDirectReading,
+        payloadID: UUID = UUID(),
+        afterSubmission: ((Bool) -> Void)? = nil
+    ) -> Bool {
         guard let directSession = libreWatchDirectSession,
               let snapshot = libreWatchCalibrationSnapshot,
               snapshot.matches(session: directSession),
@@ -804,6 +810,7 @@ final class WatchStateModel: NSObject, ObservableObject {
 
         let now = Date()
         let priorAcceptance = directReadingAcceptance
+        var wasDurablyStored = false
         let accepted = LibreWatchReadingSubmission.receive(
             reading,
             sessionID: directSession.id,
@@ -822,6 +829,7 @@ final class WatchStateModel: NSObject, ObservableObject {
                 libreWatchStorageIssue = commit.persistence.issue
                 WatchDeliveryEvidenceStore.shared.recordReading(.accepted, reading: reading)
                 let durable = commit.persistence == .durable
+                wasDurablyStored = durable
                 WatchDeliveryEvidencePipeline.localWrite(
                     durable,
                     item: .reading(reading),
@@ -843,6 +851,10 @@ final class WatchStateModel: NSObject, ObservableObject {
             return false
         }
         flushWatchConnectivityOutbox()
+        // Diagnostic work starts only after this exact payload was durably saved
+        // and the existing publication and outbox dispatch have returned. Acceptance
+        // remains independent of the optional diagnostic callback.
+        afterSubmission?(wasDurablyStored)
         return true
     }
 

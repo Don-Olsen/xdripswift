@@ -2578,3 +2578,63 @@ extension TroubleshootingLogTests {
         XCTAssertEqual(acknowledged.wait(timeout: .now() + 5), .success)
     }
 }
+
+extension TroubleshootingLogTests {
+    private func rssiDiagnosticEvent(stale: Bool = false) throws -> LibreWatchDiagnosticEvent {
+        let monitor = LibreWatchRSSIMonitor<NSObject>(), peripheral = NSObject()
+        let context = LibreWatchRSSIMonitor<NSObject>.Context(sessionID: UUID(), sensorUID: Data([0xDE, 0xAD]),
+            centralInstanceID: UUID(), connectionInstanceID: UUID(), generation: UUID())
+        _ = monitor.begin(peripheral: peripheral, context: context, payloadID: UUID(), at: referenceDate, continuousSeconds: 100)
+        let response = try XCTUnwrap(monitor.complete(peripheral: peripheral,
+            currentContext: stale ? nil : context, rssi: -76, errorPresent: false,
+            at: referenceDate.addingTimeInterval(2), continuousSeconds: 102))
+        var event = LibreWatchDiagnosticEvent(kind: .coreBluetoothCallback,
+            watchTimestamp: response.observedAt, trigger: "didReadRSSI", generation: response.generation,
+            sessionID: response.sessionID, centralInstanceID: response.centralInstanceID,
+            connectionInstanceID: response.connectionInstanceID)
+        event.rssiDiagnostic = response
+        return event
+    }
+
+    func testRSSIPhoneExportPreservesOriginalRequestResponseAndDelayedReceiptTimes() throws {
+        let event = try rssiDiagnosticEvent()
+        let projection = TroubleshootingWatchDiagnostic(event)
+        XCTAssertEqual(projection.rssiDiagnostic, event.rssiDiagnostic)
+        let entry = TroubleshootingLogEntry.detailed(.watchDiagnostic(projection),
+            timestamp: referenceDate.addingTimeInterval(3600))
+        let data = try JSONEncoder().encode(entry)
+        let decoded = try JSONDecoder().decode(TroubleshootingLogEntry.self, from: data)
+        XCTAssertEqual(decoded, entry)
+        let report = makeReport(entries: [decoded]).reportText
+        for expected in ["rssiSource=connectedRSSI", "rssiOutcome=succeeded", "rssi=-76dBm",
+                         "rssiObservedAt=08:00:02", "rssiRequestedAt=08:00:00", "receiptTime=09:00:00",
+                         "rssiElapsed=2.000s", "rssiRequest=", "rssiDecodedPayload="] {
+            XCTAssertTrue(report.contains(expected), "Missing RSSI export field: \(expected)")
+        }
+        XCTAssertFalse(String(decoding: data, as: UTF8.self).contains("sensorUID"))
+    }
+
+    func testRSSIPhoneExportLabelsStaleReplyAndRejectsWrongSessionProjection() throws {
+        var event = try rssiDiagnosticEvent(stale: true)
+        let projection = TroubleshootingWatchDiagnostic(event)
+        let report = makeReport(entries: [.detailed(.watchDiagnostic(projection), timestamp: referenceDate)]).reportText
+        XCTAssertTrue(report.contains("rssiOutcome=stale"))
+        XCTAssertFalse(report.contains("rssiOutcome=succeeded"))
+        event.sessionID = UUID()
+        XCTAssertNil(TroubleshootingWatchDiagnostic(event).rssiDiagnostic)
+    }
+
+    func testRSSIPhoneProjectionLegacyAbsenceAndRequestActionRemainExplicit() throws {
+        let event = try rssiDiagnosticEvent()
+        var encoded = try XCTUnwrap(JSONSerialization.jsonObject(with:
+            JSONEncoder().encode(TroubleshootingWatchDiagnostic(event))) as? [String: Any])
+        encoded.removeValue(forKey: "rssiDiagnostic")
+        let old = try JSONDecoder().decode(TroubleshootingWatchDiagnostic.self,
+            from: JSONSerialization.data(withJSONObject: encoded))
+        XCTAssertNil(old.rssiDiagnostic)
+        let request = TroubleshootingWatchDiagnostic(LibreWatchDiagnosticEvent(kind: .bluetoothAction,
+            watchTimestamp: referenceDate, trigger: "storedReadingRSSI", bluetoothAction: "readRSSI"))
+        XCTAssertEqual(request.action, "readRSSI")
+        XCTAssertEqual(request.trigger, "storedReadingRSSI")
+    }
+}

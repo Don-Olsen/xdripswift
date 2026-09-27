@@ -258,6 +258,8 @@ struct LibreWatchAlarmState: Codable, Equatable {
     var scheduledMissedConfirmed: Bool?
     var automaticThrottle: LibreWatchAlarmAutomaticThrottle?
     var ownershipStartedAt: Date?
+    /// Persist before requesting feedback so wrist wakes and process restarts cannot repeat it.
+    var readinessFeedbackOwnershipStartedAt: Date?
 
     /// An alarm baseline is not a glucose reading. It survives restart/wrist wakes and
     /// covers a takeover that never produces its first packet without fabricating an ID/value.
@@ -267,8 +269,22 @@ struct LibreWatchAlarmState: Codable, Equatable {
 
     mutating func endWatchOwnership() { ownershipStartedAt = nil }
 
+    mutating func claimTakeoverReadinessFeedback(_ readiness: LibreWatchAlarmReadiness) -> Bool {
+        guard readiness.status == .readyScheduled, let ownershipStartedAt,
+              readinessFeedbackOwnershipStartedAt != ownershipStartedAt else { return false }
+        readinessFeedbackOwnershipStartedAt = ownershipStartedAt
+        return true
+    }
+
     var missedReadingBaseline: Date? {
         [lastReadingAt, ownershipStartedAt].compactMap { $0 }.max()
+    }
+
+    func missedNotificationIdentifier(settings: LibreWatchAlarmSettings) -> String? {
+        guard let baseline = missedReadingBaseline else { return nil }
+        let snoozedUntil = snoozedUntil(.missed, settings: settings).timeIntervalSince1970
+        let snoozeAllUntil = settings.snoozeAllUntil?.timeIntervalSince1970 ?? 0
+        return "libreWatchAlarm.missed.\(settings.sessionID.uuidString).\(baseline.timeIntervalSince1970).\(settings.revision).\(snoozedUntil).\(snoozeAllUntil)"
     }
 
     mutating func use(_ settings: LibreWatchAlarmSettings) {
@@ -421,6 +437,94 @@ struct LibreWatchAlarmState: Codable, Equatable {
             }
         }
         return nil
+    }
+}
+
+/// Read-only evidence from the notification center. A pending request is not delivery evidence.
+struct LibreWatchAlarmPendingRequest: Equatable {
+    let identifier: String
+    let kind: LibreWatchAlarmKind?
+    let sessionID: String?
+    let baseline: Date?
+    let fireDate: Date?
+    let repeats: Bool
+}
+
+/// An asynchronous observation cannot authorize feedback for a changed takeover or deadline.
+struct LibreWatchAlarmReadinessQuery {
+    let generation: UInt64
+    let state: LibreWatchAlarmState
+    let configuration: LibreWatchAlarmConfiguration
+
+    func isCurrent(generation: UInt64, state: LibreWatchAlarmState,
+                   configuration: LibreWatchAlarmConfiguration, watchOwnsSensor: Bool) -> Bool {
+        watchOwnsSensor && self.generation == generation && self.state == state && self.configuration == configuration
+    }
+}
+
+struct LibreWatchAlarmReadiness: Equatable {
+    enum Status: String {
+        case inactive, settingsMissing, settingsPending, authorityMissing, missedRuleDisabled, snoozed
+        case checkingPermissions, notificationsDenied, alertsDisabled, soundsDisabled
+        case checkingSchedule, notScheduled, readyScheduled
+    }
+
+    let status: Status
+    let missedMinutes: Double?
+
+    var warning: String? {
+        switch status {
+        case .inactive, .readyScheduled: return nil
+        case .settingsMissing: return "Watch-alarm: mangler aktuelle iPhone-indstillinger."
+        case .settingsPending: return "Watch-alarm: afventer bekræftede indstillinger."
+        case .authorityMissing: return "Watch-alarm: alarmansvaret på uret er ikke bekræftet."
+        case .missedRuleDisabled: return "Alarm for manglende måling er slået fra."
+        case .snoozed: return "Alarm for manglende måling er snoozet."
+        case .checkingPermissions: return "Watch-alarm: kontrollerer notifikationstilladelser."
+        case .notificationsDenied: return "Watch-alarm: notifikationer er ikke fuldt tilladt."
+        case .alertsDisabled: return "Watch-alarm: visning af notifikationer er slået fra."
+        case .soundsDisabled: return "Watch-alarm: lydtilladelse mangler."
+        case .checkingSchedule: return "Watch-alarm: kontrollerer planlægningen."
+        case .notScheduled: return "Alarm for manglende måling er ikke bekræftet planlagt."
+        }
+    }
+
+    static func evaluate(
+        state: LibreWatchAlarmState, configuration: LibreWatchAlarmConfiguration,
+        watchOwnsSensor: Bool, permissionsKnown: Bool, notificationsFullyAuthorized: Bool,
+        alertsEnabled: Bool, soundsEnabled: Bool, pendingQueryCompleted: Bool,
+        pendingRequest: LibreWatchAlarmPendingRequest?, at now: Date
+    ) -> Self {
+        let settings = configuration.effectiveSettings
+        let rule = settings?.rule(for: .missed, at: now)
+        func result(_ status: Status) -> Self { Self(status: status, missedMinutes: rule?.value) }
+        guard watchOwnsSensor else { return result(.inactive) }
+        guard let settings, state.sessionID == settings.sessionID,
+              state.sensorIdentity == settings.sensorIdentity else { return result(.settingsMissing) }
+        guard configuration.pendingSettings == nil else { return result(.settingsPending) }
+        guard let rule, rule.enabled else { return result(.missedRuleDisabled) }
+        guard configuration.delegation?.matches(settings) == true,
+              configuration.delegation?.covers(.missed) == true else { return result(.authorityMissing) }
+        guard (settings.snoozeAllUntil ?? .distantPast) <= now,
+              state.snoozedUntil(.missed, settings: settings) <= now else { return result(.snoozed) }
+        guard permissionsKnown else { return result(.checkingPermissions) }
+        guard notificationsFullyAuthorized else { return result(.notificationsDenied) }
+        guard alertsEnabled else { return result(.alertsDisabled) }
+        guard !rule.soundEnabled || soundsEnabled else { return result(.soundsDisabled) }
+        guard let identifier = state.scheduledMissedID,
+              identifier == state.missedNotificationIdentifier(settings: settings),
+              let scheduledAt = state.scheduledMissedAt else { return result(.notScheduled) }
+        guard state.scheduledMissedConfirmed == true, pendingQueryCompleted else { return result(.checkingSchedule) }
+        guard let pendingRequest, pendingRequest.identifier == identifier,
+              pendingRequest.kind == .missed, pendingRequest.sessionID == settings.sessionID.uuidString,
+              pendingRequest.baseline == state.missedReadingBaseline, !pendingRequest.repeats,
+              let fireDate = pendingRequest.fireDate, fireDate > now,
+              abs(fireDate.timeIntervalSince(scheduledAt)) <= 5,
+              let expected = state.nextMissedAlarm(settings: settings, delegation: configuration.delegation,
+                  watchOwnsSensor: true, now: now),
+              abs(expected.date.timeIntervalSince(scheduledAt)) <= 1
+        else { return result(.notScheduled) }
+        return result(.readyScheduled)
     }
 }
 

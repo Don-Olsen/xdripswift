@@ -7898,3 +7898,373 @@ extension LibreWatchValuePipelineTests {
         }
     }
 }
+
+// RSSI diagnostics deliberately share no recovery/timing mutations with the collector.
+extension LibreWatchValuePipelineTests {
+    private func rssiContext(sessionID: UUID = UUID(), sensorUID: Data = Data([1, 2]),
+                             central: UUID = UUID(), connection: UUID = UUID(), generation: UUID = UUID())
+        -> LibreWatchRSSIMonitor<NSObject>.Context {
+        .init(sessionID: sessionID, sensorUID: sensorUID, centralInstanceID: central,
+              connectionInstanceID: connection, generation: generation)
+    }
+
+    func testRSSIHasOnePendingAndSixtySecondMonotonicThrottleIncludingFailures() throws {
+        let monitor = LibreWatchRSSIMonitor<NSObject>()
+        let peripheral = NSObject(), context = rssiContext(), payload = UUID()
+        let request = try XCTUnwrap(monitor.begin(peripheral: peripheral, context: context,
+            payloadID: payload, at: receivedAt, continuousSeconds: 100))
+        XCTAssertNil(monitor.begin(peripheral: peripheral, context: context,
+            payloadID: UUID(), at: receivedAt.addingTimeInterval(1), continuousSeconds: 101))
+        let failed = try XCTUnwrap(monitor.complete(peripheral: peripheral, currentContext: context,
+            rssi: -70, errorPresent: true, at: receivedAt.addingTimeInterval(2), continuousSeconds: 102))
+        XCTAssertEqual(failed.outcome, .failed)
+        XCTAssertNil(failed.rssi)
+        XCTAssertEqual(failed.requestID, request.requestID)
+        XCTAssertEqual(failed.decodedPayloadID, payload)
+        XCTAssertEqual(failed.requestElapsedSeconds, 2)
+        for tick in [99.0, 100, 159.999] {
+            XCTAssertNil(monitor.begin(peripheral: peripheral, context: context,
+                payloadID: UUID(), at: receivedAt.addingTimeInterval(6000), continuousSeconds: tick))
+        }
+        XCTAssertNotNil(monitor.begin(peripheral: peripheral, context: context,
+            payloadID: UUID(), at: receivedAt.addingTimeInterval(-6000), continuousSeconds: 160))
+    }
+
+    func testRSSILostCallbackCannotCreateOverlappingRequestsEvenAfterLongSuspension() {
+        let monitor = LibreWatchRSSIMonitor<NSObject>()
+        let peripheral = NSObject(), context = rssiContext()
+        XCTAssertNotNil(monitor.begin(peripheral: peripheral, context: context,
+            payloadID: UUID(), at: receivedAt, continuousSeconds: 100))
+        XCTAssertNil(monitor.begin(peripheral: peripheral, context: rssiContext(),
+            payloadID: UUID(), at: receivedAt.addingTimeInterval(86400), continuousSeconds: 86500))
+        XCTAssertTrue(monitor.hasPendingRequest)
+    }
+
+    func testRSSIOldSamePeripheralResponseKeepsOriginalContextAcrossAllIdentityChanges() throws {
+        let original = rssiContext()
+        let contexts = [
+            rssiContext(sessionID: UUID(), sensorUID: original.sensorUID, central: original.centralInstanceID,
+                connection: original.connectionInstanceID, generation: original.generation),
+            rssiContext(sessionID: original.sessionID, sensorUID: Data([9]), central: original.centralInstanceID,
+                connection: original.connectionInstanceID, generation: original.generation),
+            rssiContext(sessionID: original.sessionID, sensorUID: original.sensorUID, central: UUID(),
+                connection: original.connectionInstanceID, generation: original.generation),
+            rssiContext(sessionID: original.sessionID, sensorUID: original.sensorUID, central: original.centralInstanceID,
+                connection: UUID(), generation: original.generation),
+            rssiContext(sessionID: original.sessionID, sensorUID: original.sensorUID, central: original.centralInstanceID,
+                connection: original.connectionInstanceID, generation: UUID())
+        ]
+        for current in contexts {
+            let monitor = LibreWatchRSSIMonitor<NSObject>(), peripheral = NSObject()
+            let request = try XCTUnwrap(monitor.begin(peripheral: peripheral, context: original,
+                payloadID: UUID(), at: receivedAt, continuousSeconds: 100))
+            XCTAssertNil(monitor.begin(peripheral: peripheral, context: current,
+                payloadID: UUID(), at: receivedAt.addingTimeInterval(1), continuousSeconds: 101))
+            let stale = try XCTUnwrap(monitor.complete(peripheral: peripheral, currentContext: current,
+                rssi: -75, errorPresent: false, at: receivedAt.addingTimeInterval(2), continuousSeconds: 102))
+            XCTAssertEqual(stale.outcome, .stale)
+            XCTAssertEqual(stale.sessionID, original.sessionID)
+            XCTAssertEqual(stale.connectionInstanceID, original.connectionInstanceID)
+            XCTAssertEqual(stale.centralInstanceID, original.centralInstanceID)
+            XCTAssertEqual(stale.generation, original.generation)
+            XCTAssertEqual(stale.requestID, request.requestID)
+            XCTAssertTrue(stale.isValid)
+            XCTAssertFalse(monitor.hasPendingRequest)
+            XCTAssertNotNil(monitor.begin(peripheral: peripheral, context: current,
+                payloadID: UUID(), at: receivedAt.addingTimeInterval(62), continuousSeconds: 162))
+        }
+    }
+
+    func testRSSIWrongObjectCannotDrainPendingAndOwnershipLossMakesReplyStale() throws {
+        let monitor = LibreWatchRSSIMonitor<NSObject>(), peripheral = NSObject(), other = NSObject()
+        let context = rssiContext()
+        _ = monitor.begin(peripheral: peripheral, context: context, payloadID: UUID(), at: receivedAt, continuousSeconds: 100)
+        XCTAssertNil(monitor.complete(peripheral: other, currentContext: context,
+            rssi: -80, errorPresent: false, at: receivedAt, continuousSeconds: 101))
+        XCTAssertTrue(monitor.hasPendingRequest)
+        let result = try XCTUnwrap(monitor.complete(peripheral: peripheral, currentContext: nil,
+            rssi: -80, errorPresent: false, at: receivedAt, continuousSeconds: 102))
+        XCTAssertEqual(result.outcome, .stale)
+        XCTAssertNil(monitor.complete(peripheral: peripheral, currentContext: context,
+            rssi: -80, errorPresent: false, at: receivedAt, continuousSeconds: 103))
+    }
+
+    func testRSSILateResponseIsStaleAndUnavailableSentinelIsNeverSignalStrength() throws {
+        for (delay, value, outcome) in [(1.0, 127, LibreWatchRSSIDiagnostic.Outcome.unavailable),
+                                      (60.0, -127, .succeeded), (60.001, -70, .stale)] {
+            let monitor = LibreWatchRSSIMonitor<NSObject>(), peripheral = NSObject(), context = rssiContext()
+            _ = monitor.begin(peripheral: peripheral, context: context, payloadID: UUID(), at: receivedAt, continuousSeconds: 100)
+            let result = try XCTUnwrap(monitor.complete(peripheral: peripheral, currentContext: context,
+                rssi: value, errorPresent: false, at: receivedAt.addingTimeInterval(delay), continuousSeconds: 100 + delay))
+            XCTAssertEqual(result.outcome, outcome)
+            XCTAssertTrue(result.isValid)
+            if value == 127 { XCTAssertNil(result.rssi) }
+        }
+    }
+
+    func testRSSIDiscoveryRecordsEachMatchedObservationWithoutInventingConnectionOrName() throws {
+        let central = UUID(), generation = UUID()
+        func observe(_ name: String?, advertised: String?, owner: LibreWatchOwnership = .watch,
+                     poweredOn: Bool = true, at: Date) -> LibreWatchRSSIDiagnostic? {
+            LibreWatchRSSIMonitor<NSObject>.discovery(rssi: -74, peripheralName: name,
+                advertisedName: advertised, session: session, centralInstanceID: central,
+                generation: generation, ownership: owner, bluetoothIsPoweredOn: poweredOn, at: at, continuousSeconds: 100)
+        }
+        let first = try XCTUnwrap(observe(session.expectedPeripheralName, advertised: nil, at: receivedAt))
+        let duplicate = try XCTUnwrap(observe(session.expectedPeripheralName, advertised: nil,
+            at: receivedAt.addingTimeInterval(2)))
+        XCTAssertEqual(first.source, .discoveryRSSI)
+        XCTAssertEqual(first.observedAt, receivedAt)
+        XCTAssertEqual(duplicate.observedAt, receivedAt.addingTimeInterval(2))
+        XCTAssertNil(first.connectionInstanceID)
+        XCTAssertNil(first.requestID)
+        XCTAssertNotNil(observe(nil, advertised: session.expectedPeripheralName, at: receivedAt))
+        XCTAssertNil(observe("unmatched", advertised: session.expectedPeripheralName, at: receivedAt))
+        XCTAssertNil(observe(nil, advertised: nil, at: receivedAt))
+        XCTAssertNil(observe(session.expectedPeripheralName, advertised: nil, owner: .iphone, at: receivedAt))
+        XCTAssertNil(observe(session.expectedPeripheralName, advertised: nil, poweredOn: false, at: receivedAt))
+    }
+
+    func testRSSILEBoundsPreservePositiveValuesAndRejectSentinelInBothSources() throws {
+        for value in [-128, -127, 0, 1, 20, 21, 126, 127] {
+            let expected: Int? = [-127, 0, 1, 20].contains(value) ? value : nil
+            let monitor = LibreWatchRSSIMonitor<NSObject>(), peripheral = NSObject(), context = rssiContext()
+            _ = monitor.begin(peripheral: peripheral, context: context, payloadID: UUID(),
+                at: receivedAt, continuousSeconds: 100)
+            let connected = try XCTUnwrap(monitor.complete(peripheral: peripheral, currentContext: context,
+                rssi: value, errorPresent: false, at: receivedAt.addingTimeInterval(1), continuousSeconds: 101))
+            XCTAssertEqual(connected.rssi, expected)
+            XCTAssertEqual(connected.outcome, expected == nil ? .unavailable : .succeeded)
+            XCTAssertTrue(connected.isValid)
+            let discovery = try XCTUnwrap(LibreWatchRSSIMonitor<NSObject>.discovery(rssi: value,
+                peripheralName: session.expectedPeripheralName, advertisedName: nil, session: session,
+                centralInstanceID: UUID(), generation: UUID(), ownership: .watch,
+                bluetoothIsPoweredOn: true, at: receivedAt, continuousSeconds: 100))
+            XCTAssertEqual(discovery.rssi, expected)
+            XCTAssertEqual(discovery.outcome, expected == nil ? .unavailable : .observed)
+            XCTAssertTrue(discovery.isValid)
+        }
+    }
+
+    func testRSSIOptionalDiagnosticRoundTripAndLegacyAbsence() throws {
+        let monitor = LibreWatchRSSIMonitor<NSObject>(), peripheral = NSObject(), context = rssiContext()
+        let request = try XCTUnwrap(monitor.begin(peripheral: peripheral, context: context,
+            payloadID: UUID(), at: receivedAt, continuousSeconds: 100))
+        var event = LibreWatchDiagnosticEvent(kind: .bluetoothAction, watchTimestamp: request.observedAt,
+            generation: request.generation, sessionID: request.sessionID, bluetoothAction: "readRSSI",
+            centralInstanceID: request.centralInstanceID, connectionInstanceID: request.connectionInstanceID)
+        event.rssiDiagnostic = request
+        let encoded = try JSONEncoder().encode(event)
+        XCTAssertEqual(try JSONDecoder().decode(LibreWatchDiagnosticEvent.self, from: encoded).validatedRSSIDiagnostic, request)
+        var legacy = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        legacy.removeValue(forKey: "rssiDiagnostic")
+        XCTAssertNil(try JSONDecoder().decode(LibreWatchDiagnosticEvent.self,
+            from: JSONSerialization.data(withJSONObject: legacy)).rssiDiagnostic)
+        event.sessionID = UUID()
+        XCTAssertNil(event.validatedRSSIDiagnostic)
+    }
+}
+
+extension LibreWatchValuePipelineTests {
+    private struct AlarmReadinessFixture {
+        var state: LibreWatchAlarmState
+        var configuration: LibreWatchAlarmConfiguration
+        var pending: LibreWatchAlarmPendingRequest?
+    }
+
+    private func alarmReadinessFixture(soundEnabled: Bool = true, enabled: Bool = true,
+                                       snoozeAllUntil: Date? = nil) throws -> AlarmReadinessFixture {
+        let base = alarmSettings(enabled: enabled, snoozeAllUntil: snoozeAllUntil)
+        let rules = base.rules.map { rule in
+            LibreWatchAlarmRule(kind: rule.kind, startMinute: rule.startMinute, value: rule.value,
+                enabled: rule.enabled, snoozeMinutes: rule.snoozeMinutes, allowsSnooze: rule.allowsSnooze,
+                soundEnabled: soundEnabled, vibrate: rule.vibrate, title: rule.title)
+        }
+        let settings = LibreWatchAlarmSettings(sessionID: base.sessionID, sensorIdentity: base.sensorIdentity,
+            revision: base.revision, generatedAt: base.generatedAt, isMgDl: base.isMgDl,
+            rules: rules, snoozes: base.snoozes, snoozeAllUntil: base.snoozeAllUntil)
+        let configuration = LibreWatchAlarmConfiguration(settings: settings, delegation: alarmDelegation(settings))
+        var state = LibreWatchAlarmState()
+        state.use(settings)
+        state.beginWatchOwnership(at: receivedAt)
+        state.scheduledMissedID = state.missedNotificationIdentifier(settings: settings)
+        state.scheduledMissedAt = receivedAt.addingTimeInterval(300)
+        state.scheduledMissedConfirmed = true
+        let pending = LibreWatchAlarmPendingRequest(identifier: try XCTUnwrap(state.scheduledMissedID),
+            kind: .missed, sessionID: settings.sessionID.uuidString, baseline: state.missedReadingBaseline,
+            fireDate: state.scheduledMissedAt, repeats: false)
+        return AlarmReadinessFixture(state: state, configuration: configuration, pending: pending)
+    }
+
+    private func evaluateAlarmReadiness(_ fixture: AlarmReadinessFixture, owner: Bool = true,
+        permissionsKnown: Bool = true, authorized: Bool = true, alerts: Bool = true, sounds: Bool = true,
+        queryCompleted: Bool = true, at date: Date? = nil) -> LibreWatchAlarmReadiness {
+        LibreWatchAlarmReadiness.evaluate(state: fixture.state, configuration: fixture.configuration,
+            watchOwnsSensor: owner, permissionsKnown: permissionsKnown,
+            notificationsFullyAuthorized: authorized, alertsEnabled: alerts, soundsEnabled: sounds,
+            pendingQueryCompleted: queryCompleted, pendingRequest: fixture.pending, at: date ?? receivedAt)
+    }
+
+    func testTakeoverReadinessRequiresActualPendingRequestBeyondSuccessfulSubmission() throws {
+        var fixture = try alarmReadinessFixture()
+        let before = fixture
+        XCTAssertEqual(evaluateAlarmReadiness(fixture).status, .readyScheduled)
+        XCTAssertEqual(evaluateAlarmReadiness(fixture).missedMinutes, 5)
+        XCTAssertNil(evaluateAlarmReadiness(fixture).warning)
+        XCTAssertEqual(fixture.configuration, before.configuration, "The user's phone settings stay unchanged")
+        XCTAssertEqual(fixture.state, before.state, "A read-only check does not reschedule the alarm")
+        XCTAssertEqual(evaluateAlarmReadiness(fixture, queryCompleted: false).status, .checkingSchedule)
+        fixture.pending = nil
+        XCTAssertEqual(evaluateAlarmReadiness(fixture).status, .notScheduled,
+            "Successful add, delivered-only evidence or no pending request cannot establish readiness")
+        XCTAssertNotNil(evaluateAlarmReadiness(fixture).warning)
+        fixture.state.scheduledMissedConfirmed = false
+        XCTAssertEqual(evaluateAlarmReadiness(fixture).status, .checkingSchedule)
+    }
+
+    func testTakeoverReadinessRequiresCurrentRuleSnoozeStateAndConfirmedSettings() throws {
+        var fixture = try alarmReadinessFixture(enabled: false)
+        XCTAssertEqual(evaluateAlarmReadiness(fixture).status, .missedRuleDisabled)
+        fixture = try alarmReadinessFixture(snoozeAllUntil: receivedAt.addingTimeInterval(60))
+        XCTAssertEqual(evaluateAlarmReadiness(fixture).status, .snoozed)
+        fixture = try alarmReadinessFixture()
+        fixture.state.snooze(.missed, until: receivedAt.addingTimeInterval(60))
+        XCTAssertEqual(evaluateAlarmReadiness(fixture).status, .snoozed)
+        fixture = try alarmReadinessFixture()
+        var newer = try XCTUnwrap(fixture.configuration.settings)
+        newer.revision += 1
+        XCTAssertTrue(fixture.configuration.propose(newer, session: session))
+        XCTAssertEqual(evaluateAlarmReadiness(fixture).status, .settingsPending)
+        XCTAssertTrue(fixture.configuration.confirm(alarmDelegation(newer), session: session))
+        XCTAssertEqual(evaluateAlarmReadiness(fixture).status, .notScheduled,
+            "The pending request still belongs to the previous settings revision")
+    }
+
+    func testTakeoverReadinessPermissionFailuresKeepAnInAppWarningWithoutNotifications() throws {
+        let fixture = try alarmReadinessFixture()
+        let cases: [(LibreWatchAlarmReadiness, LibreWatchAlarmReadiness.Status)] = [
+            (evaluateAlarmReadiness(fixture, permissionsKnown: false), .checkingPermissions),
+            (evaluateAlarmReadiness(fixture, authorized: false), .notificationsDenied),
+            (evaluateAlarmReadiness(fixture, alerts: false), .alertsDisabled),
+            (evaluateAlarmReadiness(fixture, sounds: false), .soundsDisabled)
+        ]
+        for (readiness, expected) in cases {
+            XCTAssertEqual(readiness.status, expected)
+            XCTAssertNotNil(readiness.warning)
+            var state = fixture.state
+            XCTAssertFalse(state.claimTakeoverReadinessFeedback(readiness))
+        }
+        let silentRule = try alarmReadinessFixture(soundEnabled: false)
+        XCTAssertEqual(evaluateAlarmReadiness(silentRule, sounds: false).status, .readyScheduled,
+            "The check follows the user's sound setting without enabling sound")
+    }
+
+    func testTakeoverReadinessRequiresMatchingSessionOwnerAndMissedAlarmAuthority() throws {
+        var fixture = try alarmReadinessFixture()
+        XCTAssertEqual(evaluateAlarmReadiness(fixture, owner: false).status, .inactive)
+        XCTAssertNil(evaluateAlarmReadiness(fixture, owner: false).warning)
+        fixture.state.sessionID = UUID()
+        XCTAssertEqual(evaluateAlarmReadiness(fixture).status, .settingsMissing)
+        fixture = try alarmReadinessFixture()
+        fixture.configuration = LibreWatchAlarmConfiguration(settings: fixture.configuration.settings)
+        XCTAssertEqual(evaluateAlarmReadiness(fixture).status, .authorityMissing)
+        fixture.configuration = LibreWatchAlarmConfiguration()
+        XCTAssertEqual(evaluateAlarmReadiness(fixture).status, .settingsMissing)
+    }
+
+    func testTakeoverReadinessRejectsWrongPendingIdentityPayloadDeadlineAndRepeats() throws {
+        var fixture = try alarmReadinessFixture()
+        let good = try XCTUnwrap(fixture.pending)
+        let bad: [LibreWatchAlarmPendingRequest] = [
+            .init(identifier: "old-request", kind: .missed, sessionID: good.sessionID,
+                baseline: good.baseline, fireDate: good.fireDate, repeats: false),
+            .init(identifier: good.identifier, kind: .low, sessionID: good.sessionID,
+                baseline: good.baseline, fireDate: good.fireDate, repeats: false),
+            .init(identifier: good.identifier, kind: .missed, sessionID: UUID().uuidString,
+                baseline: good.baseline, fireDate: good.fireDate, repeats: false),
+            .init(identifier: good.identifier, kind: .missed, sessionID: good.sessionID,
+                baseline: receivedAt.addingTimeInterval(-60), fireDate: good.fireDate, repeats: false),
+            .init(identifier: good.identifier, kind: .missed, sessionID: good.sessionID,
+                baseline: good.baseline, fireDate: nil, repeats: false),
+            .init(identifier: good.identifier, kind: .missed, sessionID: good.sessionID,
+                baseline: good.baseline, fireDate: receivedAt.addingTimeInterval(360), repeats: false),
+            .init(identifier: good.identifier, kind: .missed, sessionID: good.sessionID,
+                baseline: good.baseline, fireDate: good.fireDate, repeats: true)
+        ]
+        for request in bad {
+            fixture.pending = request
+            XCTAssertEqual(evaluateAlarmReadiness(fixture).status, .notScheduled)
+        }
+        fixture.pending = good
+        XCTAssertEqual(evaluateAlarmReadiness(fixture, at: receivedAt.addingTimeInterval(301)).status, .notScheduled,
+            "An elapsed deadline is not a future scheduled alarm")
+        fixture.state.lastReadingAt = receivedAt.addingTimeInterval(60)
+        fixture.state.lastReadingID = UUID()
+        XCTAssertEqual(evaluateAlarmReadiness(fixture, at: receivedAt.addingTimeInterval(60)).status, .notScheduled,
+            "A new reading invalidates evidence for the previous deadline")
+    }
+
+    func testTakeoverReadinessPendingCallbackRejectsReturnNewQuerySettingsAndFreshReading() throws {
+        let original = try alarmReadinessFixture()
+        let query = LibreWatchAlarmReadinessQuery(generation: 4, state: original.state,
+            configuration: original.configuration)
+        func current(_ fixture: AlarmReadinessFixture, generation: UInt64 = 4, owner: Bool = true) -> Bool {
+            query.isCurrent(generation: generation, state: fixture.state,
+                configuration: fixture.configuration, watchOwnsSensor: owner)
+        }
+        XCTAssertTrue(current(original))
+        XCTAssertFalse(current(original, generation: 5))
+        XCTAssertFalse(current(original, owner: false))
+        var changed = original
+        changed.state.lastReadingAt = receivedAt.addingTimeInterval(60)
+        changed.state.lastReadingID = UUID()
+        XCTAssertFalse(current(changed))
+        changed = original
+        changed.state.snooze(.missed, until: receivedAt.addingTimeInterval(60))
+        XCTAssertFalse(current(changed))
+        changed = original
+        changed.state.endWatchOwnership()
+        changed.state.beginWatchOwnership(at: receivedAt.addingTimeInterval(60))
+        XCTAssertFalse(current(changed))
+        changed = original
+        var settings = try XCTUnwrap(changed.configuration.settings)
+        settings.revision += 1
+        XCTAssertTrue(changed.configuration.propose(settings, session: session))
+        XCTAssertFalse(current(changed))
+        changed = original
+        changed.state.sessionID = UUID()
+        XCTAssertFalse(current(changed))
+    }
+
+    func testTakeoverReadinessRequestsOneFeedbackAcrossReadingsWakesAndRestart() throws {
+        var fixture = try alarmReadinessFixture()
+        let ready = evaluateAlarmReadiness(fixture)
+        XCTAssertTrue(fixture.state.claimTakeoverReadinessFeedback(ready))
+        XCTAssertFalse(fixture.state.claimTakeoverReadinessFeedback(ready))
+        fixture.state.beginWatchOwnership(at: receivedAt.addingTimeInterval(30))
+        fixture.state.lastReadingAt = receivedAt.addingTimeInterval(60)
+        fixture.state.lastReadingID = UUID()
+        XCTAssertFalse(fixture.state.claimTakeoverReadinessFeedback(ready), "A reading does not create another takeover")
+        let defaults = isolatedDefaults()
+        LibreWatchAlarmStore.save(fixture.state, defaults: defaults)
+        var restarted = LibreWatchAlarmStore.state(defaults: defaults)
+        XCTAssertFalse(restarted.claimTakeoverReadinessFeedback(ready))
+        restarted.endWatchOwnership()
+        XCTAssertFalse(restarted.claimTakeoverReadinessFeedback(ready))
+        restarted.beginWatchOwnership(at: receivedAt.addingTimeInterval(600))
+        XCTAssertTrue(restarted.claimTakeoverReadinessFeedback(ready))
+        XCTAssertFalse(restarted.claimTakeoverReadinessFeedback(ready))
+        let legacy = try JSONDecoder().decode(LibreWatchAlarmState.self, from: Data("{\"snoozes\":[]}".utf8))
+        XCTAssertNil(legacy.readinessFeedbackOwnershipStartedAt)
+    }
+
+    func testTakeoverReadinessFailureDoesNotConsumeLaterReadyFeedback() throws {
+        var fixture = try alarmReadinessFixture()
+        let blocked = evaluateAlarmReadiness(fixture, alerts: false)
+        XCTAssertFalse(fixture.state.claimTakeoverReadinessFeedback(blocked))
+        XCTAssertNil(fixture.state.readinessFeedbackOwnershipStartedAt)
+        XCTAssertTrue(fixture.state.claimTakeoverReadinessFeedback(evaluateAlarmReadiness(fixture)))
+        XCTAssertFalse(fixture.state.claimTakeoverReadinessFeedback(blocked))
+        XCTAssertFalse(fixture.state.claimTakeoverReadinessFeedback(evaluateAlarmReadiness(fixture)))
+    }
+}

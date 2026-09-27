@@ -737,3 +737,72 @@ final class WatchDeliveryEvidenceTests: XCTestCase {
         XCTAssertTrue(text.contains("sensorElapsedMinutes"))
     }
 }
+
+extension WatchDeliveryEvidenceTests {
+    private func rssiEvent(_ evidence: LibreWatchRSSIDiagnostic) -> LibreWatchDiagnosticEvent {
+        var event = LibreWatchDiagnosticEvent(kind: .coreBluetoothCallback,
+            watchTimestamp: evidence.observedAt, generation: evidence.generation, sessionID: evidence.sessionID,
+            centralInstanceID: evidence.centralInstanceID, connectionInstanceID: evidence.connectionInstanceID)
+        event.rssiDiagnostic = evidence
+        return event
+    }
+
+    func testRSSIRequestsAndResultsSurviveLocalReloadWithOriginalTimesAndContext() throws {
+        let originalOrigin = origin(), journal = store(origin: originalOrigin)
+        let monitor = LibreWatchRSSIMonitor<NSObject>(), peripheral = NSObject()
+        let context = LibreWatchRSSIMonitor<NSObject>.Context(sessionID: UUID(), sensorUID: Data([1]),
+            centralInstanceID: UUID(), connectionInstanceID: UUID(), generation: UUID())
+        let requestedAt = now
+        let request = try XCTUnwrap(monitor.begin(peripheral: peripheral, context: context,
+            payloadID: UUID(), at: requestedAt, continuousSeconds: uptime))
+        let requestEvent = rssiEvent(request)
+        journal.recordCollectorDiagnostic(requestEvent)
+        now += 2; uptime += 2
+        let response = try XCTUnwrap(monitor.complete(peripheral: peripheral, currentContext: context,
+            rssi: -83, errorPresent: false, at: now, continuousSeconds: uptime))
+        journal.recordCollectorDiagnostic(rssiEvent(response))
+        now += 3600; uptime += 3600
+        let laterProcess = store(origin: origin())
+        let restored = try JSONDecoder().decode(WatchDeliveryEvidenceSnapshot.self, from: laterProcess.snapshotData())
+        XCTAssertEqual(restored.events.count, 2)
+        XCTAssertEqual(restored.events.map(\.stage), [.signalStrength, .signalStrength])
+        XCTAssertEqual(restored.events.map(\.rssiDiagnostic), [request, response])
+        XCTAssertEqual(restored.events.first?.payloadID, requestEvent.eventID)
+        XCTAssertTrue(restored.events.allSatisfy { $0.origin == originalOrigin && $0.sessionID == context.sessionID })
+        XCTAssertEqual(restored.events.last?.rssiDiagnostic?.requestedAt, requestedAt)
+        XCTAssertEqual(restored.events.last?.rssiDiagnostic?.requestElapsedSeconds, 2)
+        XCTAssertEqual(restored.events.last?.rssiDiagnostic?.connectionInstanceID, context.connectionInstanceID)
+        XCTAssertNotEqual(restored.events.last?.rssiDiagnostic?.observedAt, restored.exportedAt)
+    }
+
+    func testRSSIEvidenceWriteFailureDoesNotBecomeReadingFailureOrEraseOtherEvidence() throws {
+        let journal = store(append: { _, _ in throw CocoaError(.fileWriteOutOfSpace) })
+        let monitor = LibreWatchRSSIMonitor<NSObject>(), peripheral = NSObject()
+        let context = LibreWatchRSSIMonitor<NSObject>.Context(sessionID: UUID(), sensorUID: Data([1]),
+            centralInstanceID: UUID(), connectionInstanceID: UUID(), generation: UUID())
+        let request = try XCTUnwrap(monitor.begin(peripheral: peripheral, context: context,
+            payloadID: UUID(), at: now, continuousSeconds: uptime))
+        journal.recordCollectorDiagnostic(rssiEvent(request))
+        XCTAssertTrue(journal.snapshot().events.isEmpty)
+        XCTAssertEqual(journal.snapshot().writeFailures, 1)
+        XCTAssertTrue(monitor.hasPendingRequest)
+    }
+
+    func testRSSIEvidenceRejectsMismatchedContextAndOldJournalStillDecodes() throws {
+        let journal = store(), monitor = LibreWatchRSSIMonitor<NSObject>(), peripheral = NSObject()
+        let context = LibreWatchRSSIMonitor<NSObject>.Context(sessionID: UUID(), sensorUID: Data([1]),
+            centralInstanceID: UUID(), connectionInstanceID: UUID(), generation: UUID())
+        let request = try XCTUnwrap(monitor.begin(peripheral: peripheral, context: context,
+            payloadID: UUID(), at: now, continuousSeconds: uptime))
+        var wrong = rssiEvent(request)
+        wrong.sessionID = UUID()
+        journal.recordCollectorDiagnostic(wrong)
+        XCTAssertTrue(journal.snapshot().events.isEmpty)
+        XCTAssertTrue(journal.record(stage: .decoded))
+        let event = try XCTUnwrap(journal.snapshot().events.first)
+        var legacy = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(event)) as? [String: Any])
+        legacy.removeValue(forKey: "rssiDiagnostic")
+        XCTAssertNil(try JSONDecoder().decode(WatchDeliveryEvidenceEvent.self,
+            from: JSONSerialization.data(withJSONObject: legacy)).rssiDiagnostic)
+    }
+}

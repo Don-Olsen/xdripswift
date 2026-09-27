@@ -96,10 +96,18 @@ final class LibreWatchAlarmController: NSObject, UNUserNotificationCenterDelegat
     private var delegation: LibreWatchAlarmDelegation? { configuration.delegation }
     private var watchOwnsSensor = false
     private var notificationsAuthorized = false
+    private var readinessPermissionsKnown = false
+    private var notificationsFullyAuthorized = false
+    private var notificationAlertsEnabled = false
+    private var notificationSoundsEnabled = false
+    private var readinessQueryGeneration: UInt64 = 0
+    private var readinessPermissionGeneration: UInt64 = 0
+    private var lastTakeoverReadiness: LibreWatchAlarmReadiness?
     private var permissionEvidence = "authorization=unknown:alert=unknown:sound=unknown"
     private var previousReadinessEvidence: [String: String] = [:]
     private var pendingGlucoseAlarm = false
     var onStatusChange: ((String) -> Void)?
+    var onReadinessWarningChange: ((String?) -> Void)?
     var onReadinessChange: (() -> Void)?
     var onSnooze: (() -> Void)?
     private let category = "libreWatchLocalAlarmSnooze"
@@ -167,6 +175,7 @@ final class LibreWatchAlarmController: NSObject, UNUserNotificationCenterDelegat
     }
 
     func ownershipDidChange(_ ownership: LibreWatchOwnership) {
+        let becameWatchOwner = !watchOwnsSensor && ownership == .watch
         watchOwnsSensor = ownership == .watch
         if !watchOwnsSensor {
             state.endWatchOwnership()
@@ -176,6 +185,7 @@ final class LibreWatchAlarmController: NSObject, UNUserNotificationCenterDelegat
             LibreWatchAlarmStore.save(state)
             scheduleMissedIfNeeded()
         }
+        if becameWatchOwner { refreshTakeoverPermissions() }
         publishStatus()
     }
 
@@ -186,16 +196,48 @@ final class LibreWatchAlarmController: NSObject, UNUserNotificationCenterDelegat
     }
 
     func refreshPermission() {
+        readinessPermissionGeneration &+= 1
+        let permissionGeneration = readinessPermissionGeneration
         center.getNotificationSettings { [weak self] permissions in
             DispatchQueue.main.async {
                 guard let self else { return }
                 let previous = self.readinessRevision
-                self.permissionEvidence = "authorization=\(permissions.authorizationStatus.rawValue):alert=\(permissions.alertSetting.rawValue):sound=\(permissions.soundSetting.rawValue)"
+                if self.readinessPermissionGeneration == permissionGeneration {
+                    self.updateReadinessPermissionEvidence(permissions)
+                }
                 self.notificationsAuthorized = permissions.authorizationStatus == .authorized || permissions.authorizationStatus == .provisional
                 if !self.notificationsAuthorized { self.cancelScheduledAlarms() }
                 else { self.reconcileScheduledMissedAlarm() }
                 self.publishStatus()
                 if previous != self.readinessRevision { self.onReadinessChange?() }
+            }
+        }
+    }
+
+    private func updateReadinessPermissionEvidence(_ permissions: UNNotificationSettings) {
+        permissionEvidence = "authorization=\(permissions.authorizationStatus.rawValue):alert=\(permissions.alertSetting.rawValue):sound=\(permissions.soundSetting.rawValue)"
+        readinessPermissionsKnown = true
+        notificationsFullyAuthorized = permissions.authorizationStatus == .authorized
+        notificationAlertsEnabled = permissions.alertSetting == .enabled
+        notificationSoundsEnabled = permissions.soundSetting == .enabled
+    }
+
+    /// Takeover gets a fresh observation without changing the existing delegation or scheduler.
+    private func refreshTakeoverPermissions() {
+        readinessPermissionsKnown = false
+        readinessPermissionGeneration &+= 1
+        let generation = readinessPermissionGeneration
+        let ownershipStartedAt = state.ownershipStartedAt
+        let sessionID = state.sessionID
+        center.getNotificationSettings { [weak self] permissions in
+            DispatchQueue.main.async {
+                guard let self, self.watchOwnsSensor,
+                      self.readinessPermissionGeneration == generation,
+                      self.state.ownershipStartedAt == ownershipStartedAt,
+                      self.state.sessionID == sessionID else { return }
+                self.updateReadinessPermissionEvidence(permissions)
+                self.recordReadinessEvidence()
+                self.refreshTakeoverReadiness()
             }
         }
     }
@@ -234,6 +276,7 @@ final class LibreWatchAlarmController: NSObject, UNUserNotificationCenterDelegat
                 self.state.recordAutomaticThrottle(rule.kind, readingID: reading.id,
                     until: now.addingTimeInterval(Double(ConstantsAlerts.defaultDelayBetweenAlertsOfSameKindInMinutes) * 60))
                 LibreWatchAlarmStore.save(self.state)
+                self.refreshTakeoverReadiness()
                 #if canImport(WatchKit)
                 if rule.vibrate && !rule.soundEnabled { WKInterfaceDevice.current().play(.notification) }
                 #endif
@@ -271,9 +314,7 @@ final class LibreWatchAlarmController: NSObject, UNUserNotificationCenterDelegat
                 watchOwnsSensor: watchOwnsSensor, now: now),
               let baseline = state.missedReadingBaseline
         else { return }
-        let snoozedUntil = state.snoozedUntil(.missed, settings: settings).timeIntervalSince1970
-        let snoozeAllUntil = settings.snoozeAllUntil?.timeIntervalSince1970 ?? 0
-        let identifier = "libreWatchAlarm.missed.\(settings.sessionID.uuidString).\(baseline.timeIntervalSince1970).\(settings.revision).\(snoozedUntil).\(snoozeAllUntil)"
+        guard let identifier = state.missedNotificationIdentifier(settings: settings) else { return }
         guard state.scheduledMissedID != identifier else { return }
         if let previous = state.scheduledMissedID { center.removePendingNotificationRequests(withIdentifiers: [previous]) }
         let content = content(for: missed.rule)
@@ -299,10 +340,12 @@ final class LibreWatchAlarmController: NSObject, UNUserNotificationCenterDelegat
                         outcome: "missedNotificationAddFailed:\(WatchDeliveryEvidenceStore.errorClass(error))", stream: .diagnostic)
                     self.state.scheduledMissedID = nil
                     LibreWatchAlarmStore.save(self.state)
+                    self.publishStatus()
                     self.onStatusChange?("Watch-alarm kunne ikke planlægges: \((error as NSError).domain) \((error as NSError).code)")
                 } else {
                     self.state.scheduledMissedConfirmed = true
                     LibreWatchAlarmStore.save(self.state)
+                    self.publishStatus()
                 }
             }
         }
@@ -335,6 +378,7 @@ final class LibreWatchAlarmController: NSObject, UNUserNotificationCenterDelegat
 
     private func publishStatus() {
         recordReadinessEvidence()
+        refreshTakeoverReadiness()
         guard let settings else { onStatusChange?("Watch-alarmer: venter på iPhone-indstillinger"); return }
         if !settings.rules.contains(where: \.enabled) {
             onStatusChange?("Watch-alarmer er slået fra i dine indstillinger")
@@ -351,6 +395,67 @@ final class LibreWatchAlarmController: NSObject, UNUserNotificationCenterDelegat
         }
     }
 
+    private func takeoverReadiness(
+        pendingQueryCompleted: Bool = false, pendingRequest: LibreWatchAlarmPendingRequest? = nil
+    ) -> LibreWatchAlarmReadiness {
+        LibreWatchAlarmReadiness.evaluate(state: state, configuration: configuration,
+            watchOwnsSensor: watchOwnsSensor, permissionsKnown: readinessPermissionsKnown,
+            notificationsFullyAuthorized: notificationsFullyAuthorized,
+            alertsEnabled: notificationAlertsEnabled, soundsEnabled: notificationSoundsEnabled,
+            pendingQueryCompleted: pendingQueryCompleted, pendingRequest: pendingRequest, at: Date())
+    }
+
+    /// Read the actual pending queue; successful submission and delivered notifications are
+    /// deliberately insufficient. No timer, notification, handoff or permission prompt is added.
+    private func refreshTakeoverReadiness() {
+        readinessQueryGeneration &+= 1
+        let generation = readinessQueryGeneration
+        let preliminary = takeoverReadiness()
+        guard preliminary.status == .checkingSchedule, state.scheduledMissedConfirmed == true else {
+            publishTakeoverReadiness(preliminary)
+            return
+        }
+        // A fresh reading replaces the deadline every minute. Keep the last verified status
+        // while this short query runs instead of flashing a checking warning on every reading.
+        if lastTakeoverReadiness?.status != .readyScheduled { publishTakeoverReadiness(preliminary) }
+        let query = LibreWatchAlarmReadinessQuery(generation: generation, state: state, configuration: configuration)
+        center.getPendingNotificationRequests { [weak self] pending in
+            DispatchQueue.main.async {
+                guard let self, query.isCurrent(generation: self.readinessQueryGeneration,
+                    state: self.state, configuration: self.configuration, watchOwnsSensor: self.watchOwnsSensor)
+                else { return }
+                let request = pending.first { $0.identifier == query.state.scheduledMissedID }
+                let evidence = request.map { request in
+                    let info = request.content.userInfo
+                    let trigger = request.trigger as? UNTimeIntervalNotificationTrigger
+                    return LibreWatchAlarmPendingRequest(identifier: request.identifier,
+                        kind: (info["libreWatchAlarmKind"] as? Int).flatMap(LibreWatchAlarmKind.init(rawValue:)),
+                        sessionID: info["libreWatchAlarmSession"] as? String,
+                        baseline: (info["libreWatchAlarmBaseline"] as? Double).map(Date.init(timeIntervalSince1970:)),
+                        fireDate: trigger?.nextTriggerDate(), repeats: trigger?.repeats ?? true)
+                }
+                self.publishTakeoverReadiness(self.takeoverReadiness(pendingQueryCompleted: true, pendingRequest: evidence))
+            }
+        }
+    }
+
+    private func publishTakeoverReadiness(_ readiness: LibreWatchAlarmReadiness) {
+        if lastTakeoverReadiness != readiness {
+            lastTakeoverReadiness = readiness
+            onReadinessWarningChange?(readiness.warning)
+            WatchDeliveryEvidenceStore.shared.record(stage: .alarmReadiness, sessionID: settings?.sessionID,
+                outcome: "takeoverReadiness:\(readiness.status.rawValue):missedMinutes=\(readiness.missedMinutes.map { String($0) } ?? "none")",
+                stream: .diagnostic)
+        }
+        guard state.claimTakeoverReadinessFeedback(readiness) else { return }
+        LibreWatchAlarmStore.save(state)
+        #if canImport(WatchKit)
+        WKInterfaceDevice.current().play(.click)
+        WatchDeliveryEvidenceStore.shared.record(stage: .alarmReadiness, sessionID: settings?.sessionID,
+            outcome: "takeoverFeedback:clickRequested", stream: .diagnostic)
+        #endif
+    }
+
     /// Permissions and delegated responsibility are evidence, not proof that sound was heard.
     /// Record only semantic changes; presentation ticks do not create journal writes.
     private func recordReadinessEvidence() {
@@ -358,6 +463,8 @@ final class LibreWatchAlarmController: NSObject, UNUserNotificationCenterDelegat
             "authority": "ownerWatch=\(watchOwnsSensor):delegated=\(alarmsAreDelegatedToWatch):readiness=\(readinessRevision.map { String($0) } ?? "none")",
             "snoozeAll": "until=\(settings?.snoozeAllUntil.map { String($0.timeIntervalSince1970) } ?? "none")"]
         if let settings {
+            let missed = settings.rule(for: .missed, at: Date())
+            evidence["missedSettings"] = "active=\(settings.revision):offered=\(offeredSettings?.revision ?? 0):enabled=\(missed?.enabled == true):minutes=\(missed.map { String($0.value) } ?? "none")"
             evidence["snoozes"] = LibreWatchAlarmKind.allCases.map {
                 "\($0.rawValue)=\(state.snoozedUntil($0, settings: settings).timeIntervalSince1970)"
             }.joined(separator: ":")
@@ -405,6 +512,7 @@ final class LibreWatchAlarmController: NSObject, UNUserNotificationCenterDelegat
             LibreWatchAlarmStore.save(self.state)
             self.center.removeDeliveredNotifications(withIdentifiers: [response.notification.request.identifier])
             self.scheduleMissedIfNeeded()
+            self.publishStatus()
             self.onSnooze?()
         }
     }

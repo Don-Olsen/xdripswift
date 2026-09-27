@@ -141,6 +141,18 @@ struct BigNumberView: View {
                 .padding(.bottom, -20)
             }
         }
+        .safeAreaInset(edge: .top, spacing: 2) {
+            if watchState.libreWatchOwnership == .watch,
+               let warning = watchState.localAlarmReadinessWarning {
+                Text(warning)
+                    .font(.system(size: isSmallScreen ? 11 : 12, weight: .semibold))
+                    .foregroundStyle(.orange)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, 4)
+                    .accessibilityLabel("Alarmadvarsel: \(warning)")
+            }
+        }
         .onAppear {
             displayDate = Date()
             watchState.refreshDirectLibreReadingFreshness(at: displayDate)

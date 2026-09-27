@@ -83,6 +83,14 @@ struct LibreDirectView: View {
                         .foregroundStyle(.orange)
                 }
 
+                if let warning = watchState.localAlarmReadinessWarning {
+                    Text(warning)
+                        .font(.caption2.bold())
+                        .multilineTextAlignment(.center)
+                        .foregroundStyle(.orange)
+                        .accessibilityLabel("Alarmadvarsel: \(warning)")
+                }
+
                 Text(watchState.localAlarmStatus)
                     .font(.caption2)
                     .multilineTextAlignment(.center)

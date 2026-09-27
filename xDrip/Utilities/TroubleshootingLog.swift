@@ -892,6 +892,7 @@ struct TroubleshootingWatchDiagnostic: Codable, Equatable {
     let runtimeDiagnostic: LibreWatchRuntimeDiagnostic?
     let callbackElapsedSeconds: TimeInterval?
     let completedCallbackTiming: LibreWatchCallbackTimingSummary?
+    let rssiDiagnostic: LibreWatchRSSIDiagnostic?
     let bluetoothErrorClassification: String?
     let source: LibreWatchRecoveryReconcileSource?
     let reconnectObservationSource: LibreWatchReconnectObservationSource?
@@ -946,14 +947,15 @@ struct TroubleshootingWatchDiagnostic: Codable, Equatable {
         runtimeDiagnostic = event.runtimeDiagnostic
         callbackElapsedSeconds = event.callbackElapsedSeconds.flatMap { $0.isFinite && $0 >= 0 ? $0 : nil }
         completedCallbackTiming = event.completedCallbackTiming.flatMap { $0.isValid ? $0 : nil }
+        rssiDiagnostic = event.validatedRSSIDiagnostic
         bluetoothErrorClassification = Self.allow(event.bluetoothErrorClassification,
             in: ["backgroundBudgetNear", "backgroundBudgetExceeded", "recoverBluetoothLink"])
         source = event.reconcileSource
         reconnectObservationSource = event.reconnectObservationSource
         peripheral = Self.normalizedPeripheralState(event.peripheralState)
         phase = Self.allow(event.connectionPhase, in: ["idle", "connection", "services", "characteristics", "notifications", "unlock", "receiving", "cancelling"])
-        action = Self.allow(event.bluetoothAction, in: ["centralCreated", "scan", "connect", "cancel", "discoverServices", "discoverCharacteristics", "setNotifyValue", "unlockRequested", "unlockCompleted"])
-        let causes: Set<String> = ["observedLinkState", "didFailToConnect", "didConnect", "didDisconnect", "didDisconnectLegacy", "didDisconnectModern", "didDiscoverServices", "didDiscoverCharacteristics", "didModifyServices", "didUpdateNotificationState", "didWriteUnlock", "didUpdateValue", "didDiscoverConfirmedSensor", "didDiscoverDeferredSensor", "didDiscoverResumedSensor", "pendingDiscovery", "scopeStateOrAgeChanged", "restorationAccepted", "centralPoweredOn", "centralPoweredOff", "centralUnauthorized", "centralUnsupported", "centralResetting", "centralUnknown", "validBLEFrame", "invalidFrames", "noData", "setupOrBluetoothError", "returnAwaitingDisconnection", "extendedRuntimeWillExpire", "extendedRuntimeInvalidated", "exactNFCConfirmedSensor", "confirmedPeripheral", "collectorPreparation", "freshConnectionSetup", "restoredMissingService", "restoredMissingCharacteristics", "restoredNotificationSetup", "restoredNonSelectedPeripheral", "serviceDiscoveryCompleted", "serviceDiscoveryRequiresConfirmation", "serviceDiscoveryConfirmation", "characteristicsReady", "notificationSubscriptionReady", "writeAcknowledged", "controlledRecovery", "pendingConnectionAge", "serviceInvalidated", "returnToPhone", "ownershipStopped", "unexpectedPeripheralConnected", "connectionArrivedDuringCancellation", "connectionIdentityOrOwnershipMismatch", "notCurrentPeripheral", "retiredPeripheral", "linkAlreadyConnected", "disconnectPredatesCurrentConnection", "disconnectAlreadyHandled", "restoredIdentityUnresolved", "restoredIdentityMismatch", "restoredIdentityAmbiguous", "unrelatedServiceInvalidation", "serviceInvalidationNotActionable", "staleSetupGenerationOrPhase", "staleSetupGenerationOrService", "staleCharacteristicOrSetupPhase", "staleCharacteristicGenerationOrOwnership", "willRestoreState", "disconnect", "connectionTimeout", "setupTimeout"]
+        action = Self.allow(event.bluetoothAction, in: ["centralCreated", "scan", "connect", "cancel", "discoverServices", "discoverCharacteristics", "setNotifyValue", "unlockRequested", "unlockCompleted", "readRSSI"])
+        let causes: Set<String> = ["didReadRSSI", "discoveryRSSI", "storedReadingRSSI", "observedLinkState", "didFailToConnect", "didConnect", "didDisconnect", "didDisconnectLegacy", "didDisconnectModern", "didDiscoverServices", "didDiscoverCharacteristics", "didModifyServices", "didUpdateNotificationState", "didWriteUnlock", "didUpdateValue", "didDiscoverConfirmedSensor", "didDiscoverDeferredSensor", "didDiscoverResumedSensor", "pendingDiscovery", "scopeStateOrAgeChanged", "restorationAccepted", "centralPoweredOn", "centralPoweredOff", "centralUnauthorized", "centralUnsupported", "centralResetting", "centralUnknown", "validBLEFrame", "invalidFrames", "noData", "setupOrBluetoothError", "returnAwaitingDisconnection", "extendedRuntimeWillExpire", "extendedRuntimeInvalidated", "exactNFCConfirmedSensor", "confirmedPeripheral", "collectorPreparation", "freshConnectionSetup", "restoredMissingService", "restoredMissingCharacteristics", "restoredNotificationSetup", "restoredNonSelectedPeripheral", "serviceDiscoveryCompleted", "serviceDiscoveryRequiresConfirmation", "serviceDiscoveryConfirmation", "characteristicsReady", "notificationSubscriptionReady", "writeAcknowledged", "controlledRecovery", "pendingConnectionAge", "serviceInvalidated", "returnToPhone", "ownershipStopped", "unexpectedPeripheralConnected", "connectionArrivedDuringCancellation", "connectionIdentityOrOwnershipMismatch", "notCurrentPeripheral", "retiredPeripheral", "linkAlreadyConnected", "disconnectPredatesCurrentConnection", "disconnectAlreadyHandled", "restoredIdentityUnresolved", "restoredIdentityMismatch", "restoredIdentityAmbiguous", "unrelatedServiceInvalidation", "serviceInvalidationNotActionable", "staleSetupGenerationOrPhase", "staleSetupGenerationOrService", "staleCharacteristicOrSetupPhase", "staleCharacteristicGenerationOrOwnership", "willRestoreState", "disconnect", "connectionTimeout", "setupTimeout"]
         trigger = Self.allow(event.trigger, in: causes)
         reason = Self.allow(event.actionReason, in: causes)
         generation = event.generation
@@ -2207,6 +2209,9 @@ struct TroubleshootingLogReportBuilder {
                     }.joined(separator: ",")
                     fields.append("\(prefix)WorkStages=[\(stages)] \(prefix)DecodedPayload=\(breakdown.decodedPayloadID?.uuidString ?? "unknown")")
                 }
+            }
+            if let rssi = event.rssiDiagnostic, rssi.isValid {
+                fields.append("rssiSource=\(rssi.source.rawValue) rssiOutcome=\(rssi.outcome.rawValue) rssi=\(rssi.rssi.map(String.init) ?? "unavailable")dBm rssiObservedAt=\(time(rssi.observedAt)) rssiContinuousSeconds=\(String(format: "%.3f", rssi.observedContinuousSeconds)) rssiRequest=\(rssi.requestID?.uuidString ?? "none") rssiRequestedAt=\(time(rssi.requestedAt)) rssiElapsed=\(rssi.requestElapsedSeconds.map { String(format: "%.3f", $0) } ?? "none")s rssiDecodedPayload=\(rssi.decodedPayloadID?.uuidString ?? "none")")
             }
             if let classification = event.bluetoothErrorClassification { fields.append("bluetoothErrorClass=\(classification)") }
             if let reason = event.reason { fields.append("reason=\(reason)") }
