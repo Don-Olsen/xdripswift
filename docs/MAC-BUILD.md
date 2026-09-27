@@ -35,6 +35,13 @@ Agenten gennemgår/stager den ønskede kode, tests og projekt-/procesfiler.
 Den almindelige lokale buildproces uploader aldrig. Efter brugerens GO UPLOAD
 for den konkrete version køres:
 
+Før næste upload kontrolleres, om brugerens parrede, fysiske iPhone kan nås
+via Xcode/device-værktøjer over netværk eller kabel. Er den tilgængelig, laves
+en sikker fysisk smoke-test af den testede kode, hvor installation kan ske
+uden utilsigtet at erstatte TestFlight-appen eller dens data. Hvis det ikke er
+muligt, rapporteres begrænsningen tydeligt før upload. En iPhone-smoke-test
+erstatter aldrig en fysisk Watch-test af sensorforbindelsen uden telefon.
+
 ```sh
 # Kun efter agentens gennemgang af den præcise staged diff og brugerens GO UPLOAD:
 XDRIP_STAGED_DIFF_REVIEWED=YES \
