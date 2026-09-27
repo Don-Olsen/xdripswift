@@ -15,10 +15,33 @@ De følgende afsnit bevarer integrations- og testhistorikken før denne udgivels
 Apple Watch-sysdiagnose er verificeret fra en prøve kl. 18:45 den 27. september:
 trådløs hentning via iPhone, bekræftet Watch-oprindelse og læsbar HCI-log i
 PacketLogger. Prøven dokumenterer ikke årsagen til det tidligere Libre-udfald.
-Den næste diagnoseudgivelse tilføjer kun RSSI og automatisk kontrol af
+Diagnoseudgivelsen 4279 tilføjer kun RSSI og automatisk kontrol af
 alarmberedskab; genopkobling, timeout, runtime og måleflow bevares.
 Se [afgrænsning, logbegrænsninger og 90-minutters test](WATCH-RSSI-ALARM-DIAGNOSTICS.md).
-Faktiske release-tests og Apple-status registreres ved gennemført udgivelse.
+
+
+### Verifikation og fysisk afgrænsning for 4279
+
+Den præcise release-kilde bestod 1.096/1.096 XCTest-tests uden fejl eller
+skipped tests, inklusive 22 nye RSSI-/alarmtests, Python-kontrollerne og begge
+simulatorbuilds. Den signerede IPA er kontrolleret mod kilde-tagget og alle
+fem bundles. Apple-status og kildecommit står i releaseblokken ovenfor.
+
+Den parrede iPhone kunne læses trådløst med devicectl og havde 4278 installeret
+som en udviklerapp. 4279-arkivets udviklingsprofiler omfatter ikke denne iPhone.
+Der blev derfor ikke installeret eller startet ny kode på telefonen, og ingen
+appdata blev ændret. Et valgfrit opslag af enhedsregistrering hos Apple blev
+afvist af automatisk godkendelseskontrol på grund af manglende særskilt
+tilladelse til at sende enheds-id'et; opslaget blev ikke gentaget. Profiler,
+enhedsregistrering og signeringskonfiguration blev ikke ændret for at omgå det.
+Den trådløse loghentning er verificeret, men er ikke en fysisk smoke-test af 4279.
+Lokal kontrol: `build/testflight-7.1.1-4279/physical-iphone-preflight.json`.
+
+Ingen fysisk stabilitetsforbedring eller faktisk alarmlevering er endnu bevist
+med 4279. Den næste afgrænsede Watch-test varer 90 minutter som beskrevet i
+diagnosevejledningen. En kodegennemgang bemærkede desuden en mulig eksisterende
+race mellem overlappende almindelige permission-refresh-svar; den er ikke
+observeret i denne test og blev ikke ændret som del af diagnosen.
 
 <!-- testflight-7.1.1-4278:start -->
 ### TestFlight 7.1.1 (4278)
