@@ -12,12 +12,37 @@ De følgende afsnit bevarer integrations- og testhistorikken før denne udgivels
 
 ## Alarmrettelse efter den fysiske 4279-test
 
-Næste release retter kun afrundingen af Watch-notifikationers baseline.
+Build 4280 retter kun afrundingen af Watch-notifikationers baseline.
 Alle fem alarmtyper er gennemgået; otte nye tests reproducerer fejlen og
 beskytter blandt andet snooze, ejerskab og telefonens valgte alarmforsinkelse.
 Bluetooth, runtime, målebehandling og levering bevares.
 Se [rettelse og RSSI-analyse](WATCH-ALARM-TIMESTAMP-REVIEW.md).
 Trendudfyldning er kun en [plan til en senere diagnosebuild](WATCH-TREND-SHADOW-PLAN.md).
+
+
+### Verifikation og fysisk afgrænsning for 4280
+
+Afrundingsfejlen blev først reproduceret mod 4279-koden: tre af otte nye
+testmetoder fejlede med i alt 11 assertions. Med rettelsen bestod alle otte.
+Den endelige 4280-kilde bestod 1.104/1.104 XCTest-tests, Python-kontrollerne
+og begge simulatorbuilds. Kilde-tag, alle fem signerede bundles og den
+eksporterede IPA er verificeret. Rettelsen ændrer ingen Bluetooth-logik,
+timeouts, alarmindstillinger eller trendbehandling.
+
+Den parrede iPhone blev læst via lokalnettet og havde 4279 installeret.
+4280-arkivets udviklingsprofiler omfatter ikke denne iPhone, så ingen ny kode
+blev installeret eller startet direkte på telefonen. Enhedsregistrering og
+signeringskonfiguration er uændret. Dette er en verificeret trådløs
+enhedskontrol, ikke en fysisk smoke-test af 4280 eller dokumentation for
+faktisk lyd/haptik fra urets alarmer. Det sidste skal fortsat observeres på uret.
+Lokal kontrol: `build/testflight-7.1.1-4280/physical-iphone-preflight.json`.
+
+IPA SHA-256: `4372ce058bb78320503f52b81d81db99b3c3e2e6cf2ce91d730e3f7351688cc5`.
+Regressionens før/efter-resultater og den eksisterende 4279-tests
+RSSI-beregning med kildehash findes i `build/alarm-timestamp-fix/`.
+Se [alarmgennemgang og RSSI](WATCH-ALARM-TIMESTAMP-REVIEW.md) og
+[plan for en senere skyggetest af trendværdier](WATCH-TREND-SHADOW-PLAN.md).
+
 
 <!-- testflight-7.1.1-4279:start -->
 ### TestFlight 7.1.1 (4279)
