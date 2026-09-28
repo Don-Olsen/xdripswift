@@ -10,6 +10,30 @@
 
 De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
 
+## Afgrænsning og fysisk opfølgning for 4282
+
+4282 ændrer kun Home-visningen af lokale IOB/COB under en kort genindlæsning.
+En sidst bekræftet værdi kan blive stående i højst 60 sekunder, mærket med
+beregningstidspunktet; den underliggende behandlingstilstand er fortsat
+utilgængelig indtil nye data er klar. Ældre værdier og ændret datakilde giver
+fortsat streger. Watch-Bluetooth, workout, alarm, målebehandling og overdragelse
+er uændrede. Effekten på den faktiske åbningsanimation er endnu ikke fysisk
+bekræftet. Før upload viste Xcodes enhedsliste den parrede iPhone som
+`unavailable`, så ingen fysisk iPhone-smoke-test blev udført.
+
+Næste direkte Watch-test skal derfor måle stabilitet, ikke tilskrive 4282 en
+Bluetooth-forbedring. Den sidste fysiske 4279-test gav 88/90 sensorminutter,
+men femminuttersalarmen var ikke klar, og alle testbetingelser var ikke
+verificeret. Med 4282 installeret på både iPhone og Watch: sæt alarmen for
+manglende målinger til fem minutter og fjern snooze; overtag sensoren på uret,
+vent på første direkte måling, slå derefter iPhonens Bluetooth og Wi-Fi fra i
+Indstillinger og noter starttidspunktet. Lad uret være urørt i 90 minutter,
+genetabler derefter telefonens forbindelser og giv ejerskabet tilbage. Hent
+friske Watch- og iPhone-logs. Godkendelseskriterierne er mindst 86/90 modtagne
+sensorminutter, ingen pause over tre minutter og en ubrudt workout. Rapportér
+første 60 og sidste 30 minutter hver for sig; skeln mellem planlagt alarm og
+dokumenteret alarmlevering. Se `WATCH-RSSI-ALARM-DIAGNOSTICS.md`.
+
 <!-- testflight-7.1.1-4281:start -->
 ### TestFlight 7.1.1 (4281)
 
