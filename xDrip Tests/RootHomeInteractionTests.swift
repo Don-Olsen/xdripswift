@@ -13,6 +13,32 @@ import XCTest
 
 final class RootHomeInteractionTests: XCTestCase {
 
+    func testLiveChartDoesNotBecomeHistoricalWhileAppIsSuspended() {
+        let openedAt = Date()
+        let coordinator = GlucoseChartScrollCoordinator(
+            endDate: openedAt, visibleTimeInterval: .hours(3)
+        )
+        let resumedAt = openedAt.addingTimeInterval(5 * 60)
+
+        XCTAssertTrue(coordinator.isShowingCurrentTimeRange(at: resumedAt))
+        XCTAssertTrue(coordinator.refreshCurrentTimeRangeIfNeeded(at: resumedAt))
+        XCTAssertEqual(coordinator.endDate, resumedAt)
+    }
+
+    func testHistoricalChartWindowRemainsHistoricalUntilReset() {
+        let now = Date()
+        let selectedDate = now.addingTimeInterval(-5 * 60)
+        let coordinator = GlucoseChartScrollCoordinator(
+            endDate: selectedDate, visibleTimeInterval: .hours(3)
+        )
+
+        XCTAssertFalse(coordinator.isShowingCurrentTimeRange(at: now))
+        XCTAssertFalse(coordinator.refreshCurrentTimeRangeIfNeeded(at: now))
+        XCTAssertEqual(coordinator.endDate, selectedDate)
+        coordinator.resetToNow()
+        XCTAssertTrue(coordinator.isShowingCurrentTimeRange)
+    }
+
     @MainActor
     func testTherapyStripKeepsCompactHeightWhenHomeHasExtraVerticalSpace() {
         let host = UIHostingController(rootView: RootHomeLoopView(

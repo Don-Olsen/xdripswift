@@ -40,6 +40,9 @@ final class GlucoseChartScrollCoordinator: ObservableObject {
     /// to the same starting window rather than accumulating translations.
     private var overviewDragStartEndDate: Date?
     private var decelerationTimer: Timer?
+    /// A live window may be older than 60 seconds while the app is suspended. Only an explicit
+    /// chart gesture should turn that elapsed time into a historical selection.
+    private var followsCurrentTimeRange: Bool
 
     private static let minimumDecelerationVelocityWidth: CGFloat = 20
     private static let minimumDecelerationDistanceWidth: CGFloat = 1
@@ -59,6 +62,7 @@ final class GlucoseChartScrollCoordinator: ObservableObject {
     init(endDate: Date = Date(), visibleTimeInterval: TimeInterval) {
         self.endDate = endDate
         self.visibleTimeInterval = abs(visibleTimeInterval)
+        self.followsCurrentTimeRange = endDate.timeIntervalSinceNow > -60
     }
 
     // MARK: - Visible Window
@@ -68,7 +72,11 @@ final class GlucoseChartScrollCoordinator: ObservableObject {
     }
 
     var isShowingCurrentTimeRange: Bool {
-        endDate.timeIntervalSinceNow > -60
+        isShowingCurrentTimeRange(at: Date())
+    }
+
+    func isShowingCurrentTimeRange(at now: Date) -> Bool {
+        followsCurrentTimeRange || endDate.timeIntervalSince(now) > -60
     }
 
     /// Updates the visible duration while preserving the current end date.
@@ -81,6 +89,7 @@ final class GlucoseChartScrollCoordinator: ObservableObject {
     /// Returns the visible window to now and stops any in-flight drag/deceleration state.
     func resetToNow() {
         stopDeceleration()
+        followsCurrentTimeRange = true
         publishEndDate(Date(), force: true)
         dragStartEndDate = nil
         overviewDragStartEndDate = nil
@@ -88,10 +97,10 @@ final class GlucoseChartScrollCoordinator: ObservableObject {
     }
 
     /// Refreshes the end date only while the chart is already showing the current range.
-    @discardableResult func refreshCurrentTimeRangeIfNeeded() -> Bool {
-        guard isShowingCurrentTimeRange else { return false }
+    @discardableResult func refreshCurrentTimeRangeIfNeeded(at now: Date = Date()) -> Bool {
+        guard isShowingCurrentTimeRange(at: now) else { return false }
 
-        publishEndDate(Date(), force: true)
+        publishEndDate(now, force: true)
 
         return true
     }
@@ -144,7 +153,7 @@ final class GlucoseChartScrollCoordinator: ObservableObject {
             overviewEndDate: overviewEndDate,
             leadingEdgeInsetTimeInterval: leadingEdgeInsetTimeInterval
         )
-        publishEndDate(clampedEndDate, minimumTimeInterval: secondsPerPoint * Double(Self.minimumPublishDistanceWidth))
+        publishEndDate(clampedEndDate, minimumTimeInterval: secondsPerPoint * Double(Self.minimumPublishDistanceWidth), selectedByUser: true)
     }
 
     /// Applies the final overview translation and ends direct manipulation without inertia.
@@ -181,7 +190,7 @@ final class GlucoseChartScrollCoordinator: ObservableObject {
         let clampedEndDate = min(proposedEndDate, Date())
 
         dragStartEndDate = baseEndDate
-        publishEndDate(clampedEndDate, minimumTimeInterval: secondsPerPoint * Double(Self.minimumPublishDistanceWidth), force: forcePublish)
+        publishEndDate(clampedEndDate, minimumTimeInterval: secondsPerPoint * Double(Self.minimumPublishDistanceWidth), force: forcePublish, selectedByUser: true)
     }
 
     private func clampedOverviewEndDate(
@@ -276,7 +285,7 @@ final class GlucoseChartScrollCoordinator: ObservableObject {
             let proposedEndDate = self.endDate.addingTimeInterval(-Double(distanceWidth) * secondsPerPoint)
             let clampedEndDate = min(proposedEndDate, Date())
 
-            self.publishEndDate(clampedEndDate, force: true)
+            self.publishEndDate(clampedEndDate, force: true, selectedByUser: true)
             distanceTravelled += distanceWidth
 
             if proposedEndDate > Date(), velocityWidth < 0 {
@@ -289,9 +298,11 @@ final class GlucoseChartScrollCoordinator: ObservableObject {
         }
     }
 
-    private func publishEndDate(_ newEndDate: Date, minimumTimeInterval: TimeInterval = 0, force: Bool = false) {
+    private func publishEndDate(_ newEndDate: Date, minimumTimeInterval: TimeInterval = 0, force: Bool = false,
+                                selectedByUser: Bool = false) {
         guard force || abs(newEndDate.timeIntervalSince(endDate)) >= minimumTimeInterval else { return }
 
+        if selectedByUser { followsCurrentTimeRange = newEndDate.timeIntervalSinceNow > -60 }
         endDate = newEndDate
     }
 
