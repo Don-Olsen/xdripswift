@@ -170,6 +170,7 @@ final class WatchStateModel: NSObject, ObservableObject {
     @Published private(set) var libreWatchStorageIssue: String?
     @Published private(set) var localAlarmStatus = "Watch-alarmer: venter på iPhone-indstillinger"
     @Published private(set) var localAlarmReadinessWarning: String?
+    @Published private(set) var canRequestLocalAlarmPermission = false
     private let localAlarms = LibreWatchAlarmController()
 
     /// Original direct values are retained in memory so a newer iPhone calibration can
@@ -240,7 +241,11 @@ final class WatchStateModel: NSObject, ObservableObject {
         }
         updateComplicationData()
         restorePendingDiagnosticJournalToOutbox()
-        localAlarms.onStatusChange = { [weak self] status in self?.localAlarmStatus = status }
+        localAlarms.onStatusChange = { [weak self] status in
+            guard let self else { return }
+            self.localAlarmStatus = status
+            self.canRequestLocalAlarmPermission = self.localAlarms.canRequestNotificationPermission
+        }
         localAlarms.onReadinessWarningChange = { [weak self] warning in self?.localAlarmReadinessWarning = warning }
         localAlarms.onReadinessChange = { [weak self] in self?.synchronizeLocalAlarmState() }
         localAlarms.onSnooze = { [weak self] in self?.synchronizeLocalAlarmState() }

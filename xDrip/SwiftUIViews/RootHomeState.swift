@@ -431,6 +431,9 @@ final class RootHomeStateModel: ObservableObject {
 
     func applyTherapyMetrics(to loop: inout RootHomeLoopState, at date: Date = .now, external: AIDStatus? = nil,
                              historical: Bool = false, previous: TherapyMetricsSnapshot? = nil) {
+        // Capture the source identity before reading inputs. If a treatment save races with this
+        // snapshot, its later notification will use a new signature and clear any old amount.
+        let sourceSignature = historical ? "" : currentLocalTherapySourceSignature()
         var metrics = TherapyMetricsManager.shared.snapshot(at: date, external: external, historical: historical)
         if !historical {
             metrics.iob = Self.retainingConfirmedLocalVisibility(metrics.iob, from: previous?.iob, at: date)
@@ -446,7 +449,6 @@ final class RootHomeStateModel: ObservableObject {
             loop.iob.lastCalculatedAt = nil
             loop.cob.lastCalculatedAt = nil
         } else {
-            let sourceSignature = currentLocalTherapySourceSignature()
             loop.iob = localIOBPresentation.display(metrics.iob, in: loop.iob,
                 sourceSignature: sourceSignature, isIOB: true, at: date)
             loop.cob = localCOBPresentation.display(metrics.cob, in: loop.cob,
@@ -454,7 +456,7 @@ final class RootHomeStateModel: ObservableObject {
         }
     }
 
-    private func currentLocalTherapySourceSignature() -> String {
+    func currentLocalTherapySourceSignature() -> String {
         let policy = UserDefaults.standard.dataFlowPolicy
         let health = HealthKitTherapyImportManager.shared
         return [
@@ -466,7 +468,8 @@ final class RootHomeStateModel: ObservableObject {
             String(describing: health.isEnabled(.insulin)),
             health.selectedSource(.insulin)?.bundleIdentifier ?? "",
             String(describing: health.isEnabled(.carbohydrates)),
-            health.selectedSource(.carbohydrates)?.bundleIdentifier ?? ""
+            health.selectedSource(.carbohydrates)?.bundleIdentifier ?? "",
+            String(TherapyMetricsManager.shared.treatmentChangeRevision)
         ].joined(separator: "|")
     }
 

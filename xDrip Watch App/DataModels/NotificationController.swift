@@ -96,6 +96,7 @@ final class LibreWatchAlarmController: NSObject, UNUserNotificationCenterDelegat
     private var delegation: LibreWatchAlarmDelegation? { configuration.delegation }
     private var watchOwnsSensor = false
     private var notificationsAuthorized = false
+    private var notificationAuthorizationStatus: UNAuthorizationStatus?
     private var readinessPermissionsKnown = false
     private var notificationsFullyAuthorized = false
     private var notificationAlertsEnabled = false
@@ -114,6 +115,7 @@ final class LibreWatchAlarmController: NSObject, UNUserNotificationCenterDelegat
     private let snoozeAction = "libreWatchLocalSnooze"
 
     var notificationsAreAuthorized: Bool { notificationsAuthorized }
+    var canRequestNotificationPermission: Bool { notificationAuthorizationStatus == .notDetermined }
     var alarmsAreDelegatedToWatch: Bool {
         watchOwnsSensor && settings.map { delegation?.matches($0) == true } == true
     }
@@ -215,6 +217,7 @@ final class LibreWatchAlarmController: NSObject, UNUserNotificationCenterDelegat
     }
 
     private func updateReadinessPermissionEvidence(_ permissions: UNNotificationSettings) {
+        notificationAuthorizationStatus = permissions.authorizationStatus
         permissionEvidence = "authorization=\(permissions.authorizationStatus.rawValue):alert=\(permissions.alertSetting.rawValue):sound=\(permissions.soundSetting.rawValue)"
         readinessPermissionsKnown = true
         notificationsFullyAuthorized = permissions.authorizationStatus == .authorized
@@ -300,6 +303,7 @@ final class LibreWatchAlarmController: NSObject, UNUserNotificationCenterDelegat
                     if let identifier = self.state.scheduledMissedID, !knownIDs.contains(identifier),
                        self.state.shouldRestoreMissingMissedNotification(at: Date()) {
                         self.state.scheduledMissedID = nil
+                        self.state.scheduledMissedInterval = nil
                         LibreWatchAlarmStore.save(self.state)
                     }
                     self.scheduleMissedIfNeeded()
@@ -324,10 +328,12 @@ final class LibreWatchAlarmController: NSObject, UNUserNotificationCenterDelegat
         } else {
             content.body = "Ingen direkte Libre-måling efter overtagelsen kl. \(baseline.formatted(date: .omitted, time: .shortened))."
         }
+        let interval = max(1, missed.date.timeIntervalSince(now))
         let request = UNNotificationRequest(identifier: identifier, content: content,
-            trigger: UNTimeIntervalNotificationTrigger(timeInterval: max(1, missed.date.timeIntervalSince(now)), repeats: false))
+            trigger: UNTimeIntervalNotificationTrigger(timeInterval: interval, repeats: false))
         state.scheduledMissedID = identifier
         state.scheduledMissedAt = missed.date
+        state.scheduledMissedInterval = interval
         state.scheduledMissedConfirmed = false
         LibreWatchAlarmStore.save(state)
         center.add(request) { [weak self] error in
@@ -339,6 +345,7 @@ final class LibreWatchAlarmController: NSObject, UNUserNotificationCenterDelegat
                     WatchDeliveryEvidenceStore.shared.record(stage: .alarmReadiness, sessionID: self.settings?.sessionID,
                         outcome: "missedNotificationAddFailed:\(WatchDeliveryEvidenceStore.errorClass(error))", stream: .diagnostic)
                     self.state.scheduledMissedID = nil
+                    self.state.scheduledMissedInterval = nil
                     LibreWatchAlarmStore.save(self.state)
                     self.publishStatus()
                     self.onStatusChange?("Watch-alarm kunne ikke planlægges: \((error as NSError).domain) \((error as NSError).code)")
@@ -372,6 +379,7 @@ final class LibreWatchAlarmController: NSObject, UNUserNotificationCenterDelegat
         center.removeDeliveredNotifications(withIdentifiers: identifiers)
         state.scheduledMissedID = nil
         state.scheduledMissedAt = nil
+        state.scheduledMissedInterval = nil
         state.scheduledMissedConfirmed = nil
         LibreWatchAlarmStore.save(state)
     }
@@ -432,7 +440,7 @@ final class LibreWatchAlarmController: NSObject, UNUserNotificationCenterDelegat
                         kind: (info["libreWatchAlarmKind"] as? Int).flatMap(LibreWatchAlarmKind.init(rawValue:)),
                         sessionID: info["libreWatchAlarmSession"] as? String,
                         baseline: (info["libreWatchAlarmBaseline"] as? Double).map(Date.init(timeIntervalSince1970:)),
-                        fireDate: trigger?.nextTriggerDate(), repeats: trigger?.repeats ?? true)
+                        triggerInterval: trigger?.timeInterval, repeats: trigger?.repeats ?? true)
                 }
                 self.publishTakeoverReadiness(self.takeoverReadiness(pendingQueryCompleted: true, pendingRequest: evidence))
             }

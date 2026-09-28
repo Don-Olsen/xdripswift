@@ -35,6 +35,8 @@ final class TherapyMetricsManager {
     private var revision = 0
     private var treatmentCache: [String: [TherapyTreatment]] = [:]
     private var treatmentRevision = 0
+    private var treatmentPresentationRevision = 0
+    private var pendingTreatmentCommit = false
     private var pendingReads = Set<String>()
     private var failedReads: [String: Date] = [:]
     private let inputQueue = DispatchQueue(label: "therapy.inputs", qos: .utility)
@@ -58,11 +60,19 @@ final class TherapyMetricsManager {
                 }
                 var treatmentsChanged = true
                 if name == .NSManagedObjectContextDidSave {
-                    guard notification.object as? NSManagedObjectContext === self?.coreDataManager?.privateManagedObjectContext else { return }
+                    guard let context = notification.object as? NSManagedObjectContext else { return }
                     let keys = [NSInsertedObjectsKey, NSUpdatedObjectsKey, NSDeletedObjectsKey]
                     let objects = keys.flatMap { notification.userInfo?[$0] as? Set<NSManagedObject> ?? [] }
                     treatmentsChanged = objects.contains { $0 is TreatmentEntry }
+                    if context === self?.coreDataManager?.mainManagedObjectContext {
+                        if treatmentsChanged { self?.markPendingTreatmentCommit() }
+                        return
+                    }
+                    guard context === self?.coreDataManager?.privateManagedObjectContext else { return }
                     guard treatmentsChanged || objects.contains(where: { $0 is NightscoutDeviceStatusEntry }) else { return }
+                    self?.invalidate(treatmentsChanged: treatmentsChanged,
+                        committedTreatmentSave: treatmentsChanged)
+                    return
                 }
                 self?.invalidate(treatmentsChanged: treatmentsChanged)
             })
@@ -81,17 +91,36 @@ final class TherapyMetricsManager {
         })
     }
 
-    func invalidate(treatmentsChanged: Bool = true) {
+    private func markPendingTreatmentCommit() {
+        lock.lock()
+        pendingTreatmentCommit = true
+        treatmentPresentationRevision &+= 1
+        lock.unlock()
+        DispatchQueue.main.async { NotificationCenter.default.post(name: Self.changed, object: self) }
+    }
+
+    func invalidate(treatmentsChanged: Bool = true, committedTreatmentSave: Bool = false) {
         lock.lock()
         revision &+= 1
+        // A failed private save has no DidSave notification, so Home stays unavailable until
+        // a later successful treatment commit rather than confirming old persisted inputs.
+        if committedTreatmentSave { pendingTreatmentCommit = false }
         if treatmentsChanged {
             treatmentRevision &+= 1
+            treatmentPresentationRevision &+= 1
             treatmentCache.removeAll()
             failedReads.removeAll()
         }
         chartCache.removeAll()
         lock.unlock()
         DispatchQueue.main.async { NotificationCenter.default.post(name: Self.changed, object: self) }
+    }
+
+    /// Only treatment changes invalidate a briefly retained local Home amount.
+    var treatmentChangeRevision: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return treatmentPresentationRevision
     }
 
     private func key(policy: DataFlowPolicy, settings: TherapyModelSettings) -> String {
@@ -106,10 +135,17 @@ final class TherapyMetricsManager {
         let needsInputs = policy.externalIOBSource == nil || policy.externalCOBSource == nil
         let currentDate = Date()
         let window = TherapyModelSettings.visibilityInterval
-        let entries = needsInputs ? treatments(from: date.addingTimeInterval(-window),
-            to: min(currentDate, date.addingTimeInterval(window)), policy: policy, settings: settings) : []
-        let recentEntries = needsInputs && historical ? treatments(from: currentDate.addingTimeInterval(-window),
-            to: currentDate, policy: policy, settings: settings) : []
+        // A child-context save can precede its asynchronous persistent-store save. Until the
+        // latter commits, cached inputs describe the old treatment set and cannot confirm Home.
+        lock.lock(); let pendingCommit = pendingTreatmentCommit; lock.unlock()
+        let entries: [TherapyTreatment]? = needsInputs
+            ? (pendingCommit ? nil : treatments(from: date.addingTimeInterval(-window),
+                to: min(currentDate, date.addingTimeInterval(window)), policy: policy, settings: settings))
+            : []
+        let recentEntries: [TherapyTreatment]? = needsInputs && historical
+            ? (pendingCommit ? nil : treatments(from: currentDate.addingTimeInterval(-window),
+                to: currentDate, policy: policy, settings: settings))
+            : []
         return Self.resolve(at: date, external: status, policy: policy, settings: settings, entries: entries,
             currentDate: currentDate, recentEntries: recentEntries,
             localIOBAvailable: !HealthKitTherapyImportManager.shared.localInputIsIncomplete(.insulin),

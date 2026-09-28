@@ -35,12 +35,14 @@ Agenten gennemgår/stager den ønskede kode, tests og projekt-/procesfiler.
 Den almindelige lokale buildproces uploader aldrig. Efter brugerens GO UPLOAD
 for den konkrete version køres:
 
-Før næste upload kontrolleres, om brugerens parrede, fysiske iPhone kan nås
-via Xcode/device-værktøjer over netværk eller kabel. Er den tilgængelig, laves
-en sikker fysisk smoke-test af den testede kode, hvor installation kan ske
-uden utilsigtet at erstatte TestFlight-appen eller dens data. Hvis det ikke er
-muligt, rapporteres begrænsningen tydeligt før upload. En iPhone-smoke-test
-erstatter aldrig en fysisk Watch-test af sensorforbindelsen uden telefon.
+TestFlight er normal installationsvej for både iPhone og Watch. Kontroller
+fortsat den parrede iPhone læsende via Xcode/device-værktøjer før upload.
+Installer kun en lokal udviklingsbuild over en aktiv TestFlight-app, når
+brugeren udtrykkeligt ønsker det, og efter en verificeret datakopi. En sådan
+installation kan ændre, hvordan TestFlight viser Installer/Opdater, og beviser
+ikke, at Watch-appen blev opdateret. Bekræft altid urets faktiske build fra
+en frisk Watch-log før en fysisk Watch-test. Hvis direkte installation ikke er
+sikker eller mulig, rapporteres begrænsningen; TestFlight-forløbet fortsætter.
 
 ```sh
 # Kun efter agentens gennemgang af den præcise staged diff og brugerens GO UPLOAD:

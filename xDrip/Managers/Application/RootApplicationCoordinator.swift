@@ -2264,11 +2264,11 @@ struct InitialCalibrationRequestGate {
         setNightscoutSyncRequiredToTrue(forceNow: false)
         publishTherapyMetricsIfNeeded()
         
-        // this is not really the nicest place to do this, but it works well
-        // take advantage of the timer execution to update the AID status views
-        updatePumpAndAIDStatusViews()
-        
-        guard UIApplication.shared.applicationState == .active || overrideApplicationState else {return}
+        guard UIApplication.shared.applicationState == .active || overrideApplicationState else {
+            // Keep the existing background Home update without refreshing it again in the foreground.
+            updatePumpAndAIDStatusViews()
+            return
+        }
 
         refreshStatisticsEasterEgg(overrideApplicationState: overrideApplicationState)
 
@@ -2276,9 +2276,7 @@ struct InitialCalibrationRequestGate {
             rootHomeStateModel.resetChartsToNow()
         }
         
-        // force a snooze status update to see if the current snooze status has changed in the last minutes
-        updateSnoozeStatus()
-        
+        // Refresh all Home statuses, including snooze and pump/AID, once per timer tick.
         publishRootHomeState()
 
     }

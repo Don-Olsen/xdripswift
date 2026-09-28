@@ -294,6 +294,41 @@ final class TherapyMetricsTests: XCTestCase {
         XCTAssertNil(metric(nil).value(at: now), "The underlying clinical metric must remain unavailable")
     }
 
+    func testHomeClearsLastCalculatedValuesWhenTreatmentsChangeDuringReadFailure() {
+        let model = RootHomeStateModel()
+        let initialSignature = model.currentLocalTherapySourceSignature()
+        let shared = TherapyMetricsManager.shared
+        var iobPresentation = RootHomeLocalMetricPresentation()
+        var cobPresentation = RootHomeLocalMetricPresentation()
+        let iobInput = RootHomeMetricState(title: "IOB", value: "- U")
+        let cobInput = RootHomeMetricState(title: "COB", value: "- g")
+        _ = iobPresentation.display(metric([entry(2)]), in: iobInput,
+            sourceSignature: initialSignature, isIOB: true, at: now)
+        _ = cobPresentation.display(metric([entry(20, isIOB: false)], isIOB: false), in: cobInput,
+            sourceSignature: initialSignature, isIOB: false, at: now)
+
+        shared.invalidate(treatmentsChanged: false)
+        XCTAssertEqual(model.currentLocalTherapySourceSignature(), initialSignature,
+            "A status-only refresh must not discard confirmed treatment amounts")
+        let waitingIOB = iobPresentation.display(metric(nil), in: iobInput,
+            sourceSignature: initialSignature, isIOB: true, at: now.addingTimeInterval(5))
+        XCTAssertEqual(waitingIOB.value, "2 U")
+        XCTAssertEqual(waitingIOB.lastCalculatedAt, now)
+
+        shared.invalidate()
+        let changedSignature = model.currentLocalTherapySourceSignature()
+        XCTAssertNotEqual(changedSignature, initialSignature)
+        let staleIOB = iobPresentation.display(metric(nil), in: iobInput,
+            sourceSignature: changedSignature, isIOB: true, at: now.addingTimeInterval(10))
+        let staleCOB = cobPresentation.display(metric(nil, isIOB: false), in: cobInput,
+            sourceSignature: changedSignature, isIOB: false, at: now.addingTimeInterval(10))
+        XCTAssertEqual(staleIOB.value, "- U")
+        XCTAssertEqual(staleCOB.value, "- g")
+        XCTAssertNil(staleIOB.lastCalculatedAt)
+        XCTAssertNil(staleCOB.lastCalculatedAt)
+        XCTAssertEqual(metric(nil).reason, .readFailed)
+    }
+
     func testHomeDoesNotRetainValueAfterAgeSourceOrDefinitiveInputChange() {
         let input = RootHomeMetricState(title: "COB", value: "- g")
         let confirmed = metric([entry(20, isIOB: false)], isIOB: false)
@@ -752,6 +787,58 @@ final class TherapyMetricsTests: XCTestCase {
         XCTAssertTrue(core.saveChangesSynchronously())
         let committed = try await readInputs(manager)
         XCTAssertEqual(committed.count, 1)
+    }
+
+    @MainActor func testHomeHidesConfirmedAmountBetweenChildAndStoreTreatmentSaves() async throws {
+        let defaults = UserDefaults.standard
+        let priorSource = defaults.therapyDataSourceType
+        defaults.therapyDataSourceType = .none
+        defer { defaults.therapyDataSourceType = priorSource }
+
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let manager = TherapyMetricsManager()
+        manager.configure(coreDataManager: core, externalStatus: { nil })
+        let displayedAt = Date()
+        let entry = TreatmentEntry(date: displayedAt.addingTimeInterval(-60), value: 2,
+            treatmentType: .Insulin, nightscoutEventType: nil, enteredBy: nil,
+            nsManagedObjectContext: core.mainManagedObjectContext)
+        XCTAssertTrue(core.saveChangesSynchronously())
+        let policy = defaults.dataFlowPolicy
+        let modelSettings = self.settings
+        let start = displayedAt.addingTimeInterval(-TherapyModelSettings.visibilityInterval)
+        func storedInputs() async throws -> [TherapyTreatment] {
+            let loaded = await Task.detached {
+                manager.treatments(from: start, to: Date(), policy: policy, settings: modelSettings)
+            }.value
+            return try XCTUnwrap(loaded)
+        }
+
+        let initialInputs = try await storedInputs()
+        XCTAssertEqual(initialInputs.map(\.amount), [2])
+        let confirmed = manager.snapshot(at: displayedAt)
+        let confirmedAmount = try XCTUnwrap(confirmed.iob.value(at: displayedAt))
+        XCTAssertGreaterThan(confirmedAmount, 0)
+
+        let confirmedRevision = manager.treatmentChangeRevision
+        entry.value = 3
+        try core.mainManagedObjectContext.save()
+        XCTAssertGreaterThan(manager.treatmentChangeRevision, confirmedRevision,
+            "The Home presentation must lose its confirmed value as soon as the child saves")
+        let pending = manager.snapshot(at: displayedAt)
+        XCTAssertEqual(pending.iob.reason, .readFailed)
+        XCTAssertNil(pending.iob.value(at: displayedAt))
+        manager.invalidate(treatmentsChanged: false)
+        XCTAssertEqual(manager.snapshot(at: displayedAt).iob.reason, .readFailed,
+            "An unrelated status refresh must not clear a pending treatment commit")
+        let pendingInputs = try await storedInputs()
+        XCTAssertEqual(pendingInputs.map(\.amount), [2],
+            "The worker read still reflects only the committed persistent store")
+
+        XCTAssertTrue(core.saveChangesSynchronously())
+        let committedInputs = try await storedInputs()
+        XCTAssertEqual(committedInputs.map(\.amount), [3])
+        let updated = manager.snapshot(at: displayedAt)
+        XCTAssertGreaterThan(try XCTUnwrap(updated.iob.value(at: displayedAt)), confirmedAmount)
     }
 
     private func readInputs(_ manager: TherapyMetricsManager, source: TherapyDataSourceType = .none) async throws -> [TherapyTreatment] {

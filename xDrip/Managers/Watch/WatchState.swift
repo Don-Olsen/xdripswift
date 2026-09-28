@@ -255,6 +255,9 @@ struct LibreWatchAlarmState: Codable, Equatable {
     var snoozes: [LibreWatchAlarmSnooze] = []
     var scheduledMissedID: String?
     var scheduledMissedAt: Date?
+    /// The immutable interval submitted to UNUserNotificationCenter. Unlike
+    /// nextTriggerDate(), it does not move when the pending request is inspected later.
+    var scheduledMissedInterval: TimeInterval?
     var scheduledMissedConfirmed: Bool?
     var automaticThrottle: LibreWatchAlarmAutomaticThrottle?
     var ownershipStartedAt: Date?
@@ -456,7 +459,7 @@ struct LibreWatchAlarmPendingRequest: Equatable {
     let kind: LibreWatchAlarmKind?
     let sessionID: String?
     let baseline: Date?
-    let fireDate: Date?
+    let triggerInterval: TimeInterval?
     let repeats: Bool
 }
 
@@ -528,11 +531,19 @@ struct LibreWatchAlarmReadiness: Equatable {
         guard let pendingRequest, pendingRequest.identifier == identifier,
               pendingRequest.kind == .missed, pendingRequest.sessionID == settings.sessionID.uuidString,
               state.matchesMissedNotificationBaseline(pendingRequest.baseline), !pendingRequest.repeats,
-              let fireDate = pendingRequest.fireDate, fireDate > now,
-              abs(fireDate.timeIntervalSince(scheduledAt)) <= 5,
+              scheduledAt > now,
               let expected = state.nextMissedAlarm(settings: settings, delegation: configuration.delegation,
                   watchOwnsSensor: true, now: now),
               abs(expected.date.timeIntervalSince(scheduledAt)) <= 1
+        else { return result(.notScheduled) }
+        // Old persisted state does not contain the submitted interval. Its queued
+        // request may still fire, but cannot be verified until the next reading
+        // creates a request with complete evidence.
+        guard let submittedInterval = state.scheduledMissedInterval else { return result(.checkingSchedule) }
+        guard let triggerInterval = pendingRequest.triggerInterval,
+              submittedInterval.isFinite, triggerInterval.isFinite,
+              submittedInterval > 0, triggerInterval > 0,
+              abs(triggerInterval - submittedInterval) <= 0.001
         else { return result(.notScheduled) }
         return result(.readyScheduled)
     }

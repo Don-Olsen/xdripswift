@@ -2,6 +2,7 @@ import XCTest
 import CoreData
 import HealthKit
 import Combine
+import UserNotifications
 @testable import xdrip
 
 // Explicit instants make a sleeping Watch deterministic: ContinuousClock advances while the
@@ -8089,10 +8090,11 @@ extension LibreWatchValuePipelineTests {
         state.beginWatchOwnership(at: receivedAt)
         state.scheduledMissedID = state.missedNotificationIdentifier(settings: settings)
         state.scheduledMissedAt = receivedAt.addingTimeInterval(300)
+        state.scheduledMissedInterval = 300
         state.scheduledMissedConfirmed = true
         let pending = LibreWatchAlarmPendingRequest(identifier: try XCTUnwrap(state.scheduledMissedID),
             kind: .missed, sessionID: settings.sessionID.uuidString, baseline: state.missedReadingBaseline,
-            fireDate: state.scheduledMissedAt, repeats: false)
+            triggerInterval: state.scheduledMissedInterval, repeats: false)
         return AlarmReadinessFixture(state: state, configuration: configuration, pending: pending)
     }
 
@@ -8120,6 +8122,41 @@ extension LibreWatchValuePipelineTests {
         XCTAssertNotNil(evaluateAlarmReadiness(fixture).warning)
         fixture.state.scheduledMissedConfirmed = false
         XCTAssertEqual(evaluateAlarmReadiness(fixture).status, .checkingSchedule)
+    }
+
+    func testTakeoverReadinessUsesOriginalTimerIntervalAfterTimePasses() throws {
+        var fixture = try alarmReadinessFixture()
+        let pending = try XCTUnwrap(fixture.pending)
+        let timer = UNTimeIntervalNotificationTrigger(timeInterval: 300, repeats: false)
+        fixture.pending = LibreWatchAlarmPendingRequest(identifier: pending.identifier,
+            kind: pending.kind, sessionID: pending.sessionID, baseline: pending.baseline,
+            triggerInterval: timer.timeInterval, repeats: timer.repeats)
+
+        // A timer's nextTriggerDate is relative to the inspection time. Its original
+        // interval stays fixed while the scheduled missed-reading deadline approaches.
+        for elapsed in [0.0, 6.0, 60.0, 240.0] {
+            XCTAssertEqual(evaluateAlarmReadiness(fixture,
+                at: receivedAt.addingTimeInterval(elapsed)).status, .readyScheduled)
+        }
+        XCTAssertEqual(evaluateAlarmReadiness(fixture,
+            at: receivedAt.addingTimeInterval(301)).status, .notScheduled)
+    }
+
+    func testTakeoverReadinessTreatsLegacyIntervalAsUnverified() throws {
+        var fixture = try alarmReadinessFixture()
+        fixture.state.scheduledMissedInterval = nil
+        XCTAssertEqual(evaluateAlarmReadiness(fixture).status, .checkingSchedule,
+            "A pending request from an older build must not be reported as verified")
+        fixture.pending = nil
+        XCTAssertEqual(evaluateAlarmReadiness(fixture).status, .notScheduled)
+
+        let original = try alarmReadinessFixture()
+        let encodedState = try JSONEncoder().encode(original.state)
+        var encoded = try XCTUnwrap(JSONSerialization.jsonObject(with: encodedState) as? [String: Any])
+        encoded.removeValue(forKey: "scheduledMissedInterval")
+        let legacy = try JSONDecoder().decode(LibreWatchAlarmState.self,
+            from: JSONSerialization.data(withJSONObject: encoded))
+        XCTAssertNil(legacy.scheduledMissedInterval, "An older persisted Watch state must still decode")
     }
 
     func testTakeoverReadinessRequiresCurrentRuleSnoozeStateAndConfirmedSettings() throws {
@@ -8177,19 +8214,23 @@ extension LibreWatchValuePipelineTests {
         let good = try XCTUnwrap(fixture.pending)
         let bad: [LibreWatchAlarmPendingRequest] = [
             .init(identifier: "old-request", kind: .missed, sessionID: good.sessionID,
-                baseline: good.baseline, fireDate: good.fireDate, repeats: false),
+                baseline: good.baseline, triggerInterval: good.triggerInterval, repeats: false),
             .init(identifier: good.identifier, kind: .low, sessionID: good.sessionID,
-                baseline: good.baseline, fireDate: good.fireDate, repeats: false),
+                baseline: good.baseline, triggerInterval: good.triggerInterval, repeats: false),
             .init(identifier: good.identifier, kind: .missed, sessionID: UUID().uuidString,
-                baseline: good.baseline, fireDate: good.fireDate, repeats: false),
+                baseline: good.baseline, triggerInterval: good.triggerInterval, repeats: false),
             .init(identifier: good.identifier, kind: .missed, sessionID: good.sessionID,
-                baseline: receivedAt.addingTimeInterval(-60), fireDate: good.fireDate, repeats: false),
+                baseline: receivedAt.addingTimeInterval(-60), triggerInterval: good.triggerInterval, repeats: false),
             .init(identifier: good.identifier, kind: .missed, sessionID: good.sessionID,
-                baseline: good.baseline, fireDate: nil, repeats: false),
+                baseline: good.baseline, triggerInterval: nil, repeats: false),
             .init(identifier: good.identifier, kind: .missed, sessionID: good.sessionID,
-                baseline: good.baseline, fireDate: receivedAt.addingTimeInterval(360), repeats: false),
+                baseline: good.baseline, triggerInterval: 360, repeats: false),
             .init(identifier: good.identifier, kind: .missed, sessionID: good.sessionID,
-                baseline: good.baseline, fireDate: good.fireDate, repeats: true)
+                baseline: good.baseline, triggerInterval: 0, repeats: false),
+            .init(identifier: good.identifier, kind: .missed, sessionID: good.sessionID,
+                baseline: good.baseline, triggerInterval: .nan, repeats: false),
+            .init(identifier: good.identifier, kind: .missed, sessionID: good.sessionID,
+                baseline: good.baseline, triggerInterval: good.triggerInterval, repeats: true)
         ]
         for request in bad {
             fixture.pending = request
@@ -8290,10 +8331,11 @@ extension LibreWatchValuePipelineTests {
         let settings = try XCTUnwrap(fixture.configuration.settings)
         fixture.state.scheduledMissedID = fixture.state.missedNotificationIdentifier(settings: settings)
         fixture.state.scheduledMissedAt = baseline.addingTimeInterval(300)
+        fixture.state.scheduledMissedInterval = 300
         fixture.pending = LibreWatchAlarmPendingRequest(identifier: try XCTUnwrap(fixture.state.scheduledMissedID),
             kind: .missed, sessionID: settings.sessionID.uuidString,
             baseline: try notificationBaselineRoundTrip(baseline),
-            fireDate: fixture.state.scheduledMissedAt, repeats: false)
+            triggerInterval: fixture.state.scheduledMissedInterval, repeats: false)
         return fixture
     }
 
@@ -8337,7 +8379,7 @@ extension LibreWatchValuePipelineTests {
         for date in invalid {
             var fixture = original
             fixture.pending = LibreWatchAlarmPendingRequest(identifier: pending.identifier, kind: pending.kind,
-                sessionID: pending.sessionID, baseline: date, fireDate: pending.fireDate, repeats: false)
+                sessionID: pending.sessionID, baseline: date, triggerInterval: pending.triggerInterval, repeats: false)
             XCTAssertEqual(evaluateAlarmReadiness(fixture, at: baseline).status, .notScheduled)
             XCTAssertFalse(fixture.state.notificationMayBePresented(kind: .missed,
                 notificationSessionID: settings.sessionID.uuidString, notificationReadingID: nil,
@@ -8370,9 +8412,11 @@ extension LibreWatchValuePipelineTests {
             fixture.configuration = LibreWatchAlarmConfiguration(settings: settings, delegation: alarmDelegation(settings))
             fixture.state.scheduledMissedID = fixture.state.missedNotificationIdentifier(settings: settings)
             fixture.state.scheduledMissedAt = baseline.addingTimeInterval(minutes * 60)
+            fixture.state.scheduledMissedInterval = minutes * 60
             fixture.pending = LibreWatchAlarmPendingRequest(identifier: try XCTUnwrap(fixture.state.scheduledMissedID),
                 kind: .missed, sessionID: settings.sessionID.uuidString,
-                baseline: try notificationBaselineRoundTrip(baseline), fireDate: fixture.state.scheduledMissedAt, repeats: false)
+                baseline: try notificationBaselineRoundTrip(baseline),
+                triggerInterval: fixture.state.scheduledMissedInterval, repeats: false)
             let ready = evaluateAlarmReadiness(fixture, at: baseline)
             XCTAssertEqual(ready.status, .readyScheduled)
             XCTAssertEqual(ready.missedMinutes, minutes)

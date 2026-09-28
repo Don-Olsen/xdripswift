@@ -1,3 +1,25 @@
+## Rettelser efter 4282 og fysisk opfølgning
+
+Watch-alarmens beredskab sammenligner nu den oprindeligt planlagte timerperiode
+med den kølagte notifikation. Den bevægelige næste affyringsdato gav tidligere
+en falsk advarsel om, at alarmen ikke var planlagt. Knappen til at anmode om
+Watch-notifikationer vises kun, før tilladelsen er afgjort. Alarmregler,
+Bluetooth-genopkobling og timeouts ændres ikke.
+
+Home skjuler straks en gammel lokal IOB/COB-værdi, når en behandling gemmes, og
+viser først et nyt tal efter databasegemning og beregning. Et normalt
+15-sekunders-tick udløser én samlet Home-opdatering i forgrunden i stedet for
+tre; et skift i statistikperioden kan stadig give en ekstra opdatering.
+
+En særskilt udviklingssigneret 7.1.1 (4282.1) blev installeret direkte på
+brugerens iPhone 28. september efter en verificeret privat kopi af appdata.
+Den findes ikke i TestFlight, og den seneste modtagne Watch-log viser stadig
+4282. Den næste normale TestFlight-build skal installeres på begge enheder,
+og Watch-buildnummeret skal kontrolleres fra en frisk Watch-log før testen.
+Målet er 90 minutters Watch-ejerskab uden tryk: mindst 95 % direkte modtagne
+sensorminutter, ingen pause over tre minutter og ubrudt workout. Første måling
+og den første opstartstid rapporteres separat.
+
 <!-- testflight-7.1.1-4282:start -->
 ### TestFlight 7.1.1 (4282)
 
