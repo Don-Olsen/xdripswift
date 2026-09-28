@@ -73,7 +73,7 @@ struct RootHomeLoopView: View {
                 }
             }
             .padding(.horizontal, 10)
-            .padding(.vertical, 6)
+            .padding(.vertical, 2)
             .frame(maxWidth: .infinity)
             // Keep the strip at 34 points. An expanding outer frame competes with the flexible
             // glucose chart for vertical space when Home first lays out or updates.
@@ -96,14 +96,38 @@ struct RootHomeLoopView: View {
 
     private func metricButton(isIOB: Bool) -> some View {
         let metric = isIOB ? state.therapyMetrics?.iob : state.therapyMetrics?.cob
+        let displayed = isIOB ? state.iob : state.cob
         return Button {
             if metric?.source == .local { selectedMetric = isIOB; showsMetricDetails = true }
             else { actions.showAIDStatus() }
         } label: {
-            RootHomeInlineMetricView(metric: isIOB ? state.iob : state.cob, valueOpacity: state.isHistorical.rootHomeHistoricalValueOpacity)
+            VStack(alignment: .leading, spacing: 0) {
+                RootHomeInlineMetricView(metric: displayed, valueOpacity: state.isHistorical.rootHomeHistoricalValueOpacity)
+                if let lastCalculatedAt = displayed.lastCalculatedAt {
+                    Text(Self.lastCalculatedCaption(at: lastCalculatedAt))
+                        .font(.system(size: 9))
+                        .foregroundStyle(ConstantsAppColors.secondaryText)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
+                }
+            }
         }
         .accessibilityLabel(metric?.accessibilityName(isIOB: isIOB) ?? (isIOB ? "IOB" : "COB"))
-        .accessibilityValue(isIOB ? state.iob.value : state.cob.value)
+        .accessibilityValue(displayed.lastCalculatedAt.map {
+            "\(displayed.value), \(Self.lastCalculatedAccessibility(at: $0))"
+        } ?? displayed.value)
+    }
+
+    private static func lastCalculatedCaption(at date: Date) -> String {
+        let format = NSLocalizedString("therapy.lastCalculatedShort", tableName: "Common",
+            value: "Last %@", comment: "Compact timestamp for a previous IOB or COB calculation")
+        return String(format: format, date.formatted(date: .omitted, time: .shortened))
+    }
+
+    private static func lastCalculatedAccessibility(at date: Date) -> String {
+        let format = NSLocalizedString("therapy.lastCalculated", tableName: "Common",
+            value: "Last calculated at %@", comment: "Previous IOB or COB value while inputs refresh")
+        return String(format: format, date.formatted(date: .omitted, time: .shortened))
     }
 
     private var loopStatusView: some View {

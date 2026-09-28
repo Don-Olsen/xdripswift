@@ -50,6 +50,21 @@ final class RootHomeInteractionTests: XCTestCase {
         XCTAssertEqual(size.height, 34, accuracy: 0.5)
     }
 
+    @MainActor
+    func testLastCalculatedTherapyCaptionDoesNotResizeChartStrip() {
+        var state = RootHomeLoopState()
+        let calculatedAt = Date(timeIntervalSince1970: 1_800_000_000)
+        state.iob = RootHomeMetricState(title: "IOB", value: "1.2 U",
+            lastCalculatedAt: calculatedAt)
+        state.cob = RootHomeMetricState(title: "COB", value: "12 g",
+            lastCalculatedAt: calculatedAt)
+        let host = UIHostingController(rootView: RootHomeLoopView(state: state,
+            actions: RootHomeActions()))
+
+        XCTAssertEqual(host.sizeThatFits(in: CGSize(width: 320, height: 240)).height,
+            34, accuracy: 0.5)
+    }
+
     func testIPadLayoutClassRespondsToWindowWidth() {
         XCTAssertEqual(IPadLayoutClass.resolve(isPad: false, width: 1_366, usesAccessibilityText: false), .compact)
         XCTAssertEqual(IPadLayoutClass.resolve(isPad: true, width: 500, usesAccessibilityText: false), .compact)

@@ -134,6 +134,8 @@
 // Local therapy accessibility
 "therapy.estimatedIOB" = "Insuline active estimée";
 "therapy.estimatedCOB" = "Glucides actifs estimés";
+"therapy.lastCalculatedShort" = "Dern. %@";
+"therapy.lastCalculated" = "Dernier calcul à %@";
 
 /* Actions for leaving an editor with unsaved changes. */
 "common_unsavedChanges" = "Modifications non enregistrées";

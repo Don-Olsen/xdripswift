@@ -267,6 +267,59 @@ final class TherapyMetricsTests: XCTestCase {
         XCTAssertNil(expired.visibilityDeadline)
     }
 
+    func testHomeShowsRecentConfirmedLocalValueAsLastCalculatedDuringShortRefresh() {
+        var presentation = RootHomeLocalMetricPresentation()
+        let confirmed = metric([entry(2)])
+        let input = RootHomeMetricState(title: "IOB", value: "- U")
+        let initial = presentation.display(confirmed, in: input, sourceSignature: "local-a",
+            isIOB: true, at: now)
+        XCTAssertEqual(initial.value, "2 U")
+        XCTAssertNil(initial.lastCalculatedAt)
+
+        let firstRefresh = presentation.display(metric(nil), in: input, sourceSignature: "local-a",
+            isIOB: true, at: now.addingTimeInterval(10))
+        XCTAssertEqual(firstRefresh.value, "2 U")
+        XCTAssertEqual(firstRefresh.lastCalculatedAt, now)
+        // Repeated foreground publications must not lose the last confirmed Home value.
+        let repeatedRefresh = presentation.display(metric(nil), in: input, sourceSignature: "local-a",
+            isIOB: true, at: now.addingTimeInterval(30))
+        XCTAssertEqual(repeatedRefresh.value, "2 U")
+        XCTAssertEqual(repeatedRefresh.lastCalculatedAt, now)
+
+        let completed = presentation.display(metric([entry(1)]), in: input,
+            sourceSignature: "local-a", isIOB: true, at: now.addingTimeInterval(31))
+        XCTAssertNotEqual(completed.value, "- U")
+        XCTAssertNil(completed.lastCalculatedAt)
+        XCTAssertEqual(completed.valueColor, ConstantsAppColors.primaryText)
+        XCTAssertNil(metric(nil).value(at: now), "The underlying clinical metric must remain unavailable")
+    }
+
+    func testHomeDoesNotRetainValueAfterAgeSourceOrDefinitiveInputChange() {
+        let input = RootHomeMetricState(title: "COB", value: "- g")
+        let confirmed = metric([entry(20, isIOB: false)], isIOB: false)
+        let loading = metric(nil, isIOB: false)
+        var presentation = RootHomeLocalMetricPresentation()
+        _ = presentation.display(confirmed, in: input, sourceSignature: "local-a", isIOB: false, at: now)
+
+        let expired = presentation.display(loading, in: input, sourceSignature: "local-a",
+            isIOB: false, at: now.addingTimeInterval(RootHomeLocalMetricPresentation.maximumRetainedAge))
+        XCTAssertEqual(expired.value, "- g")
+        XCTAssertNil(expired.lastCalculatedAt)
+
+        _ = presentation.display(confirmed, in: input, sourceSignature: "local-a", isIOB: false, at: now)
+        let changedSource = presentation.display(loading, in: input, sourceSignature: "local-b",
+            isIOB: false, at: now.addingTimeInterval(5))
+        XCTAssertEqual(changedSource.value, "- g")
+
+        _ = presentation.display(confirmed, in: input, sourceSignature: "local-a", isIOB: false, at: now)
+        let noTreatments = presentation.display(metric([], isIOB: false), in: input,
+            sourceSignature: "local-a", isIOB: false, at: now.addingTimeInterval(5))
+        XCTAssertEqual(noTreatments.value, "- g")
+        let laterReadFailure = presentation.display(loading, in: input,
+            sourceSignature: "local-a", isIOB: false, at: now.addingTimeInterval(6))
+        XCTAssertNil(laterReadFailure.lastCalculatedAt)
+    }
+
     func testLocalValuesHaveNoApproximationSymbol() {
         XCTAssertEqual(metric([entry(2)]).formatted(isIOB: true, at: now), "2 U")
         XCTAssertEqual(metric([entry(20, isIOB: false)], isIOB: false).formatted(isIOB: false, at: now), "20 g")

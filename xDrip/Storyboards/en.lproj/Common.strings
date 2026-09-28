@@ -129,6 +129,8 @@
 // Local therapy accessibility
 "therapy.estimatedIOB" = "Estimated insulin on board";
 "therapy.estimatedCOB" = "Estimated carbohydrates on board";
+"therapy.lastCalculatedShort" = "Last %@";
+"therapy.lastCalculated" = "Last calculated at %@";
 
 /* Actions for leaving an editor with unsaved changes. */
 "common_unsavedChanges" = "Unsaved Changes";

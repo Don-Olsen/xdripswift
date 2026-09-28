@@ -177,6 +177,8 @@
 // Local therapy accessibility
 "therapy.estimatedIOB" = "Szacowana aktywna insulina";
 "therapy.estimatedCOB" = "Szacowane aktywne węglowodany";
+"therapy.lastCalculatedShort" = "Ost. %@";
+"therapy.lastCalculated" = "Ostatnio obliczono o %@";
 
 /* Actions for leaving an editor with unsaved changes. */
 "common_unsavedChanges" = "Niezapisane zmiany";

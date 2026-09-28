@@ -66,6 +66,8 @@
 // Local therapy accessibility
 "therapy.estimatedIOB" = "Расчётный активный инсулин";
 "therapy.estimatedCOB" = "Расчётные активные углеводы";
+"therapy.lastCalculatedShort" = "Посл. %@";
+"therapy.lastCalculated" = "Последний расчёт в %@";
 
 /* Actions for leaving an editor with unsaved changes. */
 "common_unsavedChanges" = "Несохранённые изменения";

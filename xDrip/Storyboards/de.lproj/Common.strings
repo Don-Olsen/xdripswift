@@ -201,6 +201,8 @@
 // Local therapy accessibility
 "therapy.estimatedIOB" = "Geschätztes aktives Insulin";
 "therapy.estimatedCOB" = "Geschätzte aktive Kohlenhydrate";
+"therapy.lastCalculatedShort" = "Zuletzt %@";
+"therapy.lastCalculated" = "Zuletzt berechnet um %@";
 
 /* Actions for leaving an editor with unsaved changes. */
 "common_unsavedChanges" = "Ungespeicherte Änderungen";

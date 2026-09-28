@@ -124,6 +124,8 @@
 // Local therapy accessibility
 "therapy.estimatedIOB" = "Insulina ativa estimada";
 "therapy.estimatedCOB" = "Hidratos de carbono ativos estimados";
+"therapy.lastCalculatedShort" = "Últ. %@";
+"therapy.lastCalculated" = "Último cálculo às %@";
 
 /* Actions for leaving an editor with unsaved changes. */
 "common_unsavedChanges" = "Alterações não guardadas";

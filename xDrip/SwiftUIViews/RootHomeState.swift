@@ -231,9 +231,53 @@ struct RootHomeMetricState: Identifiable {
     var title: String
     var value: String
     var valueColor = ConstantsAppColors.primaryText
+    /// Home only: a briefly retained value while its local inputs are being refreshed.
+    var lastCalculatedAt: Date? = nil
 
     var id: String {
         title
+    }
+}
+
+/// Keeps a recent, explicitly labelled Home value through a short local input refresh.
+/// The clinical snapshot remains unavailable and is never reused by alerts or companion views.
+struct RootHomeLocalMetricPresentation {
+    static let maximumRetainedAge: TimeInterval = 60
+
+    private var confirmed: TherapyMetricState?
+    private var sourceSignature: String?
+
+    mutating func display(_ current: TherapyMetricState, in metric: RootHomeMetricState,
+                          sourceSignature: String, isIOB: Bool, at date: Date) -> RootHomeMetricState {
+        var result = metric
+        result.value = current.formatted(isIOB: isIOB, at: date)
+        result.valueColor = ConstantsAppColors.primaryText
+        result.lastCalculatedAt = nil
+
+        guard current.source == .local else {
+            confirmed = nil
+            self.sourceSignature = nil
+            return result
+        }
+        if current.reason == nil, current.value(at: date) != nil {
+            confirmed = current
+            self.sourceSignature = sourceSignature
+            return result
+        }
+        if current.reason == .readFailed, self.sourceSignature == sourceSignature,
+           let confirmed,
+           (0..<Self.maximumRetainedAge).contains(date.timeIntervalSince(confirmed.referenceDate)),
+           confirmed.value(at: date) != nil {
+            result.value = confirmed.formatted(isIOB: isIOB, at: confirmed.referenceDate)
+            result.valueColor = ConstantsAppColors.secondaryText
+            result.lastCalculatedAt = confirmed.referenceDate
+            return result
+        }
+        // A changed source, expired value, or definitive unavailable state must not revive an
+        // earlier estimate during a later refresh.
+        confirmed = nil
+        self.sourceSignature = nil
+        return result
     }
 }
 
@@ -256,6 +300,8 @@ final class RootHomeStateModel: ObservableObject {
     private var bluetoothPeripheralManager: BluetoothPeripheralManager?
     private var alertManager: AlertManager?
     private var bgPostProcessingManager: BgPostProcessingManager?
+    private var localIOBPresentation = RootHomeLocalMetricPresentation()
+    private var localCOBPresentation = RootHomeLocalMetricPresentation()
 
     // MARK: - Configuration and Refresh
 
@@ -394,8 +440,34 @@ final class RootHomeStateModel: ObservableObject {
         loop.showsIOB = metrics.iob.isVisible(at: date)
         loop.showsCOB = metrics.cob.isVisible(at: date)
         loop.showsAIDStatus = UserDefaults.standard.dataFlowPolicy.showsTherapyStatus
-        loop.iob.value = metrics.iob.formatted(isIOB: true, at: date)
-        loop.cob.value = metrics.cob.formatted(isIOB: false, at: date)
+        if historical {
+            loop.iob.value = metrics.iob.formatted(isIOB: true, at: date)
+            loop.cob.value = metrics.cob.formatted(isIOB: false, at: date)
+            loop.iob.lastCalculatedAt = nil
+            loop.cob.lastCalculatedAt = nil
+        } else {
+            let sourceSignature = currentLocalTherapySourceSignature()
+            loop.iob = localIOBPresentation.display(metrics.iob, in: loop.iob,
+                sourceSignature: sourceSignature, isIOB: true, at: date)
+            loop.cob = localCOBPresentation.display(metrics.cob, in: loop.cob,
+                sourceSignature: sourceSignature, isIOB: false, at: date)
+        }
+    }
+
+    private func currentLocalTherapySourceSignature() -> String {
+        let policy = UserDefaults.standard.dataFlowPolicy
+        let health = HealthKitTherapyImportManager.shared
+        return [
+            String(describing: policy.isMaster),
+            String(describing: policy.therapyDataSourceSelection.rawValue),
+            String(describing: policy.therapyDataSource.rawValue),
+            String(describing: policy.nightscoutFollowType.rawValue),
+            String(describing: TherapyModelSettings(defaults: .standard)),
+            String(describing: health.isEnabled(.insulin)),
+            health.selectedSource(.insulin)?.bundleIdentifier ?? "",
+            String(describing: health.isEnabled(.carbohydrates)),
+            health.selectedSource(.carbohydrates)?.bundleIdentifier ?? ""
+        ].joined(separator: "|")
     }
 
     /// A transient local cache miss must not collapse an already visible Home strip. Retain only

@@ -66,6 +66,8 @@
 // Local therapy accessibility
 "therapy.estimatedIOB" = "Anslået aktivt insulin";
 "therapy.estimatedCOB" = "Anslåede aktive kulhydrater";
+"therapy.lastCalculatedShort" = "Sidst %@";
+"therapy.lastCalculated" = "Sidst beregnet kl. %@";
 
 /* Actions for leaving an editor with unsaved changes. */
 "common_unsavedChanges" = "Ikke-gemte ændringer";

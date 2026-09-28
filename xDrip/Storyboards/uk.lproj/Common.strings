@@ -165,6 +165,8 @@
 // Local therapy accessibility
 "therapy.estimatedIOB" = "Оцінений активний інсулін";
 "therapy.estimatedCOB" = "Оцінені активні вуглеводи";
+"therapy.lastCalculatedShort" = "Ост. %@";
+"therapy.lastCalculated" = "Востаннє обчислено о %@";
 
 /* Actions for leaving an editor with unsaved changes. */
 "common_unsavedChanges" = "Незбережені зміни";

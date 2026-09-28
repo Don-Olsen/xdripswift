@@ -66,6 +66,8 @@
 // Local therapy accessibility
 "therapy.estimatedIOB" = "الإنسولين النشط المقدّر";
 "therapy.estimatedCOB" = "الكربوهيدرات النشطة المقدّرة";
+"therapy.lastCalculatedShort" = "آخر %@";
+"therapy.lastCalculated" = "آخر حساب عند %@";
 
 /* Actions for leaving an editor with unsaved changes. */
 "common_unsavedChanges" = "تغييرات غير محفوظة";
