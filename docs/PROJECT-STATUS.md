@@ -1,3 +1,15 @@
+<!-- testflight-7.1.1-4289:start -->
+### TestFlight 7.1.1 (4289)
+
+- Kildecommit og tag: `e03747b6a7dd569bf5d6a035fb4cc761d714e379` / `testflight-7.1.1-4289`.
+- Tests: 1182/1182 bestået; 0 fejlet; 0 skipped. iPhone- og Watch-simulatorbuilds bestod.
+- Apple-status (2026-10-03T17:33:00.825514+00:00): [Internal / Testing](https://appstoreconnect.apple.com/apps/6795645396/testflight/ios/acffa794-d07b-459a-928d-3aac2eaa35d6).
+- Eksisterende intern gruppe: Ole Internal er bekræftet tilknyttet.
+- Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
+<!-- testflight-7.1.1-4289:end -->
+
+De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
+
 ## Lokal kandidat efter 4288: prognose, basalregistrering og måling af præcision
 
 Denne kandidat fortsætter `integration/upstream-7.1.1` fra
