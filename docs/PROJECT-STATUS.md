@@ -3,7 +3,7 @@
 
 - Kildecommit og tag: `90c29c14402511b67da872e607ea4d901cf361d1` / `testflight-7.1.1-4287`.
 - Tests: 1148/1148 bestået; 0 fejlet; 0 skipped. iPhone- og Watch-simulatorbuilds bestod.
-- Apple-status (2026-10-03T13:47:39.763804+00:00): [Apple behandler](https://appstoreconnect.apple.com/apps/6795645396/testflight/ios).
+- Apple-status (2026-10-03T13:48:56.847872+00:00): [Apple behandler](https://appstoreconnect.apple.com/apps/6795645396/testflight/ios).
 - Ole Internal: endnu ikke bekræftet tilknyttet.
 - Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
 <!-- testflight-7.1.1-4287:end -->
