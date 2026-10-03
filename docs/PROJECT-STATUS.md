@@ -1,3 +1,15 @@
+<!-- testflight-7.1.1-4292:start -->
+### TestFlight 7.1.1 (4292)
+
+- Kildecommit og tag: `aa3a9ffaa2c13bfb6eb365585980bcf04673497e` / `testflight-7.1.1-4292`.
+- Tests: 1230/1230 bestået; 0 fejlet; 0 skipped. iPhone- og Watch-simulatorbuilds bestod.
+- Apple-status (2026-10-03T23:33:35.954262+00:00): [Internal / Testing](https://appstoreconnect.apple.com/apps/6795645396/testflight/ios/f74c6b02-7c8d-4055-aba9-adb95cd6a93e).
+- Eksisterende intern gruppe: Ole Internal er bekræftet tilknyttet.
+- Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
+<!-- testflight-7.1.1-4292:end -->
+
+De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
+
 ## Lokal personlig ML-prognose efter 4291 — før udgivelse
 
 Den eksisterende prognosemotor forbliver uændret og er altid fallback.
