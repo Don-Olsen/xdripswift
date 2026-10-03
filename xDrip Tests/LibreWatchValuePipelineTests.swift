@@ -8277,6 +8277,33 @@ extension LibreWatchValuePipelineTests {
         XCTAssertFalse(current(changed))
     }
 
+    func testNotificationPermissionRefreshRejectsOldDenialAfterTakeoverGrant() {
+        var refresh = LibreWatchAlarmPermissionRefresh()
+        let startup = refresh.begin()
+        let takeover = refresh.begin(takeover: true)
+        XCTAssertFalse(refresh.readinessKnown)
+
+        XCTAssertEqual(refresh.accept(generation: takeover, authorized: true), .reconcileScheduled)
+        XCTAssertTrue(refresh.readinessKnown)
+        XCTAssertTrue(refresh.notificationsAuthorized)
+        XCTAssertEqual(refresh.accept(generation: startup, authorized: false), .ignored,
+            "A late startup response must not cancel the Watch's scheduled alarm")
+        XCTAssertTrue(refresh.notificationsAuthorized)
+    }
+
+    func testNotificationPermissionRefreshRejectsOldTakeoverAndAppliesLatestDenial() {
+        var refresh = LibreWatchAlarmPermissionRefresh()
+        let takeover = refresh.begin(takeover: true)
+        let laterRefresh = refresh.begin()
+
+        XCTAssertEqual(refresh.accept(generation: laterRefresh, authorized: false), .cancelScheduled)
+        XCTAssertFalse(refresh.notificationsAuthorized)
+        XCTAssertTrue(refresh.readinessKnown)
+        XCTAssertEqual(refresh.accept(generation: takeover, authorized: true), .ignored,
+            "An old takeover response must not restore authorization after denial")
+        XCTAssertFalse(refresh.notificationsAuthorized)
+    }
+
     func testTakeoverReadinessRequestsOneFeedbackAcrossReadingsWakesAndRestart() throws {
         var fixture = try alarmReadinessFixture()
         let ready = evaluateAlarmReadiness(fixture)

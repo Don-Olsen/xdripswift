@@ -475,6 +475,31 @@ struct LibreWatchAlarmReadinessQuery {
     }
 }
 
+/// The latest notification-settings request is the only one allowed to change
+/// alarm authorization or the pending missed-reading notification.
+struct LibreWatchAlarmPermissionRefresh {
+    enum Effect: Equatable {
+        case ignored, cancelScheduled, reconcileScheduled
+    }
+
+    private(set) var generation: UInt64 = 0
+    private(set) var notificationsAuthorized = false
+    private(set) var readinessKnown = false
+
+    mutating func begin(takeover: Bool = false) -> UInt64 {
+        generation &+= 1
+        if takeover { readinessKnown = false }
+        return generation
+    }
+
+    mutating func accept(generation: UInt64, authorized: Bool) -> Effect {
+        guard self.generation == generation else { return .ignored }
+        notificationsAuthorized = authorized
+        readinessKnown = true
+        return authorized ? .reconcileScheduled : .cancelScheduled
+    }
+}
+
 struct LibreWatchAlarmReadiness: Equatable {
     enum Status: String {
         case inactive, settingsMissing, settingsPending, authorityMissing, missedRuleDisabled, snoozed

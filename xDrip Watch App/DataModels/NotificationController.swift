@@ -95,14 +95,14 @@ final class LibreWatchAlarmController: NSObject, UNUserNotificationCenterDelegat
     private(set) var state = LibreWatchAlarmStore.state()
     private var delegation: LibreWatchAlarmDelegation? { configuration.delegation }
     private var watchOwnsSensor = false
-    private var notificationsAuthorized = false
+    private var permissionRefresh = LibreWatchAlarmPermissionRefresh()
+    private var notificationsAuthorized: Bool { permissionRefresh.notificationsAuthorized }
     private var notificationAuthorizationStatus: UNAuthorizationStatus?
-    private var readinessPermissionsKnown = false
+    private var readinessPermissionsKnown: Bool { permissionRefresh.readinessKnown }
     private var notificationsFullyAuthorized = false
     private var notificationAlertsEnabled = false
     private var notificationSoundsEnabled = false
     private var readinessQueryGeneration: UInt64 = 0
-    private var readinessPermissionGeneration: UInt64 = 0
     private var lastTakeoverReadiness: LibreWatchAlarmReadiness?
     private var permissionEvidence = "authorization=unknown:alert=unknown:sound=unknown"
     private var previousReadinessEvidence: [String: String] = [:]
@@ -198,49 +198,49 @@ final class LibreWatchAlarmController: NSObject, UNUserNotificationCenterDelegat
     }
 
     func refreshPermission() {
-        readinessPermissionGeneration &+= 1
-        let permissionGeneration = readinessPermissionGeneration
+        let permissionGeneration = permissionRefresh.begin()
         center.getNotificationSettings { [weak self] permissions in
             DispatchQueue.main.async {
                 guard let self else { return }
-                let previous = self.readinessRevision
-                if self.readinessPermissionGeneration == permissionGeneration {
-                    self.updateReadinessPermissionEvidence(permissions)
-                }
-                self.notificationsAuthorized = permissions.authorizationStatus == .authorized || permissions.authorizationStatus == .provisional
-                if !self.notificationsAuthorized { self.cancelScheduledAlarms() }
-                else { self.reconcileScheduledMissedAlarm() }
-                self.publishStatus()
-                if previous != self.readinessRevision { self.onReadinessChange?() }
+                self.applyPermissionResponse(permissions, generation: permissionGeneration)
             }
         }
+    }
+
+    private func applyPermissionResponse(_ permissions: UNNotificationSettings, generation: UInt64) {
+        let previous = readinessRevision
+        let authorized = permissions.authorizationStatus == .authorized || permissions.authorizationStatus == .provisional
+        let effect = permissionRefresh.accept(generation: generation, authorized: authorized)
+        guard effect != .ignored else { return }
+        updateReadinessPermissionEvidence(permissions)
+        switch effect {
+        case .ignored: break
+        case .cancelScheduled: cancelScheduledAlarms()
+        case .reconcileScheduled: reconcileScheduledMissedAlarm()
+        }
+        publishStatus()
+        if previous != readinessRevision { onReadinessChange?() }
     }
 
     private func updateReadinessPermissionEvidence(_ permissions: UNNotificationSettings) {
         notificationAuthorizationStatus = permissions.authorizationStatus
         permissionEvidence = "authorization=\(permissions.authorizationStatus.rawValue):alert=\(permissions.alertSetting.rawValue):sound=\(permissions.soundSetting.rawValue)"
-        readinessPermissionsKnown = true
         notificationsFullyAuthorized = permissions.authorizationStatus == .authorized
         notificationAlertsEnabled = permissions.alertSetting == .enabled
         notificationSoundsEnabled = permissions.soundSetting == .enabled
     }
 
-    /// Takeover gets a fresh observation without changing the existing delegation or scheduler.
+    /// Takeover gets a fresh observation of permissions for both alarms and readiness.
     private func refreshTakeoverPermissions() {
-        readinessPermissionsKnown = false
-        readinessPermissionGeneration &+= 1
-        let generation = readinessPermissionGeneration
+        let generation = permissionRefresh.begin(takeover: true)
         let ownershipStartedAt = state.ownershipStartedAt
         let sessionID = state.sessionID
         center.getNotificationSettings { [weak self] permissions in
             DispatchQueue.main.async {
                 guard let self, self.watchOwnsSensor,
-                      self.readinessPermissionGeneration == generation,
                       self.state.ownershipStartedAt == ownershipStartedAt,
                       self.state.sessionID == sessionID else { return }
-                self.updateReadinessPermissionEvidence(permissions)
-                self.recordReadinessEvidence()
-                self.refreshTakeoverReadiness()
+                self.applyPermissionResponse(permissions, generation: generation)
             }
         }
     }

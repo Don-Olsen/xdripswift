@@ -8,6 +8,19 @@
 - Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
 <!-- testflight-7.1.1-4283:end -->
 
+## Afgrænset Watch-alarmrettelse efter 4283
+
+Et ældre, forsinket svar fra watchOS om notifikationstilladelse kunne ændre
+Watch-alarmens autorisation og annullere eller genplanlægge en alarm, selv efter
+et nyere svar var modtaget. Kun svaret fra den senest startede kontrol må nu
+ændre alarmtilstand og planlagte notifikationer. Det gælder også, når den
+almindelige tilladelseskontrol overlapper kontrollen ved sensor-overtagelse.
+To regressionstests dækker svar i omvendt rækkefølge. De 1.115/1.115 XCTest-tests,
+Python-kontrollerne og begge simulatorbuilds bestod 3. oktober 2026.
+Bluetooth-genopkobling, timeouts, alarmregler og snooze er uændrede. Virkningen
+på det fysiske ur er endnu ikke bekræftet; en kort kontrol af alarmberedskabet
+erstatter ikke en 90-minutters stabilitetstest.
+
 De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
 
 ## Rettelser efter 4282 og fysisk opfølgning
