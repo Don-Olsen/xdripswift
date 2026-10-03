@@ -1,3 +1,55 @@
+## Lokal rettelse efter 4290 — prognose og kurver ved genåbning
+
+3. oktober 2026: den installerede iPhone-version blev kontrolleret trådløst og
+bekræftet som 7.1.1 (4290). Den bevarede prognoselog viste et utilgængeligt
+resultat og et gyldigt resultat på samme målereference 504 ms senere.
+App-startposter placerer dette ved opstart; det er ikke en optagelse af alle
+visningsframes ved almindeligt skift mellem apps. Rådata opbevares privat,
+uden for Git.
+
+Kodegennemgangen fandt to mekanismer: en genindlæsning fra Sundhed kunne
+ugyldiggøre prognosens visning uden ændrede behandlinger, og midlertidigt
+manglende kurver kunne ændre fælles akse-/IOB-/COB-skalering. Den lokale rettelse:
+
+- Skelner mellem en genindlæsningsanmodning og faktiske ændringer af input.
+  Kun en identificeret genindlæsning af tidligere komplette Sundhedsdata kan
+  bevare en allerede beregnet, dateret prognose i højst to sekunder, mærket
+  »Opdaterer…« uden numeriske +30/+60/+120-oversigter. Gentagne anmodninger
+  forlænger ikke fristen, og tilstanden logges ikke som en gyldig beregning.
+- Afviser fortsat gamle resultater ved ændrede behandlinger, indstillinger,
+  kilde, sensor eller referenceværdi, fejlede/ukendte input og ventende gemning.
+  Et importbarns gemning er også beskyttet frem til den endelige databasecommit.
+  En ældre databasecommit kan ikke kvittere for nyere, stadig ventende ændringer.
+- Bevarer kun aksegrænser og fælles kurveskalering under genindlæsning af
+  livegrafen. Usikre behandlingspunkter bliver ikke beholdt som aktuelle data.
+  Skift af visning, periode, indstillinger eller eksplicit nulstilling samt
+  udløb af referencepunktet fra det synlige interval nulstiller geometrien.
+
+Validering på den lokale ændring oven på `cc5e9f4f`:
+
+- `scripts/local-build.sh release-test`: exit 0.
+- **1.210/1.210 XCTest-tests bestået**, nul fejl og nul skipped, herunder 18 nye
+  regressionstests for genindlæsning, inputidentitet, importgemning og geometri.
+- Alle Python-kontroller bestod; iPhone- og Watch-simulatorbuilds bestod.
+- Hashkontrol af 196 beskyttede kilde-/testfiler bestod uden ændringer.
+  Prognosemotorens matematik, alarmer, Bluetooth, sensorejerskab og
+  workout-runtime er uændrede. Importvalg og importadfærd er uændrede;
+  den nye importmetadata bruges kun til prognosens præsentationskontrol.
+- Uafhængig slutgennemgang fandt ingen resterende blokerende fejl.
+  `git diff --check` bestod. Testmateriale og manifest for den lokale ændrede
+  kode ligger i
+  `~/DeveloperBuildData/xDrip/local-runs/xdripswift/20261003T193818Z-90863/`,
+  inklusive `results/AllTests.xcresult`, `results/stability-summary.json` og
+  `results/foreground-reentry-source-manifest.json`.
+
+Fysisk kontrol af den rettede visning på iPhone mangler stadig. Der er ikke
+udført upload, direkte enhedsinstallation eller ændring af versionsnummer,
+release-status eller releaseartefakter. Dette er en lokal, uudgivet kandidat.
+Det tidligere rapporterede tomme Watch-komplikationsfelt er fortsat særskilt
+og indgår ikke i denne rettelse.
+
+---
+
 <!-- testflight-7.1.1-4290:start -->
 ### TestFlight 7.1.1 (4290)
 

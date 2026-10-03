@@ -552,3 +552,4 @@
 "forecast.exportFailed" = "The forecast log could not be exported. The original log is unchanged.";
 "forecast.exportPreparing" = "Preparing CSV…";
 "forecast.exportPrivacy" = "This file contains health data and stays on this iPhone until you choose where to share it. Forecasts are logged when Home calculates them, not continuously throughout the day.";
+"forecast.updating" = "Updating…";

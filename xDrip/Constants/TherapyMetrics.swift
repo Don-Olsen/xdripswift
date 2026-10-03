@@ -255,9 +255,9 @@ struct TherapyChartScale {
     let baseline: Double
     let reduction: Double
 
-    init(series: TherapyChartSeries, baseline: Double) {
+    init(series: TherapyChartSeries, baseline: Double, retainedReduction: Double = 1) {
         self.baseline = baseline
-        reduction = max(1,
+        reduction = max(1, retainedReduction.isFinite ? retainedReduction : 1,
             (series.iob.map(\.amount).max() ?? 0) / ConstantsGlucoseChartSwiftUI.therapyPlotMaximumIOB,
             (series.cob.map(\.amount).max() ?? 0) / ConstantsGlucoseChartSwiftUI.therapyPlotMaximumCOB)
     }

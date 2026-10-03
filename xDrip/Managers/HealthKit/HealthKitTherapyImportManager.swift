@@ -232,6 +232,8 @@ final class HealthKitTherapyImportManager {
     private var coreDataManager: CoreDataManager?
     private var active = Set<HealthTherapyImportKind>()
     private var pending = Set<HealthTherapyImportKind>()
+    private let presentationLock = NSLock()
+    private var previouslyCompleteRefreshes: [HealthTherapyImportKind: (source: String, lastSync: Date)] = [:]
     private var observerInstalled = Set<HealthTherapyImportKind>()
     private var observerCompletions: [HealthTherapyImportKind: [() -> Void]] = [:]
     /// Injected only by isolated tests to fail one parent-store save at a precise boundary.
@@ -363,6 +365,31 @@ final class HealthKitTherapyImportManager {
         isEnabled(kind) && status(kind).isIncomplete
     }
 
+    /// Read-only presentation hint. It never makes incomplete inputs usable for calculations.
+    /// Every enabled source must have a recent, unambiguous successful import; only a new
+    /// anchored read may be in progress. First imports, source changes and failures stay unknown.
+    func isRefreshingPreviouslyCompleteInputs(at now: Date = Date()) -> Bool {
+        presentationLock.lock()
+        let refreshProof = previouslyCompleteRefreshes
+        presentationLock.unlock()
+        var refreshing = false
+        for kind in HealthTherapyImportKind.allCases where isEnabled(kind) {
+            guard selectedSource(kind) != nil,
+                  defaults.string(forKey: key(kind, "error")) == nil,
+                  let lastSync = defaults.object(forKey: key(kind, "lastSync")) as? Date,
+                  now.timeIntervalSince(lastSync) >= 0,
+                  now.timeIntervalSince(lastSync) <= TherapyModelSettings.visibilityInterval,
+                  defaults.bool(forKey: key(kind, "observedSelectedSource")),
+                  !defaults.bool(forKey: key(kind, "hasAmbiguousSelectedSource")) else { return false }
+            if defaults.bool(forKey: key(kind, "syncInProgress")) {
+                guard let proof = refreshProof[kind], proof.lastSync == lastSync,
+                      proof.source == selectedSource(kind)?.bundleIdentifier else { return false }
+                refreshing = true
+            }
+        }
+        return refreshing
+    }
+
     @objc private func retryEnabledImports() {
         queue.async {
             for kind in HealthTherapyImportKind.allCases where self.isEnabled(kind) {
@@ -410,6 +437,15 @@ final class HealthKitTherapyImportManager {
             return
         }
         guard active.insert(kind).inserted else { pending.insert(kind); return }
+        // Capture before clearing an earlier error or changing sync state. This hint does not
+        // authorize calculations and cannot survive a failed read, source switch or app restart.
+        let previousStatus = status(kind)
+        presentationLock.lock()
+        previouslyCompleteRefreshes[kind] = !previousStatus.isIncomplete
+            ? selectedSource(kind).flatMap { source in
+                previousStatus.lastSync.map { (source.bundleIdentifier, $0) }
+            } : nil
+        presentationLock.unlock()
         defaults.set(true, forKey: key(kind, "syncInProgress"))
         defaults.removeObject(forKey: key(kind, "error"))
         TherapyMetricsManager.shared.invalidate(treatmentsChanged: false)
@@ -481,6 +517,9 @@ final class HealthKitTherapyImportManager {
     }
 
     private func complete(_ kind: HealthTherapyImportKind) {
+        presentationLock.lock()
+        previouslyCompleteRefreshes.removeValue(forKey: kind)
+        presentationLock.unlock()
         active.remove(kind)
         finishObserverCallbacks(kind)
         if pending.remove(kind) != nil { startSync(kind) }

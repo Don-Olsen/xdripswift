@@ -18,6 +18,7 @@ struct RootHomeMainChartView: View {
     let chartState: GlucoseChartState
     let forecastResult: GlucoseForecastResult?
     let forecastHorizonMinutes: Int
+    var forecastIsUpdating = false
     let isLoading: Bool
     let scrollCoordinator: GlucoseChartScrollCoordinator
     let yAxisResetRevision: Int
@@ -71,7 +72,8 @@ struct RootHomeMainChartView: View {
                     chartState: chartState
                 )
                 .mainChartYAxisContext(
-                    resetRevision: yAxisResetRevision, renderBasalDownwards: renderBasalDownwards
+                    resetRevision: yAxisResetRevision, renderBasalDownwards: renderBasalDownwards,
+                    isLiveViewport: scrollCoordinator.isShowingCurrentTimeRange
                 )
                 .therapyPlots(
                     TherapyChartSeries(iob: hasIOB ? therapySeries.iob : [], cob: hasCOB ? therapySeries.cob : []),
@@ -176,10 +178,14 @@ struct RootHomeMainChartView: View {
                     if let referenceDate = forecastResult.referenceDate {
                         Text(GlucoseForecastTexts.basedOnShort(referenceDate))
                     }
-                    Text("+30 \(forecastValue(at: 30, from: forecastResult))")
-                    Text("+60 \(forecastValue(at: 60, from: forecastResult))")
-                    if forecastHorizonMinutes == 120 {
-                        Text("+120 \(forecastValue(at: 120, from: forecastResult))")
+                    if forecastIsUpdating {
+                        Text(GlucoseForecastTexts.text("forecast.updating", fallback: "Updating…"))
+                    } else {
+                        Text("+30 \(forecastValue(at: 30, from: forecastResult))")
+                        Text("+60 \(forecastValue(at: 60, from: forecastResult))")
+                        if forecastHorizonMinutes == 120 {
+                            Text("+120 \(forecastValue(at: 120, from: forecastResult))")
+                        }
                     }
                 }
             } else {

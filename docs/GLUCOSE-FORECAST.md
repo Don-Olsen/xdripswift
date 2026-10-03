@@ -24,6 +24,37 @@ non-main exclusions. Device logs establish transient input unavailability, but
 physical observation of the corrected UI still requires a separately authorized
 release. This follow-up has not been uploaded or installed on the user's devices.
 
+## Follow-up to 4290: foreground reload presentation
+
+The iPhone was read over the paired network connection and confirmed on 4290.
+Its retained log contained a `dataUnavailable` result followed by a valid result
+for the same reading 504 ms later. The app-start entries place this evidence at
+startup; the log alone is not a recording of every warm-foreground render.
+The values in this sample did not require a larger glucose axis. Consequently,
+axis retention alone does not explain every reported disappearing curve.
+
+The local follow-up separates a refresh request from an actual input revision.
+Only a specifically identified read of previously complete Health inputs may
+retain the last dated forecast for at most two seconds, marked **Updating…** with numeric
+forecast summaries hidden. This is a bounded presentation state, never a new
+valid prediction or a valid evidence-log record. Generic unavailable results,
+changed treatments/settings/sources, pending saves and mismatched glucose or
+sensor identities do not qualify. The normal input and freshness guards remain.
+A writer commit confirms only the input generation captured when that save
+began; newer child/main mutations remain pending. No previous forecast is
+loaded from disk to conceal a cold-start data check.
+
+Separately, the live chart retains overlay extrema and the common therapy scale
+while curves reload. It retains geometry, not uncertain treatment points.
+Disabling overlays, changing the visible range, explicit reset, history mode
+or viewport expiry clears the relevant geometry; a new valid result supplies
+its own extrema. Compact and Watch charts retain their existing behavior.
+
+The forecast engine, imported treatment selection, sensor transport, Watch
+runtime, alarms and evidence-log schema are unchanged. A one-shot expiry for
+the short presentation state is not polling or a background forecast. Actual
+validation and physical-check limitations are recorded in PROJECT-STATUS.md.
+
 ## Inputs and setup
 
 The calculation starts from the newest downstream-valid CGM reading and a continuous recent history from the same sensor/source. Old readings, gaps, invalid samples, incomplete treatment imports or a pending treatment save make the forecast unavailable; missing data is never treated as zero.

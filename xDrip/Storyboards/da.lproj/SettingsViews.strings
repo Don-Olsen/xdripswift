@@ -582,3 +582,4 @@
 "forecast.exportFailed" = "Prognoseloggen kunne ikke eksporteres. Den oprindelige log er uændret.";
 "forecast.exportPreparing" = "Klargør CSV…";
 "forecast.exportPrivacy" = "Filen indeholder helbredsdata og bliver på denne iPhone, indtil du vælger, hvor den skal deles. Prognoser logges, når Hjemskærmen beregner dem, ikke løbende hele døgnet.";
+"forecast.updating" = "Opdaterer…";

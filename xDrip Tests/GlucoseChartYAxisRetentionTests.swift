@@ -11,6 +11,146 @@ import XCTest
 
 final class GlucoseChartYAxisRetentionTests: XCTestCase {
 
+    private func reloadContext() -> GlucoseChartReloadGeometry.Context {
+        .init(isLiveMainChart: true, hoursToShow: 3, forecastHorizonMinutes: 60,
+              showsTherapy: true, rendersBasalDownwards: true, resetRevision: 0)
+    }
+
+    func testLiveForecastGeometrySurvivesUnavailablePointsAppearanceAndIdleReset() throws {
+        let now = Date(timeIntervalSince1970: 10_000)
+        let start = now.addingTimeInterval(-3 * 3600)
+        let points = [GlucoseChartForecastPoint(date: now, glucoseMgdl: 120),
+                      GlucoseChartForecastPoint(date: now.addingTimeInterval(3600), glucoseMgdl: 320)]
+        let loaded = GlucoseChartReloadGeometry().updated(context: reloadContext(), forecastPoints: points,
+            forecastReferenceDate: now, therapySeries: TherapyChartSeries(), start: start, end: now)
+        let missing = loaded.updated(context: reloadContext(), forecastPoints: [], forecastReferenceDate: nil,
+            therapySeries: TherapyChartSeries(), start: start.addingTimeInterval(20), end: now.addingTimeInterval(20))
+        XCTAssertEqual(missing.forecastBounds, loaded.forecastBounds)
+        // Appearance and the 10-second idle reset use the retained candidate, never the absent series.
+        var axis = GlucoseChartYAxisRetentionState()
+        axis.reset(to: try XCTUnwrap(missing.forecastBounds).values.upperBound)
+        XCTAssertEqual(axis.effectiveMaximum(for: 200), 320)
+        let reappeared = missing.updated(context: reloadContext(), forecastPoints: [], forecastReferenceDate: nil,
+            therapySeries: TherapyChartSeries(), start: start.addingTimeInterval(30), end: now.addingTimeInterval(30))
+        axis.reset(to: try XCTUnwrap(reappeared.forecastBounds).values.upperBound)
+        XCTAssertEqual(axis.effectiveMaximum(for: 200), 320)
+        let restored = reappeared.updated(context: reloadContext(), forecastPoints: points,
+            forecastReferenceDate: now, therapySeries: TherapyChartSeries(), start: start, end: now)
+        XCTAssertEqual(restored, loaded)
+        // Geometry is separate from plotted validity: no old points are made visible by retention.
+        XCTAssertTrue(GlucoseChartForecastPresentation.visiblePoints([], referenceDate: nil,
+            visibleStartDate: start, visibleEndDate: now, isMainChart: true).isEmpty)
+    }
+
+    func testForecastGeometryReplacesExtremaImmediatelyWithoutAccumulation() throws {
+        let now = Date(timeIntervalSince1970: 10_000)
+        let start = now.addingTimeInterval(-3600)
+        func update(_ state: GlucoseChartReloadGeometry, _ values: [Double]) -> GlucoseChartReloadGeometry {
+            state.updated(context: reloadContext(), forecastPoints: values.map {
+                GlucoseChartForecastPoint(date: now, glucoseMgdl: $0)
+            }, forecastReferenceDate: now, therapySeries: TherapyChartSeries(), start: start, end: now)
+        }
+        let initial = update(GlucoseChartReloadGeometry(), [100, 250])
+        let expanded = update(initial, [20, 400])
+        XCTAssertEqual(try XCTUnwrap(expanded.forecastBounds).values, 20...400)
+        var smaller = update(expanded, [110, 180])
+        for _ in 0..<100 { smaller = update(smaller, [110, 180]) }
+        XCTAssertEqual(try XCTUnwrap(smaller.forecastBounds).values, 110...180)
+        XCTAssertEqual(try XCTUnwrap(initial.forecastBounds).values, 100...250)
+    }
+
+    func testReloadGeometryResetsOnOffHistoryRangeVisibilityAndExplicitReset() {
+        let now = Date(timeIntervalSince1970: 10_000)
+        let start = now.addingTimeInterval(-3600)
+        let loaded = GlucoseChartReloadGeometry().updated(context: reloadContext(), forecastPoints: [
+            GlucoseChartForecastPoint(date: now, glucoseMgdl: 320)
+        ], forecastReferenceDate: now,
+            therapySeries: TherapyChartSeries(iob: [TherapyChartPoint(date: now, amount: 30, segment: 0)]),
+            start: start, end: now)
+        var off = reloadContext(); off.forecastHorizonMinutes = 0
+        var history = reloadContext(); history.isLiveMainChart = false
+        var wider = reloadContext(); wider.hoursToShow = 6
+        var reset = reloadContext(); reset.resetRevision = 1
+        var hidden = reloadContext(); hidden.showsTherapy = false
+        var basal = reloadContext(); basal.rendersBasalDownwards = false
+        for context in [off, history, wider, reset, hidden, basal] {
+            let cleared = loaded.updated(context: context, forecastPoints: [], forecastReferenceDate: nil,
+                therapySeries: TherapyChartSeries(), start: start, end: now)
+            XCTAssertNil(cleared.forecastBounds)
+            XCTAssertEqual(cleared.therapyReduction, 1)
+        }
+    }
+
+    func testReloadGeometryExpiresWhenItsAnchorsLeaveTheLiveViewport() {
+        let now = Date(timeIntervalSince1970: 10_000)
+        let loaded = GlucoseChartReloadGeometry().updated(context: reloadContext(), forecastPoints: [
+            GlucoseChartForecastPoint(date: now, glucoseMgdl: 320)
+        ], forecastReferenceDate: now,
+            therapySeries: TherapyChartSeries(iob: [TherapyChartPoint(date: now, amount: 30, segment: 0)]),
+            start: now.addingTimeInterval(-3600), end: now)
+        let expired = loaded.updated(context: reloadContext(), forecastPoints: [], forecastReferenceDate: nil,
+            therapySeries: TherapyChartSeries(), start: now.addingTimeInterval(1), end: now.addingTimeInterval(3601))
+        XCTAssertNil(expired.forecastBounds)
+        XCTAssertNil(expired.iobMaximum)
+        XCTAssertEqual(expired.therapyReduction, 1)
+    }
+
+    func testMissingDominantTherapyCurveDoesNotRescaleTheOtherCurve() {
+        let now = Date(timeIntervalSince1970: 10_000)
+        let start = now.addingTimeInterval(-3600)
+        func point(_ value: Double) -> TherapyChartPoint { .init(date: now, amount: value, segment: 0) }
+        for iobDominates in [true, false] {
+            let full = TherapyChartSeries(iob: [point(iobDominates ? 30 : 10)], cob: [point(iobDominates ? 35 : 140)])
+            let partial = TherapyChartSeries(iob: iobDominates ? [] : full.iob, cob: iobDominates ? full.cob : [])
+            let loaded = GlucoseChartReloadGeometry().updated(context: reloadContext(), forecastPoints: [],
+                forecastReferenceDate: nil, therapySeries: full, start: start, end: now)
+            let missing = loaded.updated(context: reloadContext(), forecastPoints: [], forecastReferenceDate: nil,
+                therapySeries: partial, start: start, end: now)
+            let before = TherapyChartScale(series: full, baseline: -10, retainedReduction: loaded.therapyReduction)
+            let during = TherapyChartScale(series: partial, baseline: -10, retainedReduction: missing.therapyReduction)
+            XCTAssertEqual(before.reduction, 2)
+            XCTAssertEqual(during.reduction, before.reduction)
+            XCTAssertEqual(during.glucoseValue(amount: 7, isIOB: !iobDominates),
+                           before.glucoseValue(amount: 7, isIOB: !iobDominates))
+            let restored = missing.updated(context: reloadContext(), forecastPoints: [], forecastReferenceDate: nil,
+                therapySeries: full, start: start, end: now)
+            XCTAssertEqual(restored.therapyReduction, 2)
+            // Retention does not populate the missing curve itself.
+            XCTAssertTrue(iobDominates ? partial.iob.isEmpty : partial.cob.isEmpty)
+        }
+    }
+
+    func testTherapyScaleUpdatesFromActualExtremaWithoutAccumulatingOrClipping() {
+        let now = Date(timeIntervalSince1970: 10_000)
+        func point(_ value: Double) -> TherapyChartPoint { .init(date: now, amount: value, segment: 0) }
+        func update(_ geometry: GlucoseChartReloadGeometry, amount: Double) -> GlucoseChartReloadGeometry {
+            geometry.updated(context: reloadContext(), forecastPoints: [], forecastReferenceDate: nil,
+                therapySeries: TherapyChartSeries(iob: [point(amount)]), start: now.addingTimeInterval(-3600), end: now)
+        }
+        var geometry = update(GlucoseChartReloadGeometry(), amount: 30)
+        for _ in 0..<100 { geometry = update(geometry, amount: 30) }
+        XCTAssertEqual(geometry.therapyReduction, 2)
+        let expanded = update(geometry, amount: 60)
+        XCTAssertEqual(expanded.therapyReduction, 4)
+        let scale = TherapyChartScale(series: TherapyChartSeries(iob: [point(60)]), baseline: -10,
+                                     retainedReduction: expanded.therapyReduction)
+        XCTAssertEqual(scale.glucoseValue(amount: 60, isIOB: true), 67)
+        XCTAssertEqual(update(expanded, amount: 15).therapyReduction, 1)
+    }
+
+    func testCompactAndHistoricalChartsKeepAdaptiveGeometry() {
+        let now = Date(timeIntervalSince1970: 10_000)
+        var context = reloadContext(); context.isLiveMainChart = false
+        let series = TherapyChartSeries(iob: [TherapyChartPoint(date: now, amount: 30, segment: 0)])
+        let geometry = GlucoseChartReloadGeometry().updated(context: context,
+            forecastPoints: [GlucoseChartForecastPoint(date: now, glucoseMgdl: 320)], forecastReferenceDate: now,
+            therapySeries: series, start: now.addingTimeInterval(-3600), end: now)
+        XCTAssertNil(geometry.forecastBounds)
+        XCTAssertEqual(geometry.therapyReduction, 1)
+        XCTAssertEqual(TherapyChartScale(series: series, baseline: -10).reduction, 2)
+        XCTAssertEqual(TherapyChartScale(series: TherapyChartSeries(), baseline: -10).reduction, 1)
+    }
+
     func testHomeTherapyAxisDoesNotDipWhenCurvesArriveAfterGlucose() {
         // Home initially renders cached glucose before the separate IOB/COB request completes.
         let beforeLoad = GlucoseChartTherapyDomain.minimum(

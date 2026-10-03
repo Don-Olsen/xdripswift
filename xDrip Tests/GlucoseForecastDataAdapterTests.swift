@@ -5,6 +5,103 @@ import XCTest
 final class GlucoseForecastDataAdapterTests: XCTestCase {
     private let referenceDate = Date(timeIntervalSince1970: 2_000_000_000)
 
+    @MainActor func testForecastInputRevisionIgnoresNoOpRefreshButTracksPendingAndCommittedTreatments() throws {
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let manager = TherapyMetricsManager()
+        manager.configure(coreDataManager: core, externalStatus: { nil })
+        let original = manager.forecastInputChangeRevision
+        let broadRevision = manager.treatmentChangeRevision
+        manager.invalidate(treatmentsChanged: false)
+        manager.invalidate() // Health import materialization/status cache invalidation.
+        XCTAssertEqual(manager.forecastInputChangeRevision, original)
+        XCTAssertGreaterThan(manager.treatmentChangeRevision, broadRevision)
+        _ = TreatmentEntry(date: Date(), value: 1, treatmentType: .Insulin,
+            nightscoutEventType: nil, enteredBy: nil, nsManagedObjectContext: core.mainManagedObjectContext)
+        try core.mainManagedObjectContext.save()
+        XCTAssertTrue(manager.hasUncommittedTreatmentChanges)
+        XCTAssertGreaterThan(manager.forecastInputChangeRevision, original)
+        let pending = manager.forecastInputChangeRevision
+        manager.invalidate()
+        XCTAssertEqual(manager.forecastInputChangeRevision, pending)
+        XCTAssertTrue(manager.hasUncommittedTreatmentChanges)
+        XCTAssertTrue(core.saveChangesSynchronously())
+        XCTAssertFalse(manager.hasUncommittedTreatmentChanges)
+        XCTAssertGreaterThan(manager.forecastInputChangeRevision, pending)
+        let committed = manager.forecastInputChangeRevision
+        manager.invalidate(forecastInputsInvalidated: true)
+        XCTAssertGreaterThan(manager.forecastInputChangeRevision, committed)
+        let beforeStoreChange = manager.forecastInputChangeRevision
+        manager.configure(coreDataManager: CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName),
+                          externalStatus: { nil })
+        XCTAssertGreaterThan(manager.forecastInputChangeRevision, beforeStoreChange)
+    }
+
+    @MainActor func testForecastInputRevisionTracksImportChildBeforeParentSave() async throws {
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let manager = TherapyMetricsManager()
+        manager.configure(coreDataManager: core, externalStatus: { nil })
+        let original = manager.forecastInputChangeRevision
+        let child = core.privateChildManagedObjectContext()
+        try await child.perform {
+            _ = TreatmentEntry(date: Date(), value: 1, treatmentType: .Insulin,
+                nightscoutEventType: nil, enteredBy: "Synthetic import", nsManagedObjectContext: child)
+            try child.save()
+        }
+        XCTAssertGreaterThan(manager.forecastInputChangeRevision, original)
+        XCTAssertTrue(manager.hasUncommittedForecastInputChanges)
+        let imported = manager.forecastInputChangeRevision
+        manager.invalidate()
+        XCTAssertTrue(manager.hasUncommittedForecastInputChanges,
+                      "A cache/status invalidation cannot certify the pending imported treatment")
+        XCTAssertTrue(core.saveChangesSynchronously())
+        XCTAssertGreaterThan(manager.forecastInputChangeRevision, imported)
+        XCTAssertFalse(manager.hasUncommittedForecastInputChanges)
+    }
+
+    @MainActor func testOlderWriterCommitCannotConfirmNewerImportChild() async throws {
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let manager = TherapyMetricsManager()
+        manager.configure(coreDataManager: core, externalStatus: { nil })
+        _ = TreatmentEntry(date: Date(), value: 1, treatmentType: .Insulin,
+            nightscoutEventType: nil, enteredBy: "A", nsManagedObjectContext: core.mainManagedObjectContext)
+        try core.mainManagedObjectContext.save() // A is forwarded, but the writer has not saved it.
+        let child = core.privateChildManagedObjectContext()
+        try await child.perform {
+            _ = TreatmentEntry(date: Date(), value: 2, treatmentType: .Insulin,
+                nightscoutEventType: nil, enteredBy: "B", nsManagedObjectContext: child)
+            try child.save() // B has reached main only, after A was forwarded.
+        }
+        XCTAssertTrue(manager.hasUncommittedForecastInputChanges)
+        try await core.privateManagedObjectContext.perform {
+            try core.privateManagedObjectContext.save() // This commit contains A, not B.
+        }
+        XCTAssertFalse(manager.hasUncommittedTreatmentChanges,
+                       "The existing snapshot pending behavior remains unchanged")
+        XCTAssertTrue(manager.hasUncommittedForecastInputChanges,
+                      "A's writer commit must not confirm the still-unforwarded B treatment")
+        manager.invalidate(committedTreatmentSave: true)
+        XCTAssertTrue(manager.hasUncommittedForecastInputChanges,
+                      "A cache invalidation is not writer-generation acknowledgement")
+        XCTAssertTrue(core.saveChangesSynchronously()) // Forward and commit B.
+        XCTAssertFalse(manager.hasUncommittedForecastInputChanges)
+    }
+
+    func testForecastWriterAcknowledgesOnlyGenerationCapturedAtWillSave() {
+        var state = ForecastInputCommitState()
+        state.mainDidSave() // A
+        state.writerWillSave()
+        state.childDidSave() // B arrives while writer A is in flight.
+        state.mainDidSave() // Even forwarding B later cannot change writer A's snapshot.
+        state.writerDidSaveTreatments()
+        XCTAssertTrue(state.hasPendingChanges)
+        state.writerDidSaveTreatments() // A repeated/unsupported acknowledgement cannot clear B.
+        XCTAssertTrue(state.hasPendingChanges)
+        state.writerWillSave()
+        XCTAssertTrue(state.hasPendingChanges, "Starting a writer save does not prove success")
+        state.writerDidSaveTreatments()
+        XCTAssertFalse(state.hasPendingChanges)
+    }
+
     func testForecastRequiresUserConfirmedSensitivityAndCarbohydrateRatio() throws {
         XCTAssertThrowsError(try GlucoseForecastDataAdapter.manualParameters(
             sensitivity: nil, ratio: 12).get()) { error in

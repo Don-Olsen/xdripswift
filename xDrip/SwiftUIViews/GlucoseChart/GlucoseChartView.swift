@@ -74,6 +74,80 @@ struct GlucoseChartTherapyDomain {
     }
 }
 
+/// Keeps only axis geometry while live Home overlays reload; never retains renderable points.
+/// Every valid replacement uses its own extrema, so repeated reloads cannot accumulate scale.
+struct GlucoseChartReloadGeometry: Equatable {
+    struct Context: Equatable {
+        var isLiveMainChart: Bool
+        var hoursToShow: Double
+        var forecastHorizonMinutes: Int
+        var showsTherapy: Bool
+        var rendersBasalDownwards: Bool
+        var resetRevision: Int
+    }
+
+    struct ForecastBounds: Equatable {
+        let values: ClosedRange<Double>
+        let referenceDate: Date
+    }
+
+    struct TherapyMaximum: Equatable {
+        let amount: Double
+        let date: Date
+    }
+
+    private(set) var context: Context?
+    private(set) var forecastBounds: ForecastBounds?
+    private(set) var iobMaximum: TherapyMaximum?
+    private(set) var cobMaximum: TherapyMaximum?
+
+    var therapyReduction: Double {
+        max(1, (iobMaximum?.amount ?? 0) / ConstantsGlucoseChartSwiftUI.therapyPlotMaximumIOB,
+            (cobMaximum?.amount ?? 0) / ConstantsGlucoseChartSwiftUI.therapyPlotMaximumCOB)
+    }
+
+    func updated(context: Context, forecastPoints: [GlucoseChartForecastPoint], forecastReferenceDate: Date?,
+                 therapySeries: TherapyChartSeries, start: Date, end: Date) -> Self {
+        var next = self.context == context ? self : Self()
+        next.context = context
+        guard context.isLiveMainChart else {
+            next.forecastBounds = nil
+            next.iobMaximum = nil
+            next.cobMaximum = nil
+            return next
+        }
+        if context.forecastHorizonMinutes == 60 || context.forecastHorizonMinutes == 120 {
+            let values = forecastPoints.map(\.glucoseMgdl).filter { $0.isFinite && $0 > 0 }
+            if let referenceDate = forecastReferenceDate, referenceDate >= start, referenceDate <= end,
+               let minimum = values.min(), let maximum = values.max() {
+                next.forecastBounds = ForecastBounds(values: minimum...maximum, referenceDate: referenceDate)
+            } else if let previous = next.forecastBounds,
+                      previous.referenceDate < start || previous.referenceDate > end {
+                next.forecastBounds = nil
+            }
+        } else {
+            next.forecastBounds = nil
+        }
+        func maximum(_ points: [TherapyChartPoint], retaining previous: TherapyMaximum?) -> TherapyMaximum? {
+            // Prefer the latest occurrence of a maximum so a flat segment remains in the viewport.
+            let valid = points.filter { $0.amount.isFinite && $0.date >= start && $0.date <= end }
+            if let point = valid.max(by: { $0.amount == $1.amount ? $0.date < $1.date : $0.amount < $1.amount }) {
+                return TherapyMaximum(amount: point.amount, date: point.date)
+            }
+            guard let previous, previous.date >= start, previous.date <= end else { return nil }
+            return previous
+        }
+        if context.showsTherapy {
+            next.iobMaximum = maximum(therapySeries.iob, retaining: next.iobMaximum)
+            next.cobMaximum = maximum(therapySeries.cob, retaining: next.cobMaximum)
+        } else {
+            next.iobMaximum = nil
+            next.cobMaximum = nil
+        }
+        return next
+    }
+}
+
 /// Limits forecast presentation to the live window without changing measured chart data.
 /// Defined in the shared renderer so extensions do not need the iPhone forecast engine.
 struct GlucoseChartForecastPoint {
@@ -191,6 +265,8 @@ struct GlucoseChartView: View {
     /// chart keeps enough low and high context for visually coherent scrolling.
     var usesMainChartYAxisContext = false
     var mainChartYAxisResetRevision = 0
+    private var isLiveViewport = false
+    @State private var reloadGeometry = GlucoseChartReloadGeometry()
 
     @StateObject private var yAxisState = ChartDelayedState(GlucoseChartYAxisRetentionState())
 
@@ -330,11 +406,12 @@ struct GlucoseChartView: View {
     ///
     /// Compact charts intentionally stay adaptive by default so widgets, watch charts,
     /// notifications and live activities do not reserve unnecessary vertical space.
-    func mainChartYAxisContext(resetRevision: Int = 0, renderBasalDownwards: Bool = false) -> Self {
+    func mainChartYAxisContext(resetRevision: Int = 0, renderBasalDownwards: Bool = false, isLiveViewport: Bool = false) -> Self {
         var view = self
         view.usesMainChartYAxisContext = true
         view.mainChartYAxisResetRevision = resetRevision
         view.renderBasalDownwards = renderBasalDownwards
+        view.isLiveViewport = isLiveViewport
 
         return view
     }
@@ -698,16 +775,26 @@ struct GlucoseChartView: View {
             + (downwardBasal ? [] : basalValues)
         let visibleForecast = visibleForecastPoints
         let allBgValues = bgReadingValues + additionalValues + treatmentValues
-        let renderableYValues = allBgValues + visibleForecast.map(\.glucoseMgdl)
+        // Keep geometry separate from visibility: unavailable estimates and treatments stay hidden.
+        let visibleTherapy = showsTreatments && usesMainChartYAxisContext ? therapySeries.clipped(from: visibleStartDate, to: visibleEndDate) : TherapyChartSeries()
+        let geometryContext = GlucoseChartReloadGeometry.Context(
+            isLiveMainChart: usesMainChartYAxisContext && isLiveViewport,
+            hoursToShow: hoursToShow, forecastHorizonMinutes: forecastHorizonMinutes,
+            showsTherapy: showsTreatments && reservesTherapyDomainWhileLoading,
+            rendersBasalDownwards: renderBasalDownwards, resetRevision: mainChartYAxisResetRevision)
+        let currentGeometry = reloadGeometry.updated(context: geometryContext, forecastPoints: visibleForecast,
+            forecastReferenceDate: forecastReferenceDate, therapySeries: visibleTherapy,
+            start: visibleStartDate, end: visibleEndDate)
+        let forecastDomainValues = currentGeometry.forecastBounds.map { [$0.values.lowerBound, $0.values.upperBound] }
+            ?? visibleForecast.map(\.glucoseMgdl)
+        let renderableYValues = allBgValues + forecastDomainValues
         let cachedBasalBaseline = chartState?.minimumChartValueInMgDl ?? ConstantsGlucoseChartSwiftUI.yAxisAbsoluteMinimumChartValueInMgDl
         let basalMinimumChartValue = showsTreatments && !basalValues.isEmpty && !downwardBasal
             ? chartState?.minimumChartValueInMgDl ?? ConstantsGlucoseChartSwiftUI.yAxisAbsoluteMinimumChartValueInMgDl
             : ConstantsGlucoseChartSwiftUI.yAxisAbsoluteMinimumChartValueInMgDl
-        // Gate curves at rendering too, so cached series cannot bypass treatment visibility.
-        let visibleTherapy = showsTreatments && usesMainChartYAxisContext ? therapySeries.clipped(from: visibleStartDate, to: visibleEndDate) : TherapyChartSeries()
         let hasTherapy = !visibleTherapy.iob.isEmpty || !visibleTherapy.cob.isEmpty
         let therapyBaseline = ConstantsGlucoseChartSwiftUI.minimumChartValueWithBottomSpace(hours: hoursToShow)
-        let therapyScale = TherapyChartScale(series: visibleTherapy, baseline: therapyBaseline)
+        let therapyScale = TherapyChartScale(series: visibleTherapy, baseline: therapyBaseline, retainedReduction: currentGeometry.therapyReduction)
         let therapyMinimum = (visibleTherapy.iob.map { therapyScale.glucoseValue(amount: $0.amount, isIOB: true) }
             + visibleTherapy.cob.map { therapyScale.glucoseValue(amount: $0.amount, isIOB: false) }).min() ?? therapyBaseline
         let effectiveMinimumChartValue = GlucoseChartTherapyDomain.minimum(
@@ -733,7 +820,7 @@ struct GlucoseChartView: View {
                                                          contentTop: (renderableYValues.max() ?? minimumDomainValue) + upperDomainPadding,
                                                          chartTop: contentMaximumDomainValue + upperDomainPadding)
         let calculatedMaximumDomainValue = contentMaximumDomainValue + requiredBasalLayout.topSpace
-        let maximumDomainValue = usesMainChartYAxisContext
+        let maximumDomainValue = usesMainChartYAxisContext && reloadGeometry.context == geometryContext
             ? yAxisRetentionState.effectiveMaximum(for: calculatedMaximumDomainValue)
             : calculatedMaximumDomainValue
         // Retain the matching context marks as well as the scale so labels do not disappear while
@@ -1153,7 +1240,14 @@ struct GlucoseChartView: View {
         .onAppear {
             guard usesMainChartYAxisContext else { return }
 
+            reloadGeometry = currentGeometry
             resetRetainedYAxisMaximum(to: calculatedMaximumDomainValue)
+        }
+        .onCompatibleChange(of: currentGeometry) { geometry in
+            guard usesMainChartYAxisContext else { return }
+            let changedContext = reloadGeometry.context != geometry.context
+            reloadGeometry = geometry
+            if changedContext { resetRetainedYAxisMaximum(to: calculatedMaximumDomainValue) }
         }
         .onCompatibleChange(of: calculatedMaximumDomainValue) { newMaximum in
             guard usesMainChartYAxisContext else { return }

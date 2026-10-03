@@ -22,6 +22,32 @@ struct TherapyTreatment: Sendable {
     let isIOB: Bool
 }
 
+/// Forecast-only save provenance. A writer commit can confirm only the mutations forwarded
+/// before that writer save began; newer child/main work must remain unavailable.
+struct ForecastInputCommitState {
+    private var mutationGeneration = 0
+    private var forwardedGeneration = 0
+    private var committedGeneration = 0
+    private var writerSaveGeneration: Int?
+
+    var hasPendingChanges: Bool { mutationGeneration > committedGeneration }
+
+    mutating func childDidSave() { mutationGeneration += 1 }
+
+    mutating func mainDidSave() {
+        mutationGeneration += 1
+        forwardedGeneration = mutationGeneration
+    }
+
+    mutating func writerWillSave() { writerSaveGeneration = forwardedGeneration }
+
+    mutating func writerDidSaveTreatments() {
+        guard let generation = writerSaveGeneration else { return }
+        committedGeneration = max(committedGeneration, generation)
+        writerSaveGeneration = nil
+    }
+}
+
 /// Core Data is read only on its owning queue. Caches contain detached value types.
 /// Reads happen outside the cache lock so a Core Data save notification cannot deadlock a fetch.
 final class TherapyMetricsManager {
@@ -36,6 +62,9 @@ final class TherapyMetricsManager {
     private var treatmentCache: [String: [TherapyTreatment]] = [:]
     private var treatmentRevision = 0
     private var treatmentPresentationRevision = 0
+    /// Presentation provenance only; cache/status invalidations are not treatment mutations.
+    private var forecastInputRevision = 0
+    private var forecastCommitState = ForecastInputCommitState()
     private var pendingTreatmentCommit = false
     private var pendingReads = Set<String>()
     private var failedReads: [String: Date] = [:]
@@ -51,9 +80,23 @@ final class TherapyMetricsManager {
     func configure(coreDataManager: CoreDataManager, externalStatus: @escaping () -> AIDStatus?) {
         self.coreDataManager = coreDataManager
         self.externalStatus = externalStatus
-        guard observers.isEmpty else { invalidate(); return }
-        for name in [Notification.Name.NSManagedObjectContextDidSave, .NSManagedObjectContextObjectsDidChange, NSNotification.Name.NSSystemClockDidChange] {
+        guard observers.isEmpty else {
+            lock.lock()
+            forecastCommitState = ForecastInputCommitState()
+            lock.unlock()
+            invalidate(forecastInputsInvalidated: true)
+            return
+        }
+        for name in [Notification.Name.NSManagedObjectContextWillSave, .NSManagedObjectContextDidSave, .NSManagedObjectContextObjectsDidChange, NSNotification.Name.NSSystemClockDidChange] {
             observers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: nil) { [weak self] notification in
+                if name == .NSManagedObjectContextWillSave {
+                    guard let self,
+                          notification.object as? NSManagedObjectContext === self.coreDataManager?.privateManagedObjectContext else { return }
+                    self.lock.lock()
+                    self.forecastCommitState.writerWillSave()
+                    self.lock.unlock()
+                    return
+                }
                 if name == .NSManagedObjectContextObjectsDidChange {
                     guard notification.object as? NSManagedObjectContext === self?.coreDataManager?.privateManagedObjectContext,
                           notification.userInfo?[NSInvalidatedAllObjectsKey] != nil else { return }
@@ -68,13 +111,22 @@ final class TherapyMetricsManager {
                         if treatmentsChanged { self?.markPendingTreatmentCommit() }
                         return
                     }
+                    if context.parent === self?.coreDataManager?.mainManagedObjectContext {
+                        if treatmentsChanged { self?.markForecastInputMutation() }
+                        return
+                    }
                     guard context === self?.coreDataManager?.privateManagedObjectContext else { return }
                     guard treatmentsChanged || objects.contains(where: { $0 is NightscoutDeviceStatusEntry }) else { return }
+                    if treatmentsChanged, let self {
+                        self.lock.lock()
+                        self.forecastCommitState.writerDidSaveTreatments()
+                        self.lock.unlock()
+                    }
                     self?.invalidate(treatmentsChanged: treatmentsChanged,
                         committedTreatmentSave: treatmentsChanged)
                     return
                 }
-                self?.invalidate(treatmentsChanged: treatmentsChanged)
+                self?.invalidate(treatmentsChanged: treatmentsChanged, forecastInputsInvalidated: true)
             })
         }
         observers.append(NotificationCenter.default.addObserver(forName: UserDefaults.didChangeNotification, object: nil, queue: nil) { [weak self] _ in
@@ -91,20 +143,36 @@ final class TherapyMetricsManager {
         })
     }
 
-    private func markPendingTreatmentCommit() {
+    /// Import children can publish a known mutation before their main/writer saves run.
+    /// Invalidate only forecast presentation here; existing cache and pending-save rules stay intact.
+    private func markForecastInputMutation() {
         lock.lock()
-        pendingTreatmentCommit = true
-        treatmentPresentationRevision &+= 1
+        forecastCommitState.childDidSave()
+        forecastInputRevision &+= 1
         lock.unlock()
         DispatchQueue.main.async { NotificationCenter.default.post(name: Self.changed, object: self) }
     }
 
-    func invalidate(treatmentsChanged: Bool = true, committedTreatmentSave: Bool = false) {
+    private func markPendingTreatmentCommit() {
+        lock.lock()
+        pendingTreatmentCommit = true
+        forecastCommitState.mainDidSave()
+        treatmentPresentationRevision &+= 1
+        forecastInputRevision &+= 1
+        lock.unlock()
+        DispatchQueue.main.async { NotificationCenter.default.post(name: Self.changed, object: self) }
+    }
+
+    func invalidate(treatmentsChanged: Bool = true, committedTreatmentSave: Bool = false,
+                    forecastInputsInvalidated: Bool = false) {
         lock.lock()
         revision &+= 1
+        if committedTreatmentSave || forecastInputsInvalidated { forecastInputRevision &+= 1 }
         // A failed private save has no DidSave notification, so Home stays unavailable until
         // a later successful treatment commit rather than confirming old persisted inputs.
-        if committedTreatmentSave { pendingTreatmentCommit = false }
+        if committedTreatmentSave {
+            pendingTreatmentCommit = false
+        }
         if treatmentsChanged {
             treatmentRevision &+= 1
             treatmentPresentationRevision &+= 1
@@ -129,6 +197,22 @@ final class TherapyMetricsManager {
         lock.lock()
         defer { lock.unlock() }
         return treatmentPresentationRevision
+    }
+
+    /// A private import child may have saved before the main/writer chain commits. Forecast
+    /// reads remain unavailable across that interval without changing normal snapshot behavior.
+    var hasUncommittedForecastInputChanges: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return pendingTreatmentCommit || forecastCommitState.hasPendingChanges
+    }
+
+    /// Pending and committed treatment mutations invalidate forecasts immediately. Import
+    /// status/cache refreshes keep this identity, and source/settings have separate UI guards.
+    var forecastInputChangeRevision: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return forecastInputRevision
     }
 
     private func key(policy: DataFlowPolicy, settings: TherapyModelSettings) -> String {
