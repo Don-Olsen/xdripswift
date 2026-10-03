@@ -8,6 +8,21 @@
 - Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
 <!-- testflight-7.1.1-4286:end -->
 
+## Prognosevisning efter 4286
+
+En fysisk observation 3. oktober viste, at prognosen kortvarigt kunne forsvinde,
+selv om Home viste en frisk sensormåling. iPhone-fejlfindingsloggen viste
+fortsatte minutmålinger under observationen. Den næste kandidat retter Home-
+visningens nulstilling ved hver grafopdatering og lader prognosen vælge den
+nyeste gyldige måling efter samme filtrering som Home. En tidligere prognose
+bevares kun kortvarigt ved uændrede behandlingskilder, indstillinger og
+sensoridentitet; den skjules ved usikker kilde, sensorskift eller for gamle data.
+Beregning, målelagring, alarmer, Bluetooth og Watch-runtime er uændrede.
+
+Hele den lokale testsuite og begge simulatorbuilds er bestået på kandidaten.
+Rettelsen er endnu ikke bekræftet på en fysisk iPhone; prognosen er stadig et
+estimat og må ikke forveksles med en målt blodsukkerværdi.
+
 De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
 
 <!-- testflight-7.1.1-4285:start -->

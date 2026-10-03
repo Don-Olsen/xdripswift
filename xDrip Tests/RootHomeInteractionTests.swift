@@ -99,6 +99,146 @@ final class RootHomeInteractionTests: XCTestCase {
                         at: reference.addingTimeInterval(5 * 60)).points.count, 1)
     }
 
+    func testForecastRemainsVisibleDuringCompatibleChartRefreshButNotAfterUnsafeReading() {
+        let reference = Date(timeIntervalSince1970: 1_800_000_000)
+        let context = forecastContext()
+        let result = GlucoseForecastResult(
+            points: [GlucoseForecastPoint(date: reference.addingTimeInterval(60), glucoseMgdl: 120)],
+            referenceDate: reference, reason: nil, parameterSource: .manual,
+            referenceSensorID: "sensor-a"
+        )
+        let completed = RootHomeCompletedForecast(result: result, context: context)
+        var chart = GlucoseChartState.empty(startDate: reference.addingTimeInterval(-3600), endDate: reference)
+        chart.newestBgReadingDate = reference.addingTimeInterval(60)
+        chart.newestBgReadingSensorID = "sensor-a"
+        chart.newestBgReadingIsValidForDownstream = true
+
+        XCTAssertEqual(RootHomeForecastFreshness.displayableResult(completed, context: context,
+                       chartState: chart, at: reference.addingTimeInterval(65))?.points.count, 1)
+        chart.newestBgReadingDate = reference.addingTimeInterval(75)
+        XCTAssertEqual(RootHomeForecastFreshness.displayableResult(completed, context: context,
+                       chartState: chart, at: reference.addingTimeInterval(75))?.points.count, 1)
+        chart.newestBgReadingDate = reference.addingTimeInterval(76)
+        XCTAssertNil(RootHomeForecastFreshness.displayableResult(completed, context: context,
+                     chartState: chart, at: reference.addingTimeInterval(76)))
+        chart.newestBgReadingDate = reference.addingTimeInterval(-60)
+        XCTAssertNil(RootHomeForecastFreshness.displayableResult(completed, context: context,
+                     chartState: chart, at: reference.addingTimeInterval(1)))
+
+        chart.newestBgReadingDate = reference
+        chart.newestBgReadingSensorID = "sensor-b"
+        XCTAssertNil(RootHomeForecastFreshness.displayableResult(completed, context: context,
+                     chartState: chart, at: reference.addingTimeInterval(30)))
+        chart.newestBgReadingSensorID = "sensor-a"
+        chart.newestBgReadingIsValidForDownstream = false
+        XCTAssertNil(RootHomeForecastFreshness.displayableResult(completed, context: context,
+                     chartState: chart, at: reference.addingTimeInterval(30)))
+
+        chart.newestBgReadingIsValidForDownstream = true
+        chart.newestBgReadingSensorID = nil
+        chart.newestBgReadingDate = reference.addingTimeInterval(1)
+        XCTAssertEqual(RootHomeForecastFreshness.displayableResult(completed, context: context,
+                       chartState: chart, at: reference.addingTimeInterval(30))?.points.count, 1)
+        chart.newestBgReadingDate = reference.addingTimeInterval(2)
+        XCTAssertNil(RootHomeForecastFreshness.displayableResult(completed, context: context,
+                     chartState: chart, at: reference.addingTimeInterval(30)))
+
+        chart.newestBgReadingDate = reference
+        chart.newestBgReadingSensorID = "sensor-a"
+        let expired = RootHomeForecastFreshness.displayableResult(completed, context: context,
+                      chartState: chart, at: reference.addingTimeInterval(GlucoseForecastEngine.maximumGlucoseAge + 1))
+        XCTAssertEqual(expired?.reason, .staleGlucose)
+        XCTAssertTrue(expired?.points.isEmpty == true)
+    }
+
+    func testForecastContextChangeHidesCompletedEstimateWhileReplacementLoads() {
+        let reference = Date(timeIntervalSince1970: 1_800_000_000)
+        let context = forecastContext()
+        let result = GlucoseForecastResult(
+            points: [GlucoseForecastPoint(date: reference.addingTimeInterval(60), glucoseMgdl: 120)],
+            referenceDate: reference, reason: nil, parameterSource: .manual,
+            referenceSensorID: "sensor-a"
+        )
+        let completed = RootHomeCompletedForecast(result: result, context: context)
+        var chart = GlucoseChartState.empty(startDate: reference.addingTimeInterval(-3600), endDate: reference)
+        chart.newestBgReadingDate = reference
+        chart.newestBgReadingSensorID = "sensor-a"
+        chart.newestBgReadingIsValidForDownstream = true
+        let now = reference.addingTimeInterval(30)
+
+        XCTAssertNotNil(RootHomeForecastFreshness.displayableResult(completed, context: context,
+                        chartState: chart, at: now))
+        var changed = context
+        changed.therapyRevision += 1
+        XCTAssertNil(RootHomeForecastFreshness.displayableResult(completed, context: changed,
+                     chartState: chart, at: now))
+        changed = context
+        changed.manualSensitivityMgdlPerUnit += 1
+        XCTAssertNil(RootHomeForecastFreshness.displayableResult(completed, context: changed,
+                     chartState: chart, at: now))
+        changed = context
+        changed.localTherapySourceSignature = "different-source"
+        XCTAssertNil(RootHomeForecastFreshness.displayableResult(completed, context: changed,
+                     chartState: chart, at: now))
+        changed = context
+        changed.horizonMinutes = 120
+        XCTAssertNil(RootHomeForecastFreshness.displayableResult(completed, context: changed,
+                     chartState: chart, at: now))
+    }
+
+    @MainActor func testSuppressedNewSensorInvalidatesVisibleForecastProvenance() async {
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let now = Date()
+        let sensorA = Sensor(startDate: now.addingTimeInterval(-3600),
+                             nsManagedObjectContext: core.mainManagedObjectContext)
+        let sensorB = Sensor(startDate: now.addingTimeInterval(-1800),
+                             nsManagedObjectContext: core.mainManagedObjectContext)
+        func add(_ secondsAgo: TimeInterval, sensor: Sensor, suppressed: Bool) {
+            let reading = BgReading(timeStamp: now.addingTimeInterval(-secondsAgo), sensor: sensor,
+                                    calibration: nil, rawData: 110, deviceName: "Libre 2 Plus",
+                                    nsManagedObjectContext: core.mainManagedObjectContext)
+            reading.calculatedValue = 110
+            reading.isSuppressedByFiveMinuteCadence = suppressed
+        }
+        add(120, sensor: sensorA, suppressed: false)
+        add(60, sensor: sensorA, suppressed: true)
+        XCTAssertTrue(core.saveChangesSynchronously())
+        let sync = NightscoutSyncManager(coreDataManager: core, messageHandler: nil)
+        let chart = GlucoseChartStateManager(coreDataManager: core, nightscoutSyncManager: sync)
+        func reload() async -> GlucoseChartState {
+            await withCheckedContinuation { continuation in
+                chart.updateState(endDate: now.addingTimeInterval(1),
+                                  startDate: now.addingTimeInterval(-3600), forceReset: true,
+                                  showTreatments: false) { continuation.resume(returning: $0) }
+            }
+        }
+        let sameSensor = await reload()
+        XCTAssertEqual(sameSensor.newestBgReadingDate, now.addingTimeInterval(-120))
+        XCTAssertTrue(sameSensor.newestBgReadingIsValidForDownstream)
+
+        add(30, sensor: sensorB, suppressed: true)
+        XCTAssertTrue(core.saveChangesSynchronously())
+        let changedSensor = await reload()
+        XCTAssertEqual(changedSensor.newestBgReadingDate, now.addingTimeInterval(-120))
+        XCTAssertFalse(changedSensor.newestBgReadingIsValidForDownstream)
+    }
+
+    private func forecastContext() -> RootHomeForecastContext {
+        RootHomeForecastContext(
+            therapyRevision: 1,
+            horizonMinutes: 60,
+            manualSensitivityMgdlPerUnit: 50,
+            manualCarbRatioGramsPerUnit: 10,
+            insulinPeak: 75,
+            carbDuration: 240,
+            therapySource: 0,
+            healthTherapySelectionSignature: "local",
+            localTherapySourceSignature: "local-therapy",
+            adjustmentEnabled: false,
+            smoothingEnabled: false
+        )
+    }
+
     func testLiveChartDoesNotBecomeHistoricalWhileAppIsSuspended() {
         let openedAt = Date()
         let coordinator = GlucoseChartScrollCoordinator(

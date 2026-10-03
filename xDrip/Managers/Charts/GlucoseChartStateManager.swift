@@ -364,6 +364,25 @@ final class GlucoseChartStateManager: ObservableObject, @unchecked Sendable {
         let cachedCalibrationsToRender = cachedCalibrations.filter { $0.value > 0 }
         let dataStartDate = cacheStartDate ?? startDate
         let dataEndDate = cacheEndDate ?? endDate
+        // Match the adapter's latest usable Home reading. Newer invalid readings can be skipped
+        // only when their nonempty sensor ID proves they belong to the same sensor. Equal-time
+        // peers must agree on value, validity and source because their order is undefined.
+        let newestReading = cachedReadings.last {
+            $0.isValidForDownstream && $0.finalValue.isFinite && $0.finalValue > 0
+        }
+        let newestReadingIsValid = newestReading.map { anchor in
+            // The original cache includes suppressed rows too. A newly suppressed row from a
+            // different sensor must not leave the previous sensor's forecast visible.
+            cachedOriginalReadings.filter { $0.date >= anchor.date }.allSatisfy { reading in
+                if reading.date == anchor.date {
+                    return !reading.isSuppressedByFiveMinuteCadence &&
+                        reading.isValidForDownstream && reading.finalValue == anchor.finalValue &&
+                        reading.sensorID == anchor.sensorID
+                }
+                guard let sensorID = anchor.sensorID, !sensorID.isEmpty else { return false }
+                return reading.sensorID == sensorID
+            }
+        } ?? false
 
         let additionalDataSets = cachedOriginalReadingsToRender.isEmpty ? [] : [
             GlucoseChartDataSet(
@@ -402,7 +421,10 @@ final class GlucoseChartStateManager: ObservableObject, @unchecked Sendable {
             calibrationPoints: cachedCalibrationsToRender.map { GlucoseChartPoint(date: $0.date, value: $0.value, idPrefix: "calibration") },
             treatmentPoints: showTreatments ? cachedTreatmentPoints : GlucoseChartTreatmentPoints(),
             minimumChartValueInMgDl: minimumChartValue,
-            backgroundBands: chartBackgroundBands(startDate: dataStartDate, endDate: dataEndDate)
+            backgroundBands: chartBackgroundBands(startDate: dataStartDate, endDate: dataEndDate),
+            newestBgReadingDate: newestReading?.date,
+            newestBgReadingSensorID: newestReading?.sensorID,
+            newestBgReadingIsValidForDownstream: newestReadingIsValid
         )
     }
 
@@ -1126,7 +1148,12 @@ final class GlucoseChartStateManager: ObservableObject, @unchecked Sendable {
 
         context.performAndWait {
             mapped = bgReadings.map {
-                CachedBgReading(date: $0.timeStamp, finalValue: $0.finalValue, calculatedValue: $0.calculatedValue)
+                CachedBgReading(date: $0.timeStamp,
+                                finalValue: $0.finalValue,
+                                calculatedValue: $0.calculatedValue,
+                                sensorID: $0.sensor?.id,
+                                isValidForDownstream: $0.isValidForDownstream,
+                                isSuppressedByFiveMinuteCadence: $0.isSuppressedByFiveMinuteCadence)
             }.sorted { $0.date < $1.date }
         }
 
@@ -1207,6 +1234,9 @@ private struct CachedBgReading: Hashable {
     let date: Date
     let finalValue: Double
     let calculatedValue: Double
+    let sensorID: String?
+    let isValidForDownstream: Bool
+    let isSuppressedByFiveMinuteCadence: Bool
 }
 
 private struct CachedCalibration: Hashable {

@@ -30,6 +30,15 @@ final class GlucoseForecastEngineTests: XCTestCase {
                          amount: amount, isIOB: insulin)
     }
 
+    func testNewestOutOfRangeSampleCannotForecastFromPriorReading() {
+        let samples = glucose() + [GlucoseForecastSample(date: now.addingTimeInterval(60),
+                                                          glucoseMgdl: 601)]
+        XCTAssertEqual(GlucoseForecastEngine.predict(input(samples, at: now.addingTimeInterval(60))).reason,
+                       .missingGlucose)
+        let conflictingPeer = glucose() + [GlucoseForecastSample(date: now, glucoseMgdl: 19)]
+        XCTAssertEqual(GlucoseForecastEngine.predict(input(conflictingPeer)).reason, .missingGlucose)
+    }
+
     func testFlatHistoryWithoutTreatmentsStaysFlatAtBothHorizons() {
         for horizon in [60, 120] {
             let result = GlucoseForecastEngine.predict(input(horizon: horizon))

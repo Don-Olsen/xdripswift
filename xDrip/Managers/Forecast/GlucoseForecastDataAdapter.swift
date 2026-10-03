@@ -117,7 +117,8 @@ final class GlucoseForecastDataAdapter {
             horizonMinutes: horizonMinutes,
             now: now
         )
-        let key = CacheKey(glucose: input.glucose.map { Stamp(date: $0.date, value: $0.glucoseMgdl) },
+        let key = CacheKey(glucose: input.glucose.map { Stamp(date: $0.date, value: $0.glucoseMgdl,
+                                                            sensorID: $0.sensorID) },
                            treatments: input.treatments.map { TreatmentStamp(date: $0.date,
                                                                                amount: $0.amount,
                                                                                isIOB: $0.isIOB) },
@@ -138,7 +139,8 @@ final class GlucoseForecastDataAdapter {
         let result = GlucoseForecastResult(points: calculated.points,
                                            referenceDate: calculated.referenceDate,
                                            reason: calculated.reason,
-                                           parameterSource: .manual)
+                                           parameterSource: .manual,
+                                           referenceSensorID: glucose.last?.sensorID)
         guard !therapyManager.hasUncommittedTreatmentChanges else {
             return Self.unavailable(.dataUnavailable)
         }
@@ -183,27 +185,37 @@ final class GlucoseForecastDataAdapter {
                 now.addingTimeInterval(-45 * 60) as NSDate, now as NSDate
             )
             request.sortDescriptors = [NSSortDescriptor(key: #keyPath(BgReading.timeStamp), ascending: false)]
-            request.fetchLimit = 200
+            // The time window bounds this query. A count cap could hide the last valid
+            // Home reading behind many rejected rows and create a false missing-data state.
+            request.fetchBatchSize = 200
             request.relationshipKeyPathsForPrefetching = ["sensor"]
             do {
                 let fetched = try context.fetch(request)
-                guard let latest = fetched.first else { result = []; return }
-                // Never discard a newer invalid observation and silently predict from an
-                // older sensor/source. The most recent candidate must itself be usable.
-                guard !latest.isSuppressedByFiveMinuteCadence,
-                      latest.isValidForDownstream,
-                      latest.finalValue.isFinite, latest.finalValue > 0 else {
-                    result = []
-                    return
-                }
-                guard let sensorID = latest.sensor?.id, !sensorID.isEmpty else {
+                // Match Home's visible, downstream-valid reading. A newly stored invalid
+                // observation or an intentionally hidden five-minute-cadence row must not
+                // turn a still-fresh Home reading into "no recent sensor reading".
+                guard let latest = fetched.first(where: {
+                    !$0.isSuppressedByFiveMinuteCadence && $0.isValidForDownstream &&
+                        $0.finalValue.isFinite && $0.finalValue > 0
+                }) else { result = []; return }
+                let latestSensorID = latest.sensor?.id
+                // Do not look through an invalid/hidden row from a different or unidentified
+                // sensor and accidentally extend the previous sensor's forecast.
+                let newerRows = fetched.prefix(while: { $0.timeStamp > latest.timeStamp })
+                guard newerRows.allSatisfy({ reading in
+                    guard let sensorID = latestSensorID, !sensorID.isEmpty else { return false }
+                    return reading.sensor?.id == sensorID
+                }) else { result = []; return }
+                guard let sensorID = latestSensorID, !sensorID.isEmpty else {
                     // Device names identify models, not sensor instances. In particular, two
                     // successive Libre sensors can share the same name. Without a sensor ID,
                     // do not splice their histories to produce a confident trend.
-                    result = [GlucoseForecastSample(date: latest.timeStamp, glucoseMgdl: latest.finalValue)]
+                    result = [GlucoseForecastSample(date: latest.timeStamp, glucoseMgdl: latest.finalValue,
+                                                    sensorID: nil)]
                     return
                 }
-                let latestCandidates = fetched.prefix { $0.timeStamp == latest.timeStamp }
+                let latestCandidates = fetched.drop(while: { $0.timeStamp > latest.timeStamp })
+                    .prefix(while: { $0.timeStamp == latest.timeStamp })
                 guard latestCandidates.allSatisfy({ reading in
                     reading.sensor?.id == sensorID && !reading.isSuppressedByFiveMinuteCadence &&
                         reading.isValidForDownstream && reading.finalValue == latest.finalValue
@@ -223,7 +235,8 @@ final class GlucoseForecastDataAdapter {
                     }
                     byDate[reading.timeStamp] = reading.finalValue
                 }
-                result = byDate.map { GlucoseForecastSample(date: $0.key, glucoseMgdl: $0.value) }
+                result = byDate.map { GlucoseForecastSample(date: $0.key, glucoseMgdl: $0.value,
+                                                            sensorID: sensorID) }
                     .sorted { $0.date < $1.date }
             } catch {
                 result = nil
@@ -245,7 +258,7 @@ final class GlucoseForecastDataAdapter {
         GlucoseForecastResult(points: [], referenceDate: nil, reason: reason)
     }
 
-    private struct Stamp: Hashable { let date: Date; let value: Double }
+    private struct Stamp: Hashable { let date: Date; let value: Double; let sensorID: String? }
     private struct TreatmentStamp: Hashable { let date: Date; let amount: Double; let isIOB: Bool }
     private struct CacheKey: Equatable {
         let glucose: [Stamp]

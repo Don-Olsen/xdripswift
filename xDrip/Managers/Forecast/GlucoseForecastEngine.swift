@@ -11,6 +11,13 @@ import Foundation
 struct GlucoseForecastSample: Sendable, Equatable {
     let date: Date
     let glucoseMgdl: Double
+    let sensorID: String?
+
+    init(date: Date, glucoseMgdl: Double, sensorID: String? = nil) {
+        self.date = date
+        self.glucoseMgdl = glucoseMgdl
+        self.sensorID = sensorID
+    }
 }
 
 struct GlucoseForecastPoint: Sendable, Equatable {
@@ -72,14 +79,19 @@ struct GlucoseForecastResult: Sendable {
     let referenceDate: Date?
     let reason: GlucoseForecastUnavailableReason?
     let parameterSource: GlucoseForecastParameterSource?
+    /// The sensor behind the reference reading, used to avoid showing an older estimate
+    /// against a chart that has already switched to a different sensor.
+    let referenceSensorID: String?
 
     init(points: [GlucoseForecastPoint], referenceDate: Date?,
          reason: GlucoseForecastUnavailableReason?,
-         parameterSource: GlucoseForecastParameterSource? = nil) {
+         parameterSource: GlucoseForecastParameterSource? = nil,
+         referenceSensorID: String? = nil) {
         self.points = points
         self.referenceDate = referenceDate
         self.reason = reason
         self.parameterSource = parameterSource
+        self.referenceSensorID = referenceSensorID
     }
 
     func value(atMinutes minutes: Int) -> Double? {
@@ -138,8 +150,13 @@ enum GlucoseForecastEngine {
             return unavailable(.invalidTreatment)
         }
 
-        // The caller supplies valid, source-selected CGM samples; validate the
-        // numeric/timing invariants again so a cache miss never becomes zero.
+        // The caller supplies valid, source-selected CGM samples. Do not silently skip a
+        // newer visible value outside the model's numeric range and predict from older data.
+        guard let newestDate = input.glucose.filter({ $0.date <= input.now }).map(\.date).max(),
+              input.glucose.filter({ $0.date == newestDate }).allSatisfy({
+                  $0.glucoseMgdl.isFinite && (20...600).contains($0.glucoseMgdl)
+              }) else { return unavailable(.missingGlucose) }
+        // Validate the remaining numeric/timing invariants so a cache miss never becomes zero.
         let ordered = input.glucose
             .filter { $0.date <= input.now && $0.glucoseMgdl.isFinite && (20...600).contains($0.glucoseMgdl) }
             .sorted { $0.date < $1.date }

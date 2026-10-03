@@ -112,6 +112,11 @@ struct GlucoseChartState {
     var backgroundBands: [GlucoseChartBackgroundBand]? = nil
     var overlayWindowStartDate: Date? = nil
     var overlayWindowEndDate: Date? = nil
+    /// Newest downstream-valid reading and its sensor provenance. A newer invalid reading from
+    /// the same sensor may be skipped, but an ambiguous or different-sensor tail is unsafe.
+    var newestBgReadingDate: Date? = nil
+    var newestBgReadingSensorID: String? = nil
+    var newestBgReadingIsValidForDownstream = false
 
     static func empty(startDate: Date, endDate: Date) -> GlucoseChartState {
         GlucoseChartState(

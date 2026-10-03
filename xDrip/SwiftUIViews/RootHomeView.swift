@@ -9,8 +9,31 @@
 import Combine
 import SwiftUI
 
+/// Inputs that must still match before a completed forecast can remain on screen.
+struct RootHomeForecastContext: Equatable {
+    var therapyRevision: Int
+    var horizonMinutes: Int
+    var manualSensitivityMgdlPerUnit: Double
+    var manualCarbRatioGramsPerUnit: Double
+    var insulinPeak: Double
+    var carbDuration: Double
+    var therapySource: Int
+    var healthTherapySelectionSignature: String
+    var localTherapySourceSignature: String
+    var adjustmentEnabled: Bool
+    var smoothingEnabled: Bool
+}
+
+struct RootHomeCompletedForecast {
+    let result: GlucoseForecastResult
+    let context: RootHomeForecastContext
+}
+
 /// Presentation must invalidate an estimate even if no new CGM event arrives.
 enum RootHomeForecastFreshness {
+    /// One minute sensor cadence plus delivery tolerance, used only with proven sensor identity.
+    private static let matchingSensorTimeTolerance: TimeInterval = 75
+
     static func isCurrent(referenceDate: Date, at now: Date) -> Bool {
         let age = now.timeIntervalSince(referenceDate)
         return age >= 0 && age <= GlucoseForecastEngine.maximumGlucoseAge
@@ -25,6 +48,30 @@ enum RootHomeForecastFreshness {
             return GlucoseForecastResult(points: [], referenceDate: referenceDate, reason: .staleGlucose)
         }
         return result
+    }
+
+    static func displayableResult(_ completed: RootHomeCompletedForecast?,
+                                  context: RootHomeForecastContext,
+                                  chartState: GlucoseChartState,
+                                  at now: Date) -> GlucoseForecastResult? {
+        guard let completed, completed.context == context else { return nil }
+        let current = presentationResult(completed.result, at: now)
+        guard current.reason == nil else { return current }
+        guard let referenceDate = current.referenceDate,
+              let newestChartDate = chartState.newestBgReadingDate,
+              chartState.newestBgReadingIsValidForDownstream else { return nil }
+
+        let chartLead = newestChartDate.timeIntervalSince(referenceDate)
+        guard chartLead.isFinite else { return nil }
+        if let referenceSensorID = current.referenceSensorID, !referenceSensorID.isEmpty,
+           let chartSensorID = chartState.newestBgReadingSensorID, !chartSensorID.isEmpty {
+            guard referenceSensorID == chartSensorID else { return nil }
+            // Retain an estimate while the chart moves one sensor minute ahead. When a new
+            // forecast finishes before the chart refresh, do not draw it against the old tail.
+            return chartLead >= -2 && chartLead <= matchingSensorTimeTolerance ? current : nil
+        }
+        // Legacy readings without both sensor IDs retain the old near-exact date gate.
+        return abs(chartLead) < 2 ? current : nil
     }
 }
 
@@ -76,6 +123,12 @@ struct RootHomeView: View {
         let automaticBasalRenderingStyleRawValue: Int
     }
 
+    private struct ForecastRequestKey: Equatable {
+        let chartRevision: Int
+        let context: RootHomeForecastContext
+        let sceneIsActive: Bool
+    }
+
     // MARK: - State
 
     @Environment(\.scenePhase) private var scenePhase
@@ -97,7 +150,7 @@ struct RootHomeView: View {
     @State private var chartYAxisResetRevision = 0
     @State private var showsExpandedIPadChart = false
     @State private var healthTherapySelectionSignature = ""
-    @State private var forecastResult: GlucoseForecastResult?
+    @State private var completedForecast: RootHomeCompletedForecast?
     @State private var forecastDataRevision = 0
     @State private var forecastFreshnessCheckTime = Date()
     @AppStorage(UserDefaults.Key.glucoseForecastHorizonMinutes.rawValue) private var forecastHorizonMinutes = 60
@@ -126,9 +179,26 @@ struct RootHomeView: View {
     private var effectiveForecastHorizonMinutes: Int {
         forecastHorizonMinutes == 0 || forecastHorizonMinutes == 120 ? forecastHorizonMinutes : 60
     }
+    private var forecastContext: RootHomeForecastContext {
+        RootHomeForecastContext(
+            therapyRevision: forecastDataRevision,
+            horizonMinutes: effectiveForecastHorizonMinutes,
+            manualSensitivityMgdlPerUnit: forecastManualISF,
+            manualCarbRatioGramsPerUnit: forecastManualCarbRatio,
+            insulinPeak: forecastInsulinPeak,
+            carbDuration: forecastCarbDuration,
+            therapySource: forecastTherapySource,
+            healthTherapySelectionSignature: healthTherapySelectionSignature,
+            localTherapySourceSignature: stateModel.currentLocalTherapySourceSignature(),
+            adjustmentEnabled: enableAdjustment,
+            smoothingEnabled: enableSmoothing
+        )
+    }
     /// SwiftUI cancels an older task before publishing a forecast from superseded inputs.
-    private var forecastRequestKey: String {
-        "\(state.chartRevision)|\(forecastDataRevision)|\(effectiveForecastHorizonMinutes)|\(forecastManualISF)|\(forecastManualCarbRatio)|\(forecastInsulinPeak)|\(forecastCarbDuration)|\(forecastTherapySource)|\(healthTherapySelectionSignature)|\(scenePhase == .active)"
+    private var forecastRequestKey: ForecastRequestKey {
+        ForecastRequestKey(chartRevision: state.chartRevision,
+                           context: forecastContext,
+                           sceneIsActive: scenePhase == .active)
     }
     private static let pannedReadingDateFormatter: DateFormatter = {
         let dateFormatter = DateFormatter()
@@ -210,16 +280,14 @@ struct RootHomeView: View {
             forecastDataRevision &+= 1
         }
         .task(id: forecastRequestKey) {
-            guard scenePhase == .active, effectiveForecastHorizonMinutes != 0 else {
-                forecastResult = nil
+            let context = forecastContext
+            guard scenePhase == .active, context.horizonMinutes != 0 else {
+                completedForecast = nil
                 return
             }
-            // Keep the previous estimate off-screen while fresh inputs are being read. An older
-            // completed worker result cannot replace a newer task's result.
-            forecastResult = nil
-            let result = await forecastDataAdapter.forecast(horizonMinutes: effectiveForecastHorizonMinutes)
+            let result = await forecastDataAdapter.forecast(horizonMinutes: context.horizonMinutes)
             guard !Task.isCancelled else { return }
-            forecastResult = result
+            completedForecast = RootHomeCompletedForecast(result: result, context: context)
         }
         .onReceive(clockRefreshTimer) { _ in
             if state.visibility.showsClock {
@@ -951,18 +1019,16 @@ struct RootHomeView: View {
         return state
     }
 
-    /// Do not draw a new estimate against an older chart tail (or an older estimate against a
-    /// newly saved reading). The chart manager and forecast adapter load independently.
+    /// The chart manager and forecast adapter load independently. Retain a completed estimate
+    /// during ordinary refreshes only while its source, context and reading age remain safe.
     private var displayableForecastResult: GlucoseForecastResult? {
-        guard let forecastResult else { return nil }
-        let current = RootHomeForecastFreshness.presentationResult(forecastResult,
-                                                                    at: forecastFreshnessCheckTime)
-        guard current.reason == nil else { return current }
-        guard let referenceDate = current.referenceDate else { return nil }
-        guard let newestChartDate = glucoseChartStateManager.state.bgReadingDates
-                .filter({ $0 <= forecastFreshnessCheckTime }).max(),
-              abs(referenceDate.timeIntervalSince(newestChartDate)) < 2 else { return nil }
-        return current
+        guard !showOriginalBGReadingsOnly else { return nil }
+        return RootHomeForecastFreshness.displayableResult(
+            completedForecast,
+            context: forecastContext,
+            chartState: glucoseChartStateManager.state,
+            at: max(Date(), forecastFreshnessCheckTime)
+        )
     }
 
     private var glucoseDisplayState: RootHomeGlucoseState {

@@ -84,6 +84,61 @@ final class GlucoseForecastDataAdapterTests: XCTestCase {
         XCTAssertTrue(invalidNewest?.isEmpty == true)
     }
 
+    @MainActor func testNewerHiddenAndInvalidSameSensorRowsKeepFreshVisibleReading() {
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let sensor = Sensor(startDate: referenceDate.addingTimeInterval(-3600),
+                            nsManagedObjectContext: core.mainManagedObjectContext)
+        func add(_ date: Date, value: Double, suppressed: Bool = false) {
+            let reading = BgReading(timeStamp: date, sensor: sensor, calibration: nil,
+                                    rawData: value, deviceName: "Libre 2 Plus",
+                                    nsManagedObjectContext: core.mainManagedObjectContext)
+            reading.calculatedValue = value
+            reading.isSuppressedByFiveMinuteCadence = suppressed
+        }
+        for minute in stride(from: -30, through: 0, by: 5) {
+            add(referenceDate.addingTimeInterval(Double(minute * 60)), value: 110)
+        }
+        for minute in 1...4 {
+            add(referenceDate.addingTimeInterval(Double(minute * 60)),
+                value: 111, suppressed: true)
+        }
+        add(referenceDate.addingTimeInterval(4.5 * 60), value: 0)
+        XCTAssertTrue(core.saveChangesSynchronously())
+        let samples = GlucoseForecastDataAdapter(coreDataManager: core)
+            .recentGlucose(at: referenceDate.addingTimeInterval(4.5 * 60))
+        XCTAssertEqual(samples?.count, 7)
+        XCTAssertEqual(samples?.last?.date, referenceDate)
+        XCTAssertEqual(samples?.last?.sensorID, sensor.id)
+        let homeReading = BgReadingsAccessor(coreDataManager: core)
+            .get2LatestBgReadings(minimumTimeIntervalInMinutes: 1).first
+        XCTAssertEqual(samples?.last?.date, homeReading?.timeStamp)
+        XCTAssertTrue(RootHomeForecastFreshness.isCurrent(
+            referenceDate: referenceDate, at: referenceDate.addingTimeInterval(4.5 * 60)))
+    }
+
+    @MainActor func testNewerInvalidDifferentOrUnknownSensorNeverReusesOldHistory() {
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let sensorA = Sensor(startDate: referenceDate.addingTimeInterval(-3600),
+                             nsManagedObjectContext: core.mainManagedObjectContext)
+        let sensorB = Sensor(startDate: referenceDate.addingTimeInterval(-1800),
+                             nsManagedObjectContext: core.mainManagedObjectContext)
+        func add(_ seconds: TimeInterval, value: Double, sensor: Sensor?) {
+            let reading = BgReading(timeStamp: referenceDate.addingTimeInterval(seconds),
+                                    sensor: sensor, calibration: nil, rawData: value,
+                                    deviceName: "Libre 2 Plus",
+                                    nsManagedObjectContext: core.mainManagedObjectContext)
+            reading.calculatedValue = value
+        }
+        add(0, value: 110, sensor: sensorA)
+        add(60, value: 0, sensor: sensorB)
+        XCTAssertTrue(core.saveChangesSynchronously())
+        let adapter = GlucoseForecastDataAdapter(coreDataManager: core)
+        XCTAssertTrue(adapter.recentGlucose(at: referenceDate.addingTimeInterval(60))?.isEmpty == true)
+        add(120, value: 0, sensor: nil)
+        XCTAssertTrue(core.saveChangesSynchronously())
+        XCTAssertTrue(adapter.recentGlucose(at: referenceDate.addingTimeInterval(120))?.isEmpty == true)
+    }
+
     @MainActor func testDuplicateLatestTimeCannotChooseArbitrarySensorOrValue() {
         let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
         let sensorA = Sensor(startDate: referenceDate.addingTimeInterval(-3600),
@@ -101,6 +156,26 @@ final class GlucoseForecastDataAdapterTests: XCTestCase {
         XCTAssertTrue(core.saveChangesSynchronously())
         let adapter = GlucoseForecastDataAdapter(coreDataManager: core)
         XCTAssertTrue(adapter.recentGlucose(at: referenceDate)?.isEmpty == true)
+    }
+
+    @MainActor func testInvalidPeerAtVisibleAnchorStillBlocksAmbiguousPrediction() {
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let sensor = Sensor(startDate: referenceDate.addingTimeInterval(-3600),
+                            nsManagedObjectContext: core.mainManagedObjectContext)
+        func add(_ seconds: TimeInterval, value: Double, suppressed: Bool = false) {
+            let reading = BgReading(timeStamp: referenceDate.addingTimeInterval(seconds),
+                                    sensor: sensor, calibration: nil, rawData: value,
+                                    deviceName: "Libre 2 Plus",
+                                    nsManagedObjectContext: core.mainManagedObjectContext)
+            reading.calculatedValue = value
+            reading.isSuppressedByFiveMinuteCadence = suppressed
+        }
+        add(0, value: 110)
+        add(0, value: 0)
+        add(60, value: 111, suppressed: true)
+        XCTAssertTrue(core.saveChangesSynchronously())
+        XCTAssertTrue(GlucoseForecastDataAdapter(coreDataManager: core)
+            .recentGlucose(at: referenceDate.addingTimeInterval(60))?.isEmpty == true)
     }
 
     func testSimultaneousNightscoutAndHealthKitTreatmentImportsAreAmbiguous() {
