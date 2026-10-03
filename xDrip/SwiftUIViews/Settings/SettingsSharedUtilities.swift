@@ -61,6 +61,7 @@ struct SettingsRoute: Hashable {
         case loopDelaySchedule
         case dataManagement(DataManagementFlow)
         case troubleshootingLog
+        case forecastLogExport
         case incomingBackup(IncomingBackupRequest)
         case custom(title: String, content: (@escaping () -> Void) -> AnyView)
     }
@@ -314,10 +315,11 @@ enum SettingsRowAction {
     case showMessage(title: String, message: String?)
     case sendTraceEmail
     case troubleshootingLog
+    case forecastLogExport
 
     var prefersDisclosure: Bool {
         switch self {
-        case .textEntry, .selectionList, .settingsScreen, .dataManagement, .troubleshootingLog:
+        case .textEntry, .selectionList, .settingsScreen, .dataManagement, .troubleshootingLog, .forecastLogExport:
             return true
         case .legacy, .run, .showMessage, .sendTraceEmail:
             return false
@@ -528,6 +530,10 @@ final class SettingsActionPresenter: ObservableObject {
             },
             cancel: nil
         )
+    }
+
+    func showForecastLogExport() {
+        router.show(.forecastLogExport)
     }
 
     func showTroubleshootingLog() {
@@ -1115,6 +1121,8 @@ private struct SettingsNativeRowView: View {
             presenter.requestTraceEmail()
         case .troubleshootingLog:
             presenter.showTroubleshootingLog()
+        case .forecastLogExport:
+            presenter.showForecastLogExport()
         case nil:
             break
         }

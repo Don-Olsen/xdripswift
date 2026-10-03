@@ -134,6 +134,8 @@ show_status() {
 }
 
 run_python_checks() {
+  python3 -B scripts/test_evaluate_glucose_forecast.py 2>&1 \
+    | tee "$logs_dir/python-evaluate-glucose-forecast.log"
   python3 -B scripts/test_local_run_receipt.py 2>&1 \
     | tee "$logs_dir/python-local-run-receipt.log"
   python3 -B scripts/test_build_environment.py 2>&1 \

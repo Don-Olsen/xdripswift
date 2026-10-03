@@ -37,6 +37,18 @@ enum WatchManualTreatmentStore {
         return treatment
     }
 
+    static func rejectionReason(_ message: [String: Any]) -> String {
+        guard let data = message[WatchManualTreatmentMessageKey.treatment] as? Data else {
+            return "invalidTreatment"
+        }
+        do {
+            _ = try JSONDecoder().decode(WatchManualTreatment.self, from: data)
+        } catch WatchManualTreatmentKind.DecodingError.unsupportedKind {
+            return "unsupportedTreatmentKind"
+        } catch { }
+        return "invalidTreatment"
+    }
+
     static func save(_ treatment: WatchManualTreatment, coreDataManager: CoreDataManager,
                      at now: Date = Date(), completion: @escaping (Outcome) -> Void) {
         guard treatment.isValid(at: now) else { completion(.invalid); return }
@@ -54,7 +66,12 @@ enum WatchManualTreatmentStore {
             }
 
             if existing == nil {
-                let type: TreatmentType = treatment.kind == .insulin ? .Insulin : .Carbs
+                let type: TreatmentType
+                switch treatment.kind {
+                case .insulin: type = .Insulin
+                case .carbs: type = .Carbs
+                case .basalInjection: type = .BasalInjection
+                }
                 let entry = TreatmentEntry(date: treatment.recordedAt, value: treatment.amount,
                     treatmentType: type, nightscoutEventType: nil, enteredBy: "xDrip4iOS Watch",
                     nsManagedObjectContext: context)
@@ -1333,7 +1350,7 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
                 let response: [String: Any] = [
                     WatchManualTreatmentMessageKey.treatmentID: rawID,
                     WatchManualTreatmentMessageKey.stored: false,
-                    WatchManualTreatmentMessageKey.error: "invalidTreatment"
+                    WatchManualTreatmentMessageKey.error: WatchManualTreatmentStore.rejectionReason(message)
                 ]
                 if let reply { reply(response) } else { self.sendManualWatchTreatmentReceipt(response) }
                 return

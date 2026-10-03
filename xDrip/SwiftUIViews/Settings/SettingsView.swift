@@ -200,6 +200,9 @@ struct SettingsNavigationView: View {
                 .navigationBarTitleDisplayMode(.large)
                 .onlineHelp(.dataManagement)
 
+        case .forecastLogExport:
+            GlucoseForecastLogExportView()
+
         case .troubleshootingLog:
             TroubleshootingLogView(coreDataManager: coreDataManager)
 

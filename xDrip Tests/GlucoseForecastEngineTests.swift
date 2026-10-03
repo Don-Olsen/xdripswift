@@ -184,4 +184,131 @@ final class GlucoseForecastEngineTests: XCTestCase {
         XCTAssertNil(jitteredResult.reason)
         XCTAssertEqual(jitteredResult.value(atMinutes: 60), 120)
     }
+
+    func testMomentumUsesTenMinuteDecayAndRetainsItsIntegratedEffect() throws {
+        // A slope of ±2 mg/dL/min, integrated in 5-minute midpoint steps,
+        // contributes ±(2 * 0.75 * 5 + 2 * 0.25 * 5) = ±10 mg/dL.
+        for slope in [-2.0, 2.0] {
+            for spacing in [1, 5] {
+                let samples = stride(from: -30, through: 0, by: spacing).map { minute in
+                    GlucoseForecastSample(date: now.addingTimeInterval(Double(minute) * 60),
+                                          glucoseMgdl: 120 + Double(minute) * slope)
+                }
+                let result = GlucoseForecastEngine.predict(input(samples, horizon: 120))
+                XCTAssertNil(result.reason)
+                XCTAssertEqual(try XCTUnwrap(result.value(atMinutes: 5)), 120 + 3.75 * slope,
+                               accuracy: 1e-10)
+                for minute in [10, 15, 30, 60, 120] {
+                    XCTAssertEqual(try XCTUnwrap(result.value(atMinutes: minute)), 120 + 5 * slope,
+                                   accuracy: 1e-10)
+                }
+            }
+        }
+    }
+
+    func testLongerResidualTrendHasNoHiddenCorrectionWhenMomentumWindowIsFlat() throws {
+        for slope in [-2.0, 2.0] {
+            let samples = (-30...0).map { minute in
+                GlucoseForecastSample(date: now.addingTimeInterval(Double(minute) * 60),
+                                      glucoseMgdl: 120 + Double(min(0, minute + 16)) * slope)
+            }
+            let result = GlucoseForecastEngine.predict(input(samples, horizon: 120))
+            XCTAssertNil(result.reason)
+            for point in result.points {
+                XCTAssertEqual(point.glucoseMgdl, 120, accuracy: 1e-10)
+            }
+        }
+    }
+
+    func testSixFiveMinuteSamplesOverTwentyFiveMinutesRemainSufficient() {
+        let samples = glucose(spacingMinutes: 5).filter { $0.date >= now.addingTimeInterval(-25 * 60) }
+        XCTAssertEqual(samples.count, 6)
+        XCTAssertNil(GlucoseForecastEngine.predict(input(samples)).reason)
+        XCTAssertEqual(GlucoseForecastEngine.predict(input(Array(samples.dropFirst()))).reason,
+                       .insufficientHistory)
+        // Preserve the 30-second cadence tolerance with the existing 30-minute lookback.
+        let jittered = glucose(spacingMinutes: 5).map { sample in
+            GlucoseForecastSample(date: sample.date == now ? now : sample.date.addingTimeInterval(-30),
+                                  glucoseMgdl: sample.glucoseMgdl)
+        }
+        XCTAssertNil(GlucoseForecastEngine.predict(input(jittered)).reason)
+        XCTAssertNil(GlucoseForecastEngine.predict(input(glucose())).reason)
+    }
+
+    func testTherapyEffectsContinueAfterMomentumEnds() throws {
+        let insulin = GlucoseForecastEngine.predict(input(treatments: [treatment(1, insulin: true)], horizon: 120))
+        let carbs = GlucoseForecastEngine.predict(input(treatments: [treatment(10, insulin: false)], horizon: 120))
+        XCTAssertNil(insulin.reason)
+        XCTAssertNil(carbs.reason)
+        XCTAssertLessThan(try XCTUnwrap(insulin.value(atMinutes: 60)),
+                          try XCTUnwrap(insulin.value(atMinutes: 10)))
+        XCTAssertLessThan(try XCTUnwrap(insulin.value(atMinutes: 120)),
+                          try XCTUnwrap(insulin.value(atMinutes: 60)))
+        XCTAssertGreaterThan(try XCTUnwrap(carbs.value(atMinutes: 60)),
+                             try XCTUnwrap(carbs.value(atMinutes: 10)))
+        XCTAssertGreaterThan(try XCTUnwrap(carbs.value(atMinutes: 120)),
+                             try XCTUnwrap(carbs.value(atMinutes: 60)))
+    }
+
+    func testFirstHourIsIdenticalForBothForecastHorizons() {
+        let samples = (-30...0).map { minute in
+            GlucoseForecastSample(date: now.addingTimeInterval(Double(minute) * 60),
+                                  glucoseMgdl: 120 + Double(minute) / 3)
+        }
+        let treatments = [treatment(1, minutesAgo: 20, insulin: true),
+                          treatment(15, minutesAgo: 15, insulin: false)]
+        let hour = GlucoseForecastEngine.predict(input(samples, treatments: treatments, horizon: 60))
+        let twoHours = GlucoseForecastEngine.predict(input(samples, treatments: treatments, horizon: 120))
+        XCTAssertNil(hour.reason)
+        XCTAssertNil(twoHours.reason)
+        XCTAssertEqual(hour.points, Array(twoHours.points.prefix(hour.points.count)))
+    }
+
+    func testSafetyBoundsRejectRatherThanClipPredictedValues() {
+        for (reference, slope) in [(599.0, 10.0), (21.0, -10.0)] {
+            let samples = (-30...0).map { minute in
+                GlucoseForecastSample(date: now.addingTimeInterval(Double(minute) * 60),
+                                      glucoseMgdl: reference + Double(minute) * slope)
+            }
+            let result = GlucoseForecastEngine.predict(input(samples, horizon: 120))
+            XCTAssertEqual(result.reason, .outOfRange)
+            XCTAssertTrue(result.points.isEmpty)
+        }
+        XCTAssertNil(GlucoseForecastEngine.predict(input(at: now.addingTimeInterval(330))).reason)
+        XCTAssertEqual(GlucoseForecastEngine.predict(input(at: now.addingTimeInterval(330.01))).reason,
+                       .staleGlucose)
+        for bad in [Double.nan, .infinity, -.infinity] {
+            let samples = glucose() + [GlucoseForecastSample(date: now, glucoseMgdl: bad)]
+            XCTAssertEqual(GlucoseForecastEngine.predict(input(samples)).reason, .missingGlucose)
+        }
+        for bad in [-1.0, Double.infinity, Double.nan] {
+            XCTAssertEqual(GlucoseForecastEngine.predict(input(treatments: [treatment(bad, insulin: true)])).reason,
+                           .invalidTreatment)
+        }
+        var settings = TherapyModelSettings()
+        settings.insulinPeak = .nan
+        let invalid = GlucoseForecastInput(glucose: glucose(), treatments: [], settings: settings,
+            sensitivityMgdlPerUnit: 40, carbohydrateRatioGramsPerUnit: 10, now: now)
+        XCTAssertEqual(GlucoseForecastEngine.predict(invalid).reason, .invalidSettings)
+    }
+
+    func testLoggedConstantsAreTheActualImmutableEngineConfiguration() throws {
+        let constants = GlucoseForecastEngine.configuration
+        XCTAssertFalse(constants.correctionContributionEnabled)
+        XCTAssertEqual(constants.correctionWeight, 0)
+        XCTAssertEqual(constants.momentumDecayMinutes, 10)
+        XCTAssertEqual(constants.momentumRegressionMinutes, 15)
+        XCTAssertEqual(constants.momentumMinimumSamples, 4)
+        XCTAssertEqual(constants.momentumMinimumSpanMinutes, 10)
+        XCTAssertEqual(constants.historyWindowMinutes, 30)
+        XCTAssertEqual(constants.historyMinimumSamples, 6)
+        XCTAssertEqual(constants.historyMinimumSpanMinutes, 25)
+        XCTAssertEqual(constants.integrationStepMinutes, 5)
+        XCTAssertEqual(constants.supportedHorizonMinutes, [60, 120])
+        XCTAssertEqual(constants.maximumGlucoseAgeSeconds, GlucoseForecastEngine.maximumGlucoseAge)
+        XCTAssertEqual(try JSONDecoder().decode(GlucoseForecastEngineConfiguration.self,
+            from: JSONEncoder().encode(constants)), constants)
+        XCTAssertFalse(GlucoseForecastEngine.engineVersion.isEmpty)
+    }
+
 }

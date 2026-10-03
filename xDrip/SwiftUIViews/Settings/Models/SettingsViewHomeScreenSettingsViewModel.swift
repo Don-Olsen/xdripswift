@@ -227,7 +227,10 @@ class SettingsViewHomeScreenSettingsViewModel: NSObject, SettingsViewModelProtoc
                             UserDefaults.standard.glucoseForecastHorizonMinutes = [0, 60, 120][index]
                         }), reloadScope: .all),
             forecastSensitivityRow(),
-            forecastCarbohydrateRatioRow()
+            forecastCarbohydrateRatioRow(),
+            SettingsRow(id: "homeScreen.forecastLogExport",
+                        title: GlucoseForecastTexts.text("forecast.exportLog", fallback: "Export forecast log"),
+                        accessory: .disclosure, action: .forecastLogExport)
         ]
 
         // Treatments gates basal and curves without changing their saved preferences.

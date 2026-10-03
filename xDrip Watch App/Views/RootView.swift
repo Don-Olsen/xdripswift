@@ -116,7 +116,8 @@ private struct WatchManualTreatmentsView: View {
             VStack(alignment: .leading, spacing: 8) {
                 Text("Registrer behandling")
                     .font(.headline)
-                treatmentButton("Insulin (U)", symbol: "drop.fill", kind: .insulin)
+                treatmentButton(WatchManualTreatmentKind.insulin.title, symbol: "drop.fill", kind: .insulin)
+                treatmentButton(WatchManualTreatmentKind.basalInjection.title, symbol: "drop", kind: .basalInjection)
                 treatmentButton("Kulhydrat (g)", symbol: "fork.knife", kind: .carbs)
                 deliveryStatus
                     .font(.footnote)
@@ -149,12 +150,12 @@ private struct WatchManualTreatmentsView: View {
     }
 
     private func treatmentDescription(_ treatment: WatchManualTreatment) -> String {
-        "\(treatment.amount.formatted()) \(treatment.kind == .insulin ? "U insulin" : "g kulhydrat")"
+        treatment.displayDescription
     }
 
     private var pendingStatus: String {
         guard let newest = watchState.pendingManualTreatments.last else { return "" }
-        let delivery = watchState.manualTreatmentDeliveryIssue == nil ? "afventer iPhone" : "prøver iPhone igen"
+        let delivery = watchState.manualTreatmentDeliveryIssue ?? "afventer iPhone"
         let count = watchState.pendingManualTreatments.count
         let countText = count > 1 ? " (\(count) i alt)" : ""
         return "\(treatmentDescription(newest)) gemt på uret · \(delivery)\(countText)"
@@ -184,25 +185,41 @@ private struct WatchManualTreatmentEntryView: View {
     @Environment(\.dismiss) private var dismiss
     let kind: WatchManualTreatmentKind
     @State private var amountText = ""
+    @State private var basalUnits = 0
     @State private var showingConfirmation = false
     @State private var saving = false
 
     private var amount: Double? {
-        let cleaned = amountText.trimmingCharacters(in: .whitespacesAndNewlines)
-            .replacingOccurrences(of: ",", with: ".")
-        let maximum = kind == .insulin ? 200.0 : 500.0
-        guard let value = Double(cleaned), value.isFinite, value > 0, value <= maximum else { return nil }
+        let value: Double?
+        switch kind {
+        case .insulin, .carbs:
+            let cleaned = amountText.trimmingCharacters(in: .whitespacesAndNewlines)
+                .replacingOccurrences(of: ",", with: ".")
+            value = Double(cleaned)
+        case .basalInjection:
+            value = Double(basalUnits)
+        }
+        guard let value, kind.isValidAmount(value) else { return nil }
         return value
     }
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 10) {
-                Text(kind == .insulin ? "Insulin taget" : "Kulhydrat spist")
+                Text(kind.title)
                     .font(.headline)
-                TextField(kind == .insulin ? "Antal U" : "Antal gram", text: $amountText)
+                switch kind {
+                case .insulin:
+                    TextField("Antal U", text: $amountText)
+                case .carbs:
+                    TextField("Antal gram", text: $amountText)
+                case .basalInjection:
+                    Stepper(value: $basalUnits, in: 0...200, step: 1) {
+                        Text(basalUnits > 0 ? "\(basalUnits) U basal" : "Vælg hele enheder")
+                    }
+                }
                 if !amountText.isEmpty && amount == nil {
-                    Text(kind == .insulin ? "Angiv over 0 og højst 200 U" : "Angiv over 0 og højst 500 g")
+                    Text(kind.validationMessage)
                         .font(.footnote)
                         .foregroundStyle(.orange)
                 }
@@ -226,7 +243,7 @@ private struct WatchManualTreatmentEntryView: View {
                 else { saving = false }
             }
         } message: {
-            Text("\(amount?.formatted() ?? "–") \(kind == .insulin ? "U insulin taget" : "g kulhydrat spist") nu?")
+            Text("\(amount?.formatted() ?? "–") \(kind.confirmationDescription) nu?")
         }
     }
 }

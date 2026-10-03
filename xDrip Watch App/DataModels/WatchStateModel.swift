@@ -226,6 +226,8 @@ final class WatchStateModel: NSObject, ObservableObject {
 
         do {
             pendingManualTreatments = try Self.loadManualTreatments()
+        } catch WatchManualTreatmentKind.DecodingError.unsupportedKind {
+            manualTreatmentStorageIssue = "Ukendt behandlingstype · opdatér appen. Køen er bevaret på uret"
         } catch {
             manualTreatmentStorageIssue = "Kunne ikke læse gemte behandlinger på uret"
             log.error("Manual Watch treatment queue load failed: \(error.localizedDescription, privacy: .public)")
@@ -1462,14 +1464,11 @@ final class WatchStateModel: NSObject, ObservableObject {
     }
 
     private static func loadManualTreatments() throws -> [WatchManualTreatment] {
-        let url = try manualTreatmentQueueURL()
-        guard FileManager.default.fileExists(atPath: url.path) else { return [] }
-        return try JSONDecoder().decode([WatchManualTreatment].self, from: Data(contentsOf: url))
+        try WatchManualTreatmentQueue.load(from: manualTreatmentQueueURL())
     }
 
     private static func persistManualTreatments(_ treatments: [WatchManualTreatment]) throws {
-        let data = try JSONEncoder().encode(treatments)
-        try data.write(to: manualTreatmentQueueURL(), options: .atomic)
+        try WatchManualTreatmentQueue.persist(treatments, to: manualTreatmentQueueURL())
     }
 
     /// Return success only after the entry is safely written on the Watch. No dose is calculated.
@@ -1477,7 +1476,7 @@ final class WatchStateModel: NSObject, ObservableObject {
     func recordManualTreatment(kind: WatchManualTreatmentKind, amount: Double) -> Bool {
         let treatment = WatchManualTreatment(id: UUID(), recordedAt: Date(), kind: kind, amount: amount)
         guard treatment.isValid() else {
-            manualTreatmentStorageIssue = "Angiv en gyldig mængde"
+            manualTreatmentStorageIssue = kind.validationMessage
             return false
         }
         guard manualTreatmentStorageIssue == nil else { return false }
@@ -1533,19 +1532,19 @@ final class WatchStateModel: NSObject, ObservableObject {
 
     @discardableResult
     private func processManualTreatmentReceipt(_ message: [String: Any]) -> Bool {
-        guard let idString = message[WatchManualTreatmentMessageKey.treatmentID] as? String,
-              let id = UUID(uuidString: idString),
-              let stored = message[WatchManualTreatmentMessageKey.stored] as? Bool else { return false }
+        guard let receipt = WatchManualTreatmentReceipt(message) else { return false }
+        let id = receipt.id
+        let idString = id.uuidString
         // Ignore a delayed failure for an entry already acknowledged and removed.
         guard let confirmed = pendingManualTreatments.first(where: { $0.id == id }) else { return true }
-        guard stored else {
-            manualTreatmentDeliveryIssue = "iPhone kunne ikke gemme behandlingen endnu · prøver igen"
-            if let reason = message[WatchManualTreatmentMessageKey.error] as? String {
+        guard receipt.stored else {
+            manualTreatmentDeliveryIssue = receipt.failureMessage
+            if let reason = receipt.error {
                 log.error("iPhone did not store manual Watch treatment \(idString, privacy: .public): \(reason, privacy: .public)")
             }
             return true
         }
-        let remaining = pendingManualTreatments.filter { $0.id != id }
+        let remaining = WatchManualTreatmentQueue.applying(receipt, to: pendingManualTreatments)
         do {
             try Self.persistManualTreatments(remaining)
             pendingManualTreatments = remaining

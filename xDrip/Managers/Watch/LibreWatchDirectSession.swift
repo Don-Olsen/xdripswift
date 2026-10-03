@@ -12,8 +12,63 @@ enum WatchManualTreatmentMessageKey {
 }
 
 enum WatchManualTreatmentKind: String, Codable, Equatable {
+    // These wire values are permanent: older queued insulin/carbs entries retain their meaning.
     case insulin
     case carbs
+    case basalInjection
+
+    enum DecodingError: Error { case unsupportedKind }
+
+    init(from decoder: Decoder) throws {
+        let value = try decoder.singleValueContainer().decode(String.self)
+        guard let kind = Self(rawValue: value) else { throw DecodingError.unsupportedKind }
+        self = kind
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    var title: String {
+        switch self {
+        case .insulin: return "Bolus (hurtigtvirkende)"
+        case .carbs: return "Kulhydrat"
+        case .basalInjection: return "Basal (langtidsvirkende)"
+        }
+    }
+
+    var unit: String {
+        switch self {
+        case .insulin, .basalInjection: return "U"
+        case .carbs: return "g"
+        }
+    }
+
+    var confirmationDescription: String {
+        switch self {
+        case .insulin: return "U bolus (hurtigtvirkende) taget"
+        case .carbs: return "g kulhydrat spist"
+        case .basalInjection: return "U basal (langtidsvirkende) taget"
+        }
+    }
+
+    var validationMessage: String {
+        switch self {
+        case .insulin: return "Angiv over 0 og højst 200 U"
+        case .carbs: return "Angiv over 0 og højst 500 g"
+        case .basalInjection: return "Angiv hele enheder fra 1 til 200 U"
+        }
+    }
+
+    func isValidAmount(_ amount: Double) -> Bool {
+        guard amount.isFinite, amount > 0 else { return false }
+        switch self {
+        case .insulin: return amount <= 200
+        case .carbs: return amount <= 500
+        case .basalInjection: return amount <= 200 && amount.rounded(.towardZero) == amount
+        }
+    }
 }
 
 struct WatchManualTreatment: Codable, Equatable, Identifiable {
@@ -24,9 +79,58 @@ struct WatchManualTreatment: Codable, Equatable, Identifiable {
 
     func isValid(at now: Date = Date()) -> Bool {
         let timestamp = recordedAt.timeIntervalSince1970
-        let maximum = kind == .insulin ? 200.0 : 500.0
-        return amount.isFinite && amount > 0 && amount <= maximum && timestamp.isFinite && timestamp >= 0 &&
+        return kind.isValidAmount(amount) && timestamp.isFinite && timestamp >= 0 &&
             recordedAt <= now.addingTimeInterval(60 * 60)
+    }
+
+    var displayDescription: String { "\(amount.formatted()) \(kind.confirmationDescription)" }
+}
+
+/// The durable queue fails closed on unknown/future types instead of silently dropping them.
+/// A downgrade or interrupted write must never overwrite the only unacknowledged record.
+enum WatchManualTreatmentQueue {
+    static func load(from url: URL) throws -> [WatchManualTreatment] {
+        guard FileManager.default.fileExists(atPath: url.path) else { return [] }
+        return try JSONDecoder().decode([WatchManualTreatment].self, from: Data(contentsOf: url))
+    }
+
+    static func persist(_ treatments: [WatchManualTreatment], to url: URL) throws {
+        // Also re-read before a write: an unreadable/future queue remains intact even if it
+        // changed after startup. Never replace such a file with an empty/current-version queue.
+        _ = try load(from: url)
+        let data = try JSONEncoder().encode(treatments)
+        try data.write(to: url, options: .atomic)
+    }
+
+    static func applying(_ receipt: WatchManualTreatmentReceipt,
+                         to pending: [WatchManualTreatment]) -> [WatchManualTreatment] {
+        guard receipt.stored else { return pending }
+        return pending.filter { $0.id != receipt.id }
+    }
+}
+
+/// A transport acknowledgement alone is not a durable phone-storage receipt.
+struct WatchManualTreatmentReceipt {
+    let id: UUID
+    let stored: Bool
+    let error: String?
+
+    init?(_ message: [String: Any]) {
+        guard let rawID = message[WatchManualTreatmentMessageKey.treatmentID] as? String,
+              let id = UUID(uuidString: rawID),
+              let stored = message[WatchManualTreatmentMessageKey.stored] as? Bool else { return nil }
+        self.id = id
+        self.stored = stored
+        self.error = message[WatchManualTreatmentMessageKey.error] as? String
+    }
+
+    var failureMessage: String {
+        switch error {
+        case "invalidTreatment", "unsupportedTreatmentKind":
+            return "iPhone afviste behandlingstypen eller mængden · opdatér begge apps. Registreringen er bevaret på uret"
+        default:
+            return "iPhone kunne ikke gemme behandlingen endnu · prøver igen"
+        }
     }
 }
 

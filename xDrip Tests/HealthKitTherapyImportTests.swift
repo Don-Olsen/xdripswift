@@ -772,3 +772,252 @@ final class WatchManualTreatmentTests: XCTestCase {
         try migrated.disconnectPersistentStoresForTesting()
     }
 }
+
+final class WatchBasalTreatmentTests: XCTestCase {
+    private let at = Date(timeIntervalSince1970: 1_800_000_000)
+
+    private func envelope(_ treatment: WatchManualTreatment) throws -> [String: Any] {
+        [WatchManualTreatmentMessageKey.treatmentID: treatment.id.uuidString,
+         WatchManualTreatmentMessageKey.treatment: try JSONEncoder().encode(treatment)]
+    }
+
+    private func queueURL() throws -> URL {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WatchBasalTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        return directory.appendingPathComponent("WatchManualTreatments.v1.json")
+    }
+
+    func testBasalUsesWholePositiveUnitsAndInsulinMaximumOnBothDevices() throws {
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        for amount in [1.0, 20, 200] {
+            let basal = WatchManualTreatment(id: UUID(), recordedAt: at, kind: .basalInjection, amount: amount)
+            XCTAssertTrue(basal.isValid(at: at))
+            XCTAssertEqual(WatchManualTreatmentStore.decode(try envelope(basal), at: at), basal)
+        }
+        for amount in [0.0, -1, 0.5, 20.5, 200.1, 201, Double.nan, .infinity, -.infinity] {
+            let invalid = WatchManualTreatment(id: UUID(), recordedAt: at, kind: .basalInjection, amount: amount)
+            XCTAssertFalse(invalid.isValid(at: at))
+            // Phone validation must also reject callers that bypass wire decoding.
+            var outcome: WatchManualTreatmentStore.Outcome?
+            WatchManualTreatmentStore.save(invalid, coreDataManager: core, at: at) { outcome = $0 }
+            XCTAssertEqual(outcome, .invalid)
+            if amount.isFinite {
+                XCTAssertNil(WatchManualTreatmentStore.decode(try envelope(invalid), at: at))
+            }
+        }
+        XCTAssertTrue(WatchManualTreatmentKind.insulin.isValidAmount(1.25))
+        XCTAssertEqual(try core.mainManagedObjectContext.fetch(TreatmentEntry.fetchRequest()).count, 0)
+    }
+
+    func testBasalLostReceiptAndRestartUseUUIDWithoutCollapsingSeparateInjections() throws {
+        let storeURL = try queueURL().deletingLastPathComponent().appendingPathComponent("treatments.sqlite")
+        let first = WatchManualTreatment(id: UUID(), recordedAt: at, kind: .basalInjection, amount: 20)
+        let second = WatchManualTreatment(id: UUID(), recordedAt: at, kind: .basalInjection, amount: 20)
+        let watchQueue = try queueURL()
+        try WatchManualTreatmentQueue.persist([first, second], to: watchQueue)
+        let phone = try CoreDataManager(testModelName: ConstantsCoreData.modelName, persistentStoreURL: storeURL)
+        let saved = expectation(description: "durable basal saved")
+        WatchManualTreatmentStore.save(first, coreDataManager: phone, at: at) { outcome in
+            XCTAssertEqual(outcome, .stored)
+            saved.fulfill()
+        }
+        wait(for: [saved], timeout: 5)
+        try phone.disconnectPersistentStoresForTesting()
+        let restartedPhone = try CoreDataManager(testModelName: ConstantsCoreData.modelName, persistentStoreURL: storeURL)
+        let restartedWatch = try WatchManualTreatmentQueue.load(from: watchQueue)
+        XCTAssertEqual(restartedWatch, [first, second])
+        for treatment in restartedWatch {
+            let delivered = expectation(description: "basal delivery \(treatment.id)")
+            WatchManualTreatmentStore.save(treatment, coreDataManager: restartedPhone, at: at) { outcome in
+                XCTAssertEqual(outcome, treatment.id == first.id ? .alreadyStored : .stored)
+                delivered.fulfill()
+            }
+            wait(for: [delivered], timeout: 5)
+        }
+        let rows = try restartedPhone.mainManagedObjectContext.fetch(TreatmentEntry.fetchRequest())
+        XCTAssertEqual(rows.count, 2)
+        XCTAssertEqual(Set(rows.compactMap(\.watchSourceUUID)), Set([first.id.uuidString, second.id.uuidString]))
+        for row in rows {
+            XCTAssertEqual(row.treatmentType, .BasalInjection)
+            XCTAssertEqual(row.value, 20)
+            XCTAssertEqual(row.date, at)
+            XCTAssertEqual(row.enteredBy, "xDrip4iOS Watch")
+            XCTAssertTrue(row.isWatchLocalOnly)
+            XCTAssertFalse(row.isHealthKitImported)
+        }
+        XCTAssertTrue(TreatmentEntryAccessor(coreDataManager: restartedPhone)
+            .getLatestTreatmentsForNightscout(limit: 10).isEmpty)
+        let receipt = try XCTUnwrap(WatchManualTreatmentReceipt([
+            WatchManualTreatmentMessageKey.treatmentID: first.id.uuidString,
+            WatchManualTreatmentMessageKey.stored: true]))
+        let remaining = WatchManualTreatmentQueue.applying(receipt, to: restartedWatch)
+        try WatchManualTreatmentQueue.persist(remaining, to: watchQueue)
+        XCTAssertEqual(try WatchManualTreatmentQueue.load(from: watchQueue), [second])
+        // A replayed receipt cannot delete another injection at the same time and amount.
+        XCTAssertEqual(WatchManualTreatmentQueue.applying(receipt, to: remaining), [second])
+        try restartedPhone.disconnectPersistentStoresForTesting()
+    }
+
+    @MainActor
+    func testStoredWatchBasalIsExcludedFromTherapyMetricsAndForecastInputs() async throws {
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let basal = WatchManualTreatment(id: UUID(), recordedAt: at, kind: .basalInjection, amount: 20)
+        let outcome: WatchManualTreatmentStore.Outcome = await withCheckedContinuation { continuation in
+            WatchManualTreatmentStore.save(basal, coreDataManager: core, at: at) { continuation.resume(returning: $0) }
+        }
+        XCTAssertEqual(outcome, .stored)
+        let manager = TherapyMetricsManager()
+        manager.configure(coreDataManager: core, externalStatus: { nil })
+        let policy = DataFlowPolicy(isMaster: true, followerDataSource: .careLink,
+            therapyDataSourceSelection: .none, nightscoutEnabled: false,
+            masterUploadsGlucoseToNightscout: false, followerUploadsGlucoseToNightscout: false,
+            nightscoutFollowType: .none)
+        let settings = TherapyModelSettings()
+        let start = at.addingTimeInterval(-600 * 60)
+        let reference = at
+        let fetched: [TherapyTreatment]? = await withCheckedContinuation { continuation in
+            // Match the adapter's queue boundary. The configured manager owns its Core Data
+            // queue/cache locks; policy is immutable for this one awaited fixture read.
+            DispatchQueue.global().async(execute: DispatchWorkItem {
+                continuation.resume(returning: manager.treatments(from: start, to: reference,
+                    policy: policy, settings: settings))
+            })
+        }
+        let entries = try XCTUnwrap(fetched)
+        XCTAssertTrue(entries.isEmpty)
+        // A basal-only window must retain the existing no-bolus/no-carb presentation,
+        // not make IOB/COB visible or fabricate a numerical zero.
+        for isIOB in [true, false] {
+            let metric = TherapyMetricsManager.localMetric(entries: entries, isIOB: isIOB,
+                date: at, settings: settings)
+            XCTAssertEqual(metric.reason, .noTreatments)
+            XCTAssertNil(metric.amount)
+            XCTAssertNil(metric.value(at: at))
+            XCTAssertFalse(metric.isVisible(at: at))
+        }
+        let forecastInputs = GlucoseForecastDataAdapter.treatmentsKnownAtReference(entries,
+            from: start, referenceDate: at)
+        XCTAssertTrue(forecastInputs.isEmpty)
+        let samples = stride(from: -30, through: 0, by: 5).map {
+            GlucoseForecastSample(date: at.addingTimeInterval(Double($0 * 60)), glucoseMgdl: 100)
+        }
+        let result = GlucoseForecastEngine.predict(GlucoseForecastInput(glucose: samples,
+            treatments: forecastInputs, settings: settings, sensitivityMgdlPerUnit: 40,
+            carbohydrateRatioGramsPerUnit: 10, horizonMinutes: 120, now: at))
+        XCTAssertNil(result.reason)
+        XCTAssertTrue(result.points.allSatisfy { abs($0.glucoseMgdl - 100) < 1e-9 })
+    }
+
+    func testUnknownIncomingTypeIsRejectedWithoutFalseStoredReceipt() throws {
+        let known = WatchManualTreatment(id: UUID(), recordedAt: at, kind: .insulin, amount: 1)
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(known)) as? [String: Any])
+        object["kind"] = "futureMedication"
+        let message: [String: Any] = [
+            WatchManualTreatmentMessageKey.treatmentID: known.id.uuidString,
+            WatchManualTreatmentMessageKey.treatment: try JSONSerialization.data(withJSONObject: object)]
+        XCTAssertNil(WatchManualTreatmentStore.decode(message, at: at))
+        XCTAssertEqual(WatchManualTreatmentStore.rejectionReason(message), "unsupportedTreatmentKind")
+        let rejected = try XCTUnwrap(WatchManualTreatmentReceipt([
+            WatchManualTreatmentMessageKey.treatmentID: known.id.uuidString,
+            WatchManualTreatmentMessageKey.stored: false,
+            WatchManualTreatmentMessageKey.error: WatchManualTreatmentStore.rejectionReason(message)]))
+        XCTAssertFalse(rejected.stored)
+        XCTAssertTrue(rejected.failureMessage.contains("opdatér begge apps"))
+        XCTAssertTrue(rejected.failureMessage.contains("bevaret"))
+        XCTAssertEqual(WatchManualTreatmentQueue.applying(rejected, to: [known]), [known])
+        XCTAssertNil(WatchManualTreatmentReceipt([WatchManualTreatmentMessageKey.stored: true]))
+    }
+
+    /// Mirror the published pre-basal wire model: an older iPhone cannot decode basal and
+    /// replies stored=false/invalidTreatment. The new Watch keeps the original UUID/payload.
+    func testNewWatchBasalWithOldPhoneFormatIsVisibleFailureAndDurableRetry() throws {
+        enum LegacyKind: String, Codable { case insulin, carbs }
+        struct LegacyEntry: Codable {
+            let id: UUID
+            let recordedAt: Date
+            let kind: LegacyKind
+            let amount: Double
+        }
+        let basal = WatchManualTreatment(id: UUID(), recordedAt: at, kind: .basalInjection, amount: 20)
+        XCTAssertThrowsError(try JSONDecoder().decode(LegacyEntry.self, from: JSONEncoder().encode(basal)))
+        let oldFailure = try XCTUnwrap(WatchManualTreatmentReceipt([
+            WatchManualTreatmentMessageKey.treatmentID: basal.id.uuidString,
+            WatchManualTreatmentMessageKey.stored: false,
+            WatchManualTreatmentMessageKey.error: "invalidTreatment"]))
+        XCTAssertTrue(oldFailure.failureMessage.contains("opdatér begge apps"))
+        let url = try queueURL()
+        try WatchManualTreatmentQueue.persist([basal], to: url)
+        let before = try Data(contentsOf: url)
+        XCTAssertEqual(WatchManualTreatmentQueue.applying(oldFailure, to: [basal]), [basal])
+        XCTAssertEqual(try WatchManualTreatmentQueue.load(from: url), [basal])
+        XCTAssertEqual(try Data(contentsOf: url), before)
+        for kind in [LegacyKind.insulin, .carbs] {
+            let old = LegacyEntry(id: UUID(), recordedAt: at, kind: kind, amount: 2.5)
+            let new = try JSONDecoder().decode(WatchManualTreatment.self, from: JSONEncoder().encode(old))
+            XCTAssertEqual(new.kind.rawValue, kind.rawValue)
+            XCTAssertEqual(new.amount, 2.5)
+            let roundTrip = try JSONDecoder().decode(LegacyEntry.self, from: JSONEncoder().encode(new))
+            XCTAssertEqual(roundTrip.kind, old.kind)
+            XCTAssertEqual(roundTrip.id, old.id)
+        }
+    }
+
+    func testFutureOrCorruptQueueCannotBeOverwrittenOrCleared() throws {
+        let known = WatchManualTreatment(id: UUID(), recordedAt: at, kind: .carbs, amount: 10)
+        var future = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(known)) as? [String: Any])
+        future["kind"] = "futureMedication"
+        let knownObject = try JSONSerialization.jsonObject(with: JSONEncoder().encode(known))
+        for data in [try JSONSerialization.data(withJSONObject: [knownObject, future]), Data("[{".utf8)] {
+            let url = try queueURL()
+            try data.write(to: url)
+            XCTAssertThrowsError(try WatchManualTreatmentQueue.load(from: url))
+            XCTAssertThrowsError(try WatchManualTreatmentQueue.persist([], to: url))
+            XCTAssertThrowsError(try WatchManualTreatmentQueue.persist([known], to: url))
+            XCTAssertEqual(try Data(contentsOf: url), data)
+        }
+    }
+
+    func testKindLabelsAndUnitsKeepBasalAndBolusDistinct() {
+        XCTAssertEqual(WatchManualTreatmentKind.insulin.title, "Bolus (hurtigtvirkende)")
+        XCTAssertEqual(WatchManualTreatmentKind.basalInjection.title, "Basal (langtidsvirkende)")
+        XCTAssertEqual(WatchManualTreatmentKind.carbs.unit, "g")
+        for kind in [WatchManualTreatmentKind.insulin, .basalInjection] {
+            XCTAssertEqual(kind.unit, "U")
+            let entry = WatchManualTreatment(id: UUID(), recordedAt: at, kind: kind, amount: 20)
+            XCTAssertTrue(entry.displayDescription.contains(kind == .insulin ? "bolus" : "basal"))
+            XCTAssertTrue(entry.displayDescription.contains("20"))
+        }
+    }
+
+    @MainActor
+    func testBasalBackupRestorePreservesTypeLocalOnlyAndDistinctUUIDs() async throws {
+        let source = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let ids = [UUID().uuidString, UUID().uuidString]
+        for id in ids {
+            let row = TreatmentEntry(date: at, value: 20, treatmentType: .BasalInjection,
+                nightscoutEventType: nil, enteredBy: "xDrip4iOS Watch",
+                nsManagedObjectContext: source.mainManagedObjectContext)
+            row.watchSourceUUID = id
+        }
+        XCTAssertTrue(source.saveChangesSynchronously())
+        let exporter = BackupService(coreDataManager: source)
+        let archive = try await exporter.createBackup(options: BackupOptions(
+            includesSettings: false, includesAccounts: false, includesBgReadings: false, includesTreatments: true))
+        defer { try? FileManager.default.removeItem(at: archive.url) }
+        let inspection = try exporter.inspectBackup(at: archive.url)
+        let destination = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let importer = BackupService(coreDataManager: destination)
+        for _ in 0..<2 {
+            _ = try await importer.restore(inspection: inspection, mode: .keepCurrent,
+                restoresSettings: false, restoredAccountCategories: [])
+        }
+        let rows = try destination.mainManagedObjectContext.fetch(TreatmentEntry.fetchRequest())
+        XCTAssertEqual(rows.count, 2)
+        XCTAssertEqual(Set(rows.compactMap(\.watchSourceUUID)), Set(ids))
+        XCTAssertTrue(rows.allSatisfy { $0.treatmentType == .BasalInjection && $0.value == 20 && $0.isWatchLocalOnly })
+        XCTAssertTrue(TreatmentEntryAccessor(coreDataManager: destination)
+            .getLatestTreatmentsForNightscout(limit: 10).isEmpty)
+    }
+}

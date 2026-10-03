@@ -101,17 +101,40 @@ struct GlucoseForecastResult: Sendable {
     }
 }
 
+/// The engine and prospective log share this immutable definition. Changes to
+/// these constants require a new engineVersion; personal therapy settings do not.
+struct GlucoseForecastEngineConfiguration: Codable, Sendable, Equatable {
+    let historyWindowMinutes: Double
+    let historyMinimumSamples: Int
+    let historyMinimumSpanMinutes: Double
+    let momentumRegressionMinutes: Double
+    let momentumMinimumSamples: Int
+    let momentumMinimumSpanMinutes: Double
+    let momentumDecayMinutes: Double
+    let correctionContributionEnabled: Bool
+    let correctionWeight: Double
+    let integrationStepMinutes: Double
+    let cadenceToleranceSeconds: TimeInterval
+    let maximumGlucoseAgeSeconds: TimeInterval
+    let maximumHistoryGapSeconds: TimeInterval
+    let minimumGlucoseMgdl: Double
+    let maximumGlucoseMgdl: Double
+    let supportedHorizonMinutes: [Int]
+}
+
 /// A deliberately small Swift adaptation of LoopKit's prediction principles:
-/// combine date-aligned treatment effects, short glucose momentum and a fading
-/// retrospective discrepancy. No LoopKit framework or pump dosing code is used.
+/// combine date-aligned treatment effects and short residual glucose momentum.
+/// No LoopKit framework or pump dosing code is used.
 ///
 /// Therapy effects are the CHANGE in absorbed bolus/carbohydrates after the
 /// latest CGM value, not present IOB/COB multiplied by a constant. Before
 /// fitting momentum, the same modeled effects are removed from observed CGM
 /// movement; this prevents a recent dose/meal from being counted twice.
-/// Residual short-term and 30-minute rates are BLENDED, never added together.
-/// The residual correction fades to zero by 60 minutes. A stable unmodeled
-/// background (including long-acting basal such as Tresiba) is assumed.
+/// The 30-minute residual correction rate is still calculated, but its
+/// contribution is explicitly disabled. Momentum uses 15 minutes of regression
+/// history and fades over 10 future minutes. Its integrated effect is retained
+/// thereafter; treatment curves continue through the selected forecast horizon.
+/// A stable unmodeled background (including long-acting basal) is assumed.
 ///
 /// This is not LoopKit's full pump prediction or StandardRetrospectiveCorrection:
 /// no basal schedule, pump zero-temp, dynamic carbohydrate absorption, or dose
@@ -121,19 +144,24 @@ struct GlucoseForecastResult: Sendable {
 /// (MIT; Copyright 2015 Nathan Racklyeft, 2016 LoopKit Authors).
 /// See docs/GLUCOSE-FORECAST.md for attribution and modeling limitations.
 enum GlucoseForecastEngine {
-    private static let lookbackMinutes = 30.0
-    private static let momentumMinutes = 15.0
-    private static let correctionMinutes = 60.0
-    private static let stepMinutes = 5.0
-    private static let fiveMinuteCadenceTolerance: TimeInterval = 30
-    static let maximumGlucoseAge: TimeInterval = 5 * 60 + fiveMinuteCadenceTolerance
+    static let engineVersion = "local-residual-momentum10-v2"
+    static let configuration = GlucoseForecastEngineConfiguration(
+        historyWindowMinutes: 30, historyMinimumSamples: 6, historyMinimumSpanMinutes: 25,
+        momentumRegressionMinutes: 15, momentumMinimumSamples: 4, momentumMinimumSpanMinutes: 10,
+        momentumDecayMinutes: 10, correctionContributionEnabled: false, correctionWeight: 0,
+        integrationStepMinutes: 5, cadenceToleranceSeconds: 30,
+        maximumGlucoseAgeSeconds: 330, maximumHistoryGapSeconds: 330,
+        minimumGlucoseMgdl: 20, maximumGlucoseMgdl: 600, supportedHorizonMinutes: [60, 120])
+    static var maximumGlucoseAge: TimeInterval { configuration.maximumGlucoseAgeSeconds }
 
     static func predict(_ input: GlucoseForecastInput) -> GlucoseForecastResult {
         func unavailable(_ reason: GlucoseForecastUnavailableReason, at date: Date? = nil) -> GlucoseForecastResult {
             GlucoseForecastResult(points: [], referenceDate: date, reason: reason)
         }
 
-        guard input.horizonMinutes == 60 || input.horizonMinutes == 120 else {
+        let constants = configuration
+        let glucoseRange = constants.minimumGlucoseMgdl...constants.maximumGlucoseMgdl
+        guard constants.supportedHorizonMinutes.contains(input.horizonMinutes) else {
             return unavailable(.invalidHorizon)
         }
         guard input.settings.validInsulin && input.settings.validCarbs else {
@@ -154,30 +182,30 @@ enum GlucoseForecastEngine {
         // newer visible value outside the model's numeric range and predict from older data.
         guard let newestDate = input.glucose.filter({ $0.date <= input.now }).map(\.date).max(),
               input.glucose.filter({ $0.date == newestDate }).allSatisfy({
-                  $0.glucoseMgdl.isFinite && (20...600).contains($0.glucoseMgdl)
+                  $0.glucoseMgdl.isFinite && glucoseRange.contains($0.glucoseMgdl)
               }) else { return unavailable(.missingGlucose) }
         // Validate the remaining numeric/timing invariants so a cache miss never becomes zero.
         let ordered = input.glucose
-            .filter { $0.date <= input.now && $0.glucoseMgdl.isFinite && (20...600).contains($0.glucoseMgdl) }
+            .filter { $0.date <= input.now && $0.glucoseMgdl.isFinite && glucoseRange.contains($0.glucoseMgdl) }
             .sorted { $0.date < $1.date }
         guard let latest = ordered.last else { return unavailable(.missingGlucose) }
         guard input.now.timeIntervalSince(latest.date) <= maximumGlucoseAge else {
             return unavailable(.staleGlucose, at: latest.date)
         }
-        let cutoff = latest.date.addingTimeInterval(-lookbackMinutes * 60 - fiveMinuteCadenceTolerance)
+        let cutoff = latest.date.addingTimeInterval(-constants.historyWindowMinutes * 60 - constants.cadenceToleranceSeconds)
         // Two observations at one timestamp are one moment, not extra history.
         var history: [GlucoseForecastSample] = []
         for sample in ordered where sample.date >= cutoff {
             if history.last?.date == sample.date { history[history.count - 1] = sample }
             else { history.append(sample) }
         }
-        guard history.count >= 6,
+        guard history.count >= constants.historyMinimumSamples,
               let first = history.first,
-              latest.date.timeIntervalSince(first.date) >= 25 * 60 else {
+              latest.date.timeIntervalSince(first.date) >= constants.historyMinimumSpanMinutes * 60 else {
             return unavailable(.insufficientHistory, at: latest.date)
         }
         guard zip(history, history.dropFirst()).allSatisfy({ pair in
-            pair.1.date.timeIntervalSince(pair.0.date) <= 5 * 60 + fiveMinuteCadenceTolerance
+            pair.1.date.timeIntervalSince(pair.0.date) <= constants.maximumHistoryGapSeconds
         }) else {
             return unavailable(.historyGap, at: latest.date)
         }
@@ -205,30 +233,33 @@ enum GlucoseForecastEngine {
         let residuals: [(date: Date, value: Double)] = history.map { sample in
             (sample.date, sample.glucoseMgdl - modeledChange(from: first.date, to: sample.date))
         }
-        let shortStart = latest.date.addingTimeInterval(-momentumMinutes * 60 - fiveMinuteCadenceTolerance)
+        let shortStart = latest.date.addingTimeInterval(-constants.momentumRegressionMinutes * 60 - constants.cadenceToleranceSeconds)
         let short = residuals.filter { $0.date >= shortStart }
-        guard short.count >= 4,
-              latest.date.timeIntervalSince(short[0].date) >= 10 * 60,
+        guard short.count >= constants.momentumMinimumSamples,
+              latest.date.timeIntervalSince(short[0].date) >= constants.momentumMinimumSpanMinutes * 60,
               let momentumRate = regressionRate(short, relativeTo: latest.date),
               let correctionRate = regressionRate(residuals, relativeTo: latest.date) else {
             return unavailable(.insufficientHistory, at: latest.date)
         }
 
+        let stepMinutes = constants.integrationStepMinutes
         var points = [GlucoseForecastPoint(date: latest.date, glucoseMgdl: latest.glucoseMgdl)]
         var residualEffect = 0.0
         for minute in stride(from: Int(stepMinutes), through: input.horizonMinutes, by: Int(stepMinutes)) {
             let midpoint = Double(minute) - stepMinutes / 2
-            let momentumWeight = max(0, 1 - midpoint / momentumMinutes)
-            let correctionWeight = max(0, 1 - midpoint / correctionMinutes)
-            // Only the unexplained component is extended. The short-term rate
-            // gives way to the 30-minute discrepancy, which then decays.
+            let momentumWeight = max(0, 1 - midpoint / constants.momentumDecayMinutes)
+            // Keep correctionRate and the blending structure explicit, but do not
+            // contribute it. No zero-duration division or hidden long trend.
+            let correctionWeight = constants.correctionContributionEnabled ? constants.correctionWeight : 0
+            // Only unexplained momentum is integrated. Once its weight reaches
+            // zero the accumulated residualEffect is retained, never reset.
             let rate = momentumWeight * momentumRate
                 + (1 - momentumWeight) * correctionWeight * correctionRate
             residualEffect += rate * stepMinutes
             let date = latest.date.addingTimeInterval(Double(minute) * 60)
             let value = latest.glucoseMgdl
                 + modeledChange(from: latest.date, to: date) + residualEffect
-            guard value.isFinite, (20...600).contains(value) else {
+            guard value.isFinite, glucoseRange.contains(value) else {
                 return unavailable(.outOfRange, at: latest.date)
             }
             points.append(GlucoseForecastPoint(date: date, glucoseMgdl: value))

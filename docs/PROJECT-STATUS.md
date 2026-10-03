@@ -1,3 +1,88 @@
+## Lokal kandidat efter 4288: prognose, basalregistrering og måling af præcision
+
+Denne kandidat fortsætter `integration/upstream-7.1.1` fra
+`bbfc66803033dd2e063954d3dd277ba0d7a6b1c7`. Rettelserne fra 4287 og 4288
+bevares; 4286 er kun sammenligningsgrundlag. Appversion/buildnummer og
+release-state var uændrede under implementeringen. Brugerens efterfølgende
+“Upload” den 3. oktober 2026 godkender nu intern TestFlight-udgivelse af denne
+kandidat. Den eksisterende releaseproces vælger nummeret fra Apple og tester
+det præcise release-træ igen. Faktisk Apple-status fremgår af releaseafsnittet,
+når processen er gennemført; der foretages ingen direkte enhedsinstallation.
+
+Ændringer:
+
+- `GlucoseForecastEngine.swift`: eksplicit nul korrektionsbidrag, fortsat
+  beregning af correctionRate, uændret 15-minutters regression og særskilt
+  10-minutters momentumaftrapning. Akkumuleret residual bevares derefter;
+  behandlingseffekter og 60/120-minutters horisont fortsætter. Delt, versionssat
+  konfiguration bruges af motor og log. Personlige indstillinger er uændrede.
+- `LibreWatchDirectSession.swift`, `WatchManager.swift`, Watch
+  `WatchStateModel.swift` og `RootView.swift`: særskilt basalregistrering som
+  `BasalInjection`, hele positive enheder op til den eksisterende 200 U-grænse,
+  tydelig bolus/basal-bekræftelse og holdbar kø/kvittering. Ukendte typer afvises
+  synligt uden falsk gemt-kvittering eller overskrivning af køen. Basal påvirker
+  ikke bolus, IOB, COB eller prognoseinput. Kun behandlingssektionerne ændres.
+- Ny `GlucoseForecastLog.swift` og adaptertilkobling: første gyldige snapshot
+  pr. reference/horisont/motorversion bevares uændret, separate fejlposter,
+  seriel lokal JSONL-lagring, højst 400 UTC-dage og almindelig enhedsbackup.
+- Ny `GlucoseForecastLogExportView.swift`, Home-indstillingsmodel/routing,
+  engelske/danske tekster og projektfil: eksplicit streaming CSV-eksport via
+  Indstillinger → Hjemskærm → Eksportér prognoselog.
+- `scripts/evaluate-glucose-forecast.py` og syntetiske Python-tests: lokal
+  +30/+60/+120-evaluering mod samme faktiske målinger som uændret-værdi-baseline,
+  faste matchregler, reelle resterende prognosetider og særskilte manglende data.
+  `local-build.sh` kører de nye Python-tests sammen med eksisterende kontroller.
+- Nye/udvidede forecast-, adapter-, log- og basal-XCTest-tests. Model og
+  CSV-/evalueringsformat er dokumenteret i `docs/GLUCOSE-FORECAST.md`.
+
+Validering af den endelige kode, 3. oktober 2026:
+
+- `scripts/local-build.sh release-test` afsluttede med exit 0.
+- **1.182/1.182 XCTest-tests bestod; 0 fejl og 0 skipped.** Heri indgår
+  17 logtests, 8 basaltests samt nye motor- og adaptertests.
+- **157 Python-tests og 54 syntetiske selvkontroller bestod**, inklusive
+  evaluatorens 18 tests. Swift-genereret CSV er også læst af det faktiske
+  Python-værktøj med kendt syntetisk facit for begge prognosehorisonter.
+- iPhone- og Watch-simulatorbuilds bestod med Xcode 27.0 (27A266a), uden
+  enhedssignering. Den eksisterende `local-build.sh`-kommando kan ikke uploade.
+- Testresultater og logs:
+  `~/DeveloperBuildData/xDrip/local-runs/xdripswift/20261003T171157Z-47158/`.
+  Se `results/AllTests.xcresult`, `results/stability-summary.json` og
+  `results/forecast-candidate-source-manifest.json`. Resultaterne vedrører den
+  lokale ændrede kode oven på den angivne HEAD; HEAD alene er ikke kandidaten.
+- `git diff --check` og projektfilens plist-kontrol bestod. Historiske tags,
+  `Version.xcconfig` og `release-automation/active.json` er uændrede.
+  Denne lokale validering oprettede ingen release/tag; den efterfølgende
+  autoriserede udgivelse får sin egen testkvittering og sit eget checkpoint.
+
+Første fulde kørsel fandt en reel JSONL-fejl: projektets generiske
+`Data.append(integer)` skrev et linjeskift plus nulbytes. Den nye log bruger nu
+en eksplicit enkelt byte og har en regressionstest. Basaltestens antagelse om
+nul ved tomme IOB/COB-data blev rettet til den eksisterende `.noTreatments`/
+ukendt-værdi-adfærd. Simulatoren kan ikke dokumentere fysisk iOS-filbeskyttelse;
+testen kontrollerer konfigurationen, og hardwarekontrollen afventer enhed.
+
+Præcision: De eksternt oplyste replay-tal er ikke reproduceret. Der foreligger
+endnu ingen fremadrettet præcisionsmåling med denne motor. Beståede softwaretests
+vil alene dokumentere beregnings- og logmekanik. Loggen er Home-drevet, ikke
+kontinuerlig døgnlogning; deduplikering og fejlbegrænsning betyder, at værktøjets
+tilgængelighed er for bevarede records, ikke alle mulige beregningsforsøg.
+Evaluatoren kan ikke identificere efterfølgende måltider/insulin ud fra de to
+CSV-filer alene.
+
+Fysisk opfølgning efter en særskilt godkendt udgivelse: basalbekræftelse og
+kvittering på Watch/iPhone, kø ved midlertidig manglende kontakt, CSV-deling,
+log efter genstart og normal enhedsbackup/gendannelse samt den eksisterende
+prognosevisning ved appskift. Frisk prospektiv log og faktiske glukosemålinger
+kræves for at vurdere præcision.
+
+Beskyttede funktioner er bevaret: alarmregler/-levering, sensor/Bluetooth,
+ejerskab/handoff/workout, Nightscout-upload/kildeprioritet, glukosemålinger,
+kalibrering/statistik og HealthKit-tilladelser/import. Ingen nye timere,
+baggrundsprognose, dosisberegning, databaseændring eller eksterne frameworks.
+
+---
+
 <!-- testflight-7.1.1-4288:start -->
 ### TestFlight 7.1.1 (4288)
 

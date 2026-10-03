@@ -15,42 +15,52 @@ final class GlucoseForecastDataAdapter {
     private let coreDataManager: CoreDataManager
     private let therapyManager: TherapyMetricsManager
     private let defaults: UserDefaults
+    private let logForecast: (GlucoseForecastLogSnapshot) -> Void
+    private let appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown"
+    private let appBuild = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown"
     private let worker = DispatchQueue(label: "glucose.forecast.inputs", qos: .utility)
     private let cacheLock = NSLock()
     private var cache: (key: CacheKey, result: GlucoseForecastResult)?
 
     init(coreDataManager: CoreDataManager,
          therapyManager: TherapyMetricsManager = .shared,
-         defaults: UserDefaults = .standard) {
+         defaults: UserDefaults = .standard,
+         logForecast: @escaping (GlucoseForecastLogSnapshot) -> Void = { GlucoseForecastLog.shared.enqueue($0) }) {
         self.coreDataManager = coreDataManager
         self.therapyManager = therapyManager
         self.defaults = defaults
+        self.logForecast = logForecast
     }
 
     func forecast(horizonMinutes: Int, at now: Date = .now) async -> GlucoseForecastResult {
+        // Disabling the feature is not a failed calculation attempt.
+        if horizonMinutes == 0 { return Self.unavailable(.dataUnavailable) }
+        func unavailable(_ reason: GlucoseForecastUnavailableReason) -> GlucoseForecastResult {
+            record(Self.unavailable(reason), horizonMinutes: horizonMinutes)
+        }
         guard horizonMinutes == 60 || horizonMinutes == 120 else {
-            return Self.unavailable(horizonMinutes == 0 ? .dataUnavailable : .invalidHorizon)
+            return unavailable(.invalidHorizon)
         }
         let policy = defaults.dataFlowPolicy
         // External AID/pump amounts own Home therapy. The local treatment cache is not a
         // substitute when an external status is missing or late.
         guard Self.sourceAllowsForecast(policy) else {
-            return Self.unavailable(.externalOwner)
+            return unavailable(.externalOwner)
         }
         let importer = HealthKitTherapyImportManager.shared
         guard Self.treatmentSourcesAreUnambiguous(policy,
                                                    healthInsulinEnabled: importer.isEnabled(.insulin),
                                                    healthCarbsEnabled: importer.isEnabled(.carbohydrates)) else {
-            return Self.unavailable(.ambiguousTreatmentSources)
+            return unavailable(.ambiguousTreatmentSources)
         }
         let settings = TherapyModelSettings(defaults: defaults)
         guard settings.validInsulin, settings.validCarbs else {
-            return Self.unavailable(.invalidSettings)
+            return unavailable(.invalidSettings)
         }
         let manualSensitivity = defaults.glucoseForecastManualSensitivityMgdlPerUnit
         let manualRatio = defaults.glucoseForecastManualCarbRatioGramsPerUnit
         let parameters = Self.manualParameters(sensitivity: manualSensitivity, ratio: manualRatio)
-        if case .failure(let reason) = parameters { return Self.unavailable(reason) }
+        if case .failure(let reason) = parameters { return unavailable(reason) }
         return await withCheckedContinuation { continuation in
             worker.async(execute: DispatchWorkItem { [self] in
                 continuation.resume(returning: buildForecast(
@@ -68,18 +78,24 @@ final class GlucoseForecastDataAdapter {
     private func buildForecast(horizonMinutes: Int, at now: Date, policy: DataFlowPolicy,
                                settings: TherapyModelSettings, manualSensitivity: Double?,
                                manualRatio: Double?) -> GlucoseForecastResult {
-        guard !Task.isCancelled else { return Self.unavailable(.dataUnavailable) }
-        guard let glucose = recentGlucose(at: now) else { return Self.unavailable(.dataUnavailable) }
-        guard let referenceDate = glucose.last?.date else { return Self.unavailable(.missingGlucose) }
+        var knownReference: GlucoseForecastSample?
+        func unavailable(_ reason: GlucoseForecastUnavailableReason) -> GlucoseForecastResult {
+            record(Self.unavailable(reason), horizonMinutes: horizonMinutes,
+                   knownReference: knownReference, settings: settings)
+        }
+        guard !Task.isCancelled else { return unavailable(.dataUnavailable) }
+        guard let glucose = recentGlucose(at: now) else { return unavailable(.dataUnavailable) }
+        knownReference = glucose.last
+        guard let referenceDate = glucose.last?.date else { return unavailable(.missingGlucose) }
         let importer = HealthKitTherapyImportManager.shared
         guard !therapyManager.hasUncommittedTreatmentChanges,
               !importer.localInputIsIncomplete(.insulin),
               !importer.localInputIsIncomplete(.carbohydrates)
-        else { return Self.unavailable(.dataUnavailable) }
+        else { return unavailable(.dataUnavailable) }
         guard Self.treatmentSourcesAreUnambiguous(policy,
                                                    healthInsulinEnabled: importer.isEnabled(.insulin),
                                                    healthCarbsEnabled: importer.isEnabled(.carbohydrates)) else {
-            return Self.unavailable(.ambiguousTreatmentSources)
+            return unavailable(.ambiguousTreatmentSources)
         }
 
         // TherapyMetricsManager fetches hour buckets. Include the interval since the newest
@@ -88,13 +104,13 @@ final class GlucoseForecastDataAdapter {
         let start = referenceDate.addingTimeInterval(-max(settings.insulinDuration, settings.carbDuration) * 60)
         guard let fetchedTreatments = therapyManager.treatments(from: start, to: now,
                                                                 policy: policy, settings: settings)
-        else { return Self.unavailable(.dataUnavailable) }
+        else { return unavailable(.dataUnavailable) }
         guard !Self.hasTreatmentAfterReading(fetchedTreatments, referenceDate: referenceDate,
                                              calculationDate: now) else {
-            return Self.unavailable(.awaitingNextReading)
+            return unavailable(.awaitingNextReading)
         }
         guard !therapyManager.hasUncommittedTreatmentChanges else {
-            return Self.unavailable(.dataUnavailable)
+            return unavailable(.dataUnavailable)
         }
         let treatments = Self.treatmentsKnownAtReference(fetchedTreatments,
                                                          from: start, referenceDate: referenceDate)
@@ -106,7 +122,7 @@ final class GlucoseForecastDataAdapter {
         let ratio: Double
         switch parameters {
         case .success(let pair): (sensitivity, ratio) = pair
-        case .failure(let reason): return Self.unavailable(reason)
+        case .failure(let reason): return unavailable(reason)
         }
         let input = GlucoseForecastInput(
             glucose: glucose,
@@ -134,7 +150,7 @@ final class GlucoseForecastDataAdapter {
         let cached = cache?.key == key ? cache?.result : nil
         cacheLock.unlock()
         if let cached { return cached }
-        guard !Task.isCancelled else { return Self.unavailable(.dataUnavailable) }
+        guard !Task.isCancelled else { return unavailable(.dataUnavailable) }
         let calculated = GlucoseForecastEngine.predict(input)
         let result = GlucoseForecastResult(points: calculated.points,
                                            referenceDate: calculated.referenceDate,
@@ -142,11 +158,38 @@ final class GlucoseForecastDataAdapter {
                                            parameterSource: .manual,
                                            referenceSensorID: glucose.last?.sensorID)
         guard !therapyManager.hasUncommittedTreatmentChanges else {
-            return Self.unavailable(.dataUnavailable)
+            return unavailable(.dataUnavailable)
         }
         cacheLock.lock()
         cache = (key, result)
         cacheLock.unlock()
+        // Freeze the completed result and actual value inputs before enqueueing IO.
+        // UI never awaits the log worker. Cache hits above do not create new records.
+        return record(result, horizonMinutes: horizonMinutes, input: input,
+                      knownReference: knownReference, settings: settings,
+                      treatmentWindowStart: start, treatmentWindowEnd: referenceDate)
+    }
+
+    private func record(_ result: GlucoseForecastResult, horizonMinutes: Int,
+                        input: GlucoseForecastInput? = nil,
+                        knownReference: GlucoseForecastSample? = nil,
+                        settings: TherapyModelSettings? = nil,
+                        treatmentWindowStart: Date? = nil,
+                        treatmentWindowEnd: Date? = nil) -> GlucoseForecastResult {
+        let sensorID = knownReference?.sensorID
+        let context = GlucoseForecastLogContext(
+            appVersion: appVersion, appBuild: appBuild,
+            sourceIdentity: sensorID.map { "sensor:" + $0 } ?? "unresolved",
+            sensorIdentity: sensorID, knownReference: knownReference,
+            computedAt: Date(), horizonMinutes: horizonMinutes,
+            insulinModel: settings.map { TherapyInsulinPreset.nearest(to: $0.insulinPeak).rawValue },
+            treatmentWindowStart: treatmentWindowStart, treatmentWindowEnd: treatmentWindowEnd)
+        do {
+            logForecast(try GlucoseForecastLogSnapshot.make(input: input, result: result, context: context))
+        } catch {
+            // Deliberately excludes inputs, paths and the error's potentially sensitive text.
+            GlucoseForecastLog.shared.captureFailure()
+        }
         return result
     }
 

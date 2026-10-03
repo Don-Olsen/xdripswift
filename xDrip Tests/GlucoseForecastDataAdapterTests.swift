@@ -215,4 +215,69 @@ final class GlucoseForecastDataAdapterTests: XCTestCase {
             [before, later, future], referenceDate: referenceDate,
             calculationDate: referenceDate.addingTimeInterval(60)))
     }
+    @MainActor func testLoggingDoesNotTurnDisabledFeatureIntoFailedAttempt() async {
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let captured = ForecastAdapterLogCapture()
+        let adapter = GlucoseForecastDataAdapter(coreDataManager: core, logForecast: captured.append)
+        let result = await adapter.forecast(horizonMinutes: 0)
+        XCTAssertEqual(result.reason, .dataUnavailable)
+        XCTAssertEqual(captured.count, 0)
+        let invalid = await adapter.forecast(horizonMinutes: 35)
+        XCTAssertEqual(invalid.reason, .invalidHorizon)
+        XCTAssertNil(invalid.referenceDate)
+        XCTAssertEqual(captured.count, 1)
+    }
+
+    @MainActor func testCompletedCalculationLogsOncePerCacheAndSettingsStillRefreshUI() async throws {
+        let suite = "ForecastAdapterLogging-" + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.isMaster = true
+        defaults.therapyDataSourceType = .none
+        defaults.nightscoutEnabled = false
+        defaults.glucoseForecastManualSensitivityMgdlPerUnit = 36
+        defaults.glucoseForecastManualCarbRatioGramsPerUnit = 10
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let date = Date(timeIntervalSince1970: floor(Date().timeIntervalSince1970 / 60) * 60)
+        let sensor = Sensor(startDate: date.addingTimeInterval(-3600),
+                            nsManagedObjectContext: core.mainManagedObjectContext)
+        for minute in stride(from: -30, through: 0, by: 5) {
+            let reading = BgReading(timeStamp: date.addingTimeInterval(Double(minute * 60)),
+                                    sensor: sensor, calibration: nil, rawData: 140,
+                                    deviceName: "Synthetic", nsManagedObjectContext: core.mainManagedObjectContext)
+            reading.calculatedValue = 140
+        }
+        _ = TreatmentEntry(date: date.addingTimeInterval(-300), value: 1,
+                           treatmentType: .Insulin, nightscoutEventType: nil, enteredBy: "Synthetic",
+                           nsManagedObjectContext: core.mainManagedObjectContext)
+        XCTAssertTrue(core.saveChangesSynchronously())
+        let therapy = TherapyMetricsManager()
+        therapy.configure(coreDataManager: core, externalStatus: { nil })
+        let captured = ForecastAdapterLogCapture()
+        let adapter = GlucoseForecastDataAdapter(coreDataManager: core, therapyManager: therapy,
+                                                defaults: defaults, logForecast: captured.append)
+        let first = await adapter.forecast(horizonMinutes: 60, at: date)
+        XCTAssertNil(first.reason)
+        XCTAssertEqual(captured.count, 1)
+        let cached = await adapter.forecast(horizonMinutes: 60, at: date)
+        XCTAssertEqual(cached.points, first.points)
+        XCTAssertEqual(captured.count, 1)
+        defaults.glucoseForecastManualSensitivityMgdlPerUnit = 45
+        let changed = await adapter.forecast(horizonMinutes: 60, at: date)
+        XCTAssertNil(changed.reason)
+        XCTAssertNotEqual(changed.points, first.points)
+        // The store independently preserves the first valid record. It must not freeze the UI.
+        XCTAssertEqual(captured.count, 2)
+    }
+
+}
+
+
+private final class ForecastAdapterLogCapture: @unchecked Sendable {
+    private let lock = NSLock()
+    private var records: [GlucoseForecastLogSnapshot] = []
+    var count: Int { lock.lock(); defer { lock.unlock() }; return records.count }
+    func append(_ snapshot: GlucoseForecastLogSnapshot) {
+        lock.lock(); defer { lock.unlock() }; records.append(snapshot)
+    }
 }
