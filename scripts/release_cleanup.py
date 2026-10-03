@@ -15,6 +15,7 @@ import subprocess
 import zipfile
 
 from build_lock import build_lock
+import local_run_receipt
 
 class CleanupBlocked(RuntimeError):
     pass
@@ -329,6 +330,61 @@ def ensure_unopened(paths):
         require(p.returncode == 1 and not p.stdout.strip() and not p.stderr.strip(),
                 "Open files or uncertain lsof result: " + path)
 
+
+def local_candidates(root, current):
+    """Only explicitly registered, immutable completed local runs are considered."""
+    candidates, kept = [], []
+    registry = root / "build/release-automation/local-runs"
+    if not registry.exists():
+        return candidates, kept
+    require(not registry.is_symlink(), "Linked local-run registry")
+    cutoff = current.get("statusRecordedAt")
+    protected = [root, Path.home() / "DeveloperBuildData/xDrip/DerivedData"]
+    for release in (root / "build").glob("testflight-*"):
+        protected.extend((release.resolve(), (release / "build").resolve(),
+                          (release / "test").resolve(), (release / "verify").resolve()))
+    for registration in sorted(registry.glob("*.json")):
+        try:
+            row = read_json(registration)
+            output = Path(row["outputRoot"])
+            path = Path(row["receipt"])
+            require(row.get("schemaVersion") == 1 and path == output / local_run_receipt.RECEIPT,
+                    "Invalid local registration")
+            require(output.is_absolute() and output == output.resolve()
+                    and output != root and output not in root.parents,
+                    "Unknown local output path")
+            if root in output.parents:
+                require(root / "build" in output.parents, "Local output overlaps source tree")
+            receipt = read_json(path)
+            # All release roots, including incomplete and previous releases, are
+            # handled only by the stricter release-specific rules above.
+            dd = output / "DerivedData"
+            require(not any(p == dd or p in dd.parents or dd in p.parents
+                            for p in protected[1:]), "Local cache overlaps a protected build/cache")
+            require(cutoff is not None, "Current release has no completion timestamp")
+            cutoff_ns = int(datetime.fromisoformat(cutoff).timestamp() * 1_000_000_000)
+            derived = local_run_receipt.validate(receipt, root, output, cutoff_ns)
+            candidates.append({"kind": "local-run", "path": str(derived),
+                               "outputRoot": str(output), "receiptPath": str(path),
+                               "receiptSha256": hash_file(path),
+                               "registrationPath": str(registration),
+                               "registrationSha256": hash_file(registration),
+                               "files": scan_derived(derived) + scan_generated_products(derived)})
+        except (CleanupBlocked, OSError, ValueError, KeyError, TypeError) as error:
+            kept.append({"path": str(registration), "reason": str(error)})
+    return candidates, kept
+
+
+def confirm_local_receipts(candidates):
+    for candidate in candidates:
+        if candidate.get("kind") != "local-run":
+            continue
+        for prefix in ("receipt", "registration"):
+            path = Path(candidate[prefix + "Path"])
+            require(path == path.resolve() and path.is_file() and not path.is_symlink()
+                    and hash_file(path) == candidate[prefix + "Sha256"],
+                    "Local run registration/receipt changed during cleanup")
+
 def safe_unlink(item):
     # Open every parent with NOFOLLOW and unlink relative to an open directory.
     p = Path(item["path"])
@@ -346,7 +402,7 @@ def safe_unlink(item):
     finally:
         os.close(fd)
 
-def preservation_inventory(root, deletions):
+def preservation_inventory(root, deletions, local_outputs=()):
     """Metadata digest of every retained release file, including external signing output.
 
     Avoid reading multi-GiB XCResult/archives just to hash them. IPA content is
@@ -354,7 +410,7 @@ def preservation_inventory(root, deletions):
     change when cache leaves are removed, so only files and links are compared.
     """
     result = {}
-    for release in sorted((root / "build").glob("testflight-*")):
+    for release in sorted(set((root / "build").glob("testflight-*")) | set(local_outputs)):
         bases = {release.resolve()}
         for name in ("build", "verify"):
             child = release / name
@@ -387,7 +443,7 @@ def preservation_inventory(root, deletions):
 
 BUILD_AREA_LIMIT_BYTES = 15 * 1024 ** 3
 
-def build_area_usage(root, snapshot):
+def build_area_usage(root, snapshot, local_outputs=()):
     """Count worktree build areas and external signed output without following links twice."""
     paths = set()
     works = [Path(p) for p in snapshot if p != "refs"]
@@ -407,6 +463,10 @@ def build_area_usage(root, snapshot):
     if central.exists():
         require(central.is_dir() and not central.is_symlink(), "Unknown central build root")
         paths.add(central.resolve())
+    paths.update(Path(p).resolve() for p in local_outputs)
+    # A local checkout or signing directory may itself live under the central
+    # area. Count its outermost physical directory once, never add it twice.
+    paths = {p for p in paths if not any(other in p.parents for other in paths)}
     result = {}
     for path in sorted(paths):
         result[str(path)] = int(command(["du", "-sk", str(path)]).split()[0]) * 1024
@@ -430,18 +490,25 @@ def cleanup(root, client, apply=False):
                 "Active release identity mismatch")
         apple = confirm_apple(client, current)
         before = git_snapshot(root)
-        usage_before = build_area_usage(root, before)
         candidates, kept = release_candidates(root, current)
+        local, local_kept = local_candidates(root, current)
+        candidates.extend(local)
+        kept.extend(local_kept)
+        local_outputs = [Path(c["outputRoot"]) for c in local]
+        usage_before = build_area_usage(root, before, local_outputs)
         files = [f for c in candidates for f in c["files"]]
-        tracked = command(["git", "ls-files", "-z", "--", "build"], root).split("\0")
-        require(not any(str((root / p).resolve()) in {f["path"] for f in files} for p in tracked if p),
-                "Candidate includes a tracked file")
+        targets = {f["path"] for f in files}
+        for work in (Path(p) for p in before if p != "refs"):
+            tracked = command(["git", "ls-files", "-z"], work).split("\0")
+            require(not any(str((work / p).resolve()) in targets for p in tracked if p),
+                    "Candidate includes a tracked file")
         require(len({f["path"] for f in files}) == len(files), "Overlapping cleanup targets")
-        retained = preservation_inventory(root, {f["path"] for f in files})
+        retained = preservation_inventory(root, targets, local_outputs)
         ensure_unopened([c["path"] for c in candidates if c["files"]])
         idle()
         require(git_snapshot(root) == before, "Git changed during planning")
         require(read_json(root / "build/release-automation/active.json") == active, "Active release changed")
+        confirm_local_receipts(candidates)
         for f in files:
             require(fingerprint(Path(f["path"])) == f["fingerprint"], "Cache changed during planning")
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
@@ -465,6 +532,7 @@ def cleanup(root, client, apply=False):
                             continue
                         idle()
                         ensure_unopened([c["path"]])
+                        confirm_local_receipts([c])
                         for i, f in enumerate(c["files"]):
                             if i % 1000 == 0:
                                 idle()
@@ -475,11 +543,12 @@ def cleanup(root, client, apply=False):
                             report["deletedFiles"] += 1
                         journal.flush()
                         os.fsync(journal.fileno())
-            report["retainedAfter"] = preservation_inventory(root, {f["path"] for f in files})
+            confirm_local_receipts(candidates)
+            report["retainedAfter"] = preservation_inventory(root, targets, local_outputs)
             require(report["retainedAfter"] == retained, "Retained release files changed; inspect report")
             report["gitAfter"] = git_snapshot(root)
             require(report["gitAfter"] == before, "Git changed during cleanup; inspect report")
-            report["buildAreaAfter"] = build_area_usage(root, before)
+            report["buildAreaAfter"] = build_area_usage(root, before, local_outputs)
             report["spaceLimitResult"] = ("within-limit" if not report["buildAreaAfter"]["overLimitBytes"]
                                           else "limit-unmet; only protected or unclassified data remain")
             report["status"] = "completed" if apply else "dry-run"

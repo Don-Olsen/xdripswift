@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 cd "$repo_root"
 # Re-exec under the host-wide lock. A release parent passes the same open lock.
 if [[ -z "${XDRIP_BUILD_LOCK_FD:-}" ]]; then
@@ -17,23 +17,27 @@ xcrun() { python3 -B "$repo_root/scripts/build_lock.py" --child xcrun "$@"; }
 team_id="GFZ896KN66"
 main_bundle_id="com.GFZ896KN66.xdripswift"
 workspace="$repo_root/xdrip.xcworkspace"
-run_stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+run_stamp="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 if [[ -n "${XDRIP_OUTPUT_ROOT:-}" ]]; then
   # Release jobs supply their own output root; preserve that layout exactly.
   output_root="$XDRIP_OUTPUT_ROOT"
   derived_data="$output_root/DerivedData"
+  cache_mode="dedicated"
 else
   # Local runs share one cache per worktree instead of duplicating it per run.
   worktree_key="$(basename "$repo_root")"
   central_build_root="${HOME}/DeveloperBuildData/xDrip"
   output_root="$central_build_root/local-runs/$worktree_key/$run_stamp"
   derived_data="$central_build_root/DerivedData/$worktree_key"
+  cache_mode="shared"
 fi
 logs_dir="$output_root/logs"
 results_dir="$output_root/results"
 xcode_auth_args=(-allowProvisioningUpdates)
 
 mkdir -p "$logs_dir" "$results_dir" "$derived_data"
+output_root="$(cd "$output_root" && pwd -P)"
+derived_data="$(cd "$derived_data" && pwd -P)"
 
 die() {
   echo "error: $*" >&2
@@ -130,6 +134,10 @@ show_status() {
 }
 
 run_python_checks() {
+  python3 -B scripts/test_local_run_receipt.py 2>&1 \
+    | tee "$logs_dir/python-local-run-receipt.log"
+  python3 -B scripts/test_build_environment.py 2>&1 \
+    | tee "$logs_dir/python-build-environment.log"
   python3 -B scripts/test_release_cleanup.py 2>&1 \
     | tee "$logs_dir/python-release-cleanup.log"
   set -o pipefail
@@ -722,6 +730,40 @@ PY
 
 ensure_tools
 ensure_identity_override
+
+case "${1:-}" in
+  test-ci|test-all|build|all|release-test|archive)
+    python3 -B scripts/build_environment.py --repo "$repo_root" \
+      --output "$output_root" --derived-data "$derived_data"
+    ;;
+esac
+
+record_local_run_exit() {
+  local code=$?
+  trap - EXIT
+  python3 -B "$repo_root/scripts/local_run_receipt.py" finish \
+    --output "$output_root" --exit-code "$code" || {
+      echo "Local run receipt could not be finalized; cache remains protected." >&2
+      [ "$code" -ne 0 ] || code=1
+    }
+  exit "$code"
+}
+
+case "${1:-}" in
+  test-ci|test-all|build|all|release-test)
+    # Release-owned test runs already have release-state/test receipts and may
+    # be retried by the release state machine. Never add a local-run receipt.
+    case "$output_root" in
+      "$repo_root"/build/testflight-*/*) ;;
+      *)
+        python3 -B scripts/local_run_receipt.py start --repo "$repo_root" \
+          --output "$output_root" --derived "$derived_data" --command "$1" \
+          --cache-mode "$cache_mode"
+        trap record_local_run_exit EXIT
+        ;;
+    esac
+    ;;
+esac
 
 case "${1:-}" in
   status) show_status ;;

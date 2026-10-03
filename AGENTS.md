@@ -1,7 +1,19 @@
 # Release instructions for Don-Olsen/xdripswift
 
-First read `docs/PROJECT-STATUS.md` and `docs/MAC-BUILD.md`. Continue the existing
-`integration/upstream-7.1.1` worktree for 7.1.1; preserve the 4263 checkpoint.
+First read `docs/PROJECT-STATUS.md` and `docs/MAC-BUILD.md`. The active local
+checkout is `~/Developer/xdripswift`, branch `integration/upstream-7.1.1`.
+Continue that checkout for 7.1.1; preserve the 4263 checkpoint. The historical
+Documents/File Provider worktrees are retained for source and release evidence,
+but must not be used for new builds. The old `release-4288-local` path is only
+a compatibility symlink. Never delete source because it once lived under a
+build-data directory, and never delete a Git object-recovery repository while
+another repository references it through `objects/info/alternates`.
+
+Before Xcode work, `local-build.sh` verifies that source/output/cache paths are
+outside File Provider folders and have at least 10 GiB free. A blocked check is
+not permission to delete protected releases or bypass the check. Keep local
+runs on the default shared cache unless an isolated run is necessary; isolated
+runs must use the completion receipts documented in MAC-BUILD.md.
 
 Every future TestFlight release follows this sequence automatically:
 

@@ -14,6 +14,7 @@ from unittest import mock
 
 import release_cleanup as c
 import build_lock as locks
+import local_run_receipt as receipts
 
 class CleanupTests(unittest.TestCase):
     def setUp(self):
@@ -280,6 +281,77 @@ class CleanupTests(unittest.TestCase):
         parent=p.parent;parent.rename(parent.with_name('hold'));parent.symlink_to(parent.with_name('hold'))
         with self.assertRaises(OSError):c.safe_unlink(item)
         self.assertTrue(p.exists())
+
+    def make_local_run(self):
+        output = self.root / "build/local-test"
+        for relative in ("logs/iphone-build.log", "logs/watch-build.log",
+                         "results/retained.json", "DerivedData/iphone/ModuleCache.noindex/file.pcm",
+                         "DerivedData/iphone/Build/Products/app.app/binary",
+                         "DerivedData/iphone/Build/Intermediates.noindex/source.swift"):
+            path = output / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("** BUILD SUCCEEDED **")
+        receipts.start(self.root, output, output / "DerivedData", "build", "dedicated")
+        receipts.finish(output, 0)
+        path = self.current / "release-state.json"
+        state = json.loads(path.read_text())
+        state["statusRecordedAt"] = "2100-01-01T00:00:00+00:00"
+        self.write(path, state)
+        return output
+
+    def test_explicit_completed_local_run_only_loses_cache_and_preserves_evidence(self):
+        output = self.make_local_run()
+        before = self.manifest(output)
+        result = c.cleanup(self.root, self.client, True)
+        after = self.manifest(output)
+        self.assertEqual(set(before) - set(after), {
+            "DerivedData/iphone/ModuleCache.noindex/file.pcm",
+            "DerivedData/iphone/Build/Products/app.app/binary"})
+        self.assertTrue(all(before[name] == value for name, value in after.items()))
+        self.assertEqual(result["retainedBefore"], result["retainedAfter"])
+        self.assertEqual(c.cleanup(self.root, self.client, True)["deletedFiles"], 0)
+
+    def test_shared_incomplete_changed_and_unregistered_local_runs_preserved(self):
+        output = self.make_local_run()
+        path = output / receipts.RECEIPT
+        original = json.loads(path.read_text())
+        for change in ({"cacheMode": "shared"}, {"status": "running"}, {"exitCode": 1}):
+            self.write(path, dict(original, **change))
+            result = c.cleanup(self.root, self.client)
+            self.assertFalse(any(row.get("kind") == "local-run" for row in result["candidates"]))
+        self.write(path, original)
+        (output / "DerivedData/iphone/new.log").write_text("reused")
+        result = c.cleanup(self.root, self.client)
+        self.assertFalse(any(row.get("kind") == "local-run" for row in result["candidates"]))
+        self.assertTrue(any("reused" in row["reason"] for row in result["kept"]))
+
+    def test_registration_cannot_target_current_or_previous_release(self):
+        self.make_local_run()
+        for release in (self.current, self.previous):
+            output = release / "test"
+            self.write(output / receipts.RECEIPT, {"status": "completed"})
+            receipts.register(self.root, output)
+        result = c.cleanup(self.root, self.client)
+        self.assertTrue(any("protected build" in row["reason"] for row in result["kept"]))
+        self.assertTrue(self.cache(self.previous).exists())
+
+    def test_receipt_change_after_planning_blocks(self):
+        output = self.make_local_run()
+        current = json.loads((self.current / "release-state.json").read_text())
+        candidates, _ = c.local_candidates(self.root, current)
+        (output / receipts.RECEIPT).write_text("{}")
+        with self.assertRaisesRegex(c.CleanupBlocked, "receipt changed"):
+            c.confirm_local_receipts(candidates)
+
+    def test_nested_build_usage_counts_parent_once(self):
+        central = self.root / "DeveloperBuildData/xDrip"
+        work = central / "checkout"
+        (work / "build").mkdir(parents=True)
+        with mock.patch.object(c.Path, "home", return_value=self.root), \
+                mock.patch.object(c, "command", return_value="42 path"):
+            result = c.build_area_usage(work, {str(work): {}}, [work / "build"])
+        self.assertEqual(result["paths"], {str(central): 42 * 1024})
+        self.assertEqual(result["totalBytes"], 42 * 1024)
 
 class ProcessGateTests(unittest.TestCase):
     def test_empty_process_inventory_is_not_idle(self):

@@ -12,17 +12,39 @@ branchen bevarer denne vejledning og release-scriptet. Oplysningerne under
 
 ## Aktuel 7.1.1-integrationsworktree
 
-Fortsæt i `../xdripswift-upstream-7.1.1`, branch `integration/upstream-7.1.1`.
-Appkodecommit `f90b1dcb1d716aea41a0c68be7c6a47cc405ceee` har 983/983 beståede
-XCTest-tests og beståede iPhone-/Watch-simulatorbuilds. De efterfølgende
-procesændringer ændrer ikke appkoden. Checkpointet for 4263 og den ældre
-arbejdskopi er bevaret. Se aktuel adgangs-/uploadstatus i PROJECT-STATUS.md.
+Det faste arbejdssted på denne Mac er nu **`~/Developer/xdripswift`**, branch
+`integration/upstream-7.1.1`. Det er den lokale, selvstændige Git-kopi, som
+byggede og uploadede 4288. Den blev flyttet uden kopiering den 3. oktober 2026;
+hele træets 41.949 poster blev sammenlignet før/efter, og Git-status var ren.
+`~/DeveloperBuildData/xDrip/release-4288-local` er bevaret som kompatibilitetslink,
+så historiske kvitteringers absolutte stier stadig virker. Git og kildekode
+ligger dermed uden for området til genererede lokale builddata.
 
-Brugeren har givet **GO UPLOAD for 7.1.1**, inklusive automatisk valg af nummer,
-tracked versionsændring, checkpoint/push/tag, signering, arkiv/IPA, upload og
-Ole Internal. Der kræves ikke endnu et GO UPLOAD for samme udgivelse.
-Marketingversionen er 7.1.1 på alle fem bundles. Fallback 4231 er ikke et
-release-buildnummer og må ikke uploades.
+Documents-kopien `~/Documents/Codex/xdrip-release-4288` og de øvrige historiske
+worktrees bevares. De indeholder tidligere releases og lokale ændringer.
+Brug dem ikke til nye builds, og nulstil dem ikke. Git-hjælpekopien
+`~/Documents/Codex/xdrip-4288-object-recovery` er fortsat en nødvendig
+object-alternate for det historiske repository og må ikke slettes.
+Checkpointet for 4263 er urørt. Aktuel release-status findes i PROJECT-STATUS.md.
+
+Codex-projektets primære mappe skal være `~/Developer/xdripswift`. Kontroller
+arbejdsmappen ved nye opgaver; det gamle gemte projekt pegede ved denne
+vedligeholdelse stadig på Documents-kopien. Projektmenuens **Edit project /
+Rediger projekt** bruges til at vælge den lokale mappe som primær uden at
+slette chats eller historiske projektfiler. Det er beskrevet i
+[OpenAI Projects and chats](https://learn.chatgpt.com/docs/projects).
+
+Før test, simulatorbuild eller arkivering kontrollerer `local-build.sh`
+source-, output- og DerivedData-stier. File Provider-markører i en sti eller
+dens forældre stopper kørslen før Xcode. Det samme gælder, hvis der er under
+10 GiB fri diskplads, eller kontrollen ikke kan gennemføres. Det er en
+forhåndskontrol, ikke en garanti for et bestemt maksimalt buildforbrug.
+`XDRIP_OUTPUT_ROOT` og `XDRIP_SIGNING_OUTPUT_ROOT` bevarer deres betydning;
+brug lokale, ikke-synkroniserede placeringer.
+
+GO UPLOAD gælder den konkrete udgivelse. Vedligeholdelse og oprydning starter
+ingen release, ændrer intet versionsnummer og uploader ikke. Marketingversionen
+er fortsat 7.1.1 på alle fem bundles. Fallback 4231 må ikke uploades.
 
 ## Permanent automatisk TestFlight-proces
 
@@ -56,10 +78,11 @@ genoptager det registrerede forløb og kører selv prepare, checkpoint, publish,
 build, verify, upload, processing-kontrol og status. Ved en afsluttet release
 og nye kildeændringer vælges et nyt nummer; uændret kode gen-uploades ikke.
 
-Når worktree ligger i en macOS File Provider-mappe, kan den tilføje
-`com.apple.FinderInfo` til genererede app-bundles og få `codesign` til at
-afvise arkivet. Sæt i så fald `XDRIP_SIGNING_OUTPUT_ROOT` til en **ny, absolut
-sti på lokal disk uden for worktree**, f.eks. under
+Historisk kunne File Provider tilføje `com.apple.FinderInfo` til genererede
+app-bundles og få `codesign` til at afvise arkivet. Byg nu fra den lokale
+checkout ovenfor; ekstern signering alene gør ikke en synkroniseret kilde sikker.
+`XDRIP_SIGNING_OUTPUT_ROOT` kan stadig sættes til en **ny, absolut sti på lokal
+disk uden for worktree**, f.eks. under
 `~/Library/Application Support/xDrip4iOS/TestFlight/`. Release-scriptet
 opretter links fra de ignorerede `build/testflight-…/build` og
 `build/testflight-…/verify` til denne sti, så både signering og udpakning af
@@ -154,12 +177,13 @@ Efter en fuldført statuscommit/push med `Internal / Testing` forsøger
 Det aktuelle build bevares fuldstændigt, også DerivedData, den eksterne lokale
 signeringsmappe og verifikationsudpakningen. Nyere lokale builds bevares også.
 
-Oprydningen omfatter kun dette worktrees `build/testflight-<version>-<nummer>`
+Oprydning af releases omfatter kun dette worktrees `build/testflight-<version>-<nummer>`
 med lavere nummer end det aktive build, en afsluttet `status-recorded` /
 `internal-testing`-kvittering, korrekt Git-tag, verificeret IPA-hash, eksisterende
 XCArchive/dSYMs, XCResult og Apple-status. Fejlede, uafsluttede, ukendte og
-historiske lokale buildmapper samt andre worktrees og globale Xcode-caches
-ryddes ikke automatisk. Et tidligere eksternt signeringsoutput accepteres kun,
+uregistrerede historiske lokale buildmapper samt andre worktrees og globale
+Xcode-caches ryddes ikke automatisk. Registrerede lokale testcaches behandles
+separat efter reglerne nedenfor i den samme oprydningsmekanisme. Et tidligere eksternt signeringsoutput accepteres kun,
 når build-linket matcher den registrerede sti og ikke overlapper et beskyttet build.
 
 Der slettes kun navngivne, gendannelige filer fra **ældre afsluttede** builds,
@@ -223,6 +247,35 @@ eksisterende betydning: når den er sat, ligger logs, resultater og DerivedData
 under den valgte sti, så TestFlight-flowet fortsat bruger samme layout.
 Signeringsoutput kan fortsat styres med `XDRIP_SIGNING_OUTPUT_ROOT`. Den
 centrale placering er på den interne disk og er ikke et eksternt backup-arkiv.
+
+### Afsluttede lokale testkørsler
+
+`local-build.sh` registrerer lokale test- og simulatorbuilds med en
+`local-run-receipt.json` og en henvisning i
+`build/release-automation/local-runs/`. Den delte standardcache bevares og
+genbruges. En isoleret cache valgt med `XDRIP_OUTPUT_ROOT` kan først blive
+kandidat efter dokumenteret succes og en efterfølgende verificeret release.
+Brug en ny outputmappe til et nyt isoleret run; eksisterende kvitteringer må
+ikke overskrives for at genbruge en gammel mappe. Almindelige release-testmapper
+følger fortsat release-statusmaskinen og får ikke denne ekstra kvittering.
+
+Rå XCResult og slutmarkører i test-/buildlogs verificeres. Logs og testresultater
+bevares med SHA-256-kontrol, og alle cachefiler registreres med filidentitet,
+størrelse og ændringstid. Nyere, delte, aktive, fejlede eller ændrede caches
+bevares. Sletning bruger de eksisterende selektive filregler, proceskontroller,
+lås, journal og før/efter-kontrol; ingen hel mappe slettes.
+
+Gamle runs får ikke automatisk efterkonstrueret succes. Efter konkret analyse
+kan `local_run_receipt.py inspect-legacy` kontrollere rå XCResult, logs,
+eksisterende summary og den registrerede kildecommit. `register-legacy` gemmer
+resultatet som **legacy-inspected** med eksplicit proveniens, ikke som et nyt
+historisk exit-resultat. En registreret commit er ikke dokumentation for, at
+kilden dengang var uden lokale ændringer. Registreringen sletter intet;
+`release-testflight.py cleanup` planlægger, og `cleanup --apply` udfører den
+samme sikre kontrol og oprydning. Genkørsel skal slette nul yderligere filer.
+
+Den konkrete oprydning og validering den 3. oktober 2026 er beskrevet i
+[BUILD-STORAGE-20261003.md](BUILD-STORAGE-20261003.md).
 
 En afvist automatisk oprydning registreres som `blocked-*.json`; den ændrer ikke
 den færdige release og starter aldrig upload igen. Efter årsagen er afklaret:
