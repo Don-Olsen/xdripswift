@@ -337,6 +337,11 @@ struct RootHomeView: View {
         .onReceive(NotificationCenter.default.publisher(for: TherapyMetricsManager.changed)) { _ in
             forecastDataRevision &+= 1
         }
+        .onReceive(NotificationCenter.default.publisher(for: GlucoseForecastMLManager.modelDidChange)) { _ in
+            // Reuse the cached authoritative engine result with the newly activated
+            // local model; no glucose or treatment state is changed.
+            forecastDataRevision &+= 1
+        }
         .task(id: forecastRequestKey) {
             let context = forecastContext
             guard context.horizonMinutes != 0 else {

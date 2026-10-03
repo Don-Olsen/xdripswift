@@ -1,3 +1,50 @@
+## Lokal personlig ML-prognose efter 4291 — før udgivelse
+
+Den eksisterende prognosemotor forbliver uændret og er altid fallback.
+Den lokale kandidat træner på iPhone seks Create ML-modeller: korrektion og
+forventet fejl ved +30, +60 og +120 minutter. Retrospektiv genberegning bruger
+samme motor og featurefunktion som visningen, ti minutters afstand mellem
+træningsankre samt kronologisk adskilt træning, kalibrering og selvtjek.
+De sidste 28 kalenderdage frem til seneste brugbare dag deles i 14 dage til
+kalibrering og 14 dage til selvtjek; de behøver ikke alle være brugbare.
+Der kræves samlet mindst 60 kalenderdage med brugbare eksempler på alle tre
+horisonter. For hver horisont kræver træningsperioden mindst 30 brugbare dage
+og 300 eksempler; kalibrering og selvtjek kræver hver mindst 10 brugbare dage
+og 100 eksempler.
+En kandidat må kun aktiveres, hvis den samlede viste kurve forbedrer MAE mod
+motoren ved alle tre horisonter og ikke forværrer en gyldigt sammenlignelig
+aktiv model. Den aktiveres først efter fuld modelpakke er genindlæst og
+kontrolleret. Træning afbrydes, når appen forlades. Modellen bindes til
+behandlingskilde og indstillinger; ugyldige eller ukomplette prognoser
+falder tilbage til motoren.
+Midlertidige Create ML-checkpoints beskyttes og udelades fra backup, og
+afbrudte sessioner fjernes ved næste start. Kun den aktive model og én
+verificeret tidligere model beholdes; ukendte mapper bevares.
+
+Historiske behandlingers import-/registreringstid og tidligere indstillinger
+kan ikke altid bevises. Selvtjekket markeres derfor retrospektivt og kan ikke
+dokumentere fremtidig personlig præcision. Usikkerhedsbåndets 80 %-mål gælder
+kun de kalibrerede +30/+60/+120-punkter, ikke hele kurven. Der er ikke indført
+nye HealthKit-tilladelser eller ændret Bluetooth, Watch, alarmer, målinger,
+Nightscout eller kildeprioritet. Ingen trænede modeller eller helbredsdata
+skal i Git.
+
+Validering på den endelige lokale kilde 3. oktober 2026:
+`scripts/local-build.sh release-test` bestod med **1.227/1.227 XCTest-tests**,
+nul fejl og nul skipped, alle Python-kontroller samt iPhone- og Watch-
+simulatorbuilds. En separat usigneret iPhoneOS-arm64-build kompilerede
+Create ML-stien og bestod. Testkvittering og xcresult findes i
+`~/DeveloperBuildData/xDrip/local-runs/xdripswift/20261003T214314Z-23236/`.
+Den sidste iPhoneOS-kontrol er logget i
+`/tmp/xdrip-ml-final-device-build.log`. `git diff --check` og
+Xcode-projektets plist-kontrol bestod. Der er ikke trænet en model på
+brugerens faktiske iPhone eller målt dens fremtidige præcision; denne
+softwarevalidering dokumenterer hverken forbedret patientpræcision eller
+bånddækning i drift. Ingen version er ændret, og intet er uploadet eller
+installeret på tidspunktet for denne kontrol. Brugeren godkendte intern TestFlight-upload 4. oktober 2026; release-validering skal fortsat bestås.
+
+---
+
 <!-- testflight-7.1.1-4291:start -->
 ### TestFlight 7.1.1 (4291)
 

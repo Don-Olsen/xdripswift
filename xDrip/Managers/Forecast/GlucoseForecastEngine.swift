@@ -82,16 +82,20 @@ struct GlucoseForecastResult: Sendable {
     /// The sensor behind the reference reading, used to avoid showing an older estimate
     /// against a chart that has already switched to a different sensor.
     let referenceSensorID: String?
+    /// Optional display-only ML correction. The authoritative engine points above are unchanged.
+    let mlForecast: GlucoseForecastMLForecast?
 
     init(points: [GlucoseForecastPoint], referenceDate: Date?,
          reason: GlucoseForecastUnavailableReason?,
          parameterSource: GlucoseForecastParameterSource? = nil,
-         referenceSensorID: String? = nil) {
+         referenceSensorID: String? = nil,
+         mlForecast: GlucoseForecastMLForecast? = nil) {
         self.points = points
         self.referenceDate = referenceDate
         self.reason = reason
         self.parameterSource = parameterSource
         self.referenceSensorID = referenceSensorID
+        self.mlForecast = mlForecast
     }
 
     func value(atMinutes minutes: Int) -> Double? {

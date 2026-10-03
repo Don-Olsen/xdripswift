@@ -77,6 +77,63 @@ final class RootHomeInteractionTests: XCTestCase {
         XCTAssertTrue(measured.bgReadingDates.isEmpty)
     }
 
+    func testMLPresentationSelectsCentralLineAndPreservesEngineFallback() throws {
+        let reference = Date(timeIntervalSince1970: 1_800_000_000)
+        let future = reference.addingTimeInterval(30 * 60)
+        let enginePoints = [GlucoseForecastPoint(date: reference, glucoseMgdl: 110),
+                            GlucoseForecastPoint(date: future, glucoseMgdl: 120)]
+        let mlPoints = [GlucoseForecastPoint(date: reference, glucoseMgdl: 110),
+                        GlucoseForecastPoint(date: future, glucoseMgdl: 135)]
+        let rawBand = [GlucoseForecastMLBandPoint(date: future, lowerMgdl: -15, upperMgdl: 710)]
+        let ml = GlucoseForecastMLForecast(points: mlPoints, band: rawBand, modelID: "test-model")
+        let result = GlucoseForecastResult(points: enginePoints, referenceDate: reference,
+                                           reason: nil, mlForecast: ml)
+        XCTAssertTrue(GlucoseForecastMLPresentation.isML(result))
+        XCTAssertEqual(GlucoseForecastMLPresentation.points(in: result), mlPoints)
+        XCTAssertEqual(GlucoseForecastMLPresentation.band(in: result), rawBand)
+        XCTAssertEqual(GlucoseForecastMLPresentation.value(atMinutes: 30, in: result), 135)
+        XCTAssertEqual(result.points, enginePoints)
+        XCTAssertEqual(result.value(atMinutes: 30), 120)
+        XCTAssertEqual(try XCTUnwrap(result.mlForecast).band, rawBand)
+
+        let fallback = GlucoseForecastResult(points: enginePoints, referenceDate: reference,
+                                             reason: nil)
+        XCTAssertFalse(GlucoseForecastMLPresentation.isML(fallback))
+        XCTAssertEqual(GlucoseForecastMLPresentation.points(in: fallback), enginePoints)
+        XCTAssertTrue(GlucoseForecastMLPresentation.band(in: fallback).isEmpty)
+        XCTAssertEqual(GlucoseForecastMLPresentation.value(atMinutes: 30, in: fallback), 120)
+
+        let unavailable = GlucoseForecastResult(points: enginePoints, referenceDate: reference,
+                                                reason: .dataUnavailable, mlForecast: ml)
+        XCTAssertFalse(GlucoseForecastMLPresentation.isML(unavailable))
+        XCTAssertTrue(GlucoseForecastMLPresentation.points(in: unavailable).isEmpty)
+        XCTAssertTrue(GlucoseForecastMLPresentation.band(in: unavailable).isEmpty)
+    }
+
+    func testMLBandIsVisibleOnlyInLiveMainChartAndClippedWithoutChangingRawBounds() {
+        let reference = Date(timeIntervalSince1970: 1_800_000_000)
+        let point = GlucoseChartForecastBandPoint(date: reference.addingTimeInterval(30 * 60),
+                                                   lowerMgdl: -15, upperMgdl: 710)
+        let invalid = GlucoseChartForecastBandPoint(date: reference.addingTimeInterval(60 * 60),
+                                                     lowerMgdl: 200, upperMgdl: 100)
+        let start = reference.addingTimeInterval(-3 * 3600)
+        let visible = GlucoseChartForecastPresentation.visibleBandPoints([point, invalid],
+            referenceDate: reference, visibleStartDate: start, visibleEndDate: reference,
+            isMainChart: true)
+        XCTAssertEqual(visible, [point])
+        XCTAssertEqual(GlucoseChartForecastPresentation.clippedBand(point, to: -20...700), 20...600)
+        XCTAssertEqual(GlucoseChartForecastPresentation.clippedBand(point, to: 70...240), 70...240)
+        XCTAssertEqual(point.lowerMgdl, -15)
+        XCTAssertEqual(point.upperMgdl, 710)
+        XCTAssertNil(GlucoseChartForecastPresentation.clippedBand(invalid, to: 70...240))
+        XCTAssertTrue(GlucoseChartForecastPresentation.visibleBandPoints([point],
+            referenceDate: reference, visibleStartDate: start, visibleEndDate: reference,
+            isMainChart: false).isEmpty)
+        XCTAssertTrue(GlucoseChartForecastPresentation.visibleBandPoints([point],
+            referenceDate: reference, visibleStartDate: reference.addingTimeInterval(-4 * 3600),
+            visibleEndDate: reference.addingTimeInterval(-2 * 3600), isMainChart: true).isEmpty)
+    }
+
     func testForecastTimeDomainRemainsStableAcrossLoadingAndUnavailableResults() {
         let now = Date(timeIntervalSince1970: 1_800_000_000)
         let reference = now.addingTimeInterval(-30)

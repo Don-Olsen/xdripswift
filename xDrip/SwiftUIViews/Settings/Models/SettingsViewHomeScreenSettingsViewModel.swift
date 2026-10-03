@@ -228,6 +228,9 @@ class SettingsViewHomeScreenSettingsViewModel: NSObject, SettingsViewModelProtoc
                         }), reloadScope: .all),
             forecastSensitivityRow(),
             forecastCarbohydrateRatioRow(),
+            SettingsRow(id: "homeScreen.forecastMLTraining",
+                        title: GlucoseForecastTexts.text("forecast.personalML", fallback: "Personal forecast model"),
+                        accessory: .disclosure, action: .forecastMLTraining),
             SettingsRow(id: "homeScreen.forecastLogExport",
                         title: GlucoseForecastTexts.text("forecast.exportLog", fallback: "Export forecast log"),
                         accessory: .disclosure, action: .forecastLogExport)

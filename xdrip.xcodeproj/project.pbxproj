@@ -862,6 +862,17 @@
 		FA0310000000000000000001 /* GlucoseForecastLog.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA0310000000000000000011 /* GlucoseForecastLog.swift */; };
 		FA0310000000000000000002 /* GlucoseForecastLogTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA0310000000000000000012 /* GlucoseForecastLogTests.swift */; };
 		FA0310000000000000000003 /* GlucoseForecastLogExportView.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA0310000000000000000013 /* GlucoseForecastLogExportView.swift */; };
+		A33C0F010000000000000001 /* GlucoseForecastGlucoseSelection.swift in Sources */ = {isa = PBXBuildFile; fileRef = A33C0F020000000000000001 /* GlucoseForecastGlucoseSelection.swift */; };
+		A33C0F010000000000000002 /* GlucoseForecastMLFeatures.swift in Sources */ = {isa = PBXBuildFile; fileRef = A33C0F020000000000000002 /* GlucoseForecastMLFeatures.swift */; };
+		A33C0F010000000000000003 /* GlucoseForecastMLReplay.swift in Sources */ = {isa = PBXBuildFile; fileRef = A33C0F020000000000000003 /* GlucoseForecastMLReplay.swift */; };
+		A33C0F010000000000000004 /* GlucoseForecastMLHistoryLoader.swift in Sources */ = {isa = PBXBuildFile; fileRef = A33C0F020000000000000004 /* GlucoseForecastMLHistoryLoader.swift */; };
+		A33C0F010000000000000005 /* GlucoseForecastMLPresentation.swift in Sources */ = {isa = PBXBuildFile; fileRef = A33C0F020000000000000005 /* GlucoseForecastMLPresentation.swift */; };
+		A33C0F010000000000000006 /* GlucoseForecastMLTrainer.swift in Sources */ = {isa = PBXBuildFile; fileRef = A33C0F020000000000000006 /* GlucoseForecastMLTrainer.swift */; };
+		A33C0F010000000000000007 /* GlucoseForecastMLModelStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A33C0F020000000000000007 /* GlucoseForecastMLModelStore.swift */; };
+		A33C0F010000000000000008 /* GlucoseForecastMLTrainingCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = A33C0F020000000000000008 /* GlucoseForecastMLTrainingCoordinator.swift */; };
+		A33C0F010000000000000009 /* GlucoseForecastMLSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A33C0F020000000000000009 /* GlucoseForecastMLSettingsView.swift */; };
+		A33C0F01000000000000000A /* GlucoseForecastMLReplayTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A33C0F02000000000000000A /* GlucoseForecastMLReplayTests.swift */; };
+		A33C0F01000000000000000B /* GlucoseForecastMLTrainerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A33C0F02000000000000000B /* GlucoseForecastMLTrainerTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -2098,6 +2109,17 @@
 		FA0310000000000000000011 /* GlucoseForecastLog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "GlucoseForecastLog.swift"; sourceTree = "<group>"; };
 		FA0310000000000000000012 /* GlucoseForecastLogTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "xDrip Tests/GlucoseForecastLogTests.swift"; sourceTree = SOURCE_ROOT; };
 		FA0310000000000000000013 /* GlucoseForecastLogExportView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "GlucoseForecastLogExportView.swift"; sourceTree = "<group>"; };
+		A33C0F020000000000000001 /* GlucoseForecastGlucoseSelection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "GlucoseForecastGlucoseSelection.swift"; sourceTree = "<group>"; };
+		A33C0F020000000000000002 /* GlucoseForecastMLFeatures.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "GlucoseForecastMLFeatures.swift"; sourceTree = "<group>"; };
+		A33C0F020000000000000003 /* GlucoseForecastMLReplay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "GlucoseForecastMLReplay.swift"; sourceTree = "<group>"; };
+		A33C0F020000000000000004 /* GlucoseForecastMLHistoryLoader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "GlucoseForecastMLHistoryLoader.swift"; sourceTree = "<group>"; };
+		A33C0F020000000000000005 /* GlucoseForecastMLPresentation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "GlucoseForecastMLPresentation.swift"; sourceTree = "<group>"; };
+		A33C0F020000000000000006 /* GlucoseForecastMLTrainer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "GlucoseForecastMLTrainer.swift"; sourceTree = "<group>"; };
+		A33C0F020000000000000007 /* GlucoseForecastMLModelStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "GlucoseForecastMLModelStore.swift"; sourceTree = "<group>"; };
+		A33C0F020000000000000008 /* GlucoseForecastMLTrainingCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "GlucoseForecastMLTrainingCoordinator.swift"; sourceTree = "<group>"; };
+		A33C0F020000000000000009 /* GlucoseForecastMLSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "GlucoseForecastMLSettingsView.swift"; sourceTree = "<group>"; };
+		A33C0F02000000000000000A /* GlucoseForecastMLReplayTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "xDrip Tests/GlucoseForecastMLReplayTests.swift"; sourceTree = SOURCE_ROOT; };
+		A33C0F02000000000000000B /* GlucoseForecastMLTrainerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "xDrip Tests/GlucoseForecastMLTrainerTests.swift"; sourceTree = SOURCE_ROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -2161,6 +2183,14 @@
 				FC0303000000000000000005 /* GlucoseForecastEngine.swift */,
 				FC0303000000000000000006 /* GlucoseForecastDataAdapter.swift */,
 				FA0310000000000000000011 /* GlucoseForecastLog.swift */,
+				A33C0F020000000000000001 /* GlucoseForecastGlucoseSelection.swift */,
+				A33C0F020000000000000002 /* GlucoseForecastMLFeatures.swift */,
+				A33C0F020000000000000003 /* GlucoseForecastMLReplay.swift */,
+				A33C0F020000000000000004 /* GlucoseForecastMLHistoryLoader.swift */,
+				A33C0F020000000000000005 /* GlucoseForecastMLPresentation.swift */,
+				A33C0F020000000000000006 /* GlucoseForecastMLTrainer.swift */,
+				A33C0F020000000000000007 /* GlucoseForecastMLModelStore.swift */,
+				A33C0F020000000000000008 /* GlucoseForecastMLTrainingCoordinator.swift */,
 			);
 			path = Forecast;
 			sourceTree = "<group>";
@@ -2749,6 +2779,8 @@
 				FC0303000000000000000007 /* GlucoseForecastEngineTests.swift */,
 				FC0303000000000000000008 /* GlucoseForecastDataAdapterTests.swift */,
 				FA0310000000000000000012 /* GlucoseForecastLogTests.swift */,
+				A33C0F02000000000000000A /* GlucoseForecastMLReplayTests.swift */,
+				A33C0F02000000000000000B /* GlucoseForecastMLTrainerTests.swift */,
 				A9C7F0043003000100000001 /* HealthKitTherapyImportTests.swift */,
 			);
 			path = "xDrip Tests";
@@ -3170,6 +3202,7 @@
 				CD00FB5270FD0E5E2F710BE6 /* TimeScheduleView.swift */,
 				4D7A00033014000100000001 /* TroubleshootingLogView.swift */,
 				FA0310000000000000000013 /* GlucoseForecastLogExportView.swift */,
+				A33C0F020000000000000009 /* GlucoseForecastMLSettingsView.swift */,
 				A30000000000000000000001 /* Followers */,
 				6E033988052CBCF93DBE169B /* Models */,
 			);
@@ -4579,6 +4612,8 @@
 				FC0303000000000000000003 /* GlucoseForecastEngineTests.swift in Sources */,
 				FC0303000000000000000004 /* GlucoseForecastDataAdapterTests.swift in Sources */,
 				FA0310000000000000000002 /* GlucoseForecastLogTests.swift in Sources */,
+				A33C0F01000000000000000A /* GlucoseForecastMLReplayTests.swift in Sources */,
+				A33C0F01000000000000000B /* GlucoseForecastMLTrainerTests.swift in Sources */,
 				A9C7F0033003000100000001 /* HealthKitTherapyImportTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -5006,6 +5041,15 @@
 				FC0303000000000000000002 /* GlucoseForecastDataAdapter.swift in Sources */,
 				FA0310000000000000000001 /* GlucoseForecastLog.swift in Sources */,
 				FA0310000000000000000003 /* GlucoseForecastLogExportView.swift in Sources */,
+				A33C0F010000000000000001 /* GlucoseForecastGlucoseSelection.swift in Sources */,
+				A33C0F010000000000000002 /* GlucoseForecastMLFeatures.swift in Sources */,
+				A33C0F010000000000000003 /* GlucoseForecastMLReplay.swift in Sources */,
+				A33C0F010000000000000004 /* GlucoseForecastMLHistoryLoader.swift in Sources */,
+				A33C0F010000000000000005 /* GlucoseForecastMLPresentation.swift in Sources */,
+				A33C0F010000000000000006 /* GlucoseForecastMLTrainer.swift in Sources */,
+				A33C0F010000000000000007 /* GlucoseForecastMLModelStore.swift in Sources */,
+				A33C0F010000000000000008 /* GlucoseForecastMLTrainingCoordinator.swift in Sources */,
+				A33C0F010000000000000009 /* GlucoseForecastMLSettingsView.swift in Sources */,
 				4D20C0042FF1000100000001 /* RootHomeView.swift in Sources */,
 				4D21B0022FF8000100000001 /* RootHomeChartRange.swift in Sources */,
 				4D21B0032FF8000100000001 /* RootHomeToolbarView.swift in Sources */,

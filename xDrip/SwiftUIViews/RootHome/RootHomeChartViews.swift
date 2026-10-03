@@ -35,6 +35,15 @@ struct RootHomeMainChartView: View {
     // Hide curves immediately and cancel pending chart work when Treatments is off.
     private var hasIOB: Bool { showsTreatments && allowsTherapyCharts && showIOBCOB && !therapySeries.iob.isEmpty }
     private var hasCOB: Bool { showsTreatments && allowsTherapyCharts && showIOBCOB && !therapySeries.cob.isEmpty }
+    private var displayedForecastPoints: [GlucoseForecastPoint] {
+        forecastResult.map { GlucoseForecastMLPresentation.points(in: $0) } ?? []
+    }
+    private var displayedForecastBand: [GlucoseForecastMLBandPoint] {
+        forecastResult.map { GlucoseForecastMLPresentation.band(in: $0) } ?? []
+    }
+    private var isMLForecast: Bool {
+        forecastResult.map(GlucoseForecastMLPresentation.isML) ?? false
+    }
     // Reuse the glucose cache's buffered coverage, rounded outward so tiny pans do
     // not dispatch another fetch and rebuild for each visible-range change.
     private var therapyStart: Date { Date(timeIntervalSince1970: floor(chartState.dataStartDate.timeIntervalSince1970 / 3600) * 3600) }
@@ -80,9 +89,14 @@ struct RootHomeMainChartView: View {
                     reservesDomainWhileLoading: showsTreatments && allowsTherapyCharts && showIOBCOB
                 )
                 .forecastPlot(
-                    forecastResult?.reason == nil ? forecastResult?.points.map {
+                    displayedForecastPoints.map {
                         GlucoseChartForecastPoint(date: $0.date, glucoseMgdl: $0.glucoseMgdl)
-                    } ?? [] : [],
+                    },
+                    bandPoints: displayedForecastBand.map {
+                        GlucoseChartForecastBandPoint(date: $0.date, lowerMgdl: $0.lowerMgdl,
+                                                      upperMgdl: $0.upperMgdl)
+                    },
+                    isML: isMLForecast,
                     from: forecastResult?.reason == nil ? forecastResult?.referenceDate : nil,
                     horizonMinutes: forecastHorizonMinutes
                 )
@@ -171,7 +185,7 @@ struct RootHomeMainChartView: View {
     private var forecastBadge: some View {
         VStack(alignment: .leading, spacing: 2) {
             if let forecastResult, forecastResult.reason == nil {
-                Text("\(GlucoseForecastTexts.estimate) · \(forecastSource(forecastResult.parameterSource)) · \(forecastUnit)" +
+                Text("\(forecastKind) · \(forecastSource(forecastResult.parameterSource)) · \(forecastUnit)" +
                      (forecastHorizonMinutes == 120 ? " · \(GlucoseForecastTexts.uncertain)" : ""))
                     .fontWeight(.semibold)
                 HStack(spacing: 6) {
@@ -187,6 +201,11 @@ struct RootHomeMainChartView: View {
                             Text("+120 \(forecastValue(at: 120, from: forecastResult))")
                         }
                     }
+                }
+                if isMLForecast {
+                    Text(GlucoseForecastTexts.text("forecast.pointwise80Target",
+                                                   fallback: "80% target at +30/+60/+120 min; intermediate widths are interpolated"))
+                        .foregroundStyle(ConstantsAppColors.secondaryText)
                 }
             } else {
                 Text(GlucoseForecastTexts.estimate)
@@ -207,12 +226,19 @@ struct RootHomeMainChartView: View {
         .accessibilityValue(forecastResult?.referenceDate.map(GlucoseForecastTexts.basedOnReading) ?? "")
     }
 
+    private var forecastKind: String {
+        isMLForecast
+            ? GlucoseForecastTexts.text("forecast.mlEstimate", fallback: "ML estimate")
+            : GlucoseForecastTexts.text("forecast.engineEstimate", fallback: "Engine estimate")
+    }
+
     private var forecastUnit: String {
         UserDefaults.standard.bloodGlucoseUnitIsMgDl ? Texts_Common.mgdl : Texts_Common.mmol
     }
 
     private func forecastValue(at minutes: Int, from result: GlucoseForecastResult) -> String {
-        guard let value = result.value(atMinutes: minutes), value.isFinite else { return "–" }
+        guard let value = GlucoseForecastMLPresentation.value(atMinutes: minutes, in: result),
+              value.isFinite else { return "–" }
         return value.mgDlToMmolAndToString(mgDl: UserDefaults.standard.bloodGlucoseUnitIsMgDl)
     }
 

@@ -1149,6 +1149,10 @@ final class CareLinkTests: XCTestCase {
             }
         }
         let end = Date(timeIntervalSince1970: Date().timeIntervalSince1970.rounded(.down))
+        // Repair corroborates a timestamp shift from three distinct events on one UTC day.
+        // Keep the first three half-hourly events together when this rolling window starts near midnight.
+        let secondsUntilNextUTCDay = 86_400 - end.timeIntervalSince1970.truncatingRemainder(dividingBy: 86_400)
+        let firstEventOffset = secondsUntilNextUTCDay <= 4_200 ? secondsUntilNextUTCDay + 600 : 600
         let core = try CoreDataManager(testModelName: ConstantsCoreData.modelName, persistentStoreURL: beforeURL)
         var incoming = [CareLinkTherapyRecord]()
         for day in 0..<7 {
@@ -1160,7 +1164,7 @@ final class CareLinkTests: XCTestCase {
                 reading.calculatedValue = 110 + Double(sample % 30)
             }
             for hour in 0..<24 {
-                let date = start.addingTimeInterval(Double(hour) * 3300 + 600)
+                let date = start.addingTimeInterval(Double(hour) * 1800 + firstEventOffset)
                 var events = [repairRecord(date, amount: [1.25, 1.75, 2.25][hour % 3])] // 42 U/day basal
                 if hour % 6 == 0 { events.append(repairRecord(date, amount: [5.0, 6, 8, 9][hour / 6], type: .Insulin)) } // 28 U/day bolus
                 if hour % 8 == 0 { events.append(repairRecord(date, amount: 60, type: .Carbs)) }

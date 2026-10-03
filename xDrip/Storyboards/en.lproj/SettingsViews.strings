@@ -553,3 +553,24 @@
 "forecast.exportPreparing" = "Preparing CSV…";
 "forecast.exportPrivacy" = "This file contains health data and stays on this iPhone until you choose where to share it. Forecasts are logged when Home calculates them, not continuously throughout the day.";
 "forecast.updating" = "Updating…";
+
+// Local personal forecast model
+"forecast.personalML" = "Personal forecast model";
+"forecast.mlEstimate" = "ML estimate";
+"forecast.engineEstimate" = "engine";
+"forecast.pointwise80Target" = "80% target at +30/+60/+120 min; intermediate widths are interpolated";
+"forecast.mlActive" = "Active personal model";
+"forecast.mlCompatible" = "Model matches current settings";
+"forecast.mlIncompatible" = "Saved model does not match current settings";
+"forecast.mlIncompatibleFallback" = "The forecast engine is used until a model for the current settings and treatment sources passes self-check.";
+"forecast.mlUsableDays" = "Usable data days";
+"forecast.mlModelID" = "Model ID";
+"forecast.mlEngineFallback" = "The forecast engine is active until a personal model passes every self-check.";
+"forecast.mlTraining" = "Training locally on this iPhone…";
+"forecast.mlTrainNow" = "Train now";
+"forecast.mlOnDevice" = "Training and models stay on this iPhone. The existing forecast engine remains the fallback. Training never changes measured glucose or alarms.";
+"forecast.mlSelfCheck" = "Last historical self-check";
+"forecast.mlPairs" = "pairs";
+"forecast.mlMAE" = "MAE";
+"forecast.mlCoverage" = "Observed band coverage";
+"forecast.mlRetrospective" = "Historical treatment import times and past settings are not always known. The self-check is retrospective, not a guarantee of future accuracy. The band targets 80% coverage at each horizon, not for the entire curve.";

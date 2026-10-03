@@ -71,6 +71,71 @@ For each five-minute point, bolus and carbohydrate effects are the difference be
 
 The model assumes stable unmodeled background glucose/long-acting basal action. Missed or changed Tresiba, exercise, illness, stress, sensor lag and new food or insulin can invalidate that assumption. The forecast is exploratory until prospective device data establishes its error and coverage. No claim of Trio-equivalent accuracy is made.
 
+## Local personal ML candidate after 4291 (pre-release validation)
+
+This local candidate keeps the existing Swift forecast engine authoritative. When a
+validated device-local model is compatible with the current treatment sources and
+therapy settings, it adds a bounded correction to each existing five-minute engine
+point; otherwise the complete engine forecast remains visible. The engine's stored
+points and its prospective baseline log are unchanged. ML never creates a
+forecast when the engine has rejected its inputs. It does not write measured
+glucose, therapy, alarms, HealthKit, Nightscout or Watch data. There is no model
+import, Mac training pipeline, new permission, background polling or dose advice.
+
+The fixed 16-column feature contract uses raw glucose slopes, the existing
+treatment curves, IOB/COB from bolus/carbohydrates only, and the local time at
+the reference reading. Retrospective examples use all original glucose samples
+inside each selected engine window; only the training anchors are spaced ten
+minutes apart. Targets are nearest same-sensor readings within ±2 minutes,
+with earlier readings winning ties. Historical treatment ingestion times and
+past therapy settings are not reliably retained. The replay marks their
+availability provenance **unknown** and applies one snapshot of current
+settings; its self-check cannot prove live accuracy or freedom from all
+retrospective information bias.
+
+Create ML trains separate boosted-tree correction and expected-error models at
++30, +60 and +120 minutes, sequentially on the iPhone while the app is active.
+The error targets come from chronological out-of-sample complete-line
+predictions. The last 28 calendar days ending on the latest usable day
+are held apart: 14 for interval calibration and 14 for final self-check;
+targets crossing boundaries are excluded. Training requires at least 60
+calendar days with usable examples across all three horizons. Within each
+period and horizon, A requires at least 30 usable days and 300 examples,
+while B and C each require at least 10 usable days and 100 examples. A
+candidate activates only if the complete ML line's MAE beats the engine at
+all three horizons and does not worsen against a fairly comparable current
+model. An incompatible model, failed training, partial package, nonfinite
+result or any central point outside 20–600 mg/dL leaves the engine in use.
+No trained model is committed to Git.
+
+Corrections are capped at ±27 mg/dL at +30/+60/+120 and linearly interpolated
+between knots, with zero correction at the reference. The engine's own
+five-minute shape remains intact. The displayed interval targets 80% coverage
+at **the three calibrated horizons** using deterministic nearest-rank
+calibration of positive expected error; intermediate interval widths are
+interpolated. This is neither a probability for the whole curve nor a
+hypoglycemia safety limit. Settings → Home Screen → Personal forecast model
+shows the current status, historical self-check and **Train now**. Training
+stops when the app leaves the foreground; the next foreground use can retry.
+Model packages are written in Application Support and activated through an
+atomic pointer only after all six compiled models reload and validate.
+Create ML checkpoint directories are protected and excluded from backup before
+training writes to them; interrupted sessions are removed on the next start.
+Model retention keeps the active package and one verified previous package,
+while unknown directories are preserved.
+
+These checks are software safeguards, not an observed improvement for this
+person. A physical run must compare newly collected predictions with later
+measured glucose and document any intervening meals, boluses or setting changes.
+The exact local candidate passed 1,227/1,227 XCTest tests (zero failed or
+skipped), all existing Python controls, both iPhone/Watch simulator builds and
+a separate unsigned iPhoneOS arm64 compile of the Create ML path on
+2026-10-03. The local result bundle is under
+`~/DeveloperBuildData/xDrip/local-runs/xdripswift/20261003T214314Z-23236/`.
+No model has been trained or exercised on the user's actual iPhone, so the
+self-check promotion and claimed 80% interval target remain unverified in
+physical use. The user authorized internal TestFlight upload on 2026-10-04; release validation remains required.
+
 ## Validation boundary
 
 Unit tests cover model curves, timing, units, stale and gapped data, treatment selection, source ownership and missing settings. Real-world accuracy must be assessed at +30, +60 and +120 minutes separately against measured glucose, an unchanged-value baseline and a simple short trend. Inputs must be frozen at prediction time; later meals, insulin, corrections and changed settings must be reported separately. Historical xDrip treatment rows do not consistently retain a “known to the app at this time” timestamp, so a retrospective replay cannot prove that it avoided future information. Prospective snapshots or an external dataset with that provenance are needed before reporting comparative accuracy.

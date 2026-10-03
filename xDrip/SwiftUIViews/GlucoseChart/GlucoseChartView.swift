@@ -155,7 +155,16 @@ struct GlucoseChartForecastPoint {
     let glucoseMgdl: Double
 }
 
+struct GlucoseChartForecastBandPoint: Equatable {
+    let date: Date
+    let lowerMgdl: Double
+    let upperMgdl: Double
+}
+
 struct GlucoseChartForecastPresentation {
+    /// A practical glucose display range for a pointwise ML interval, independent of raw output.
+    static let practicalBandRange: ClosedRange<Double> = 20...600
+
     static func visiblePoints(_ points: [GlucoseChartForecastPoint], referenceDate: Date?,
                               visibleStartDate: Date, visibleEndDate: Date,
                               isMainChart: Bool) -> [GlucoseChartForecastPoint] {
@@ -166,6 +175,30 @@ struct GlucoseChartForecastPresentation {
             $0.date >= referenceDate && $0.date <= referenceDate.addingTimeInterval(120 * 60) &&
                 $0.glucoseMgdl.isFinite && $0.glucoseMgdl > 0
         }
+    }
+
+    static func visibleBandPoints(_ points: [GlucoseChartForecastBandPoint], referenceDate: Date?,
+                                  visibleStartDate: Date, visibleEndDate: Date,
+                                  isMainChart: Bool) -> [GlucoseChartForecastBandPoint] {
+        guard isMainChart, let referenceDate,
+              referenceDate >= visibleStartDate, referenceDate <= visibleEndDate else { return [] }
+        return points.filter {
+            $0.date >= referenceDate && $0.date <= referenceDate.addingTimeInterval(120 * 60) &&
+                $0.lowerMgdl.isFinite && $0.upperMgdl.isFinite && $0.lowerMgdl <= $0.upperMgdl
+        }
+    }
+
+    /// Clamp only values passed to Swift Charts. Neither raw interval nor central forecast changes.
+    static func clippedBand(_ point: GlucoseChartForecastBandPoint,
+                            to chartDomain: ClosedRange<Double>) -> ClosedRange<Double>? {
+        guard point.lowerMgdl.isFinite, point.upperMgdl.isFinite,
+              point.lowerMgdl <= point.upperMgdl else { return nil }
+        let lowerLimit = max(practicalBandRange.lowerBound, chartDomain.lowerBound)
+        let upperLimit = min(practicalBandRange.upperBound, chartDomain.upperBound)
+        guard lowerLimit < upperLimit else { return nil }
+        let lower = min(max(point.lowerMgdl, lowerLimit), upperLimit)
+        let upper = min(max(point.upperMgdl, lowerLimit), upperLimit)
+        return lower...upper
     }
 
     /// Reserve the configured live horizon even while an estimate is loading or unavailable.
@@ -218,6 +251,8 @@ struct GlucoseChartView: View {
     private var renderBasalDownwards = false
     /// A separate presentation series. These values never enter GlucoseChartState or measured BG.
     private var forecastPoints = [GlucoseChartForecastPoint]()
+    private var forecastBandPoints = [GlucoseChartForecastBandPoint]()
+    private var forecastIsML = false
     private var forecastReferenceDate: Date?
     private var forecastHorizonMinutes = 0
 
@@ -424,10 +459,13 @@ struct GlucoseChartView: View {
     }
 
     /// Show an estimated future series only in the live Home chart.
-    func forecastPlot(_ points: [GlucoseChartForecastPoint], from referenceDate: Date?,
-                      horizonMinutes: Int = 0) -> Self {
+    func forecastPlot(_ points: [GlucoseChartForecastPoint],
+                      bandPoints: [GlucoseChartForecastBandPoint] = [], isML: Bool = false,
+                      from referenceDate: Date?, horizonMinutes: Int = 0) -> Self {
         var view = self
         view.forecastPoints = points
+        view.forecastBandPoints = bandPoints
+        view.forecastIsML = isML
         view.forecastReferenceDate = referenceDate
         view.forecastHorizonMinutes = horizonMinutes
         return view
@@ -436,6 +474,15 @@ struct GlucoseChartView: View {
     private var visibleForecastPoints: [GlucoseChartForecastPoint] {
         GlucoseChartForecastPresentation.visiblePoints(
             forecastPoints, referenceDate: forecastReferenceDate,
+            visibleStartDate: visibleStartDate, visibleEndDate: visibleEndDate,
+            isMainChart: usesMainChartYAxisContext
+        )
+    }
+
+    private var visibleForecastBandPoints: [GlucoseChartForecastBandPoint] {
+        guard !visibleForecastPoints.isEmpty else { return [] }
+        return GlucoseChartForecastPresentation.visibleBandPoints(
+            forecastBandPoints, referenceDate: forecastReferenceDate,
             visibleStartDate: visibleStartDate, visibleEndDate: visibleEndDate,
             isMainChart: usesMainChartYAxisContext
         )
@@ -774,6 +821,7 @@ struct GlucoseChartView: View {
         let treatmentValues = visibleCalibrationPoints.map { $0.value } + visibleTreatmentPoints.nonBasalRenderableValues
             + (downwardBasal ? [] : basalValues)
         let visibleForecast = visibleForecastPoints
+        let visibleForecastBand = visibleForecastBandPoints
         let allBgValues = bgReadingValues + additionalValues + treatmentValues
         // Keep geometry separate from visibility: unavailable estimates and treatments stay hidden.
         let visibleTherapy = showsTreatments && usesMainChartYAxisContext ? therapySeries.clipped(from: visibleStartDate, to: visibleEndDate) : TherapyChartSeries()
@@ -1021,6 +1069,20 @@ struct GlucoseChartView: View {
                 }
             }
 
+            // The pointwise ML interval is a chart-only layer behind measured glucose. It does
+            // not contribute to the axis bounds, which continue to follow the central line.
+            ForEach(visibleForecastBand, id: \.date) { point in
+                if let clipped = GlucoseChartForecastPresentation.clippedBand(point, to: domain) {
+                    AreaMark(x: .value("Estimated time", point.date),
+                             yStart: .value("Interval lower", clipped.lowerBound),
+                             yEnd: .value("Interval upper", clipped.upperBound),
+                             series: .value("Series", "glucose-forecast-ml-band"))
+                        .interpolationMethod(.linear)
+                        .foregroundStyle(Color.cyan.opacity(0.18))
+                        .accessibilityHidden(true)
+                }
+            }
+
             // Main glucose points.
             ForEach(bgReadingValues.indices, id: \.self) { index in
                 PointMark(x: .value("Time", bgReadingDates[index]),
@@ -1037,9 +1099,10 @@ struct GlucoseChartView: View {
                          y: .value("Estimated glucose", point.glucoseMgdl),
                          series: .value("Series", "glucose-forecast"))
                     .interpolationMethod(.linear)
-                    .lineStyle(StrokeStyle(lineWidth: 2.5, dash: [5, 4]))
+                    .lineStyle(forecastIsML ? StrokeStyle(lineWidth: 2.5)
+                                             : StrokeStyle(lineWidth: 2.5, dash: [5, 4]))
                     .foregroundStyle(Color.cyan)
-                    .accessibilityLabel(Bundle.main.localizedString(forKey: "forecast.estimate", value: "Estimate", table: "SettingsViews"))
+                    .accessibilityLabel(forecastIsML ? "ML estimate" : Bundle.main.localizedString(forKey: "forecast.estimate", value: "Estimate", table: "SettingsViews"))
                     .accessibilityValue(point.glucoseMgdl.mgDlToMmolAndToString(mgDl: isMgDl))
             }
 

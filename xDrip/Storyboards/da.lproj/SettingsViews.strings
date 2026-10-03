@@ -583,3 +583,24 @@
 "forecast.exportPreparing" = "Klargør CSV…";
 "forecast.exportPrivacy" = "Filen indeholder helbredsdata og bliver på denne iPhone, indtil du vælger, hvor den skal deles. Prognoser logges, når Hjemskærmen beregner dem, ikke løbende hele døgnet.";
 "forecast.updating" = "Opdaterer…";
+
+// Local personal forecast model
+"forecast.personalML" = "Personlig prognosemodel";
+"forecast.mlEstimate" = "ML-estimat";
+"forecast.engineEstimate" = "motor";
+"forecast.pointwise80Target" = "80 % mål ved +30/+60/+120 min.; bredden imellem er interpoleret";
+"forecast.mlActive" = "Aktiv personlig model";
+"forecast.mlCompatible" = "Modellen passer til de aktuelle indstillinger";
+"forecast.mlIncompatible" = "Den gemte model passer ikke til de aktuelle indstillinger";
+"forecast.mlIncompatibleFallback" = "Prognosemotoren bruges, indtil en model for de aktuelle indstillinger og behandlingskilder består selvtjekket.";
+"forecast.mlUsableDays" = "Dage med brugbare data";
+"forecast.mlModelID" = "Model-id";
+"forecast.mlEngineFallback" = "Prognosemotoren bruges, indtil en personlig model består alle selvtjek.";
+"forecast.mlTraining" = "Træner lokalt på denne iPhone…";
+"forecast.mlTrainNow" = "Træn nu";
+"forecast.mlOnDevice" = "Træning og modeller bliver på denne iPhone. Den eksisterende prognosemotor er reserve. Træningen ændrer aldrig målte glukoseværdier eller alarmer.";
+"forecast.mlSelfCheck" = "Seneste historiske selvtjek";
+"forecast.mlPairs" = "par";
+"forecast.mlMAE" = "MAE";
+"forecast.mlCoverage" = "Observeret bånddækning";
+"forecast.mlRetrospective" = "Tidspunkter for historisk import af behandlinger og tidligere indstillinger kendes ikke altid. Selvtjekket er retrospektivt og garanterer ikke fremtidig præcision. Båndet sigter mod 80 % dækning ved +30/+60/+120 minutter; bredden imellem er interpoleret.";

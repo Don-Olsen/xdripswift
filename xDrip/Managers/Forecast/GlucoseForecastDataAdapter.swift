@@ -75,6 +75,8 @@ final class GlucoseForecastDataAdapter {
         }
         let inputSignature = Self.presentationInputSignature(horizonMinutes: horizonMinutes,
                                                             defaults: defaults, importer: healthImporter)
+        let mlSourceSignature = Self.presentationInputSignature(horizonMinutes: 120,
+                                                                defaults: defaults, importer: healthImporter)
         guard horizonMinutes == 60 || horizonMinutes == 120 else {
             return unavailable(.invalidHorizon)
         }
@@ -107,7 +109,8 @@ final class GlucoseForecastDataAdapter {
                     settings: settings,
                     manualSensitivity: manualSensitivity,
                     manualRatio: manualRatio,
-                    inputSignature: inputSignature
+                    inputSignature: inputSignature,
+                    mlSourceSignature: mlSourceSignature
                 ))
             })
         }
@@ -115,7 +118,8 @@ final class GlucoseForecastDataAdapter {
 
     private func buildForecast(horizonMinutes: Int, at now: Date, policy: DataFlowPolicy,
                                settings: TherapyModelSettings, manualSensitivity: Double?,
-                               manualRatio: Double?, inputSignature: String) -> GlucoseForecastPresentationOutcome {
+                               manualRatio: Double?, inputSignature: String,
+                               mlSourceSignature: String) -> GlucoseForecastPresentationOutcome {
         var knownReference: GlucoseForecastSample?
         func unavailable(_ reason: GlucoseForecastUnavailableReason) -> GlucoseForecastPresentationOutcome {
             .init(result: record(Self.unavailable(reason), horizonMinutes: horizonMinutes,
@@ -203,25 +207,62 @@ final class GlucoseForecastDataAdapter {
         cacheLock.lock()
         let cached = cache?.key == key ? cache?.result : nil
         cacheLock.unlock()
-        if let cached { return .init(result: cached) }
+        if let cached {
+            if cached.reason == nil {
+                GlucoseForecastMLTrainingCoordinator.shared.scheduleIfNeeded(
+                    coreDataManager: coreDataManager, policy: policy, settings: settings,
+                    sensitivity: sensitivity, ratio: ratio,
+                    sourceSignature: mlSourceSignature)
+            }
+            return .init(result: addMLIfUsable(to: cached, input: input, sourceSignature: mlSourceSignature))
+        }
         guard !Task.isCancelled else { return unavailable(.dataUnavailable) }
         let calculated = GlucoseForecastEngine.predict(input)
-        let result = GlucoseForecastResult(points: calculated.points,
-                                           referenceDate: calculated.referenceDate,
-                                           reason: calculated.reason,
-                                           parameterSource: .manual,
-                                           referenceSensorID: glucose.last?.sensorID)
+        let engineResult = GlucoseForecastResult(points: calculated.points,
+                                                 referenceDate: calculated.referenceDate,
+                                                 reason: calculated.reason,
+                                                 parameterSource: .manual,
+                                                 referenceSensorID: glucose.last?.sensorID)
         guard !therapyManager.hasUncommittedForecastInputChanges else {
             return unavailable(.dataUnavailable)
         }
         cacheLock.lock()
-        cache = (key, result)
+        cache = (key, engineResult)
         cacheLock.unlock()
-        // Freeze the completed result and actual value inputs before enqueueing IO.
-        // UI never awaits the log worker. Cache hits above do not create new records.
-        return .init(result: record(result, horizonMinutes: horizonMinutes, input: input,
-                      knownReference: knownReference, settings: settings,
-                      treatmentWindowStart: start, treatmentWindowEnd: referenceDate))
+        // Replay and Create ML run on independent low-priority workers only after
+        // the unchanged forecast engine has accepted the current sensor inputs.
+        if engineResult.reason == nil {
+            GlucoseForecastMLTrainingCoordinator.shared.scheduleIfNeeded(
+                coreDataManager: coreDataManager, policy: policy, settings: settings,
+                sensitivity: sensitivity, ratio: ratio,
+                sourceSignature: mlSourceSignature)
+        }
+        // Keep the prospective evidence log's engine baseline immutable. A cached
+        // engine result can be re-presented with a newly validated local ML model.
+        let recordedEngineResult = record(engineResult, horizonMinutes: horizonMinutes,
+            input: input, knownReference: knownReference, settings: settings,
+            treatmentWindowStart: start, treatmentWindowEnd: referenceDate)
+        return .init(result: addMLIfUsable(to: recordedEngineResult, input: input, sourceSignature: mlSourceSignature))
+    }
+
+    private func addMLIfUsable(to engineResult: GlucoseForecastResult,
+                               input: GlucoseForecastInput,
+                               sourceSignature: String) -> GlucoseForecastResult {
+        // A treatment source can change while the serial data read is in flight.
+        // Never decorate a result from the old source with a model for the new one.
+        guard engineResult.reason == nil,
+              sourceSignature == Self.presentationInputSignature(horizonMinutes: 120,
+                  defaults: defaults, importer: healthImporter),
+              let mlForecast = GlucoseForecastMLManager.shared.infer(input: input,
+                  result: engineResult, sourceSignature: sourceSignature) else {
+            return engineResult
+        }
+        return GlucoseForecastResult(points: engineResult.points,
+                                     referenceDate: engineResult.referenceDate,
+                                     reason: engineResult.reason,
+                                     parameterSource: engineResult.parameterSource,
+                                     referenceSensorID: engineResult.referenceSensorID,
+                                     mlForecast: mlForecast)
     }
 
     private func record(_ result: GlucoseForecastResult, horizonMinutes: Int,
@@ -288,53 +329,13 @@ final class GlucoseForecastDataAdapter {
             request.relationshipKeyPathsForPrefetching = ["sensor"]
             do {
                 let fetched = try context.fetch(request)
-                // Match Home's visible, downstream-valid reading. A newly stored invalid
-                // observation or an intentionally hidden five-minute-cadence row must not
-                // turn a still-fresh Home reading into "no recent sensor reading".
-                guard let latest = fetched.first(where: {
-                    !$0.isSuppressedByFiveMinuteCadence && $0.isValidForDownstream &&
-                        $0.finalValue.isFinite && $0.finalValue > 0
-                }) else { result = []; return }
-                let latestSensorID = latest.sensor?.id
-                // Do not look through an invalid/hidden row from a different or unidentified
-                // sensor and accidentally extend the previous sensor's forecast.
-                let newerRows = fetched.prefix(while: { $0.timeStamp > latest.timeStamp })
-                guard newerRows.allSatisfy({ reading in
-                    guard let sensorID = latestSensorID, !sensorID.isEmpty else { return false }
-                    return reading.sensor?.id == sensorID
-                }) else { result = []; return }
-                guard let sensorID = latestSensorID, !sensorID.isEmpty else {
-                    // Device names identify models, not sensor instances. In particular, two
-                    // successive Libre sensors can share the same name. Without a sensor ID,
-                    // do not splice their histories to produce a confident trend.
-                    result = [GlucoseForecastSample(date: latest.timeStamp, glucoseMgdl: latest.finalValue,
-                                                    sensorID: nil)]
-                    return
+                let observations = fetched.map { reading in
+                    GlucoseForecastGlucoseObservation(date: reading.timeStamp,
+                        glucoseMgdl: reading.finalValue, sensorID: reading.sensor?.id,
+                        isValidForDownstream: reading.isValidForDownstream,
+                        isSuppressedByFiveMinuteCadence: reading.isSuppressedByFiveMinuteCadence)
                 }
-                let latestCandidates = fetched.drop(while: { $0.timeStamp > latest.timeStamp })
-                    .prefix(while: { $0.timeStamp == latest.timeStamp })
-                guard latestCandidates.allSatisfy({ reading in
-                    reading.sensor?.id == sensorID && !reading.isSuppressedByFiveMinuteCadence &&
-                        reading.isValidForDownstream && reading.finalValue == latest.finalValue
-                }) else {
-                    // Core Data does not define an order for equal timestamps. A duplicate
-                    // latest observation with a different source or value is ambiguous.
-                    result = []
-                    return
-                }
-                var byDate = [Date: Double]()
-                for reading in fetched where reading.sensor?.id == sensorID &&
-                    !reading.isSuppressedByFiveMinuteCadence && reading.isValidForDownstream &&
-                    reading.finalValue.isFinite && reading.finalValue > 0 {
-                    if let existing = byDate[reading.timeStamp], existing != reading.finalValue {
-                        result = []
-                        return
-                    }
-                    byDate[reading.timeStamp] = reading.finalValue
-                }
-                result = byDate.map { GlucoseForecastSample(date: $0.key, glucoseMgdl: $0.value,
-                                                            sensorID: sensorID) }
-                    .sorted { $0.date < $1.date }
+                result = GlucoseForecastGlucoseSelection.select(observations, at: now)
             } catch {
                 result = nil
             }
