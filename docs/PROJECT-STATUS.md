@@ -10,6 +10,18 @@
 
 De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
 
+## Prognose ved appskift efter 4287
+
+En fysisk iPhone-observation viste, at 4287 viste “Beregner estimat…” i
+appvælgeren, når xDrip blev inaktiv, selv om Home havde en frisk måling.
+Home-nulstillingen ved scene-skift fjernes: en færdig prognose bevares under
+et kort appskift, mens ny beregning stadig kun sker i forgrunden. Den
+eksisterende visningskontrol skjuler estimatet ved for gamle målinger,
+sensorskift, ændret behandlingsgrundlag eller uoverensstemmelse med grafen.
+Sensorforbindelse, målelagring, alarmer og Watch-kode er uændrede.
+Appvælgeren viser fortsat et iOS-snapshot, ikke live data. Fysisk kontrol af
+visningen efter installation af næste build mangler.
+
 <!-- testflight-7.1.1-4286:start -->
 ### TestFlight 7.1.1 (4286)
 

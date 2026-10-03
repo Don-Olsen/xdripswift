@@ -281,10 +281,13 @@ struct RootHomeView: View {
         }
         .task(id: forecastRequestKey) {
             let context = forecastContext
-            guard scenePhase == .active, context.horizonMinutes != 0 else {
+            guard context.horizonMinutes != 0 else {
                 completedForecast = nil
                 return
             }
+            // Backgrounding cancels forecast work, but must not erase a still-valid result.
+            // The presentation gate checks reading age, sensor, chart tail and therapy context.
+            guard scenePhase == .active else { return }
             let result = await forecastDataAdapter.forecast(horizonMinutes: context.horizonMinutes)
             guard !Task.isCancelled else { return }
             completedForecast = RootHomeCompletedForecast(result: result, context: context)
