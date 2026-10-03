@@ -1,3 +1,15 @@
+<!-- testflight-7.1.1-4286:start -->
+### TestFlight 7.1.1 (4286)
+
+- Kildecommit og tag: `143ca805e65c88fc953e84f74fd3abd75b62babf` / `testflight-7.1.1-4286`.
+- Tests: 1141/1141 bestået; 0 fejlet; 0 skipped. iPhone- og Watch-simulatorbuilds bestod.
+- Apple-status (2026-10-03T12:14:50.086359+00:00): [Apple behandler](https://appstoreconnect.apple.com/apps/6795645396/testflight/ios).
+- Ole Internal: endnu ikke bekræftet tilknyttet.
+- Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
+<!-- testflight-7.1.1-4286:end -->
+
+De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
+
 <!-- testflight-7.1.1-4285:start -->
 ### TestFlight 7.1.1 (4285)
 
