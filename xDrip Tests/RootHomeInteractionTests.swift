@@ -13,6 +13,92 @@ import XCTest
 
 final class RootHomeInteractionTests: XCTestCase {
 
+    func testForecastPreferenceDefaultsTo60AndSupportsOffAnd120() throws {
+        let suite = "ForecastPresentationTests-" + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        XCTAssertEqual(defaults.glucoseForecastHorizonMinutes, 60)
+        defaults.glucoseForecastHorizonMinutes = 0
+        XCTAssertEqual(try XCTUnwrap(UserDefaults(suiteName: suite)).glucoseForecastHorizonMinutes, 0)
+        defaults.glucoseForecastHorizonMinutes = 120
+        XCTAssertEqual(try XCTUnwrap(UserDefaults(suiteName: suite)).glucoseForecastHorizonMinutes, 120)
+        defaults.glucoseForecastHorizonMinutes = 75
+        XCTAssertEqual(defaults.glucoseForecastHorizonMinutes, 60)
+    }
+
+    func testForecastManualSensitivityConvertsUnitsAndNeverTreatsZeroAsMissing() throws {
+        let suite = "ForecastSettingsTests-" + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        XCTAssertNil(defaults.glucoseForecastManualSensitivityMgdlPerUnit)
+        XCTAssertNil(GlucoseForecastSettingsInput.positiveNumber(""))
+        XCTAssertNil(GlucoseForecastSettingsInput.positiveNumber("0"))
+        XCTAssertNotNil(GlucoseForecastSettingsInput.validationMessage("0"))
+        XCTAssertEqual(GlucoseForecastSettingsInput.sensitivityMgdl("50", isMgDl: true), 50)
+        let converted = try XCTUnwrap(GlucoseForecastSettingsInput.sensitivityMgdl("2,8", isMgDl: false))
+        XCTAssertEqual(converted, 2.8.mmolToMgdl(), accuracy: 0.001)
+        defaults.glucoseForecastManualSensitivityMgdlPerUnit = converted
+        XCTAssertEqual(try XCTUnwrap(defaults.glucoseForecastManualSensitivityMgdlPerUnit), converted)
+        defaults.glucoseForecastManualSensitivityMgdlPerUnit = 0
+        XCTAssertNil(defaults.glucoseForecastManualSensitivityMgdlPerUnit)
+        defaults.glucoseForecastManualCarbRatioGramsPerUnit = 10
+        XCTAssertEqual(defaults.glucoseForecastManualCarbRatioGramsPerUnit, 10)
+        defaults.glucoseForecastManualCarbRatioGramsPerUnit = nil
+        XCTAssertNil(defaults.glucoseForecastManualCarbRatioGramsPerUnit)
+    }
+
+    func testForecastFutureDomainIsPresentationOnlyAndHiddenInHistoricalWindow() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let measured = GlucoseChartState.empty(startDate: now.addingTimeInterval(-3 * 3600), endDate: now)
+        let sixtyMinutePoints = stride(from: 0, through: 60, by: 5).map {
+            GlucoseChartForecastPoint(date: now.addingTimeInterval(Double($0) * 60), glucoseMgdl: 110)
+        }
+        let live = GlucoseChartForecastPresentation.visiblePoints(
+            sixtyMinutePoints, referenceDate: now,
+            visibleStartDate: measured.startDate, visibleEndDate: measured.endDate,
+            isMainChart: true
+        )
+        XCTAssertEqual(live.count, 13)
+        XCTAssertEqual(GlucoseChartForecastPresentation.endDate(visibleEndDate: now, visiblePoints: live),
+                       now.addingTimeInterval(60 * 60))
+        XCTAssertEqual(GlucoseChartForecastPresentation.endDate(visibleEndDate: now, visiblePoints: []), now)
+        XCTAssertTrue(GlucoseChartForecastPresentation.visiblePoints(
+            sixtyMinutePoints, referenceDate: now,
+            visibleStartDate: now.addingTimeInterval(-4 * 3600),
+            visibleEndDate: now.addingTimeInterval(-2 * 3600), isMainChart: true
+        ).isEmpty)
+        XCTAssertTrue(GlucoseChartForecastPresentation.visiblePoints(
+            sixtyMinutePoints, referenceDate: now,
+            visibleStartDate: measured.startDate, visibleEndDate: measured.endDate,
+            isMainChart: false
+        ).isEmpty)
+        XCTAssertTrue(measured.bgReadingValues.isEmpty)
+        XCTAssertTrue(measured.bgReadingDates.isEmpty)
+    }
+
+    func testForecastPresentationExpiresWithoutAnotherSensorReading() {
+        let reference = Date(timeIntervalSince1970: 1_800_000_000)
+        let result = GlucoseForecastResult(
+            points: [GlucoseForecastPoint(date: reference.addingTimeInterval(60 * 60), glucoseMgdl: 120)],
+            referenceDate: reference, reason: nil, parameterSource: .manual
+        )
+        XCTAssertTrue(RootHomeForecastFreshness.isCurrent(referenceDate: reference,
+                                                           at: reference.addingTimeInterval(5 * 60)))
+        XCTAssertTrue(RootHomeForecastFreshness.isCurrent(referenceDate: reference,
+                                                           at: reference.addingTimeInterval(GlucoseForecastEngine.maximumGlucoseAge)))
+        XCTAssertFalse(RootHomeForecastFreshness.isCurrent(referenceDate: reference,
+                                                            at: reference.addingTimeInterval(GlucoseForecastEngine.maximumGlucoseAge + 1)))
+        XCTAssertFalse(RootHomeForecastFreshness.isCurrent(referenceDate: reference,
+                                                            at: reference.addingTimeInterval(-1)))
+        XCTAssertEqual(RootHomeForecastFreshness.presentationResult(result,
+                        at: reference.addingTimeInterval(GlucoseForecastEngine.maximumGlucoseAge + 1)).reason,
+                       .staleGlucose)
+        XCTAssertTrue(RootHomeForecastFreshness.presentationResult(result,
+                      at: reference.addingTimeInterval(GlucoseForecastEngine.maximumGlucoseAge + 1)).points.isEmpty)
+        XCTAssertEqual(RootHomeForecastFreshness.presentationResult(result,
+                        at: reference.addingTimeInterval(5 * 60)).points.count, 1)
+    }
+
     func testLiveChartDoesNotBecomeHistoricalWhileAppIsSuspended() {
         let openedAt = Date()
         let coordinator = GlucoseChartScrollCoordinator(

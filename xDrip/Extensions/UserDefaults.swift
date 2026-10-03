@@ -173,6 +173,12 @@ extension UserDefaults {
         case showOriginalBGReadings = "showOriginalBGReadings"
         /// should visible sensor noise UI be shown?
         case showSensorNoise = "showSensorNoise"
+        /// Presentation-only local glucose forecast horizon: 0 (off), 60 or 120 minutes.
+        case glucoseForecastHorizonMinutes = "glucoseForecastHorizonMinutes"
+        /// Manually confirmed insulin sensitivity, always persisted in mg/dL per unit.
+        case glucoseForecastManualSensitivityMgdlPerUnit = "glucoseForecastManualSensitivityMgdlPerUnit"
+        /// Manually confirmed carbohydrate ratio in grams per unit.
+        case glucoseForecastManualCarbRatioGramsPerUnit = "glucoseForecastManualCarbRatioGramsPerUnit"
         /// how strictly should stored sensor noise values be interpreted?
         case sensorNoiseSensitivity = "sensorNoiseSensitivity"
         /// should actionable sensor health episodes create system notifications?
@@ -1163,6 +1169,38 @@ extension UserDefaults {
     }
 
     // MARK: Home Screen Settings
+
+    /// 60 minutes is the initial presentation choice. An explicit 0 disables all forecast work.
+    @objc dynamic var glucoseForecastHorizonMinutes: Int {
+        get {
+            guard object(forKey: Key.glucoseForecastHorizonMinutes.rawValue) != nil else { return 60 }
+            let value = integer(forKey: Key.glucoseForecastHorizonMinutes.rawValue)
+            return value == 0 || value == 120 ? value : 60
+        }
+        set { set(newValue == 0 || newValue == 120 ? newValue : 60, forKey: Key.glucoseForecastHorizonMinutes.rawValue) }
+    }
+
+    /// A missing or nonpositive value is unknown, never a usable zero sensitivity.
+    var glucoseForecastManualSensitivityMgdlPerUnit: Double? {
+        get {
+            guard let value = object(forKey: Key.glucoseForecastManualSensitivityMgdlPerUnit.rawValue) as? Double,
+                  value.isFinite, value > 0 else { return nil }
+            return value
+        }
+        set { set(newValue?.isFinite == true && (newValue ?? 0) > 0 ? newValue : nil,
+                  forKey: Key.glucoseForecastManualSensitivityMgdlPerUnit.rawValue) }
+    }
+
+    /// A missing or nonpositive value is unknown, never a usable zero carbohydrate ratio.
+    var glucoseForecastManualCarbRatioGramsPerUnit: Double? {
+        get {
+            guard let value = object(forKey: Key.glucoseForecastManualCarbRatioGramsPerUnit.rawValue) as? Double,
+                  value.isFinite, value > 0 else { return nil }
+            return value
+        }
+        set { set(newValue?.isFinite == true && (newValue ?? 0) > 0 ? newValue : nil,
+                  forKey: Key.glucoseForecastManualCarbRatioGramsPerUnit.rawValue) }
+    }
 
     /// the amount of hours to show in the mini-chart. Usually 24 hours but can be set to 48 hours by the user
     @objc dynamic var miniChartHoursToShow: Double {

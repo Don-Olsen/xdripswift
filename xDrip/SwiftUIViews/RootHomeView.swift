@@ -9,6 +9,25 @@
 import Combine
 import SwiftUI
 
+/// Presentation must invalidate an estimate even if no new CGM event arrives.
+enum RootHomeForecastFreshness {
+    static func isCurrent(referenceDate: Date, at now: Date) -> Bool {
+        let age = now.timeIntervalSince(referenceDate)
+        return age >= 0 && age <= GlucoseForecastEngine.maximumGlucoseAge
+    }
+
+    static func presentationResult(_ result: GlucoseForecastResult, at now: Date) -> GlucoseForecastResult {
+        guard result.reason == nil else { return result }
+        guard let referenceDate = result.referenceDate else {
+            return GlucoseForecastResult(points: [], referenceDate: nil, reason: .missingGlucose)
+        }
+        guard isCurrent(referenceDate: referenceDate, at: now) else {
+            return GlucoseForecastResult(points: [], referenceDate: referenceDate, reason: .staleGlucose)
+        }
+        return result
+    }
+}
+
 /// Native SwiftUI home screen.
 ///
 /// This view owns presentation-level state and chart scrolling state. RootTabView owns its
@@ -70,6 +89,7 @@ struct RootHomeView: View {
 
     private let coreDataManager: CoreDataManager
     private let nightscoutSyncManager: NightscoutSyncManager
+    private let forecastDataAdapter: GlucoseForecastDataAdapter
     @State private var selectedRange: RootHomeChartRange
     @State private var isLoadingChart = false
     @State private var isBackgroundLoadingChart = false
@@ -77,6 +97,15 @@ struct RootHomeView: View {
     @State private var chartYAxisResetRevision = 0
     @State private var showsExpandedIPadChart = false
     @State private var healthTherapySelectionSignature = ""
+    @State private var forecastResult: GlucoseForecastResult?
+    @State private var forecastDataRevision = 0
+    @State private var forecastFreshnessCheckTime = Date()
+    @AppStorage(UserDefaults.Key.glucoseForecastHorizonMinutes.rawValue) private var forecastHorizonMinutes = 60
+    @AppStorage(UserDefaults.Key.glucoseForecastManualSensitivityMgdlPerUnit.rawValue) private var forecastManualISF = 0.0
+    @AppStorage(UserDefaults.Key.glucoseForecastManualCarbRatioGramsPerUnit.rawValue) private var forecastManualCarbRatio = 0.0
+    @AppStorage("localInsulinPeak") private var forecastInsulinPeak = 75.0
+    @AppStorage("localCarbDuration") private var forecastCarbDuration = 240.0
+    @AppStorage(UserDefaults.Key.therapyDataSourceType.rawValue) private var forecastTherapySource = 0
     @AppStorage(UserDefaults.KeysCharts.chartWidthInHours.rawValue) private var chartWidthInHours = ConstantsGlucoseChart.defaultChartWidthInHours
     @AppStorage("showTherapySummary") private var showTherapySummary = UserDefaults.standard.showTherapySummary
     @AppStorage(UserDefaults.Key.miniChartHoursToShow.rawValue) private var miniChartHoursToShow = ConstantsGlucoseChart.miniChartHoursToShow1
@@ -93,6 +122,13 @@ struct RootHomeView: View {
         let importer = HealthKitTherapyImportManager.shared
         return "\(importer.isEnabled(.insulin))|\(importer.selectedSource(.insulin)?.bundleIdentifier ?? "")|"
             + "\(importer.isEnabled(.carbohydrates))|\(importer.selectedSource(.carbohydrates)?.bundleIdentifier ?? "")"
+    }
+    private var effectiveForecastHorizonMinutes: Int {
+        forecastHorizonMinutes == 0 || forecastHorizonMinutes == 120 ? forecastHorizonMinutes : 60
+    }
+    /// SwiftUI cancels an older task before publishing a forecast from superseded inputs.
+    private var forecastRequestKey: String {
+        "\(state.chartRevision)|\(forecastDataRevision)|\(effectiveForecastHorizonMinutes)|\(forecastManualISF)|\(forecastManualCarbRatio)|\(forecastInsulinPeak)|\(forecastCarbDuration)|\(forecastTherapySource)|\(healthTherapySelectionSignature)|\(scenePhase == .active)"
     }
     private static let pannedReadingDateFormatter: DateFormatter = {
         let dateFormatter = DateFormatter()
@@ -119,6 +155,7 @@ struct RootHomeView: View {
         self.actions = actions
         self.coreDataManager = coreDataManager
         self.nightscoutSyncManager = nightscoutSyncManager
+        self.forecastDataAdapter = GlucoseForecastDataAdapter(coreDataManager: coreDataManager)
         // only the main chart can show sensor noise background bands. The mini-chart keeps the
         // same clean overview behaviour and does not need the extra Core Data fetch.
         _glucoseChartStateManager = StateObject(wrappedValue: GlucoseChartStateManager(coreDataManager: coreDataManager, nightscoutSyncManager: nightscoutSyncManager, showsSensorNoiseBands: true))
@@ -140,6 +177,7 @@ struct RootHomeView: View {
         }
         .colorScheme(.dark)
         .onAppear {
+            forecastFreshnessCheckTime = Date()
             healthTherapySelectionSignature = currentHealthTherapySelectionSignature
             scrollCoordinator.resetToNow()
             if state.usesScreenLockNightLayout {
@@ -157,6 +195,8 @@ struct RootHomeView: View {
             historicalDataCache.cleanUpMemory()
         }
         .onReceive(chartRefreshTimer) { _ in
+            let now = Date()
+            forecastFreshnessCheckTime = now
             refreshCurrentTimeRangeIfNeeded(showsLoading: false)
             requestMiniChartState(forceReset: false)
         }
@@ -165,6 +205,21 @@ struct RootHomeView: View {
             guard signature != healthTherapySelectionSignature else { return }
             healthTherapySelectionSignature = signature
             requestChartState(forceReset: true, showsLoading: false)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: TherapyMetricsManager.changed)) { _ in
+            forecastDataRevision &+= 1
+        }
+        .task(id: forecastRequestKey) {
+            guard scenePhase == .active, effectiveForecastHorizonMinutes != 0 else {
+                forecastResult = nil
+                return
+            }
+            // Keep the previous estimate off-screen while fresh inputs are being read. An older
+            // completed worker result cannot replace a newer task's result.
+            forecastResult = nil
+            let result = await forecastDataAdapter.forecast(horizonMinutes: effectiveForecastHorizonMinutes)
+            guard !Task.isCancelled else { return }
+            forecastResult = result
         }
         .onReceive(clockRefreshTimer) { _ in
             if state.visibility.showsClock {
@@ -259,6 +314,7 @@ struct RootHomeView: View {
         .onChange(of: scenePhase) { newPhase in
             guard newPhase == .active else { return }
 
+            forecastFreshnessCheckTime = Date()
             resetChartsToNow()
         }
         .fullScreenCover(isPresented: $showsExpandedIPadChart) {
@@ -732,6 +788,8 @@ struct RootHomeView: View {
             showsTreatments: showsTreatments,
             allowsTherapyCharts: !state.isScreenLocked,
             chartState: chartState,
+            forecastResult: scrollCoordinator.isShowingCurrentTimeRange && !state.usesScreenLockNightLayout ? displayableForecastResult : nil,
+            forecastHorizonMinutes: scrollCoordinator.isShowingCurrentTimeRange && !state.usesScreenLockNightLayout ? effectiveForecastHorizonMinutes : 0,
             isLoading: isLoadingChart,
             scrollCoordinator: scrollCoordinator,
             yAxisResetRevision: chartYAxisResetRevision,
@@ -891,6 +949,20 @@ struct RootHomeView: View {
         state.endDate = endDate
 
         return state
+    }
+
+    /// Do not draw a new estimate against an older chart tail (or an older estimate against a
+    /// newly saved reading). The chart manager and forecast adapter load independently.
+    private var displayableForecastResult: GlucoseForecastResult? {
+        guard let forecastResult else { return nil }
+        let current = RootHomeForecastFreshness.presentationResult(forecastResult,
+                                                                    at: forecastFreshnessCheckTime)
+        guard current.reason == nil else { return current }
+        guard let referenceDate = current.referenceDate else { return nil }
+        guard let newestChartDate = glucoseChartStateManager.state.bgReadingDates
+                .filter({ $0 <= forecastFreshnessCheckTime }).max(),
+              abs(referenceDate.timeIntervalSince(newestChartDate)) < 2 else { return nil }
+        return current
     }
 
     private var glucoseDisplayState: RootHomeGlucoseState {

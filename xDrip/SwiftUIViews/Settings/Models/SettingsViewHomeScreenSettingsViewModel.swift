@@ -8,6 +8,81 @@
 
 import SwiftUI
 
+/// Forecast copy lives with the only settings screen that enables this iPhone-only feature.
+/// English is the fallback for translations that have not yet been added.
+enum GlucoseForecastTexts {
+    static func text(_ key: String, fallback: String) -> String {
+        Bundle.main.localizedString(forKey: key, value: fallback, table: "SettingsViews")
+    }
+
+    static var title: String { text("forecast.title", fallback: "Glucose forecast") }
+    static var estimate: String { text("forecast.estimate", fallback: "Estimate") }
+    static var uncertain: String { text("forecast.uncertain", fallback: "more uncertain") }
+    static var calculating: String { text("forecast.calculating", fallback: "Calculating estimate…") }
+    static var manualSource: String { text("forecast.manualSource", fallback: "Manually entered ISF and carb ratio") }
+    static var profileSource: String { text("forecast.profileSource", fallback: "Nightscout treatment profile") }
+    static var manualSourceShort: String { text("forecast.manualSourceShort", fallback: "manual") }
+    static var profileSourceShort: String { text("forecast.profileSourceShort", fallback: "NS profile") }
+    static func basedOnReading(_ date: Date) -> String {
+        let format = text("forecast.basedOnReading", fallback: "Based on reading %@")
+        return String(format: format, date.formatted(date: .omitted, time: .shortened))
+    }
+    static func basedOnShort(_ date: Date) -> String {
+        let format = text("forecast.basedOnShort", fallback: "from %@")
+        return String(format: format, date.formatted(date: .omitted, time: .shortened))
+    }
+
+    static func unavailable(_ reason: GlucoseForecastUnavailableReason) -> String {
+        switch reason {
+        case .missingGlucose, .staleGlucose:
+            return text("forecast.noRecentGlucose", fallback: "No recent sensor reading")
+        case .insufficientHistory, .historyGap:
+            return text("forecast.historyGap", fallback: "Insufficient continuous glucose history")
+        case .missingProfile:
+            return text("forecast.missingProfile", fallback: "Enter ISF and carb ratio in Home settings")
+        case .invalidProfile, .profileChange:
+            return text("forecast.invalidProfile", fallback: "Treatment profile is not valid for this period")
+        case .externalOwner:
+            return text("forecast.externalOwner", fallback: "External therapy source owns these values")
+        case .awaitingNextReading:
+            return text("forecast.awaitingNextReading", fallback: "Waiting for a sensor reading after treatment")
+        case .ambiguousTreatmentSources:
+            return text("forecast.ambiguousTreatmentSources", fallback: "Treatment sources cannot be reconciled safely")
+        case .invalidTreatment:
+            return text("forecast.invalidTreatment", fallback: "Treatment history is incomplete")
+        case .invalidSettings, .invalidHorizon:
+            return text("forecast.invalidSettings", fallback: "Check forecast settings")
+        case .outOfRange:
+            return text("forecast.outOfRange", fallback: "Estimate is outside the supported range")
+        case .dataUnavailable:
+            return text("forecast.dataUnavailable", fallback: "Data temporarily unavailable")
+        }
+    }
+}
+
+/// Input conversion is explicit so a zero cannot be confused with a missing profile value.
+enum GlucoseForecastSettingsInput {
+    static func positiveNumber(_ input: String) -> Double? {
+        let normalized = input.trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: ",", with: ".")
+        guard !normalized.isEmpty, let value = Double(normalized), value.isFinite, value > 0 else { return nil }
+        return value
+    }
+
+    static func sensitivityMgdl(_ input: String, isMgDl: Bool) -> Double? {
+        positiveNumber(input)?.mmolToMgdl(mgDl: isMgDl)
+    }
+
+    static func validationMessage(_ input: String) -> String? {
+        if input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return nil }
+        return positiveNumber(input) == nil
+            ? GlucoseForecastTexts.text("forecast.positiveNumber", fallback: "Enter a positive number.") : nil
+    }
+
+    static func displayNumber(_ value: Double) -> String {
+        value.formatted(.number.precision(.fractionLength(0...2)))
+    }
+}
+
 fileprivate enum Setting:Int, CaseIterable {
     
     // allow the homescreen to be show a landscape chart when rotated?
@@ -138,7 +213,21 @@ class SettingsViewHomeScreenSettingsViewModel: NSObject, SettingsViewModelProtoc
             mainChartHoursRow,
             nativeSettingsRow(id: "homeScreen.allowScreenRotation", index: Setting.allowScreenRotation.rawValue, sectionID: sectionID),
             nativeSettingsRow(id: "homeScreen.showOriginalBGReadings", index: Setting.showOriginalBGReadings.rawValue, sectionID: sectionID),
-            nativeSettingsRow(id: "homeScreen.showSensorNoise", index: Setting.showSensorNoise.rawValue, sectionID: sectionID)
+            nativeSettingsRow(id: "homeScreen.showSensorNoise", index: Setting.showSensorNoise.rawValue, sectionID: sectionID),
+            SettingsRow(id: "homeScreen.glucoseForecastHorizon", title: GlucoseForecastTexts.title,
+                        control: .menu(options: {
+                            let chosen = UserDefaults.standard.glucoseForecastHorizonMinutes
+                            return [
+                                SettingsMenuOption(title: GlucoseForecastTexts.text("forecast.off", fallback: "Off"), isSelected: chosen == 0),
+                                SettingsMenuOption(title: GlucoseForecastTexts.text("forecast.60", fallback: "60 minutes"), isSelected: chosen == 60),
+                                SettingsMenuOption(title: GlucoseForecastTexts.text("forecast.120", fallback: "120 minutes (more uncertain)"), isSelected: chosen == 120)
+                            ]
+                        }, selectOption: { index in
+                            guard (0...2).contains(index) else { return }
+                            UserDefaults.standard.glucoseForecastHorizonMinutes = [0, 60, 120][index]
+                        }), reloadScope: .all),
+            forecastSensitivityRow(),
+            forecastCarbohydrateRatioRow()
         ]
 
         // Treatments gates basal and curves without changing their saved preferences.
@@ -196,6 +285,58 @@ class SettingsViewHomeScreenSettingsViewModel: NSObject, SettingsViewModelProtoc
         case .glucoseRanges:
             return glucoseRangeRows
         }
+    }
+
+    private func forecastSensitivityRow() -> SettingsRow {
+        let defaults = UserDefaults.standard
+        let isMgDl = defaults.bloodGlucoseUnitIsMgDl
+        let unit = isMgDl ? "mg/dL/U" : "mmol/L/U"
+        let title = GlucoseForecastTexts.text("forecast.sensitivity", fallback: "Insulin sensitivity (ISF)")
+        let message = GlucoseForecastTexts.text("forecast.sensitivityHelp", fallback: "Enter your own confirmed insulin sensitivity. Leave blank to remove a previously entered value. The forecast will not guess it.")
+        let saved = defaults.glucoseForecastManualSensitivityMgdlPerUnit
+        return SettingsRow(
+            id: "homeScreen.glucoseForecastSensitivity", title: title,
+            detail: saved.map { GlucoseForecastSettingsInput.displayNumber($0.mgDlToMmol(mgDl: isMgDl)) + " " + unit }
+                ?? GlucoseForecastTexts.text("forecast.notSet", fallback: "Not set"),
+            accessory: .disclosure, isVisible: defaults.glucoseForecastHorizonMinutes != 0,
+            reloadScope: .all,
+            action: .textEntry {
+                SettingsTextEntryContent(
+                    title: title, message: message, keyboardType: .decimalPad,
+                    text: saved.map { GlucoseForecastSettingsInput.displayNumber($0.mgDlToMmol(mgDl: isMgDl)) },
+                    placeholder: nil, fieldTitle: Texts_Common.enterValue, unitText: unit,
+                    actionTitle: Texts_Common.Ok, cancelTitle: Texts_Common.Cancel,
+                    action: { input in
+                        defaults.glucoseForecastManualSensitivityMgdlPerUnit = GlucoseForecastSettingsInput.sensitivityMgdl(input, isMgDl: isMgDl)
+                    }, cancel: nil,
+                    validator: { input in GlucoseForecastSettingsInput.validationMessage(input) }
+                )
+            }
+        )
+    }
+
+    private func forecastCarbohydrateRatioRow() -> SettingsRow {
+        let defaults = UserDefaults.standard
+        let title = GlucoseForecastTexts.text("forecast.carbRatio", fallback: "Carbohydrate ratio")
+        let message = GlucoseForecastTexts.text("forecast.carbRatioHelp", fallback: "Enter your own confirmed grams of carbohydrate per insulin unit. Leave blank to remove a previously entered value.")
+        let saved = defaults.glucoseForecastManualCarbRatioGramsPerUnit
+        return SettingsRow(
+            id: "homeScreen.glucoseForecastCarbRatio", title: title,
+            detail: saved.map { GlucoseForecastSettingsInput.displayNumber($0) + " g/U" }
+                ?? GlucoseForecastTexts.text("forecast.notSet", fallback: "Not set"),
+            accessory: .disclosure, isVisible: defaults.glucoseForecastHorizonMinutes != 0,
+            reloadScope: .all,
+            action: .textEntry {
+                SettingsTextEntryContent(
+                    title: title, message: message, keyboardType: .decimalPad,
+                    text: saved.map(GlucoseForecastSettingsInput.displayNumber), placeholder: nil,
+                    fieldTitle: Texts_Common.enterValue, unitText: "g/U",
+                    actionTitle: Texts_Common.Ok, cancelTitle: Texts_Common.Cancel,
+                    action: { input in defaults.glucoseForecastManualCarbRatioGramsPerUnit = GlucoseForecastSettingsInput.positiveNumber(input) },
+                    cancel: nil, validator: { input in GlucoseForecastSettingsInput.validationMessage(input) }
+                )
+            }
+        )
     }
 
     var sectionReloadClosure: (() -> Void)?

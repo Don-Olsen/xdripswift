@@ -16,6 +16,8 @@ struct RootHomeMainChartView: View {
     let showsTreatments: Bool
     var allowsTherapyCharts = true
     let chartState: GlucoseChartState
+    let forecastResult: GlucoseForecastResult?
+    let forecastHorizonMinutes: Int
     let isLoading: Bool
     let scrollCoordinator: GlucoseChartScrollCoordinator
     let yAxisResetRevision: Int
@@ -75,6 +77,12 @@ struct RootHomeMainChartView: View {
                     TherapyChartSeries(iob: hasIOB ? therapySeries.iob : [], cob: hasCOB ? therapySeries.cob : []),
                     reservesDomainWhileLoading: showsTreatments && allowsTherapyCharts && showIOBCOB
                 )
+                .forecastPlot(
+                    forecastResult?.reason == nil ? forecastResult?.points.map {
+                        GlucoseChartForecastPoint(date: $0.date, glucoseMgdl: $0.glucoseMgdl)
+                    } ?? [] : [],
+                    from: forecastResult?.reason == nil ? forecastResult?.referenceDate : nil
+                )
                 .transaction { transaction in
                     transaction.animation = nil
                 }
@@ -102,6 +110,14 @@ struct RootHomeMainChartView: View {
                         }
                 )
                 .clipped()
+
+                if forecastHorizonMinutes != 0 {
+                    forecastBadge
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                        .padding(.leading, 7)
+                        .padding(.top, 5)
+                        .allowsHitTesting(false)
+                }
 
                 if rangeOverlay.value {
                     HStack(spacing: 4) {
@@ -146,6 +162,61 @@ struct RootHomeMainChartView: View {
         .onReceive(NotificationCenter.default.publisher(for: TherapyMetricsManager.changed)) { _ in if scenePhase == .active { therapyRevision &+= 1 } }
         .onDisappear {
             rangeOverlay.cancel()
+        }
+    }
+
+    private var forecastBadge: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            if let forecastResult, forecastResult.reason == nil {
+                Text("\(GlucoseForecastTexts.estimate) · \(forecastSource(forecastResult.parameterSource)) · \(forecastUnit)" +
+                     (forecastHorizonMinutes == 120 ? " · \(GlucoseForecastTexts.uncertain)" : ""))
+                    .fontWeight(.semibold)
+                HStack(spacing: 6) {
+                    if let referenceDate = forecastResult.referenceDate {
+                        Text(GlucoseForecastTexts.basedOnShort(referenceDate))
+                    }
+                    Text("+30 \(forecastValue(at: 30, from: forecastResult))")
+                    Text("+60 \(forecastValue(at: 60, from: forecastResult))")
+                    if forecastHorizonMinutes == 120 {
+                        Text("+120 \(forecastValue(at: 120, from: forecastResult))")
+                    }
+                }
+            } else {
+                Text(GlucoseForecastTexts.estimate)
+                    .fontWeight(.semibold)
+                Text(forecastResult?.reason.map(GlucoseForecastTexts.unavailable) ?? GlucoseForecastTexts.calculating)
+                    .foregroundStyle(ConstantsAppColors.secondaryText)
+            }
+        }
+        .font(.system(size: 11))
+        .lineLimit(1)
+        .minimumScaleFactor(0.9)
+        .foregroundStyle(Color.cyan)
+        .padding(.horizontal, 7)
+        .padding(.vertical, 5)
+        .background(ConstantsAppColors.homePanelBackground.opacity(0.92),
+                    in: RoundedRectangle(cornerRadius: 7))
+        .accessibilityElement(children: .combine)
+        .accessibilityValue(forecastResult?.referenceDate.map(GlucoseForecastTexts.basedOnReading) ?? "")
+    }
+
+    private var forecastUnit: String {
+        UserDefaults.standard.bloodGlucoseUnitIsMgDl ? Texts_Common.mgdl : Texts_Common.mmol
+    }
+
+    private func forecastValue(at minutes: Int, from result: GlucoseForecastResult) -> String {
+        guard let value = result.value(atMinutes: minutes), value.isFinite else { return "–" }
+        return value.mgDlToMmolAndToString(mgDl: UserDefaults.standard.bloodGlucoseUnitIsMgDl)
+    }
+
+    private func forecastSource(_ source: GlucoseForecastParameterSource?) -> String {
+        switch source {
+        case .manual:
+            return GlucoseForecastTexts.manualSourceShort
+        case .nightscoutProfile:
+            return GlucoseForecastTexts.profileSourceShort
+        case nil:
+            return GlucoseForecastTexts.text("forecast.sourceUnknown", fallback: "Source unavailable")
         }
     }
 

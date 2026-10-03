@@ -7,6 +7,10 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		FC0303000000000000000001 /* GlucoseForecastEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = FC0303000000000000000005 /* GlucoseForecastEngine.swift */; };
+		FC0303000000000000000002 /* GlucoseForecastDataAdapter.swift in Sources */ = {isa = PBXBuildFile; fileRef = FC0303000000000000000006 /* GlucoseForecastDataAdapter.swift */; };
+		FC0303000000000000000003 /* GlucoseForecastEngineTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FC0303000000000000000007 /* GlucoseForecastEngineTests.swift */; };
+		FC0303000000000000000004 /* GlucoseForecastDataAdapterTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FC0303000000000000000008 /* GlucoseForecastDataAdapterTests.swift */; };
 		D72500012026092500000001 /* LibreWatchConnectionPresentation.swift in Sources */ = {isa = PBXBuildFile; fileRef = D72500022026092500000001 /* LibreWatchConnectionPresentation.swift */; };
 		D72500012026092500000002 /* LibreWatchConnectionPresentation.swift in Sources */ = {isa = PBXBuildFile; fileRef = D72500022026092500000001 /* LibreWatchConnectionPresentation.swift */; };
 		D72500012026092500000003 /* LibreWatchConnectionPresentationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D72500022026092500000002 /* LibreWatchConnectionPresentationTests.swift */; };
@@ -943,6 +947,10 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		FC0303000000000000000005 /* GlucoseForecastEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GlucoseForecastEngine.swift; sourceTree = "<group>"; };
+		FC0303000000000000000006 /* GlucoseForecastDataAdapter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GlucoseForecastDataAdapter.swift; sourceTree = "<group>"; };
+		FC0303000000000000000007 /* GlucoseForecastEngineTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "xDrip Tests/GlucoseForecastEngineTests.swift"; sourceTree = SOURCE_ROOT; };
+		FC0303000000000000000008 /* GlucoseForecastDataAdapterTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "xDrip Tests/GlucoseForecastDataAdapterTests.swift"; sourceTree = SOURCE_ROOT; };
 		D72500022026092500000001 /* LibreWatchConnectionPresentation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LibreWatchConnectionPresentation.swift; sourceTree = "<group>"; };
 		D72500022026092500000002 /* LibreWatchConnectionPresentationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LibreWatchConnectionPresentationTests.swift; sourceTree = "<group>"; };
 		D72500022026092500000003 /* da */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; name = da; path = da.lproj/WatchApp.strings; sourceTree = "<group>"; };
@@ -2141,6 +2149,15 @@
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
+		FC0303000000000000000009 /* Forecast */ = {
+			isa = PBXGroup;
+			children = (
+				FC0303000000000000000005 /* GlucoseForecastEngine.swift */,
+				FC0303000000000000000006 /* GlucoseForecastDataAdapter.swift */,
+			);
+			path = Forecast;
+			sourceTree = "<group>";
+		};
 		065EEDCFBA12133E67945FEA /* CareLink */ = {
 			isa = PBXGroup;
 			children = (
@@ -2722,6 +2739,8 @@
 				4F2600113002000200000001 /* SensorNoisePersistenceTests.swift */,
 				4D7A00053014000100000001 /* TroubleshootingLogTests.swift */,
 				50E2401E5ED94424A2FEC5E8 /* xDrip Tests/TherapyMetricsTests.swift */,
+				FC0303000000000000000007 /* GlucoseForecastEngineTests.swift */,
+				FC0303000000000000000008 /* GlucoseForecastDataAdapterTests.swift */,
 				A9C7F0043003000100000001 /* HealthKitTherapyImportTests.swift */,
 			);
 			path = "xDrip Tests";
@@ -3030,6 +3049,7 @@
 				F227BF1A2B9E425800CEEAAD /* ContactImage */,
 				F821CF4D229BF43A005C1E43 /* CoreData */,
 				F81D6D4622BD5F43005EFAE2 /* DexcomShare */,
+				FC0303000000000000000009 /* Forecast */,
 				47DB06CC2A7013EF00267BE3 /* Followers */,
 				F821CF9122ADB064005C1E43 /* HealthKit */,
 				47DB06DB2A7136E900267BE3 /* LibreLinkUp */,
@@ -4547,6 +4567,8 @@
 				4F2600013002000200000001 /* SensorNoisePersistenceTests.swift in Sources */,
 				377EBC0A484BFC8EA77C623C /* CareLinkTests.swift in Sources */,
 				0A51F9C534B04BD682E1EF4D /* xDrip Tests/TherapyMetricsTests.swift in Sources */,
+				FC0303000000000000000003 /* GlucoseForecastEngineTests.swift in Sources */,
+				FC0303000000000000000004 /* GlucoseForecastDataAdapterTests.swift in Sources */,
 				A9C7F0033003000100000001 /* HealthKitTherapyImportTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -4970,6 +4992,8 @@
 				4D20C0022FF1000100000001 /* RootHomeState.swift in Sources */,
 				C15D80D0E8DB47A6A9BE68DF /* xDrip/SwiftUIViews/Settings/TherapyMetricsSettingsView.swift in Sources */,
 				B3DBAE6F4DF8465BBF554DE4 /* xDrip/Managers/Therapy/TherapyMetricsManager.swift in Sources */,
+				FC0303000000000000000001 /* GlucoseForecastEngine.swift in Sources */,
+				FC0303000000000000000002 /* GlucoseForecastDataAdapter.swift in Sources */,
 				4D20C0042FF1000100000001 /* RootHomeView.swift in Sources */,
 				4D21B0022FF8000100000001 /* RootHomeChartRange.swift in Sources */,
 				4D21B0032FF8000100000001 /* RootHomeToolbarView.swift in Sources */,

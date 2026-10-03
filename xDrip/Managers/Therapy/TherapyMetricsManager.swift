@@ -116,6 +116,14 @@ final class TherapyMetricsManager {
         DispatchQueue.main.async { NotificationCenter.default.post(name: Self.changed, object: self) }
     }
 
+    /// A child-context save is not confirmed until the private persistent-store save commits.
+    /// Forecasts must not use the previous treatment snapshot during this interval.
+    var hasUncommittedTreatmentChanges: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return pendingTreatmentCommit
+    }
+
     /// Only treatment changes invalidate a briefly retained local Home amount.
     var treatmentChangeRevision: Int {
         lock.lock()
@@ -221,9 +229,14 @@ final class TherapyMetricsManager {
         // Hour buckets let 15-second refreshes reuse the same input snapshot, including future entries.
         let from = Date(timeIntervalSince1970: floor(start.timeIntervalSince1970 / 3600) * 3600)
         let to = Date(timeIntervalSince1970: (floor(end.timeIntervalSince1970 / 3600) + 1) * 3600)
+        let importer = HealthKitTherapyImportManager.shared
+        // A source choice can change eligibility without any Core Data save. Include it in the
+        // cache identity so a previously selected source never leaks into a new forecast.
+        let sourceSignature = "\(importer.isEnabled(.insulin))-\(importer.selectedSource(.insulin)?.bundleIdentifier ?? "")-" +
+            "\(importer.isEnabled(.carbohydrates))-\(importer.selectedSource(.carbohydrates)?.bundleIdentifier ?? "")"
         lock.lock()
         let generation = treatmentRevision
-        let cacheKey = "\(generation)-\(policy.therapyDataSource.rawValue)-\(policy.nightscoutFollowType.rawValue)-\(from)-\(to)"
+        let cacheKey = "\(generation)-\(policy.therapyDataSource.rawValue)-\(policy.nightscoutFollowType.rawValue)-\(sourceSignature)-\(from)-\(to)"
         let cached = treatmentCache[cacheKey]
         let recentlyFailed = failedReads[cacheKey].map { Date().timeIntervalSince($0) < 60 } ?? false
         if let cached { lock.unlock(); return cached }

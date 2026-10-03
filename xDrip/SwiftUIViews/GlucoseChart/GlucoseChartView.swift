@@ -74,6 +74,31 @@ struct GlucoseChartTherapyDomain {
     }
 }
 
+/// Limits forecast presentation to the live window without changing measured chart data.
+/// Defined in the shared renderer so extensions do not need the iPhone forecast engine.
+struct GlucoseChartForecastPoint {
+    let date: Date
+    let glucoseMgdl: Double
+}
+
+struct GlucoseChartForecastPresentation {
+    static func visiblePoints(_ points: [GlucoseChartForecastPoint], referenceDate: Date?,
+                              visibleStartDate: Date, visibleEndDate: Date,
+                              isMainChart: Bool) -> [GlucoseChartForecastPoint] {
+        guard isMainChart, let referenceDate,
+              referenceDate >= visibleStartDate, referenceDate <= visibleEndDate,
+              !points.isEmpty else { return [] }
+        return points.filter {
+            $0.date >= referenceDate && $0.date <= referenceDate.addingTimeInterval(120 * 60) &&
+                $0.glucoseMgdl.isFinite && $0.glucoseMgdl > 0
+        }
+    }
+
+    static func endDate(visibleEndDate: Date, visiblePoints: [GlucoseChartForecastPoint]) -> Date {
+        max(visibleEndDate, visiblePoints.last?.date ?? visibleEndDate)
+    }
+}
+
 /// Reflect cached basal heights without changing treatment data or glucose-axis retention.
 /// Trio uses the same top-minus-height mapping in its Home ChartElements/BasalChart.swift.
 struct GlucoseChartBasalLayout {
@@ -114,6 +139,9 @@ struct GlucoseChartView: View {
     private var therapySeries = TherapyChartSeries()
     private var reservesTherapyDomainWhileLoading = false
     private var renderBasalDownwards = false
+    /// A separate presentation series. These values never enter GlucoseChartState or measured BG.
+    private var forecastPoints = [GlucoseChartForecastPoint]()
+    private var forecastReferenceDate: Date?
 
     // MARK: - Input Data
 
@@ -314,6 +342,22 @@ struct GlucoseChartView: View {
         return view
     }
 
+    /// Show an estimated future series only in the live Home chart.
+    func forecastPlot(_ points: [GlucoseChartForecastPoint], from referenceDate: Date?) -> Self {
+        var view = self
+        view.forecastPoints = points
+        view.forecastReferenceDate = referenceDate
+        return view
+    }
+
+    private var visibleForecastPoints: [GlucoseChartForecastPoint] {
+        GlucoseChartForecastPresentation.visiblePoints(
+            forecastPoints, referenceDate: forecastReferenceDate,
+            visibleStartDate: visibleStartDate, visibleEndDate: visibleEndDate,
+            isMainChart: usesMainChartYAxisContext
+        )
+    }
+
     /// Blood glucose color dependant on the user defined limit values
     /// - Returns: a Color object either red, yellow or green
     func bgColor(bgValueInMgDl: Double) -> Color {
@@ -353,7 +397,7 @@ struct GlucoseChartView: View {
             return miniChartXAxisLabelDates()
         }
 
-        return ConstantsGlucoseChartSwiftUI.xAxisDates(from: visibleStartDate, to: visibleEndDate, everyHours: everyHours)
+        return ConstantsGlucoseChartSwiftUI.xAxisDates(from: visibleStartDate, to: renderedXScaleEndDate(), everyHours: everyHours)
     }
 
     private func miniChartXAxisLabelDates() -> [Date] {
@@ -393,7 +437,7 @@ struct GlucoseChartView: View {
             date = nextDate
         }
 
-        while date <= visibleEndDate {
+        while date <= renderedXScaleEndDate() {
             dates.append(date)
 
             guard let nextDate = calendar.date(byAdding: .day, value: 1, to: date), nextDate > date else {
@@ -525,7 +569,8 @@ struct GlucoseChartView: View {
     /// of the view's rounded corner without creating future glucose values.
     private func renderedXScaleEndDate() -> Date {
         if usesMainChartYAxisContext {
-            return visibleEndDate
+            return GlucoseChartForecastPresentation.endDate(visibleEndDate: visibleEndDate,
+                                                            visiblePoints: visibleForecastPoints)
         }
 
         guard chartType == .miniChart else {
@@ -644,7 +689,9 @@ struct GlucoseChartView: View {
         let downwardBasal = usesMainChartYAxisContext && renderBasalDownwards
         let treatmentValues = visibleCalibrationPoints.map { $0.value } + visibleTreatmentPoints.nonBasalRenderableValues
             + (downwardBasal ? [] : basalValues)
+        let visibleForecast = visibleForecastPoints
         let allBgValues = bgReadingValues + additionalValues + treatmentValues
+        let renderableYValues = allBgValues + visibleForecast.map(\.glucoseMgdl)
         let cachedBasalBaseline = chartState?.minimumChartValueInMgDl ?? ConstantsGlucoseChartSwiftUI.yAxisAbsoluteMinimumChartValueInMgDl
         let basalMinimumChartValue = showsTreatments && !basalValues.isEmpty && !downwardBasal
             ? chartState?.minimumChartValueInMgDl ?? ConstantsGlucoseChartSwiftUI.yAxisAbsoluteMinimumChartValueInMgDl
@@ -665,8 +712,8 @@ struct GlucoseChartView: View {
         )
         let showsBasalDomain = effectiveMinimumChartValue < ConstantsGlucoseChartSwiftUI.yAxisAbsoluteMinimumChartValueInMgDl
         let lowerDomainPadding = showsBasalDomain ? ConstantsGlucoseChartSwiftUI.yAxisBasalDomainPaddingInMgDl : ConstantsGlucoseChartSwiftUI.yAxisDomainPaddingInMgDl
-        let minimumDomainValue = min((allBgValues.min() ?? 40), urgentLowLimitInMgDl, effectiveMinimumChartValue)
-        let maximumRenderableValue = max((allBgValues.max() ?? urgentHighLimitInMgDl), urgentHighLimitInMgDl)
+        let minimumDomainValue = min((renderableYValues.min() ?? 40), urgentLowLimitInMgDl, effectiveMinimumChartValue)
+        let maximumRenderableValue = max((renderableYValues.max() ?? urgentHighLimitInMgDl), urgentHighLimitInMgDl)
         let calculatedYAxisContextMarks = mainChartYAxisContextMarks(maximumRenderableValue: maximumRenderableValue)
         let calculatedYAxisContextValues = calculatedYAxisContextMarks.labeledValues + calculatedYAxisContextMarks.gridOnlyValues
         let calculatedMaximumContextValue = calculatedYAxisContextValues.max() ?? maximumRenderableValue
@@ -676,7 +723,7 @@ struct GlucoseChartView: View {
         // Using a retained bound here would feed previous clearance back into the next candidate.
         let requiredBasalLayout = GlucoseChartBasalLayout(cachedBaseline: cachedBasalBaseline, values: basalValues,
                                                          rendersDownwards: downwardBasal,
-                                                         contentTop: (allBgValues.max() ?? minimumDomainValue) + upperDomainPadding,
+                                                         contentTop: (renderableYValues.max() ?? minimumDomainValue) + upperDomainPadding,
                                                          chartTop: contentMaximumDomainValue + upperDomainPadding)
         let calculatedMaximumDomainValue = contentMaximumDomainValue + requiredBasalLayout.topSpace
         let maximumDomainValue = usesMainChartYAxisContext
@@ -719,6 +766,21 @@ struct GlucoseChartView: View {
                     yEnd: .value("Sensor noise maximum", domain.upperBound)
                 )
                 .foregroundStyle(backgroundBand.style.color)
+            }
+
+            if let forecastReferenceDate, !visibleForecast.isEmpty, forecastReferenceDate < xScaleEndDate {
+                // Subtle future-only tint separates a prediction from saved sensor observations.
+                RectangleMark(
+                    xStart: .value("Estimate begins", forecastReferenceDate),
+                    xEnd: .value("Estimate ends", xScaleEndDate),
+                    yStart: .value("Minimum", domain.lowerBound),
+                    yEnd: .value("Maximum", domain.upperBound)
+                )
+                .foregroundStyle(Color.cyan.opacity(0.05))
+
+                RuleMark(x: .value("Estimate begins", forecastReferenceDate))
+                    .lineStyle(StrokeStyle(lineWidth: 1, dash: [3, 4]))
+                    .foregroundStyle(Color.cyan.opacity(0.55))
             }
 
             if chartType != .miniChart {
@@ -872,6 +934,19 @@ struct GlucoseChartView: View {
                     .symbol(Circle())
                     .symbolSize(glucosePointSymbolSize())
                     .foregroundStyle(bgColor(bgValueInMgDl: bgReadingValues[index]))
+            }
+
+            // Deliberately not a glucose-like data set: forecast points cannot leak into
+            // measured history, statistics, alarms, exports or chart-state consumers.
+            ForEach(visibleForecast, id: \.date) { point in
+                LineMark(x: .value("Estimated time", point.date),
+                         y: .value("Estimated glucose", point.glucoseMgdl),
+                         series: .value("Series", "glucose-forecast"))
+                    .interpolationMethod(.linear)
+                    .lineStyle(StrokeStyle(lineWidth: 2.5, dash: [5, 4]))
+                    .foregroundStyle(Color.cyan)
+                    .accessibilityLabel(Bundle.main.localizedString(forKey: "forecast.estimate", value: "Estimate", table: "SettingsViews"))
+                    .accessibilityValue(point.glucoseMgdl.mgDlToMmolAndToString(mgDl: isMgDl))
             }
 
             // Calibration and BG check markers sit above glucose points.
