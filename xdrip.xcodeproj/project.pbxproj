@@ -1380,6 +1380,7 @@
 		A7BC01020000000000000001 /* HealthKitTherapySample+CoreDataClass.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "HealthKitTherapySample+CoreDataClass.swift"; sourceTree = "<group>"; };
 		A7BC01020000000000000002 /* HealthKitTherapySample+CoreDataProperties.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "HealthKitTherapySample+CoreDataProperties.swift"; sourceTree = "<group>"; };
 		A7BC01030000000000000001 /* xdrip v33.xcdatamodel */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcdatamodel; path = "xdrip v33.xcdatamodel"; sourceTree = "<group>"; };
+		A7BC01040000000000000001 /* xdrip v34.xcdatamodel */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcdatamodel; path = "xdrip v34.xcdatamodel"; sourceTree = "<group>"; };
 		D40C3DA52775438F00111B73 /* TreatmentEntry+CoreDataProperties.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "TreatmentEntry+CoreDataProperties.swift"; sourceTree = "<group>"; };
 		D41F32912827240E00861B3D /* SettingsViewHousekeeperSettingsViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsViewHousekeeperSettingsViewModel.swift; sourceTree = "<group>"; };
 		D48E8F77278E49B300CCEE08 /* TreatmentNSResponse.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TreatmentNSResponse.swift; sourceTree = "<group>"; };
@@ -6226,6 +6227,7 @@
 		F85FF3C2252D0C32004E6FF1 /* xdrip.xcdatamodeld */ = {
 			isa = XCVersionGroup;
 			children = (
+				A7BC01040000000000000001 /* xdrip v34.xcdatamodel */,
 				A7BC01030000000000000001 /* xdrip v33.xcdatamodel */,
 				4F3200313008000100000001 /* xdrip v32.xcdatamodel */,
 				4F3100313007000100000001 /* xdrip v31.xcdatamodel */,
@@ -6249,7 +6251,7 @@
 				F85FF3CB252F9C9A004E6FF1 /* xdrip v13.xcdatamodel */,
 				F85FF3C3252D0C32004E6FF1 /* xdrip v12.xcdatamodel */,
 			);
-			currentVersion = A7BC01030000000000000001 /* xdrip v33.xcdatamodel */;
+			currentVersion = A7BC01040000000000000001 /* xdrip v34.xcdatamodel */;
 			path = xdrip.xcdatamodeld;
 			sourceTree = "<group>";
 			versionGroupType = wrapper.xcdatamodel;

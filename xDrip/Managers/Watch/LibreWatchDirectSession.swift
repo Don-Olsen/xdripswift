@@ -2,6 +2,34 @@ import Foundation
 import Combine
 import os.log
 
+/// Manual treatment entries have their own WatchConnectivity lifetime. They must not be
+/// scoped to (or discarded with) a Libre sensor connection session.
+enum WatchManualTreatmentMessageKey {
+    static let treatment = "watchManualTreatment"
+    static let treatmentID = "watchManualTreatmentID"
+    static let stored = "watchManualTreatmentStored"
+    static let error = "watchManualTreatmentError"
+}
+
+enum WatchManualTreatmentKind: String, Codable, Equatable {
+    case insulin
+    case carbs
+}
+
+struct WatchManualTreatment: Codable, Equatable, Identifiable {
+    let id: UUID
+    let recordedAt: Date
+    let kind: WatchManualTreatmentKind
+    let amount: Double
+
+    func isValid(at now: Date = Date()) -> Bool {
+        let timestamp = recordedAt.timeIntervalSince1970
+        let maximum = kind == .insulin ? 200.0 : 500.0
+        return amount.isFinite && amount > 0 && amount <= maximum && timestamp.isFinite && timestamp >= 0 &&
+            recordedAt <= now.addingTimeInterval(60 * 60)
+    }
+}
+
 enum LibreWatchMessageKey {
     static let session = "libreWatchDirectSession"
     static let command = "libreWatchDirectCommand"

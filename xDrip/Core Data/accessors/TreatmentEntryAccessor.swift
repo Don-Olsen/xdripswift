@@ -48,11 +48,10 @@ class TreatmentEntryAccessor {
         return getLatestTreatments(limit:limit, howOld:nil)
     }
 
-    /// HealthKit treatment import is local-only. Exclude it in the fetch predicate,
-    /// before applying Nightscout's limit, so imported rows cannot crowd out
-    /// manual treatments waiting to sync.
+    /// HealthKit imports and manual Watch entries are local-only. Exclude both before
+    /// applying Nightscout's limit so they cannot crowd out treatments waiting to sync.
     func getLatestTreatmentsForNightscout(limit: Int) -> [TreatmentEntry] {
-        fetchTreatments(limit: limit, fromDate: nil, excludingHealthKit: true)
+        fetchTreatments(limit: limit, fromDate: nil, excludingExternalLocalOnly: true)
     }
 
     /// Gives treatments with maximumDays old
@@ -313,7 +312,7 @@ class TreatmentEntryAccessor {
     ///     - fromDate : if specified, only return readings with timestamp > fromDate
     /// - returns:
     ///     List of treatments, descending, ie first is youngest
-    private func fetchTreatments(limit:Int?, fromDate:Date?, excludingHealthKit: Bool = false) -> [TreatmentEntry] {
+    private func fetchTreatments(limit:Int?, fromDate:Date?, excludingExternalLocalOnly: Bool = false) -> [TreatmentEntry] {
         let fetchRequest: NSFetchRequest<TreatmentEntry> = TreatmentEntry.fetchRequest()
         fetchRequest.sortDescriptors = [NSSortDescriptor(key: #keyPath(TreatmentEntry.date), ascending: false)]
         fetchRequest.returnsObjectsAsFaults = false
@@ -323,8 +322,9 @@ class TreatmentEntryAccessor {
         if let fromDate = fromDate {
             predicates.append(NSPredicate(format: "date > %@", fromDate as NSDate))
         }
-        if excludingHealthKit {
+        if excludingExternalLocalOnly {
             predicates.append(NSPredicate(format: "healthKitSampleUUID == nil"))
+            predicates.append(NSPredicate(format: "watchSourceUUID == nil"))
         }
         if !predicates.isEmpty {
             fetchRequest.predicate = NSCompoundPredicate(andPredicateWithSubpredicates: predicates)

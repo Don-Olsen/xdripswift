@@ -8,6 +8,32 @@
 - Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
 <!-- testflight-7.1.1-4284:end -->
 
+## Ændringer efter 4284
+
+Watch kan nu registrere insulin (U) og kulhydrat (g) manuelt uden dosisberegning.
+En registrering gemmes først lokalt på uret og leveres derefter til iPhone;
+iPhone kvitterer først efter databasegemning og genlevering genkendes på et
+stabilt UUID. Registreringerne er lokale på iPhone og indgår i backup, men
+sendes ikke til Nightscout. Den nye Watch-side viser den registrerede mængde
+og om den afventer iPhone eller er gemt der. Manglende lagring vises som fejl.
+
+Watch markerer en for gammel direkte glukosemåling tydeligt ved tallet og
+viser dens alder adskilt fra forbindelsesstatus. iPhone Home skjuler
+ændringsværdien for en for gammel måling og reserverer fast plads til
+IOB/COB-status, så rækken ikke rykker ved genindlæsning. Sensorens Bluetooth-
+og overdragelseslogik samt alarmernes regler er uændrede. En særskilt
+Watch-alarmtone er ikke tilføjet, da det anvendte watchOS-SDK ikke understøtter
+den ønskede tilpassede notifikationslyd.
+
+Den lokale kontrol af disse ændringer 3. oktober 2026 bestod 1.120/1.120
+XCTest-tests, Python-kontroller og både iPhone- og Watch-simulatorbuilds.
+Fysisk registrering og levering samt effekten på Home-visningen er endnu
+ikke testet på brugerens enheder. I den seneste fysiske 4284-test modtog uret
+89/91 sensorminutter under 91 minutters ejerskab, men én pause varede
+181,175 sekunder og overskred dermed treminutterskravet. Der er ingen
+Bluetooth-rettelse i de nye ændringer. Ved en lokal filfejl i Watch-køen
+vises en fejl, og nye registreringer blokeres i den aktuelle app-session.
+
 De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
 
 <!-- testflight-7.1.1-4283:start -->

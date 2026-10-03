@@ -34,6 +34,11 @@ struct RootView: View {
             BigNumberView(libreDirectCollector: libreDirectCollector)
                 .tag(WatchAppPage.bigNumber.rawValue)
 
+            // One swipe from the large glucose display. Entries are saved on the
+            // Watch before delivery and do not depend on current sensor ownership.
+            WatchManualTreatmentsView()
+                .tag(WatchAppPage.treatments.rawValue)
+
             // Explicit persistent hand-off between iPhone and direct Watch reception.
             LibreDirectView(collector: libreDirectCollector)
                 .tag(WatchAppPage.libreDirect.rawValue)
@@ -52,8 +57,12 @@ struct RootView: View {
         }
         .onChange(of: scenePhase) { newPhase in
             libreDirectCollector.applicationActivityDidChange(newPhase.libreWatchApplicationState)
-            if newPhase == .active { watchState.refreshLocalAlarmPermission() }
-            if newPhase == .active, watchState.libreWatchOwnership == .watch {
+            if newPhase == .active {
+                watchState.refreshLocalAlarmPermission()
+                watchState.retryPendingManualTreatments()
+            }
+            if newPhase == .active, watchState.libreWatchOwnership == .watch,
+               selectedPage != WatchAppPage.treatments.rawValue {
                 selectedPage = WatchAppPage.bigNumber.rawValue
             }
             updatePhoneRefreshVisibility()
@@ -94,6 +103,132 @@ private enum WatchAppPage: Int {
     case agp = 1
     case bigNumber = 2
     case libreDirect = 3
+    case treatments = 4
+}
+
+private struct WatchManualTreatmentsView: View {
+    @EnvironmentObject private var watchState: WatchStateModel
+    @State private var selectedKind: WatchManualTreatmentKind = .insulin
+    @State private var showingEntry = false
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Registrer behandling")
+                    .font(.headline)
+                treatmentButton("Insulin (U)", symbol: "drop.fill", kind: .insulin)
+                treatmentButton("Kulhydrat (g)", symbol: "fork.knife", kind: .carbs)
+                deliveryStatus
+                    .font(.footnote)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.top, 4)
+            }
+            .padding(.horizontal, 8)
+        }
+        .sheet(isPresented: $showingEntry) {
+            WatchManualTreatmentEntryView(kind: selectedKind)
+                .environmentObject(watchState)
+        }
+        .onAppear { watchState.retryPendingManualTreatments() }
+    }
+
+    private func open(_ kind: WatchManualTreatmentKind) {
+        selectedKind = kind
+        showingEntry = true
+    }
+
+    private func treatmentButton(_ title: String, symbol: String, kind: WatchManualTreatmentKind) -> some View {
+        Button { open(kind) } label: {
+            Label(title, systemImage: symbol)
+                .font(.body.weight(.semibold))
+                .frame(maxWidth: .infinity, minHeight: 52, alignment: .leading)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.bordered)
+        .accessibilityLabel("Registrer \(title)")
+    }
+
+    private func treatmentDescription(_ treatment: WatchManualTreatment) -> String {
+        "\(treatment.amount.formatted()) \(treatment.kind == .insulin ? "U insulin" : "g kulhydrat")"
+    }
+
+    private var pendingStatus: String {
+        guard let newest = watchState.pendingManualTreatments.last else { return "" }
+        let delivery = watchState.manualTreatmentDeliveryIssue == nil ? "afventer iPhone" : "prøver iPhone igen"
+        let count = watchState.pendingManualTreatments.count
+        let countText = count > 1 ? " (\(count) i alt)" : ""
+        return "\(treatmentDescription(newest)) gemt på uret · \(delivery)\(countText)"
+    }
+
+    @ViewBuilder
+    private var deliveryStatus: some View {
+        if let issue = watchState.manualTreatmentStorageIssue {
+            Label(issue, systemImage: "exclamationmark.triangle.fill")
+                .foregroundStyle(.red)
+                .accessibilityLabel("Registrering fejlede: \(issue)")
+        } else if !watchState.pendingManualTreatments.isEmpty {
+            Label(pendingStatus, systemImage: "clock")
+                .foregroundStyle(.orange)
+        } else if let stored = watchState.lastStoredManualTreatment {
+            Label("\(treatmentDescription(stored)) gemt på iPhone", systemImage: "checkmark.circle.fill")
+                .foregroundStyle(.green)
+        } else {
+            Label("Ingen afventende registreringer", systemImage: "info.circle")
+                .foregroundStyle(.secondary)
+        }
+    }
+}
+
+private struct WatchManualTreatmentEntryView: View {
+    @EnvironmentObject private var watchState: WatchStateModel
+    @Environment(\.dismiss) private var dismiss
+    let kind: WatchManualTreatmentKind
+    @State private var amountText = ""
+    @State private var showingConfirmation = false
+    @State private var saving = false
+
+    private var amount: Double? {
+        let cleaned = amountText.trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: ",", with: ".")
+        let maximum = kind == .insulin ? 200.0 : 500.0
+        guard let value = Double(cleaned), value.isFinite, value > 0, value <= maximum else { return nil }
+        return value
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 10) {
+                Text(kind == .insulin ? "Insulin taget" : "Kulhydrat spist")
+                    .font(.headline)
+                TextField(kind == .insulin ? "Antal U" : "Antal gram", text: $amountText)
+                if !amountText.isEmpty && amount == nil {
+                    Text(kind == .insulin ? "Angiv over 0 og højst 200 U" : "Angiv over 0 og højst 500 g")
+                        .font(.footnote)
+                        .foregroundStyle(.orange)
+                }
+                Text("Kun registrering · ingen dosisberegning")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                if let issue = watchState.manualTreatmentStorageIssue {
+                    Text(issue).font(.footnote).foregroundStyle(.red)
+                }
+                Button("Fortsæt") { showingConfirmation = true }
+                    .disabled(amount == nil || watchState.manualTreatmentStorageIssue != nil)
+            }
+            .padding(.horizontal, 8)
+        }
+        .alert("Bekræft registrering", isPresented: $showingConfirmation) {
+            Button("Annuller", role: .cancel) {}
+            Button("Gem") {
+                guard !saving, let amount else { return }
+                saving = true
+                if watchState.recordManualTreatment(kind: kind, amount: amount) { dismiss() }
+                else { saving = false }
+            }
+        } message: {
+            Text("\(amount?.formatted() ?? "–") \(kind == .insulin ? "U insulin taget" : "g kulhydrat spist") nu?")
+        }
+    }
 }
 
 #if os(watchOS)

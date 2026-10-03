@@ -43,15 +43,32 @@ struct BigNumberView: View {
     let originalMinsAgoTextColor = Color.colorSecondary
     let animatedMinsAgoTextColor = Color.white
     @State private var minsAgoTextColor = Color.colorSecondary
+
+    private var directPresentation: LibreWatchConnectionPresentation {
+        watchState.directLibrePresentation(stage: libreDirectCollector.state.stage, at: displayDate)
+    }
     
     var body: some View {
+        let showsDirectReading = watchState.libreWatchOwnership == .watch
+        let directReadingIsStale = showsDirectReading && directPresentation.reading == .stale
+        let awaitsFirstDirectReading = showsDirectReading && directPresentation.reading == .waiting
+
         VStack(alignment: .center ,spacing: 0) {
-            Text("\(watchState.bgValueStringInUserChosenUnit())")
+            if directReadingIsStale {
+                Label("Ikke aktuel", systemImage: "exclamationmark.triangle.fill")
+                    .font(.system(size: isSmallScreen ? 12 : 14, weight: .bold))
+                    .foregroundStyle(.orange)
+                    .padding(.top, 2)
+            }
+
+            Text(awaitsFirstDirectReading ? (watchState.isMgDl ? "---" : "-.-") : watchState.bgValueStringInUserChosenUnit())
                 .scaleEffect(textScaleValue)
-                .font(.system(size:  isSmallScreen ? 100 : 120)).fontWeight(.semibold)
-                .foregroundStyle(watchState.bgTextColor())
-                .padding(.top, isSmallScreen ? -15 : -20)
+                .font(.system(size: directReadingIsStale ? (isSmallScreen ? 72 : 84) : (isSmallScreen ? 100 : 120)))
+                .fontWeight(.semibold)
+                .foregroundStyle(directReadingIsStale ? Color.secondary : watchState.bgTextColor())
+                .padding(.top, directReadingIsStale ? 0 : (isSmallScreen ? -15 : -20))
                 .padding(.trailing, 10)
+                .lineLimit(1)
                 .minimumScaleFactor(0.5)
                 .animation(.easeOut(duration: 0.3), value: textScaleValue)
                 .onChange(of: watchState.bgValueStringInUserChosenUnit()) { oldState, newState in
@@ -64,9 +81,18 @@ struct BigNumberView: View {
                     watchState.updateBigNumberViewDate = Date()
                     watchState.requestWatchStateUpdate()
                 }
+
+            if directReadingIsStale {
+                Text("\(Texts_WatchApp.directReadingAge(directPresentation)) · \(watchState.bgUnitString())")
+                    .font(.system(size: isSmallScreen ? 13 : 15, weight: .semibold))
+                    .foregroundStyle(.orange)
+                    .multilineTextAlignment(.center)
+                    .lineLimit(2)
+                    .minimumScaleFactor(0.8)
+                    .padding(.top, 2)
+            }
             
-            if watchState.libreWatchOwnership != .watch ||
-                watchState.directLibreReadingIsCurrent(at: displayDate) {
+            if !showsDirectReading || directPresentation.reading == .current {
                 HStack(alignment: .center, spacing: 10) {
                     HStack(alignment: .firstTextBaseline, spacing: 3) {
                         Text(watchState.deltaChangeStringInUserChosenUnit())
@@ -88,39 +114,42 @@ struct BigNumberView: View {
                 .padding(.bottom, 10)
             }
             
-            VStack(alignment: .center, spacing: 1) {
-                Gauge(value: watchState.bgValueInMgDl() ?? watchState.gaugeModel().nilValue, in: watchState.gaugeModel().minValue...watchState.gaugeModel().maxValue) {
-                    // empty. No need for any labels or descriptions
-                }
-                .tint(watchState.gaugeModel().gaugeGradient)
-                .gaugeStyle(.accessoryLinear)
-                .opacity(gaugeOpacityValue)
-                .scaleEffect(0.8)
-                .animation(.easeOut(duration: 0.3), value: gaugeOpacityValue)
-                .onChange(of: watchState.bgValueStringInUserChosenUnit()) { oldState, newState in
-                    animateGaugeOpacityValue()
-                }
-                .onChange(of: watchState.updateBigNumberViewDate) { oldState, newState in
-                    animateGaugeOpacityValue()
+            if !directReadingIsStale && !awaitsFirstDirectReading {
+                VStack(alignment: .center, spacing: 1) {
+                    Gauge(value: watchState.bgValueInMgDl() ?? watchState.gaugeModel().nilValue, in: watchState.gaugeModel().minValue...watchState.gaugeModel().maxValue) {
+                        // empty. No need for any labels or descriptions
+                    }
+                    .tint(watchState.gaugeModel().gaugeGradient)
+                    .gaugeStyle(.accessoryLinear)
+                    .opacity(gaugeOpacityValue)
+                    .scaleEffect(0.8)
+                    .animation(.easeOut(duration: 0.3), value: gaugeOpacityValue)
+                    .onChange(of: watchState.bgValueStringInUserChosenUnit()) { oldState, newState in
+                        animateGaugeOpacityValue()
+                    }
+                    .onChange(of: watchState.updateBigNumberViewDate) { oldState, newState in
+                        animateGaugeOpacityValue()
+                    }
                 }
             }
             
-            if watchState.libreWatchOwnership == .watch {
-                let presentation = watchState.directLibrePresentation(stage: libreDirectCollector.state.stage, at: displayDate)
+            if showsDirectReading {
                 VStack(spacing: 2) {
-                    Text(Texts_WatchApp.directConnectionTitle(presentation))
+                    if !directReadingIsStale {
+                        Text(Texts_WatchApp.directReadingAge(directPresentation))
+                            .font(.system(size: isSmallScreen ? 13 : 15))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                    }
+                    Text(Texts_WatchApp.directConnectionTitle(directPresentation))
                         .font(.system(size: isSmallScreen ? 12 : 14, weight: .semibold))
-                        .foregroundStyle(presentation.statusColor)
-                        .lineLimit(2)
-                    Text(Texts_WatchApp.directReadingAge(presentation))
-                        .font(.system(size: isSmallScreen ? 14 : 16))
-                        .foregroundStyle(presentation.reading == .stale ? Color.orange : Color.secondary)
+                        .foregroundStyle(directPresentation.statusColor)
                         .lineLimit(2)
                 }
                 .multilineTextAlignment(.center)
                 .minimumScaleFactor(0.8)
-                .padding(.top, 8)
-                .accessibilityElement(children: .combine)
+                .padding(.top, directReadingIsStale ? 4 : 8)
+                .accessibilityElement(children: .contain)
             } else {
                 HStack(alignment: .center, spacing: 3) {
                     Image(systemName: ConstantsAppleWatch.requestingDataIconSFSymbolName)
@@ -170,6 +199,10 @@ struct BigNumberView: View {
     }
     
     func animateTextScale(){
+        guard watchState.libreWatchOwnership != .watch || directPresentation.reading != .stale else {
+            textScaleValue = originalTextScaleValue
+            return
+        }
         textScaleValue = animatedTextScaleValue
         DispatchQueue.main.asyncAfter(deadline: DispatchTime.now() + 0.3){
             textScaleValue = originalTextScaleValue

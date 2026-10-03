@@ -173,6 +173,15 @@ final class WatchStateModel: NSObject, ObservableObject {
     @Published private(set) var canRequestLocalAlarmPermission = false
     private let localAlarms = LibreWatchAlarmController()
 
+    // Manual treatments are independent of Libre ownership and its six-hour sensor outbox.
+    // They remain on disk until the iPhone confirms a durable Core Data save.
+    @Published private(set) var pendingManualTreatments: [WatchManualTreatment] = []
+    @Published private(set) var lastStoredManualTreatment: WatchManualTreatment?
+    @Published private(set) var manualTreatmentStorageIssue: String?
+    @Published private(set) var manualTreatmentDeliveryIssue: String?
+    private var lastManualTreatmentSendAt: [UUID: Date] = [:]
+    private var manualTreatmentRetryScheduled = false
+
     /// Original direct values are retained in memory so a newer iPhone calibration can
     /// recompute the Watch-only presentation without altering values sent back to iPhone.
     private var directReadingHistory: [LibreWatchDirectReadingPayload] = []
@@ -214,6 +223,13 @@ final class WatchStateModel: NSObject, ObservableObject {
         libreWatchOwnership = LibreWatchSessionStore.loadOwnership()
         libreWatchCalibrationSnapshot = LibreWatchSessionStore.loadCalibration()
         super.init()
+
+        do {
+            pendingManualTreatments = try Self.loadManualTreatments()
+        } catch {
+            manualTreatmentStorageIssue = "Kunne ikke læse gemte behandlinger på uret"
+            log.error("Manual Watch treatment queue load failed: \(error.localizedDescription, privacy: .public)")
+        }
 
         if let pending = pendingPhoneReturn {
             if !pending.matches(libreWatchDirectSession) ||
@@ -257,6 +273,7 @@ final class WatchStateModel: NSObject, ObservableObject {
         if session.activationState == .activated {
             retryPendingPhoneReturn()
             flushWatchConnectivityOutbox()
+            flushManualTreatmentQueue()
         } else {
             requestSessionActivationIfNeeded()
         }
@@ -1438,6 +1455,112 @@ final class WatchStateModel: NSObject, ObservableObject {
         session.activate()
     }
 
+    private static func manualTreatmentQueueURL() throws -> URL {
+        let directory = try FileManager.default.url(
+            for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+        return directory.appendingPathComponent("WatchManualTreatments.v1.json")
+    }
+
+    private static func loadManualTreatments() throws -> [WatchManualTreatment] {
+        let url = try manualTreatmentQueueURL()
+        guard FileManager.default.fileExists(atPath: url.path) else { return [] }
+        return try JSONDecoder().decode([WatchManualTreatment].self, from: Data(contentsOf: url))
+    }
+
+    private static func persistManualTreatments(_ treatments: [WatchManualTreatment]) throws {
+        let data = try JSONEncoder().encode(treatments)
+        try data.write(to: manualTreatmentQueueURL(), options: .atomic)
+    }
+
+    /// Return success only after the entry is safely written on the Watch. No dose is calculated.
+    @discardableResult
+    func recordManualTreatment(kind: WatchManualTreatmentKind, amount: Double) -> Bool {
+        let treatment = WatchManualTreatment(id: UUID(), recordedAt: Date(), kind: kind, amount: amount)
+        guard treatment.isValid() else {
+            manualTreatmentStorageIssue = "Angiv en gyldig mængde"
+            return false
+        }
+        guard manualTreatmentStorageIssue == nil else { return false }
+        let updated = pendingManualTreatments + [treatment]
+        do {
+            try Self.persistManualTreatments(updated)
+            pendingManualTreatments = updated
+            flushManualTreatmentQueue()
+            return true
+        } catch {
+            manualTreatmentStorageIssue = "Behandlingen kunne ikke gemmes på uret"
+            log.error("Manual Watch treatment write failed: \(error.localizedDescription, privacy: .public)")
+            return false
+        }
+    }
+
+    private func flushManualTreatmentQueue() {
+        guard manualTreatmentStorageIssue == nil, !pendingManualTreatments.isEmpty else { return }
+        guard session.activationState == .activated else {
+            requestSessionActivationIfNeeded()
+            return
+        }
+        let now = Date()
+        let outstandingIDs = Set(session.outstandingUserInfoTransfers.compactMap {
+            ($0.userInfo[WatchManualTreatmentMessageKey.treatmentID] as? String).flatMap(UUID.init(uuidString:))
+        })
+        for treatment in pendingManualTreatments {
+            // WCSession already retains its offline transfer. Do not enqueue copies while it waits.
+            if outstandingIDs.contains(treatment.id) { continue }
+            if let lastSend = lastManualTreatmentSendAt[treatment.id],
+               now.timeIntervalSince(lastSend) < 5 * 60 { continue }
+            guard let data = try? JSONEncoder().encode(treatment) else { continue }
+            let message: [String: Any] = [
+                WatchManualTreatmentMessageKey.treatment: data,
+                WatchManualTreatmentMessageKey.treatmentID: treatment.id.uuidString
+            ]
+            session.transferUserInfo(message)
+            lastManualTreatmentSendAt[treatment.id] = now
+            log.info("Queued manual Watch treatment \(treatment.id.uuidString, privacy: .public) for phone delivery")
+        }
+        if !manualTreatmentRetryScheduled {
+            manualTreatmentRetryScheduled = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 5 * 60) { [weak self] in
+                self?.manualTreatmentRetryScheduled = false
+                self?.flushManualTreatmentQueue()
+            }
+        }
+    }
+
+    func retryPendingManualTreatments() {
+        flushManualTreatmentQueue()
+    }
+
+    @discardableResult
+    private func processManualTreatmentReceipt(_ message: [String: Any]) -> Bool {
+        guard let idString = message[WatchManualTreatmentMessageKey.treatmentID] as? String,
+              let id = UUID(uuidString: idString),
+              let stored = message[WatchManualTreatmentMessageKey.stored] as? Bool else { return false }
+        // Ignore a delayed failure for an entry already acknowledged and removed.
+        guard let confirmed = pendingManualTreatments.first(where: { $0.id == id }) else { return true }
+        guard stored else {
+            manualTreatmentDeliveryIssue = "iPhone kunne ikke gemme behandlingen endnu · prøver igen"
+            if let reason = message[WatchManualTreatmentMessageKey.error] as? String {
+                log.error("iPhone did not store manual Watch treatment \(idString, privacy: .public): \(reason, privacy: .public)")
+            }
+            return true
+        }
+        let remaining = pendingManualTreatments.filter { $0.id != id }
+        do {
+            try Self.persistManualTreatments(remaining)
+            pendingManualTreatments = remaining
+            lastStoredManualTreatment = confirmed
+            manualTreatmentDeliveryIssue = nil
+            lastManualTreatmentSendAt[id] = nil
+            log.info("iPhone confirmed manual Watch treatment \(idString, privacy: .public)")
+        } catch {
+            // Retaining the Watch record is safe: the phone deduplicates by the stable UUID.
+            manualTreatmentStorageIssue = "iPhone har gemt behandlingen, men uret kan ikke opdatere køen"
+            log.error("Manual Watch treatment receipt write failed: \(error.localizedDescription, privacy: .public)")
+        }
+        return true
+    }
+
     private func message(for item: LibreWatchOutboxItem) -> [String: Any]? {
         guard let command = item.command else { return nil }
         var message: [String: Any] = [
@@ -2152,6 +2275,7 @@ extension WatchStateModel: WCSessionDelegate {
             self.retryPendingPhoneReturn()
             self.synchronizeLocalAlarmState()
             self.flushWatchConnectivityOutbox()
+            self.flushManualTreatmentQueue()
         }
     }
 
@@ -2161,6 +2285,7 @@ extension WatchStateModel: WCSessionDelegate {
             self.synchronizeLocalAlarmState()
             self.phoneRefresh.reachabilityDidChange()
             self.flushWatchConnectivityOutbox()
+            self.flushManualTreatmentQueue()
         }
     }
 
@@ -2169,6 +2294,7 @@ extension WatchStateModel: WCSessionDelegate {
     func session(_ session: WCSession, didReceiveMessage message: [String: Any]) {
         DispatchQueue.main.async {
             if WatchDeliveryEvidenceTransfer.shared.handleRequest(message, session: session, reply: nil) { return }
+            if self.processManualTreatmentReceipt(message) { return }
             if self.processLibreWatchDeliveryReceipt(message) { return }
             self.phoneRefresh.receivePush(message)
             self.requestingDataIconColor = ConstantsAppleWatch.requestingDataIconColorActive
@@ -2184,6 +2310,10 @@ extension WatchStateModel: WCSessionDelegate {
     func session(_ session: WCSession, didReceiveMessage message: [String: Any], replyHandler: @escaping ([String: Any]) -> Void) {
         DispatchQueue.main.async {
             if WatchDeliveryEvidenceTransfer.shared.handleRequest(message, session: session, reply: replyHandler) { return }
+            if self.processManualTreatmentReceipt(message) {
+                replyHandler([WatchManualTreatmentMessageKey.stored: true])
+                return
+            }
             // Reply after the synchronous main-queue validation/persistence, rather than
             // treating the dispatch itself as completion. Measurement receipts are separate.
             replyHandler(WatchSnapshotPushContract.reply(to: message) { self.phoneRefresh.receivePush($0) })
@@ -2192,6 +2322,7 @@ extension WatchStateModel: WCSessionDelegate {
 
     func session(_: WCSession, didReceiveUserInfo userInfo: [String: Any] = [:]) {
         DispatchQueue.main.async {
+            if self.processManualTreatmentReceipt(userInfo) { return }
             if self.processLibreWatchDeliveryReceipt(userInfo) { return }
             self.phoneRefresh.receivePush(userInfo)
         }

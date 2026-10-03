@@ -103,13 +103,13 @@ struct RootHomeLoopView: View {
         } label: {
             VStack(alignment: .leading, spacing: 0) {
                 RootHomeInlineMetricView(metric: displayed, valueOpacity: state.isHistorical.rootHomeHistoricalValueOpacity)
-                if let lastCalculatedAt = displayed.lastCalculatedAt {
-                    Text(Self.lastCalculatedCaption(at: lastCalculatedAt))
-                        .font(.system(size: 9))
-                        .foregroundStyle(ConstantsAppColors.secondaryText)
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.8)
-                }
+                Text(displayed.lastCalculatedAt.map { Self.lastCalculatedCaption(at: $0) } ?? " ")
+                    .font(.system(size: 9))
+                    .foregroundStyle(ConstantsAppColors.secondaryText)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
+                    .opacity(displayed.lastCalculatedAt == nil ? 0 : 1)
+                    .accessibilityHidden(true)
             }
         }
         .accessibilityLabel(metric?.accessibilityName(isIOB: isIOB) ?? (isIOB ? "IOB" : "COB"))

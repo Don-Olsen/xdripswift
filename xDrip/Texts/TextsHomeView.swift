@@ -4,6 +4,11 @@ import Foundation
 enum Texts_HomeView {
     static private let filename = "HomeView"
 
+    static let lastReadingAgeFormat = NSLocalizedString(
+        "home_lastReadingAgeFormat", tableName: filename, bundle: .main,
+        value: "Last reading: %d min", comment: "Age of a glucose reading that is no longer current"
+    )
+
     static let expandChart: String = {
         return NSLocalizedString("home_expandChart", tableName: filename, bundle: Bundle.main, value: "Expand chart", comment: "accessibility label for the iPad full screen chart button")
     }()

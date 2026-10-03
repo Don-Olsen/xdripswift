@@ -239,6 +239,8 @@ struct BackupTreatment: Codable, Sendable {
     let healthKitSourceBundleIdentifier: String?
     let healthKitExternalUUID: String?
     let healthKitSyncIdentifier: String?
+    /// Preserves manual Watch entry identity so restoring a backup cannot erase retry deduplication.
+    let watchSourceUUID: String?
     let id: String
     let nightscoutEventType: String?
     let notes: String?
@@ -263,7 +265,8 @@ struct BackupTreatment: Codable, Sendable {
         healthKitSampleUUID: String? = nil,
         healthKitSourceBundleIdentifier: String? = nil,
         healthKitExternalUUID: String? = nil,
-        healthKitSyncIdentifier: String? = nil
+        healthKitSyncIdentifier: String? = nil,
+        watchSourceUUID: String? = nil
     ) {
         self.careLinkSourceIdentifier = careLinkSourceIdentifier
         self.date = date
@@ -272,6 +275,7 @@ struct BackupTreatment: Codable, Sendable {
         self.healthKitSourceBundleIdentifier = healthKitSourceBundleIdentifier
         self.healthKitExternalUUID = healthKitExternalUUID
         self.healthKitSyncIdentifier = healthKitSyncIdentifier
+        self.watchSourceUUID = watchSourceUUID
         self.id = id
         self.nightscoutEventType = nightscoutEventType
         self.notes = notes

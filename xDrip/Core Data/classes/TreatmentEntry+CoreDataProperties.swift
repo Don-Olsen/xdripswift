@@ -62,7 +62,13 @@ extension TreatmentEntry {
     @NSManaged public var healthKitExternalUUID: String?
     @NSManaged public var healthKitSyncIdentifier: String?
 
+    /// Stable identity of a manual Watch entry across transport retries and restores.
+    @NSManaged public var watchSourceUUID: String?
+
     /// HealthKit imports are read-only and must never be forwarded to Nightscout.
     public var isHealthKitImported: Bool { healthKitSampleUUID != nil }
+    /// Manual entries received from Watch stay local unless the user explicitly chooses
+    /// an external export for them in a future release.
+    public var isWatchLocalOnly: Bool { watchSourceUUID != nil }
     
 }

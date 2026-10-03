@@ -635,16 +635,17 @@ final class RootHomeStateModel: ObservableObject {
 
         let minutesAgo = max(0, -Int(latestReading.timeStamp.timeIntervalSinceNow) / 60)
         let previousReading = latestReadings.count > 1 ? latestReadings[1] : nil
+        let ageUnit = minutesAgo == 1 ? Texts_Common.minute : Texts_Common.minutes
 
         return RootHomeGlucoseState(
             valueText: valueText,
             valueColor: valueColor,
             valueHasStrikethrough: isStale,
-            minutesText: String(minutesAgo),
-            minutesAgoText: "\(minutesAgo == 1 ? Texts_Common.minute : Texts_Common.minutes) \(Texts_HomeView.ago)",
+            minutesText: isStale ? String(format: Texts_HomeView.lastReadingAgeFormat, minutesAgo) : String(minutesAgo),
+            minutesAgoText: isStale ? "" : "\(ageUnit) \(Texts_HomeView.ago)",
             minutesColor: ConstantsAppColors.primaryText,
-            deltaText: latestReading.unitizedDeltaString(previousBgReading: previousReading, showUnit: false, highGranularity: true, mgDl: isMgDl),
-            deltaUnitText: isMgDl ? Texts_Common.mgdl : Texts_Common.mmol,
+            deltaText: isStale ? "" : latestReading.unitizedDeltaString(previousBgReading: previousReading, showUnit: false, highGranularity: true, mgDl: isMgDl),
+            deltaUnitText: isStale ? "" : (isMgDl ? Texts_Common.mgdl : Texts_Common.mmol),
             deltaColor: ConstantsAppColors.primaryText
         )
     }

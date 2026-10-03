@@ -540,7 +540,8 @@ final class BackupService: @unchecked Sendable {
                 healthKitSampleUUID: $0.healthKitSampleUUID,
                 healthKitSourceBundleIdentifier: $0.healthKitSourceBundleIdentifier,
                 healthKitExternalUUID: $0.healthKitExternalUUID,
-                healthKitSyncIdentifier: $0.healthKitSyncIdentifier
+                healthKitSyncIdentifier: $0.healthKitSyncIdentifier,
+                watchSourceUUID: $0.watchSourceUUID
             )
         }
     }
@@ -803,6 +804,7 @@ final class BackupService: @unchecked Sendable {
             treatment.healthKitSourceBundleIdentifier = record.healthKitSourceBundleIdentifier
             treatment.healthKitExternalUUID = record.healthKitExternalUUID
             treatment.healthKitSyncIdentifier = record.healthKitSyncIdentifier
+            treatment.watchSourceUUID = record.watchSourceUUID
             if !record.id.isEmpty {
                 ids.insert(record.id)
             }
@@ -1056,11 +1058,15 @@ final class BackupService: @unchecked Sendable {
             healthKitSampleUUID: treatment.healthKitSampleUUID,
             healthKitSourceBundleIdentifier: treatment.healthKitSourceBundleIdentifier,
             healthKitExternalUUID: treatment.healthKitExternalUUID,
-            healthKitSyncIdentifier: treatment.healthKitSyncIdentifier
+            healthKitSyncIdentifier: treatment.healthKitSyncIdentifier,
+            watchSourceUUID: treatment.watchSourceUUID
         ))
     }
 
     private func treatmentFingerprint(_ treatment: BackupTreatment) -> String {
+        if let uuid = treatment.watchSourceUUID, !uuid.isEmpty {
+            return "watch|\(uuid)"
+        }
         // HealthKit UUIDs, rather than rounded time and amount, distinguish repeated real
         // doses and prevent an imported treatment from merging with a manual entry.
         if let uuid = treatment.healthKitSampleUUID, !uuid.isEmpty {

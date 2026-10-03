@@ -618,3 +618,157 @@ final class HealthKitTherapyImportTests: XCTestCase {
         }
     }
 }
+
+/// Manual Watch entries are kept through phone restarts and transport retries, while their
+/// local-only provenance prevents an unrelated Nightscout sync from exporting them.
+final class WatchManualTreatmentTests: XCTestCase {
+    private let at = Date(timeIntervalSince1970: 1_800_000_000)
+
+    func testEnvelopeRequiresMatchingIDAndValidPositiveAmountAndTime() throws {
+        let id = UUID()
+        let now = at.addingTimeInterval(10)
+        let good = WatchManualTreatment(id: id, recordedAt: at, kind: .insulin, amount: 1.25)
+        let envelope: [String: Any] = [
+            WatchManualTreatmentMessageKey.treatmentID: id.uuidString,
+            WatchManualTreatmentMessageKey.treatment: try JSONEncoder().encode(good)
+        ]
+        XCTAssertEqual(WatchManualTreatmentStore.decode(envelope, at: now), good)
+        var wrongID = envelope
+        wrongID[WatchManualTreatmentMessageKey.treatmentID] = UUID().uuidString
+        XCTAssertNil(WatchManualTreatmentStore.decode(wrongID, at: now))
+
+        for amount in [0, -1, Double.nan, Double.infinity, 200.1] {
+            let entry = WatchManualTreatment(id: id, recordedAt: at, kind: .insulin, amount: amount)
+            XCTAssertFalse(entry.isValid(at: now), "insulin \(amount)")
+        }
+        XCTAssertTrue(WatchManualTreatment(id: id, recordedAt: at, kind: .insulin, amount: 200).isValid(at: now))
+        XCTAssertFalse(WatchManualTreatment(id: id, recordedAt: at, kind: .carbs, amount: 500.1).isValid(at: now))
+        XCTAssertTrue(WatchManualTreatment(id: id, recordedAt: at, kind: .carbs, amount: 500).isValid(at: now))
+        XCTAssertFalse(WatchManualTreatment(id: id, recordedAt: now.addingTimeInterval(3601),
+                                            kind: .carbs, amount: 10).isValid(at: now))
+    }
+
+    func testLostReceiptRetryAfterPhoneRestartDoesNotDuplicateTreatment() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WatchManualTreatmentTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let storeURL = directory.appendingPathComponent("treatments.sqlite")
+        let first = WatchManualTreatment(id: UUID(), recordedAt: at, kind: .insulin, amount: 2.5)
+        let sameValueDifferentID = WatchManualTreatment(id: UUID(), recordedAt: at, kind: .insulin, amount: 2.5)
+
+        let phone = try CoreDataManager(testModelName: ConstantsCoreData.modelName, persistentStoreURL: storeURL)
+        let firstReceipt = expectation(description: "phone committed the first entry")
+        WatchManualTreatmentStore.save(first, coreDataManager: phone, at: at.addingTimeInterval(1)) { outcome in
+            XCTAssertEqual(outcome, .stored)
+            firstReceipt.fulfill()
+        }
+        wait(for: [firstReceipt], timeout: 5)
+        try phone.disconnectPersistentStoresForTesting()
+
+        let restartedPhone = try CoreDataManager(testModelName: ConstantsCoreData.modelName, persistentStoreURL: storeURL)
+        let retryReceipt = expectation(description: "retry after lost receipt is deduplicated")
+        WatchManualTreatmentStore.save(first, coreDataManager: restartedPhone, at: at.addingTimeInterval(2)) { outcome in
+            XCTAssertEqual(outcome, .alreadyStored)
+            retryReceipt.fulfill()
+        }
+        wait(for: [retryReceipt], timeout: 5)
+        let distinctReceipt = expectation(description: "same value with a new UUID is a distinct entry")
+        WatchManualTreatmentStore.save(sameValueDifferentID, coreDataManager: restartedPhone,
+                                       at: at.addingTimeInterval(2)) { outcome in
+            XCTAssertEqual(outcome, .stored)
+            distinctReceipt.fulfill()
+        }
+        wait(for: [distinctReceipt], timeout: 5)
+
+        let context = restartedPhone.mainManagedObjectContext
+        context.performAndWait {
+            let rows = (try? context.fetch(TreatmentEntry.fetchRequest())) ?? []
+            XCTAssertEqual(rows.count, 2)
+            XCTAssertEqual(Set(rows.compactMap(\.watchSourceUUID)), Set([first.id.uuidString, sameValueDifferentID.id.uuidString]))
+            XCTAssertTrue(rows.allSatisfy { $0.treatmentType == .Insulin && $0.value == 2.5 && $0.isWatchLocalOnly })
+        }
+        try restartedPhone.disconnectPersistentStoresForTesting()
+    }
+
+    func testWatchEntriesStayVisibleLocallyButNeverEnterNightscoutUploadSelection() {
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let context = core.mainManagedObjectContext
+        let watch = TreatmentEntry(date: at, value: 12, treatmentType: .Carbs,
+            nightscoutEventType: nil, enteredBy: "xDrip4iOS Watch", nsManagedObjectContext: context)
+        watch.watchSourceUUID = UUID().uuidString
+        let manual = TreatmentEntry(date: at.addingTimeInterval(-60), value: 15, treatmentType: .Carbs,
+            nightscoutEventType: nil, enteredBy: "Manual", nsManagedObjectContext: context)
+        XCTAssertTrue(core.saveChangesSynchronously())
+        XCTAssertEqual(TreatmentEntryAccessor(coreDataManager: core).getLatestTreatments(limit: 10).count, 2)
+        let uploadRows = TreatmentEntryAccessor(coreDataManager: core).getLatestTreatmentsForNightscout(limit: 1)
+        XCTAssertEqual(uploadRows.count, 1)
+        XCTAssertTrue(uploadRows[0] === manual)
+    }
+
+    @MainActor
+    func testBackupRetainsDistinctWatchIDsAndRestoreRemainsIdempotent() async throws {
+        let source = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let ids = [UUID().uuidString, UUID().uuidString]
+        for id in ids {
+            let row = TreatmentEntry(date: at, value: 3, treatmentType: .Insulin,
+                nightscoutEventType: nil, enteredBy: "xDrip4iOS Watch",
+                nsManagedObjectContext: source.mainManagedObjectContext)
+            row.watchSourceUUID = id
+        }
+        XCTAssertTrue(source.saveChangesSynchronously())
+        let exporter = BackupService(coreDataManager: source)
+        let archive = try await exporter.createBackup(options: BackupOptions(
+            includesSettings: false, includesAccounts: false, includesBgReadings: false, includesTreatments: true
+        ))
+        defer { try? FileManager.default.removeItem(at: archive.url) }
+        let inspection = try exporter.inspectBackup(at: archive.url)
+        XCTAssertEqual(Set(inspection.payload.treatments.compactMap(\.watchSourceUUID)), Set(ids))
+
+        let destination = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let importer = BackupService(coreDataManager: destination)
+        _ = try await importer.restore(inspection: inspection, mode: .keepCurrent,
+                                       restoresSettings: false, restoredAccountCategories: [])
+        _ = try await importer.restore(inspection: inspection, mode: .keepCurrent,
+                                       restoresSettings: false, restoredAccountCategories: [])
+        let rows = try destination.mainManagedObjectContext.fetch(TreatmentEntry.fetchRequest())
+        XCTAssertEqual(rows.count, 2)
+        XCTAssertEqual(Set(rows.compactMap(\.watchSourceUUID)), Set(ids))
+    }
+
+    func testV33TreatmentStoreMigratesToV34WithoutChangingExistingRows() throws {
+        let modelDirectory = try XCTUnwrap(Bundle.main.url(forResource: ConstantsCoreData.modelName, withExtension: "momd"))
+        let v33 = try XCTUnwrap(NSManagedObjectModel(contentsOf: modelDirectory.appendingPathComponent("xdrip v33.mom")))
+        let v34 = try XCTUnwrap(NSManagedObjectModel(contentsOf: modelDirectory.appendingPathComponent("xdrip v34.mom")))
+        XCTAssertNoThrow(try NSMappingModel.inferredMappingModel(forSourceModel: v33, destinationModel: v34))
+        XCTAssertNil(v33.entitiesByName["TreatmentEntry"]?.attributesByName["watchSourceUUID"])
+        XCTAssertTrue(try XCTUnwrap(v34.entitiesByName["TreatmentEntry"]?.attributesByName["watchSourceUUID"]).isOptional)
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WatchTreatmentMigration-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("legacy.sqlite")
+        let oldCoordinator = NSPersistentStoreCoordinator(managedObjectModel: v33)
+        let oldStore = try oldCoordinator.addPersistentStore(ofType: NSSQLiteStoreType,
+            configurationName: nil, at: url)
+        let oldContext = NSManagedObjectContext(concurrencyType: .privateQueueConcurrencyType)
+        oldContext.persistentStoreCoordinator = oldCoordinator
+        try oldContext.performAndWait {
+            let row = NSEntityDescription.insertNewObject(forEntityName: "TreatmentEntry", into: oldContext)
+            row.setValue(at, forKey: "date")
+            row.setValue(3.5, forKey: "value")
+            row.setValue(TreatmentType.Insulin.rawValue, forKey: "treatmentType")
+            row.setValue("", forKey: "id")
+            try oldContext.save()
+            oldContext.reset()
+        }
+        try oldCoordinator.remove(oldStore)
+
+        let migrated = try CoreDataManager(testModelName: ConstantsCoreData.modelName, persistentStoreURL: url)
+        let rows = try migrated.mainManagedObjectContext.fetch(TreatmentEntry.fetchRequest())
+        XCTAssertEqual(rows.count, 1)
+        XCTAssertEqual(rows[0].value, 3.5)
+        XCTAssertNil(rows[0].watchSourceUUID)
+        try migrated.disconnectPersistentStoresForTesting()
+    }
+}

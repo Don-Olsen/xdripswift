@@ -14,6 +14,64 @@ import UIKit
 import WatchConnectivity
 import WidgetKit
 
+/// The phone is the only writer of manual Watch treatments to the regular treatment
+/// database. A stable Watch UUID identifies a single entry even if WCSession replays it
+/// after a process restart or loses the first acknowledgement.
+enum WatchManualTreatmentStore {
+    enum Outcome: Equatable {
+        case stored
+        case alreadyStored
+        case invalid
+        case failed
+
+        var isStored: Bool { self == .stored || self == .alreadyStored }
+    }
+
+    static func decode(_ message: [String: Any], at now: Date = Date()) -> WatchManualTreatment? {
+        guard let rawID = message[WatchManualTreatmentMessageKey.treatmentID] as? String,
+              let id = UUID(uuidString: rawID),
+              let data = message[WatchManualTreatmentMessageKey.treatment] as? Data,
+              let treatment = try? JSONDecoder().decode(WatchManualTreatment.self, from: data),
+              treatment.id == id, treatment.isValid(at: now)
+        else { return nil }
+        return treatment
+    }
+
+    static func save(_ treatment: WatchManualTreatment, coreDataManager: CoreDataManager,
+                     at now: Date = Date(), completion: @escaping (Outcome) -> Void) {
+        guard treatment.isValid(at: now) else { completion(.invalid); return }
+        let context = coreDataManager.mainManagedObjectContext
+        context.perform {
+            let request: NSFetchRequest<TreatmentEntry> = TreatmentEntry.fetchRequest()
+            request.fetchLimit = 1
+            request.predicate = NSPredicate(format: "watchSourceUUID == %@", treatment.id.uuidString)
+            let existing: TreatmentEntry?
+            do {
+                existing = try context.fetch(request).first
+            } catch {
+                completion(.failed)
+                return
+            }
+
+            if existing == nil {
+                let type: TreatmentType = treatment.kind == .insulin ? .Insulin : .Carbs
+                let entry = TreatmentEntry(date: treatment.recordedAt, value: treatment.amount,
+                    treatmentType: type, nightscoutEventType: nil, enteredBy: "xDrip4iOS Watch",
+                    nsManagedObjectContext: context)
+                entry.watchSourceUUID = treatment.id.uuidString
+            }
+
+            // saveChanges() only saves the child context before returning. Its completion
+            // variant confirms that the parent SQLite store has committed the entry.
+            // Repeat that parent save for an existing row, too: a prior attempt may have
+            // saved only the child before failing or before the phone was terminated.
+            coreDataManager.saveChanges { stored in
+                completion(stored ? (existing == nil ? .stored : .alreadyStored) : .failed)
+            }
+        }
+    }
+}
+
 // WatchConnectivity delegate callbacks can trigger async AGP generation
 // mutable watch payloads are still committed back on the main queue
 final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
@@ -1261,6 +1319,55 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
         }
     }
 
+    /// Accept independent manual Watch entries even after Libre ownership has returned to the
+    /// phone. A receipt means the parent persistent store has committed, never merely that WC
+    /// delivered the envelope or the in-memory context contains it.
+    @discardableResult
+    private func handleManualWatchTreatment(_ message: [String: Any],
+                                             reply: (([String: Any]) -> Void)?) -> Bool {
+        guard message[WatchManualTreatmentMessageKey.treatment] != nil else { return false }
+        let rawID = message[WatchManualTreatmentMessageKey.treatmentID] as? String ?? ""
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            guard let treatment = WatchManualTreatmentStore.decode(message) else {
+                let response: [String: Any] = [
+                    WatchManualTreatmentMessageKey.treatmentID: rawID,
+                    WatchManualTreatmentMessageKey.stored: false,
+                    WatchManualTreatmentMessageKey.error: "invalidTreatment"
+                ]
+                if let reply { reply(response) } else { self.sendManualWatchTreatmentReceipt(response) }
+                return
+            }
+            WatchManualTreatmentStore.save(treatment, coreDataManager: self.coreDataManager) { [weak self] outcome in
+                guard let self else { return }
+                var response: [String: Any] = [
+                    WatchManualTreatmentMessageKey.treatmentID: treatment.id.uuidString,
+                    WatchManualTreatmentMessageKey.stored: outcome.isStored
+                ]
+                if !outcome.isStored {
+                    response[WatchManualTreatmentMessageKey.error] = outcome == .invalid
+                        ? "invalidTreatment" : "persistenceFailed"
+                }
+                if let reply { reply(response) } else { self.sendManualWatchTreatmentReceipt(response) }
+            }
+        }
+        return true
+    }
+
+    private func sendManualWatchTreatmentReceipt(_ receipt: [String: Any]) {
+        guard session.activationState == .activated else { return }
+        if session.isReachable {
+            session.sendMessage(receipt, replyHandler: nil) { [weak self] _ in
+                DispatchQueue.main.async {
+                    guard let self, self.session.activationState == .activated else { return }
+                    self.session.transferUserInfo(receipt)
+                }
+            }
+        } else {
+            session.transferUserInfo(receipt)
+        }
+    }
+
     @discardableResult
     private func updateLibreWatchUnlockCounter(
         from message: [String: Any],
@@ -1343,6 +1450,7 @@ extension WatchManager: WCSessionDelegate {
 
     // process any received messages from the watch app
     func session(_ session: WCSession, didReceiveMessage message: [String: Any]) {
+        if handleManualWatchTreatment(message, reply: nil) { return }
         if handleLibreWatchMessage(message, transport: .interactiveMessage, reply: nil) { return }
         if let kind = message["requestWatchUpdate"] as? String {
             DispatchQueue.main.async {
@@ -1361,6 +1469,7 @@ extension WatchManager: WCSessionDelegate {
         didReceiveMessage message: [String: Any],
         replyHandler: @escaping ([String: Any]) -> Void
     ) {
+        if handleManualWatchTreatment(message, reply: replyHandler) { return }
         if handleLibreWatchMessage(message, transport: .interactiveMessage, reply: replyHandler) { return }
         DispatchQueue.main.async {
             if self.phoneRefresh.receive(message, reply: replyHandler) { return }
@@ -1374,6 +1483,7 @@ extension WatchManager: WCSessionDelegate {
     }
 
     func session(_: WCSession, didReceiveUserInfo userInfo: [String: Any] = [:]) {
+        if handleManualWatchTreatment(userInfo, reply: nil) { return }
         _ = handleLibreWatchMessage(userInfo, transport: .queuedUserInfo, reply: nil)
     }
 
