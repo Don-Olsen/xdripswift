@@ -16,6 +16,10 @@ final class WatchRefreshCoordinatorTests: XCTestCase {
         var sent: [Sent] = []
         var jobs: [(TimeInterval, () -> Void)] = []
         var events: [(WatchRefreshCoordinator.Stream, String, String?)] = []
+        var indicatorStates: [WatchRefreshActivityIndicator.State] = []
+        lazy var indicator = WatchRefreshActivityIndicator(
+            schedule: { [unowned self] delay, action in jobs.append((uptime + delay, action)) },
+            changed: { [unowned self] state in indicatorStates.append(state) })
         var onSend: ((Sent) -> Void)?
         var displayedReadingDate: Date?
         var appliedStatusLimit: Double?
@@ -26,11 +30,15 @@ final class WatchRefreshCoordinatorTests: XCTestCase {
             schedule: { [unowned self] delay, action in jobs.append((uptime + delay, action)) },
             isReachable: { [unowned self] in reachable },
             send: { [unowned self] message, reply, failure in
+                indicator.sending()
                 let value = Sent(message: message, reply: reply, failure: failure)
                 sent.append(value); onSend?(value)
             },
             consume: { [unowned self] payload in consume(payload) },
-            event: { [unowned self] stream, action, reason in events.append((stream, action, reason)) })
+            event: { [unowned self] stream, action, reason in
+                events.append((stream, action, reason))
+                indicator.receiveEvent(action)
+            })
 
         deinit { defaults.removePersistentDomain(forName: suite) }
         func start() { client.setExecutionAvailable(true); advance(0.25) }
@@ -170,6 +178,97 @@ final class WatchRefreshCoordinatorTests: XCTestCase {
             return result
         }
         func start() { watch.client.setExecutionAvailable(true); watch.advance(0.5) }
+    }
+
+    func testActivityIndicatorPulsesForValidatedCorrelatedReplyThenExpires() {
+        let h = Harness(); h.start()
+        XCTAssertEqual(h.indicator.state, .pending)
+        h.respond(0)
+        XCTAssertEqual(h.indicator.state, .received)
+        h.advance(0.25)
+        XCTAssertEqual(h.indicator.state, .received)
+        h.advance(0.25)
+        XCTAssertEqual(h.indicator.state, .inactive)
+        XCTAssertEqual(h.sent.count, 1, "The pulse does not request another update")
+    }
+
+    func testActivityIndicatorPulsesForCorrelatedUnchangedReply() {
+        let h = Harness(); h.start(); h.respond(0); h.advance(0.5)
+        h.client.request(force: true); h.advance(0.25)
+        XCTAssertEqual(h.indicator.state, .pending)
+        h.respond(1, payload: ["contentIDs": ["status": "s-a", "bgReadings": "g-a"],
+                               "unchangedStreams": ["status", "bgReadings"]])
+        XCTAssertEqual(h.indicator.state, .received)
+        XCTAssertNil(h.client.inFlightRequestID)
+    }
+
+    func testActivityIndicatorPulsesForAcknowledgedValidatedPush() {
+        let h = Harness()
+        var payload = h.payload()
+        payload["watchSnapshotPush"] = 1
+        payload["pushID"] = UUID().uuidString
+        let reply = WatchSnapshotPushContract.reply(to: payload) { h.client.receivePush($0) }
+        XCTAssertEqual(reply["success"] as? Bool, true)
+        XCTAssertEqual(h.indicator.state, .received)
+        h.advance(0.5)
+        XCTAssertEqual(h.indicator.state, .inactive)
+        XCTAssertTrue(h.sent.isEmpty)
+    }
+
+    func testActivityIndicatorDoesNotPulseForUnknownOrRejectedPayloads() {
+        let h = Harness()
+        XCTAssertTrue(h.client.receivePush(["unknown": true]).isEmpty)
+        let rejected: [String: Any] = ["watchSnapshotPush": 1, "pushID": UUID().uuidString,
+                                       "status": ["isMgDl": true]]
+        let reply = WatchSnapshotPushContract.reply(to: rejected) { h.client.receivePush($0) }
+        XCTAssertEqual(reply["success"] as? Bool, false)
+        XCTAssertEqual(h.indicator.state, .inactive)
+        h.start()
+        h.respond(0, payload: ["status": ["isMgDl": true]])
+        XCTAssertEqual(h.indicator.state, .inactive)
+        XCTAssertFalse(h.indicatorStates.contains(.received))
+    }
+
+    func testActivityIndicatorPulsesForValidatedLegacyPush() {
+        let h = Harness(); h.start()
+        h.sent[0].reply?([LibreWatchMessageKey.success: false])
+        XCTAssertTrue(h.client.usesLegacyCompatibility)
+        XCTAssertEqual(h.indicator.state, .pending)
+        h.client.receivePush(h.payload())
+        XCTAssertEqual(h.indicator.state, .received)
+        XCTAssertNil(h.client.inFlightRequestID)
+    }
+
+    func testActivityIndicatorOldPulseCannotClearNewPendingRequest() {
+        let h = Harness(); h.start(); h.respond(0)
+        h.client.request(force: true); h.advance(0.25)
+        XCTAssertEqual(h.sent.count, 2)
+        XCTAssertEqual(h.indicator.state, .pending)
+        h.advance(0.25)
+        XCTAssertEqual(h.indicator.state, .pending)
+    }
+
+    func testActivityIndicatorOldPulseCannotShortenNewValidatedPulse() {
+        let h = Harness()
+        h.client.receivePush(h.payload())
+        h.advance(0.25)
+        h.client.receivePush(h.payload(offset: 0.25, identity: "new"))
+        h.advance(0.25)
+        XCTAssertEqual(h.indicator.state, .received)
+        h.advance(0.25)
+        XCTAssertEqual(h.indicator.state, .inactive)
+    }
+
+    func testActivityIndicatorFailureInvalidatesEarlierPulseReset() {
+        let h = Harness(); h.start()
+        h.client.receivePush(h.payload())
+        XCTAssertEqual(h.indicator.state, .received)
+        h.advance(0.25)
+        h.sent[0].failure(NSError(domain: "WCErrorDomain", code: 7007))
+        XCTAssertEqual(h.indicator.state, .inactive)
+        let changesAfterFailure = h.indicatorStates.count
+        h.advance(0.25)
+        XCTAssertEqual(h.indicatorStates.count, changesAfterFailure)
     }
 
     func testConcurrentVisibleRequestsEncodeOneCombinedRequestBeforeTransport() {

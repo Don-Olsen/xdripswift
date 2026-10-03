@@ -95,12 +95,21 @@ final class WatchStateModel: NSObject, ObservableObject {
     private var sensorAgeReferenceDate: Date?
     private var mappedAGPRange: (start: Date, end: Date)?
     private var mappedAGPPoints: [GlucoseChartAGPPoint] = []
+    private lazy var phoneRefreshIndicator = WatchRefreshActivityIndicator(
+        schedule: { delay, work in DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work) },
+        changed: { [weak self] state in
+            switch state {
+            case .inactive: self?.requestingDataIconColor = ConstantsAppleWatch.requestingDataIconColorInactive
+            case .pending: self?.requestingDataIconColor = ConstantsAppleWatch.requestingDataIconColorPending
+            case .received: self?.requestingDataIconColor = ConstantsAppleWatch.requestingDataIconColorActive
+            }
+        })
     private lazy var phoneRefresh = WatchRefreshCoordinator(
         schedule: { delay, work in DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work) },
         isReachable: { [weak self] in self?.phoneIsReachable == true },
         send: { [weak self] message, reply, failure in
             guard let self else { return }
-            self.requestingDataIconColor = ConstantsAppleWatch.requestingDataIconColorPending
+            self.phoneRefreshIndicator.sending()
             let replyHandler: (([String: Any]) -> Void)? = reply.map { callback in
                 { payload in DispatchQueue.main.async { callback(payload) } }
             }
@@ -121,11 +130,10 @@ final class WatchStateModel: NSObject, ObservableObject {
             case .agp: evidenceStream = .agp
             }
             WatchDeliveryEvidenceStore.shared.recordTransport(stream: evidenceStream, action: action, outcome: outcome)
+            self?.phoneRefreshIndicator.receiveEvent(action)
             if action == "failed" {
                 self?.log.error("Watch refresh \(stream.rawValue, privacy: .public) failed: \(outcome ?? "unknown", privacy: .public)")
-                self?.requestingDataIconColor = ConstantsAppleWatch.requestingDataIconColorInactive
             } else if action == "received" {
-                self?.requestingDataIconColor = ConstantsAppleWatch.requestingDataIconColorInactive
                 if stream == .status { self?.lastPhoneStatusReceivedAt = Date() }
                 if stream == .bgReadings { self?.lastPhoneGraphReceivedAt = Date() }
             }
@@ -2296,13 +2304,6 @@ extension WatchStateModel: WCSessionDelegate {
             if self.processManualTreatmentReceipt(message) { return }
             if self.processLibreWatchDeliveryReceipt(message) { return }
             self.phoneRefresh.receivePush(message)
-            self.requestingDataIconColor = ConstantsAppleWatch.requestingDataIconColorActive
-
-            // change the requesting icon color back after a small delay to prevent it
-            // flashing on/off too quickly
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                self.requestingDataIconColor = ConstantsAppleWatch.requestingDataIconColorInactive
-            }
         }
     }
 

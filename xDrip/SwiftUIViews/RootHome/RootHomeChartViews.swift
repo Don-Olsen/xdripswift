@@ -81,7 +81,8 @@ struct RootHomeMainChartView: View {
                     forecastResult?.reason == nil ? forecastResult?.points.map {
                         GlucoseChartForecastPoint(date: $0.date, glucoseMgdl: $0.glucoseMgdl)
                     } ?? [] : [],
-                    from: forecastResult?.reason == nil ? forecastResult?.referenceDate : nil
+                    from: forecastResult?.reason == nil ? forecastResult?.referenceDate : nil,
+                    horizonMinutes: forecastHorizonMinutes
                 )
                 .transaction { transaction in
                     transaction.animation = nil

@@ -59,9 +59,10 @@ final class RootHomeInteractionTests: XCTestCase {
             isMainChart: true
         )
         XCTAssertEqual(live.count, 13)
-        XCTAssertEqual(GlucoseChartForecastPresentation.endDate(visibleEndDate: now, visiblePoints: live),
-                       now.addingTimeInterval(60 * 60))
-        XCTAssertEqual(GlucoseChartForecastPresentation.endDate(visibleEndDate: now, visiblePoints: []), now)
+        XCTAssertEqual(GlucoseChartForecastPresentation.endDate(visibleEndDate: now, horizonMinutes: 60,
+                                                               isMainChart: true), now.addingTimeInterval(60 * 60))
+        XCTAssertEqual(GlucoseChartForecastPresentation.endDate(visibleEndDate: now, horizonMinutes: 0,
+                                                               isMainChart: true), now)
         XCTAssertTrue(GlucoseChartForecastPresentation.visiblePoints(
             sixtyMinutePoints, referenceDate: now,
             visibleStartDate: now.addingTimeInterval(-4 * 3600),
@@ -74,6 +75,64 @@ final class RootHomeInteractionTests: XCTestCase {
         ).isEmpty)
         XCTAssertTrue(measured.bgReadingValues.isEmpty)
         XCTAssertTrue(measured.bgReadingDates.isEmpty)
+    }
+
+    func testForecastTimeDomainRemainsStableAcrossLoadingAndUnavailableResults() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let reference = now.addingTimeInterval(-30)
+        let start = now.addingTimeInterval(-3 * 3600)
+        for horizon in [60, 120] {
+            var context = forecastContext()
+            context.horizonMinutes = horizon
+            let valid = GlucoseForecastResult(
+                points: stride(from: 0, through: horizon, by: 5).map {
+                    GlucoseForecastPoint(date: reference.addingTimeInterval(Double($0) * 60), glucoseMgdl: 110)
+                },
+                referenceDate: reference, reason: nil, parameterSource: .manual,
+                referenceSensorID: "sensor-a"
+            )
+            let unavailable = GlucoseForecastResult(points: [], referenceDate: reference, reason: .dataUnavailable)
+            let results: [GlucoseForecastResult?] = [nil, valid, unavailable, valid]
+            var chart = GlucoseChartState.empty(startDate: start, endDate: now)
+            chart.newestBgReadingDate = reference
+            chart.newestBgReadingSensorID = "sensor-a"
+            chart.newestBgReadingIsValidForDownstream = true
+            let expectedDomain = start ... now.addingTimeInterval(Double(horizon) * 60)
+            var pointCounts: [Int] = []
+            for result in results {
+                let completed = result.map { RootHomeCompletedForecast(result: $0, context: context) }
+                let displayable = RootHomeForecastFreshness.displayableResult(completed, context: context,
+                    chartState: chart, at: now)
+                let points = displayable?.reason == nil ? displayable?.points.map {
+                    GlucoseChartForecastPoint(date: $0.date, glucoseMgdl: $0.glucoseMgdl)
+                } ?? [] : []
+                let visible = GlucoseChartForecastPresentation.visiblePoints(points,
+                    referenceDate: displayable?.reason == nil ? displayable?.referenceDate : nil,
+                    visibleStartDate: start, visibleEndDate: now, isMainChart: true)
+                pointCounts.append(visible.count)
+                let domain = start ... GlucoseChartForecastPresentation.endDate(visibleEndDate: now,
+                    horizonMinutes: context.horizonMinutes, isMainChart: true)
+                XCTAssertEqual(domain, expectedDomain)
+            }
+            // Geometry remains steady while safety gates still remove the unavailable estimate.
+            XCTAssertEqual(pointCounts, [0, horizon / 5 + 1, 0, horizon / 5 + 1])
+            XCTAssertTrue(chart.bgReadingValues.isEmpty)
+            XCTAssertTrue(chart.bgReadingDates.isEmpty)
+        }
+    }
+
+    func testForecastTimeDomainDoesNotReserveSpaceWhenOffHistoricalOrNotMainChart() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let historicalEnd = now.addingTimeInterval(-2 * 3600)
+        // Home passes zero for both the disabled preference and a historical chart window.
+        XCTAssertEqual(GlucoseChartForecastPresentation.endDate(visibleEndDate: now,
+            horizonMinutes: 0, isMainChart: true), now)
+        XCTAssertEqual(GlucoseChartForecastPresentation.endDate(visibleEndDate: historicalEnd,
+            horizonMinutes: 0, isMainChart: true), historicalEnd)
+        for horizon in [60, 120] {
+            XCTAssertEqual(GlucoseChartForecastPresentation.endDate(visibleEndDate: now,
+                horizonMinutes: horizon, isMainChart: false), now)
+        }
     }
 
     func testForecastPresentationExpiresWithoutAnotherSensorReading() {

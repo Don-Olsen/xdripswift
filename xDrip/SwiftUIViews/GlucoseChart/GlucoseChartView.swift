@@ -94,8 +94,11 @@ struct GlucoseChartForecastPresentation {
         }
     }
 
-    static func endDate(visibleEndDate: Date, visiblePoints: [GlucoseChartForecastPoint]) -> Date {
-        max(visibleEndDate, visiblePoints.last?.date ?? visibleEndDate)
+    /// Reserve the configured live horizon even while an estimate is loading or unavailable.
+    /// Hiding an unsafe estimate must not rescale measured glucose and therapy curves.
+    static func endDate(visibleEndDate: Date, horizonMinutes: Int, isMainChart: Bool) -> Date {
+        guard isMainChart, horizonMinutes == 60 || horizonMinutes == 120 else { return visibleEndDate }
+        return visibleEndDate.addingTimeInterval(Double(horizonMinutes) * 60)
     }
 }
 
@@ -142,6 +145,7 @@ struct GlucoseChartView: View {
     /// A separate presentation series. These values never enter GlucoseChartState or measured BG.
     private var forecastPoints = [GlucoseChartForecastPoint]()
     private var forecastReferenceDate: Date?
+    private var forecastHorizonMinutes = 0
 
     // MARK: - Input Data
 
@@ -343,10 +347,12 @@ struct GlucoseChartView: View {
     }
 
     /// Show an estimated future series only in the live Home chart.
-    func forecastPlot(_ points: [GlucoseChartForecastPoint], from referenceDate: Date?) -> Self {
+    func forecastPlot(_ points: [GlucoseChartForecastPoint], from referenceDate: Date?,
+                      horizonMinutes: Int = 0) -> Self {
         var view = self
         view.forecastPoints = points
         view.forecastReferenceDate = referenceDate
+        view.forecastHorizonMinutes = horizonMinutes
         return view
     }
 
@@ -570,7 +576,8 @@ struct GlucoseChartView: View {
     private func renderedXScaleEndDate() -> Date {
         if usesMainChartYAxisContext {
             return GlucoseChartForecastPresentation.endDate(visibleEndDate: visibleEndDate,
-                                                            visiblePoints: visibleForecastPoints)
+                                                            horizonMinutes: forecastHorizonMinutes,
+                                                            isMainChart: usesMainChartYAxisContext)
         }
 
         guard chartType == .miniChart else {

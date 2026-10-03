@@ -8,6 +8,113 @@
 - Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
 <!-- testflight-7.1.1-4289:end -->
 
+## Godkendt udgivelse af de to lokale visningsrettelser
+
+3. oktober 2026: brugerens “indtil videre så upload” godkender intern
+TestFlight-udgivelse af rettelserne til grafens prognosebredde og Watch-appens
+modtagelsesprik beskrevet nedenfor. Releaseprocessen vælger næste ledige
+buildnummer hos Apple og gentager hele valideringen på det præcise release-træ.
+De lokale testtal nedenfor er forudgående testmateriale; endelig Apple-status
+og tests registreres i releaseafsnittet efter gennemført udgivelse.
+
+Det tomme xDrip-felt på urskiven er fortsat et åbent, særskilt problem.
+Watch-systemdiagnosen fra 20.04 blev læst via iPhone og viste både en ældre
+xDrip-komplikation og vores aktuelle på samme urskive. Den dokumenterer ikke
+årsagen til det tomme felt eller et nedbrud i vores komplikation. Brugeren
+ønsker at udskyde denne undersøgelse. Der indgår ingen komplikationsrettelse,
+ændring af Bluetooth, alarmer, sensorejerskab, workout-runtime eller
+behandlings-/prognoseberegning i denne udgivelse. Ingen direkte installation
+på brugerens enheder; TestFlight er installationsvejen.
+
+## Lokal Watch-visningsrettelse efter 4289 — modtagelsesprik
+
+3. oktober 2026: prikken ved målingens alder er en aktivitetsindikator, som
+historisk lyser grønt i 0,5 sekunder ved datamodtagelse; den er ikke et
+vedvarende signal om Bluetooth-rækkevidde eller friske sensorværdier.
+Kodegennemgangen fandt, at kun den gamle `didReceiveMessage`-variant uden
+replyHandler tændte grønt. Den fælles refresh-modtagelse satte indikatoren grå,
+så moderne kvitterede pushes og svar på urets anmodninger ikke viste blinket.
+Fejlvejen fandtes før 4289 og skyldes ikke de nye basal-/prognosefunktioner.
+
+iPhonens aktivitetslog blev læst trådløst; den havde nye Watch 4289-hændelser
+med højst ét sekund mellem Watch-tid og telefonens modtagelse i det seneste
+udsnit. Det dokumenterer Watch→iPhone-trafik, ikke hvert iPhone→Watch-svar eller
+prikkens rendering. Den lokale eksport af hele Watch-journalen var ældre og
+bruges ikke som bevis for urets aktuelle modtagelser.
+
+Rettelsen knytter det grønne 0,5-sekunders blink til den fælles, validerede
+`received`-hændelse. Afviste payloads og behandlings-/målekvitteringer tænder
+ikke alene grønt. Ældre forsinkede nulstillinger kan ikke slukke et nyere blink
+eller en nyere ventende anmodning. Orange under afventning og grå i hvile
+bevares. Dette er kun præsentation; leveringsprotokol, genopkobling,
+sensorejerskab, runtime, alarmer og behandlinger ændres ikke. Der tilføjes
+ingen polling eller keepalive. iPhone-grafrettelsen nedenfor bevares.
+
+Validering af begge lokale visningsrettelser, 3. oktober 2026:
+
+- `scripts/local-build.sh release-test` afsluttede med exit 0.
+- **1.192/1.192 XCTest-tests bestod**, nul fejl/skipped, inklusive otte nye
+  tests for validerede/afviste modtagelser, ældre og kvitterede leveringsveje,
+  uændrede korrelerede svar, udløb og overlappende indikatoropdateringer.
+- Alle Python-kontroller og både iPhone- og Watch-simulatorbuilds bestod.
+- Uafhængig diff-gennemgang fandt ingen ændring af transport-/kvitteringslogik.
+  `git diff --check` bestod. Den tidligere grafrettelses kodehash er bevaret.
+- Testmateriale:
+  `~/DeveloperBuildData/xDrip/local-runs/xdripswift/20261003T175751Z-69579/`,
+  inklusive `results/AllTests.xcresult`, `results/stability-summary.json` og
+  `results/combined-visual-fixes-source-manifest.json` for den lokale ændrede
+  kode oven på `fa3aaf23`.
+
+Fysisk bekræftelse af blinket afventer en særskilt autoriseret udgivelse.
+Ingen upload, enhedsinstallation, versions- eller release-statusændring.
+
+---
+
+## Lokal visningsrettelse efter 4289 — stabil prognosebredde
+
+3. oktober 2026: iPhone blev læst trådløst med Apples devicectl og bekræftet
+på 7.1.1 (4289). Den lokale prognoselog viste fem `dataUnavailable`-poster;
+fire blev efterfulgt af en gyldig prognose på samme målereference efter
+219–511 ms. Den femte reference havde allerede en gyldig bevaret post, så
+loggens første-gyldige-deduplikering kan ikke afgøre dens senere restitution.
+Aktivitetsloggen viste ti fortløbende sensormålinger i det undersøgte interval,
+med højst 61 sekunder mellem målingerne. Rådata ligger privat uden for Git.
+Dette dokumenterer korte inputpauser; der er ikke optaget skærmbilleder af
+hver render-frame på telefonen.
+
+Kodefund: Home koblede hele grafens fremtidige tidsområde til tilstedeværelsen
+af prognosepunkter. En midlertidigt skjult prognose trak derfor tidsaksen ind
+og ud for både glukose, behandlinger og IOB/COB. Rettelsen reserverer det valgte
+60/120-minutters område under genindlæsning, også når resultatet er utilgængeligt.
+Fra, historik, natvisning og kompakte grafer bevarer deres eksisterende område.
+Gyldighedskontrollerne er uændrede; der vises ingen gammel prognose hen over
+ukendte eller ændrede behandlingsdata.
+
+Ændringerne er begrænset til grafvisning, regressionstests og dokumentation.
+Prognosemotor, logformat, HealthKit-import, alarmer, Bluetooth, Watch-runtime,
+ejerskab og levering er uændrede. Buildnummer og release-status ændres ikke.
+Ingen upload eller direkte installation er foretaget for denne rettelse.
+
+Validering af denne lokale rettelse, 3. oktober 2026:
+
+- `scripts/local-build.sh release-test` afsluttede med exit 0.
+- **1.184/1.184 XCTest-tests bestod**, nul fejl/skipped, herunder to nye
+  regressionstests for stabilt tidsområde ved 60/120 minutter og ved
+  indlæsning → gyldig → utilgængelig → gyldig prognose.
+- Alle Python-kontroller samt iPhone- og Watch-simulatorbuilds bestod.
+- `git diff --check` bestod. Kodeændringen omfatter kun `GlucoseChartView.swift`,
+  `RootHomeChartViews.swift` og den eksisterende `RootHomeInteractionTests.swift`.
+- Kvittering og logs:
+  `~/DeveloperBuildData/xDrip/local-runs/xdripswift/20261003T174636Z-66258/`.
+  `results/forecast-reentry-source-manifest.json` knytter testen til den lokale
+  kode oven på `fa3aaf23`; HEAD alene indeholder endnu ikke rettelsen.
+
+Fysisk kontrol af grafen ved gentagne appskift afventer en særskilt godkendt
+udgivelse. Den korte skjulning af estimatet under reel inputkontrol kan fortsat
+forekomme; hele grafen skal ikke længere ændre vandret skala af den grund.
+
+---
+
 De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
 
 ## Lokal kandidat efter 4288: prognose, basalregistrering og måling af præcision

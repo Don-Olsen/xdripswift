@@ -395,3 +395,42 @@ final class WatchRefreshCoordinator {
         return "\(error.domain):\(error.code)"
     }
 }
+
+/// Presentation only: a validated phone update flashes green for half a second.
+/// Runs on the owner's serial queue and never requests transport or background time.
+final class WatchRefreshActivityIndicator {
+    enum State { case inactive, pending, received }
+
+    private let schedule: (TimeInterval, @escaping () -> Void) -> Void
+    private let changed: (State) -> Void
+    private var resetToken = UUID()
+    private(set) var state = State.inactive
+
+    init(schedule: @escaping (TimeInterval, @escaping () -> Void) -> Void,
+         changed: @escaping (State) -> Void) {
+        self.schedule = schedule
+        self.changed = changed
+    }
+
+    func sending() { set(.pending) }
+
+    func receiveEvent(_ action: String) {
+        switch action {
+        case "received": set(.received)
+        case "failed": set(.inactive)
+        default: break
+        }
+    }
+
+    private func set(_ state: State) {
+        resetToken = UUID()
+        self.state = state
+        changed(state)
+        guard state == .received else { return }
+        let token = resetToken
+        schedule(0.5) { [weak self] in
+            guard let self, self.resetToken == token else { return }
+            self.set(.inactive)
+        }
+    }
+}

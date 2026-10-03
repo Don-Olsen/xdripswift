@@ -4,6 +4,26 @@ The iPhone Home chart can show a separate, dotted estimate for the next 60 minut
 
 The forecast is display-only. Its points are never saved as BG readings, used for statistics or alerts, sent to Nightscout or Apple Health, or sent to Watch. Watch sensor ownership, Bluetooth recovery, workout runtime and alarm rules are unchanged. It uses existing event-driven Home updates and adds no polling or keepalive timer.
 
+## Home presentation during reloads
+
+The live Home graph reserves the selected 60/120-minute future span independently
+of whether a forecast is ready. A foreground refresh or a temporary unavailable
+result therefore does not collapse and re-expand the time axis of glucose,
+treatments and IOB/COB curves. Turning the forecast off, viewing history or using
+the night layout removes this reservation. Compact/Watch/widget charts do not
+opt into it. An empty reserved area is not a prediction: the existing freshness,
+sensor, treatment and settings checks still decide whether forecast points can
+be drawn. HealthKit synchronization can briefly make treatment inputs incomplete
+on reentry; the estimate can remain hidden until that check succeeds. This change
+does not change forecasting, import behavior or its availability log.
+
+The local follow-up to 4289 passed 1,184/1,184 XCTest tests, all Python checks
+and both simulator builds on 2026-10-03. The new presentation regression tests
+cover 60/120-minute loading/valid/unavailable transitions and the off/history/
+non-main exclusions. Device logs establish transient input unavailability, but
+physical observation of the corrected UI still requires a separately authorized
+release. This follow-up has not been uploaded or installed on the user's devices.
+
 ## Inputs and setup
 
 The calculation starts from the newest downstream-valid CGM reading and a continuous recent history from the same sensor/source. Old readings, gaps, invalid samples, incomplete treatment imports or a pending treatment save make the forecast unavailable; missing data is never treated as zero.
