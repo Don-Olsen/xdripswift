@@ -186,11 +186,11 @@ verified before upload, and Apple confirmed **Internal / Testing** on
 iPhone, so future personal accuracy and the 80% interval target remain
 unverified in physical use.
 
-## Local follow-up after 4293: usable-day training periods and diagnostics
+## Build 4294: usable-day training periods and diagnostics
 
 In 4293, a large annual example count could still end in the generic
 `mlNotEnoughHistory` message: its fixed 14-calendar-day B and C periods each
-needed ten usable days, and the reason for rejection was hidden. This local
+needed ten usable days, and the reason for rejection was hidden. The 4294
 follow-up does **not** relax the minimum number of days, rows, walk-forward
 residuals or calibration predictions. It reports the failing phase, horizon,
 fold where applicable, actual and required counts, and the period's dates in
@@ -245,7 +245,10 @@ latter produced an arm64 Mach-O iPhone app. The first full run had one faulty
 new test fixture; the fixture was corrected and the entire suite passed on
 rerun. Passing software checks does not prove that the original iPhone failure
 is resolved or that personal accuracy has improved; the specific on-device
-gate and outcome must be read from the new status display.
+gate and outcome must be read from the new status display. The release process
+repeated **1,255/1,255 XCTest tests** and both simulator builds on the exact
+4294 source checkpoint; Apple confirmed **Internal / Testing** in the existing
+Ole Internal group.
 
 ## Validation boundary
 
