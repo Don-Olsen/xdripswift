@@ -224,6 +224,11 @@ final class GlucoseForecastMLTrainerTests: XCTestCase {
             periodEnd: Date(timeIntervalSince1970: 1_700_086_400))
         XCTAssertEqual(GlucoseForecastMLStatusPresentation.outcome(
             "trainingIssue", issue: issue, localize: fallback), issue.danishMessage)
+        XCTAssertEqual(GlucoseForecastMLStatusPresentation.preparationOrPreviousIssue(
+            "Ny historiklæsning: 1 af 60", previousIssue: issue),
+            "Ny historiklæsning: 1 af 60")
+        XCTAssertEqual(GlucoseForecastMLStatusPresentation.preparationOrPreviousIssue(
+            "", previousIssue: issue), issue.danishMessage)
         XCTAssertTrue(issue.danishMessage.contains("Kalibrering (+60): 9 af 10 brugbare dage"))
         XCTAssertTrue(issue.danishMessage.contains("2023"))
         XCTAssertEqual(GlucoseForecastMLStatusPresentation.outcome(

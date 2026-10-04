@@ -13,8 +13,33 @@ struct GlucoseForecastMLSourceSegment: Sendable {
     let endDate: Date
 }
 
+/// Aggregate read evidence only: no glucose values or treatment amounts are retained.
+struct GlucoseForecastMLHistoryReadSpan: Sendable {
+    private(set) var count = 0
+    private(set) var firstDate: Date?
+    private(set) var lastDate: Date?
+
+    mutating func include(_ date: Date) {
+        count += 1
+        if firstDate.map({ date < $0 }) ?? true { firstDate = date }
+        if lastDate.map({ date > $0 }) ?? true { lastDate = date }
+    }
+}
+
 struct GlucoseForecastMLHistoryCoverage: Sendable {
     let requestedDays: Int
+    let requestedStart: Date
+    let requestedEnd: Date
+    let healthGlucoseByBundle: [String: GlucoseForecastMLHistoryReadSpan]
+    let localGlucoseRead: GlucoseForecastMLHistoryReadSpan
+    let healthInsulinRead: GlucoseForecastMLHistoryReadSpan
+    let healthCarbohydrateRead: GlucoseForecastMLHistoryReadSpan
+    let localInsulinRead: GlucoseForecastMLHistoryReadSpan
+    let localCarbohydrateRead: GlucoseForecastMLHistoryReadSpan
+    let insulinSourceBundleID: String?
+    let carbohydrateSourceBundleID: String?
+    let acceptedHealthInsulinCount: Int
+    let acceptedHealthCarbohydrateCount: Int
     let completedDays: Int
     let usableDays: Int
     let healthKitDays: Int

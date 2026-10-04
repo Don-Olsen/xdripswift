@@ -141,7 +141,9 @@ final class GlucoseForecastMLTrainingCoordinator: @unchecked Sendable {
                         cancellation: cancellation)
                 }
             } else {
-                self.finishPreparation("Historikken kunne ikke læses sikkert. Prognosemotoren bruges fortsat.",
+                let reason = cancellation.readFailure.map { "Historiklæsning stoppet: \($0)." }
+                    ?? "Historikken kunne ikke læses sikkert."
+                self.finishPreparation("\(reason) Prognosemotoren bruges fortsat.",
                     cancellation: cancellation)
             }
         }
@@ -265,12 +267,35 @@ final class GlucoseForecastMLTrainingCoordinator: @unchecked Sendable {
         guard preparationInProgress, preparationCancellation === cancellation,
               !cancellation.isCancelled else { lock.unlock(); return }
         let counts = coverage.exampleCountsByHorizon
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "da_DK")
+        formatter.dateStyle = .short
+        formatter.timeStyle = .none
+        func spanText(_ span: GlucoseForecastMLHistoryReadSpan) -> String {
+            guard let first = span.firstDate, let last = span.lastDate else { return "0 poster" }
+            return "\(span.count) poster (\(formatter.string(from: first))–\(formatter.string(from: last)))"
+        }
         var lines = [
             "\(coverage.usableDays) brugbare dage · Sundhed: \(coverage.healthKitDays) · app: \(coverage.localFallbackDays)",
             "Kandidatdage før kildevalg: Sundhed \(coverage.healthCandidateDays) · app \(coverage.localCandidateDays)",
             "+30: \(counts[30, default: 0]) · +60: \(counts[60, default: 0]) · +120: \(counts[120, default: 0]) eksempler",
-            "Sundhed-tidspunkter: \(coverage.mergedHealthGlucoseTimestamps) samlet fra kopier · \(coverage.discardedHealthGlucoseTimestamps) kasseret ved konflikt"
+            "Sundhed-tidspunkter: \(coverage.mergedHealthGlucoseTimestamps) samlet fra kopier · \(coverage.discardedHealthGlucoseTimestamps) kasseret ved konflikt",
+            "Ønsket: \(formatter.string(from: coverage.requestedStart))–\(formatter.string(from: coverage.requestedEnd)) · læst \(coverage.completedDays) af \(coverage.requestedDays) dage"
         ]
+        if coverage.healthGlucoseByBundle.isEmpty {
+            lines.append("Sundhed glukose: ingen læsbare xDrip-kilder fundet")
+        } else {
+            for bundle in coverage.healthGlucoseByBundle.keys.sorted() {
+                if let span = coverage.healthGlucoseByBundle[bundle] {
+                    lines.append("Sundhed glukose (\(bundle)): \(spanText(span))")
+                }
+            }
+        }
+        lines.append("App glukose: \(spanText(coverage.localGlucoseRead))")
+        lines.append("Sundhed insulin (\(coverage.insulinSourceBundleID ?? "ingen kilde")): \(spanText(coverage.healthInsulinRead)) · \(coverage.acceptedHealthInsulinCount) gyldige bolusposter")
+        lines.append("Sundhed kulhydrat (\(coverage.carbohydrateSourceBundleID ?? "ingen kilde")): \(spanText(coverage.healthCarbohydrateRead)) · \(coverage.acceptedHealthCarbohydrateCount) gyldige poster")
+        lines.append("App-database insulin/kulhydrat: \(spanText(coverage.localInsulinRead)) / \(spanText(coverage.localCarbohydrateRead))")
+        lines.append("Dage uden påvist behandlingsdækning: insulin \(coverage.unknownInsulinDays) · kulhydrat \(coverage.unknownCarbohydrateDays)")
         if let median = coverage.healthLocalAbsoluteDifferenceMedianMgdl,
            let p95 = coverage.healthLocalAbsoluteDifferenceP95Mgdl {
             let numberLocale = Locale(identifier: "da_DK")

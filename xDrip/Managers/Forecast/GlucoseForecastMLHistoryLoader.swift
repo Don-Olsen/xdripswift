@@ -7,6 +7,19 @@ import Foundation
 final class GlucoseForecastMLHistoryCancellation: @unchecked Sendable {
     private let lock = NSLock()
     private var cancelled = false
+    private var failure: String?
+
+    var readFailure: String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return failure
+    }
+
+    func recordReadFailure(_ message: String) {
+        lock.lock()
+        if failure == nil { failure = message }
+        lock.unlock()
+    }
 
     var isCancelled: Bool {
         lock.lock()
@@ -57,7 +70,7 @@ final class GlucoseForecastMLHistoryLoader {
     }
 
     /// A non-nil empty result means the available history is insufficient.
-    /// Nil is reserved for cancellation, changed inputs, or failed local reads.
+    /// Nil is reserved for cancellation, changed inputs, or failed local/Health reads.
     func load(days: Int = 365, at endDate: Date = .now, policy: DataFlowPolicy,
               settings: TherapyModelSettings, sensitivityMgdlPerUnit: Double,
               carbohydrateRatioGramsPerUnit: Double, calendar: Calendar = .current,
@@ -123,12 +136,20 @@ final class GlucoseForecastMLHistoryLoader {
 
         // Freeze all xDrip-named glucose source bundle identifiers for this run.
         // An empty/denied HealthKit response is unknown, never proof of absence.
-        let discovered: [GlucoseForecastMLHealthSource] = queryValue(
-            cancellation: cancellation) { completion in
+        guard let discovered: [GlucoseForecastMLHealthSource] = queryValue(
+            cancellation: cancellation, context: "glukosekilder", start: { completion in
                 healthQuery.sources(for: .glucose, completion: completion)
-            } ?? []
+            }) else { return nil }
         let glucoseBundles = GlucoseForecastMLHistoryCoverageRules
             .matchingGlucoseSources(discovered).map(\.bundleIdentifier)
+        var healthGlucoseByBundle = Dictionary(uniqueKeysWithValues: glucoseBundles.map {
+            ($0, GlucoseForecastMLHistoryReadSpan())
+        })
+        var localGlucoseRead = GlucoseForecastMLHistoryReadSpan()
+        var healthInsulinRead = GlucoseForecastMLHistoryReadSpan()
+        var healthCarbohydrateRead = GlucoseForecastMLHistoryReadSpan()
+        var localInsulinRead = GlucoseForecastMLHistoryReadSpan()
+        var localCarbohydrateRead = GlucoseForecastMLHistoryReadSpan()
 
         var daysRead = [DaySnapshot]()
         var directHealthInsulin = [TherapyTreatment]()
@@ -146,6 +167,9 @@ final class GlucoseForecastMLHistoryLoader {
         var discardedHealthGlucoseTimestamps = 0
         var completed = 0
         var dayStart = firstDay
+        let dayFormatter = ISO8601DateFormatter()
+        dayFormatter.formatOptions = [.withFullDate]
+        dayFormatter.timeZone = calendar.timeZone
         while dayStart < endDate {
             guard !cancellation.isCancelled,
                   inputsStable(policy: policy, signature: signature,
@@ -154,9 +178,13 @@ final class GlucoseForecastMLHistoryLoader {
                   let nextDay = calendar.date(byAdding: .day, value: 1, to: dayStart),
                   nextDay > dayStart else { return nil }
             let dayEnd = min(nextDay, endDate)
+            let dayLabel = dayFormatter.string(from: dayStart)
             guard let local = readLocalDay(context: context, start: dayStart, end: dayEnd,
                                            policy: policy, cancellation: cancellation) else { return nil }
             let cleanLocal = GlucoseForecastMLHistoryCoverageRules.normalizedLocalGlucose(local.glucose)
+            for row in local.glucose { localGlucoseRead.include(row.date) }
+            for date in local.insulinDates { localInsulinRead.include(date) }
+            for date in local.carbohydrateDates { localCarbohydrateRead.include(date) }
             localTreatments.append(contentsOf: local.treatments)
             localInsulinDates.append(contentsOf: local.importedInsulinDates)
             localCarbsDates.append(contentsOf: local.importedCarbohydrateDates)
@@ -164,39 +192,41 @@ final class GlucoseForecastMLHistoryLoader {
             allLocalCarbsDates.append(contentsOf: local.carbohydrateDates)
 
             var allHealthSamples = [GlucoseForecastMLHealthSample]()
-            var allGlucoseSourcesRead = true
             for bundle in glucoseBundles {
-                if let values = queryValue(cancellation: cancellation, start: { completion in
+                guard let values = queryValue(cancellation: cancellation,
+                                              context: "glukose \(bundle) \(dayLabel)",
+                                              start: { completion in
                     healthQuery.samples(for: .glucose, from: dayStart, to: dayEnd,
                                         sourceBundleIdentifier: bundle, completion: completion)
-                }) {
-                    let bounded = values.filter {
-                        $0.sourceBundleIdentifier == bundle &&
-                            $0.startDate >= dayStart && $0.startDate < dayEnd
-                    }
-                    allHealthSamples.append(contentsOf: bounded)
-                } else {
-                    // A partial set of frozen bundles cannot establish whether
-                    // another bundle disagrees at the same instant. Fall back to
-                    // separately covered local history for this day.
-                    allGlucoseSourcesRead = false
+                }) else { return nil }
+                let bounded = values.filter {
+                    $0.sourceBundleIdentifier == bundle &&
+                        $0.startDate >= dayStart && $0.startDate < dayEnd
                 }
+                for sample in bounded {
+                    healthGlucoseByBundle[bundle, default: GlucoseForecastMLHistoryReadSpan()]
+                        .include(sample.startDate)
+                }
+                allHealthSamples.append(contentsOf: bounded)
             }
             let normalizedHealth = GlucoseForecastMLHistoryCoverageRules.normalizeHealthGlucose(
-                allGlucoseSourcesRead ? allHealthSamples : [])
+                allHealthSamples)
             let byBundle = normalizedHealth.observationsByBundle
             let healthConflicts = normalizedHealth.conflicts.union(normalizedHealth.invalidOnlyDates)
             mergedHealthGlucoseTimestamps += normalizedHealth.mergedTimestamps
             discardedHealthGlucoseTimestamps += normalizedHealth.conflicts.count
-            if insulinEnabled, let insulinBundle,
-               let values = queryValue(cancellation: cancellation, start: { completion in
-                   healthQuery.samples(for: .insulin, from: dayStart, to: dayEnd,
-                                       sourceBundleIdentifier: insulinBundle, completion: completion)
-               }) {
+            if insulinEnabled, let insulinBundle {
+                guard let values = queryValue(cancellation: cancellation,
+                                              context: "insulin \(insulinBundle) \(dayLabel)",
+                                              start: { completion in
+                    healthQuery.samples(for: .insulin, from: dayStart, to: dayEnd,
+                                        sourceBundleIdentifier: insulinBundle, completion: completion)
+                }) else { return nil }
                 for sample in values where sample.sourceBundleIdentifier == insulinBundle &&
-                    sample.startDate >= dayStart && sample.startDate < dayEnd &&
-                    (cutover?.permitsImported(eventDate: sample.startDate, kind: .insulin,
-                        sourceBundleID: sample.sourceBundleIdentifier) ?? true) {
+                    sample.startDate >= dayStart && sample.startDate < dayEnd {
+                    healthInsulinRead.include(sample.startDate)
+                    guard cutover?.permitsImported(eventDate: sample.startDate, kind: .insulin,
+                        sourceBundleID: sample.sourceBundleIdentifier) ?? true else { continue }
                     if !sample.isUnambiguous(kind: .insulin) {
                         ambiguousInsulinDates.append(sample.startDate)
                     }
@@ -206,15 +236,18 @@ final class GlucoseForecastMLHistoryLoader {
                     }
                 }
             }
-            if carbsEnabled, let carbsBundle,
-               let values = queryValue(cancellation: cancellation, start: { completion in
-                   healthQuery.samples(for: .carbohydrates, from: dayStart, to: dayEnd,
-                                       sourceBundleIdentifier: carbsBundle, completion: completion)
-               }) {
+            if carbsEnabled, let carbsBundle {
+                guard let values = queryValue(cancellation: cancellation,
+                                              context: "kulhydrat \(carbsBundle) \(dayLabel)",
+                                              start: { completion in
+                    healthQuery.samples(for: .carbohydrates, from: dayStart, to: dayEnd,
+                                        sourceBundleIdentifier: carbsBundle, completion: completion)
+                }) else { return nil }
                 for sample in values where sample.sourceBundleIdentifier == carbsBundle &&
-                    sample.startDate >= dayStart && sample.startDate < dayEnd &&
-                    (cutover?.permitsImported(eventDate: sample.startDate, kind: .carbohydrates,
-                        sourceBundleID: sample.sourceBundleIdentifier) ?? true) {
+                    sample.startDate >= dayStart && sample.startDate < dayEnd {
+                    healthCarbohydrateRead.include(sample.startDate)
+                    guard cutover?.permitsImported(eventDate: sample.startDate, kind: .carbohydrates,
+                        sourceBundleID: sample.sourceBundleIdentifier) ?? true else { continue }
                     if !sample.isUnambiguous(kind: .carbohydrates) {
                         ambiguousCarbsDates.append(sample.startDate)
                     }
@@ -413,6 +446,17 @@ final class GlucoseForecastMLHistoryLoader {
             $0.row.horizonMinutes
         }).mapValues(\.count)
         let coverage = GlucoseForecastMLHistoryCoverage(requestedDays: days,
+            requestedStart: firstDay, requestedEnd: endDate,
+            healthGlucoseByBundle: healthGlucoseByBundle,
+            localGlucoseRead: localGlucoseRead,
+            healthInsulinRead: healthInsulinRead,
+            healthCarbohydrateRead: healthCarbohydrateRead,
+            localInsulinRead: localInsulinRead,
+            localCarbohydrateRead: localCarbohydrateRead,
+            insulinSourceBundleID: insulinBundle,
+            carbohydrateSourceBundleID: carbsBundle,
+            acceptedHealthInsulinCount: healthInsulinDates.count,
+            acceptedHealthCarbohydrateCount: healthCarbsDates.count,
             completedDays: completed, usableDays: usableDays,
             healthKitDays: healthDays, localFallbackDays: localDays,
             healthCandidateDays: healthCandidateDays,
@@ -537,6 +581,7 @@ final class GlucoseForecastMLHistoryLoader {
     }
 
     private func queryValue<T>(cancellation: GlucoseForecastMLHistoryCancellation,
+                               context: String,
                                start: (@escaping (Result<T, Error>) -> Void)
                                    -> GlucoseForecastMLHealthQueryTicket) -> T? {
         guard !cancellation.isCancelled else { return nil }
@@ -545,12 +590,28 @@ final class GlucoseForecastMLHistoryLoader {
         let ticket = start { result in response = result; semaphore.signal() }
         let deadline = Date().addingTimeInterval(45)
         while semaphore.wait(timeout: .now() + 0.25) == .timedOut {
-            if cancellation.isCancelled || Date() >= deadline {
+            if cancellation.isCancelled {
                 ticket.cancel()
                 return nil
             }
+            if Date() >= deadline {
+                ticket.cancel()
+                cancellation.recordReadFailure("Sundhed \(context): intet svar inden 45 sekunder")
+                return nil
+            }
         }
-        return try? response?.get()
+        guard let response else {
+            cancellation.recordReadFailure("Sundhed \(context): intet svar")
+            return nil
+        }
+        switch response {
+        case .success(let value): return value
+        case .failure(let error):
+            let details = error as NSError
+            cancellation.recordReadFailure(
+                "Sundhed \(context): \(details.domain)/\(details.code)")
+            return nil
+        }
     }
 
     private func inputsStable(policy: DataFlowPolicy, signature: String,

@@ -120,7 +120,14 @@ bolus features. The first training attempt requests Health blood-glucose
 **read** access; no new Health write access is requested. HealthKit does not
 reveal read authorization, so an empty response is treated as missing data,
 not as proof of denial or of zero treatments. The loader then tries the app's
-own history under the same coverage rules.
+own history under the same coverage rules. An explicit HealthKit query error or
+timeout now stops history preparation instead of silently treating that source
+as empty. A successful but empty read remains unknown, so local fallback still
+requires its own complete evidence. The ML status shows the requested window,
+raw per-source read counts/date spans and treatment-coverage gaps to distinguish
+these cases on a later device run; it does not expose glucose or dose values.
+The newest preparation result takes precedence over any older training error
+in Settings; a prior failure can no longer mask a new read outcome.
 
 Every historical example requires continuous glucose and separately proven
 insulin and carbohydrate coverage for its whole treatment window. A day

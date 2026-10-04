@@ -13,6 +13,12 @@ enum GlucoseForecastMLStatusPresentation {
 
     static func maeMmolPerL(_ mgdl: Double) -> Double { mgdl.mgDlToMmol() }
 
+    static func preparationOrPreviousIssue(_ preparation: String,
+                                           previousIssue: GlucoseForecastMLTrainingIssue?) -> String? {
+        if !preparation.isEmpty { return preparation }
+        return previousIssue?.danishMessage
+    }
+
     static func progress(_ progress: GlucoseForecastMLTrainingProgress?,
                          localize: Localize) -> String {
         switch progress {
@@ -120,10 +126,10 @@ struct GlucoseForecastMLSettingsView: View {
                     Text(t("forecast.mlKeepOpen", "Keep the app open until training and the self-check finish."))
                         .font(.footnote)
                         .foregroundStyle(.secondary)
-                } else if status.lastOutcome == "trainingIssue", let issue = status.lastIssue {
-                    Text(issue.danishMessage).foregroundStyle(.secondary)
-                } else if !preparationStatus.isEmpty {
-                    Text(preparationStatus).foregroundStyle(.secondary)
+                } else if let message = GlucoseForecastMLStatusPresentation.preparationOrPreviousIssue(
+                    preparationStatus,
+                    previousIssue: status.lastOutcome == "trainingIssue" ? status.lastIssue : nil) {
+                    Text(message).foregroundStyle(.secondary)
                 } else if let outcome = GlucoseForecastMLStatusPresentation.outcome(
                     status.lastOutcome, report: status.lastSelfCheck,
                     issue: status.lastIssue, localize: t) {

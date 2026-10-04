@@ -589,20 +589,134 @@ final class GlucoseForecastMLReplayTests: XCTestCase {
         }
     }
 
+    @MainActor func testPreCutoverHealthHistoryRemainsUsableAfterLocalSourceSwitch() async throws {
+        let defaults = UserDefaults.standard
+        let previousCutover = defaults.object(forKey: TreatmentSourceCutover.defaultsKey)
+        defer {
+            if let previousCutover { defaults.set(previousCutover, forKey: TreatmentSourceCutover.defaultsKey) }
+            else { defaults.removeObject(forKey: TreatmentSourceCutover.defaultsKey) }
+        }
+        defaults.removeObject(forKey: TreatmentSourceCutover.defaultsKey)
+        let calendar = utcCalendar
+        let finalDay = calendar.startOfDay(for: reference)
+        let therapyBundle = "com.example.selected.therapy"
+        XCTAssertTrue(TreatmentSourceCutover.persist(.init(cutoff: finalDay,
+            insulinSourceBundleID: therapyBundle,
+            carbohydrateSourceBundleID: therapyBundle)))
+        var glucose = [GlucoseForecastMLHealthSample]()
+        var insulin = [GlucoseForecastMLHealthSample]()
+        var carbs = [GlucoseForecastMLHealthSample]()
+        for offset in -63..<0 {
+            let day = try XCTUnwrap(calendar.date(byAdding: .day, value: offset, to: finalDay))
+            let anchor = day.addingTimeInterval(12 * 3600)
+            for minute in stride(from: -40, through: 130, by: 5) {
+                let date = anchor.addingTimeInterval(Double(minute) * 60)
+                glucose.append(.init(uuid: UUID(), sourceBundleIdentifier: "com.xdrip.glucose",
+                    startDate: date, endDate: date, value: 120,
+                    insulinReason: nil, hasUndeterminedDuration: false, sampleCount: 1))
+            }
+            let treatmentDate = day.addingTimeInterval(8 * 3600)
+            insulin.append(.init(uuid: UUID(), sourceBundleIdentifier: therapyBundle,
+                startDate: treatmentDate, endDate: treatmentDate, value: 1,
+                insulinReason: HKInsulinDeliveryReason.bolus.rawValue,
+                hasUndeterminedDuration: false, sampleCount: 1))
+            carbs.append(.init(uuid: UUID(), sourceBundleIdentifier: therapyBundle,
+                startDate: treatmentDate, endDate: treatmentDate, value: 20,
+                insulinReason: nil, hasUndeterminedDuration: false, sampleCount: 1))
+        }
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let manager = TherapyMetricsManager()
+        manager.configure(coreDataManager: core, externalStatus: { nil })
+        let query = FakeHistoryHealthQuery(glucoseSamples: glucose,
+            insulinSamples: insulin, carbohydrateSamples: carbs)
+        let loader = GlucoseForecastMLHistoryLoader(coreDataManager: core,
+            therapyManager: manager, healthQuery: query)
+        let policy = DataFlowPolicy(isMaster: true, followerDataSource: .careLink,
+            therapyDataSourceSelection: .none, nightscoutEnabled: false,
+            masterUploadsGlucoseToNightscout: false,
+            followerUploadsGlucoseToNightscout: false, nightscoutFollowType: .none)
+        let result = await loader.load(days: 64,
+            at: finalDay.addingTimeInterval(20 * 3600), policy: policy,
+            settings: settings, sensitivityMgdlPerUnit: 40,
+            carbohydrateRatioGramsPerUnit: 10, calendar: calendar)
+        let loaded = try XCTUnwrap(result)
+        XCTAssertEqual(loaded.coverage.completedDays, 64)
+        XCTAssertEqual(loaded.coverage.healthGlucoseByBundle["com.xdrip.glucose"]?.count, 63 * 35)
+        XCTAssertEqual(loaded.coverage.healthInsulinRead.count, 63)
+        XCTAssertEqual(loaded.coverage.healthCarbohydrateRead.count, 63)
+        XCTAssertEqual(loaded.coverage.acceptedHealthInsulinCount, 63)
+        XCTAssertEqual(loaded.coverage.acceptedHealthCarbohydrateCount, 63)
+        XCTAssertGreaterThanOrEqual(loaded.coverage.healthKitDays, 60)
+        XCTAssertGreaterThanOrEqual(loaded.coverage.usableDays, 60)
+        XCTAssertEqual(loaded.coverage.localFallbackDays, 0)
+    }
+
+    @MainActor func testFailedHealthReadNeverLooksLikeSuccessfulInsufficientHistory() async throws {
+        let suite = "MLHistoryReadFailure.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        for kind in HealthTherapyImportKind.allCases {
+            let prefix = "healthTherapyImport.v1.\(kind.rawValue)."
+            defaults.set(true, forKey: prefix + "enabled")
+            defaults.set("com.example.selected.therapy", forKey: prefix + "sourceBundleID")
+            defaults.set("Selected source", forKey: prefix + "sourceName")
+            defaults.set(reference, forKey: prefix + "lastSync")
+            defaults.set(true, forKey: prefix + "observedSelectedSource")
+            defaults.set(reference.addingTimeInterval(-24 * 3600), forKey: prefix + "historyStart")
+        }
+        let importer = HealthKitTherapyImportManager(query: NoopTherapyQuery(), defaults: defaults)
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let manager = TherapyMetricsManager()
+        manager.configure(coreDataManager: core, externalStatus: { nil })
+        let policy = DataFlowPolicy(isMaster: true, followerDataSource: .careLink,
+            therapyDataSourceSelection: .none, nightscoutEnabled: false,
+            masterUploadsGlucoseToNightscout: false,
+            followerUploadsGlucoseToNightscout: false, nightscoutFollowType: .none)
+        let failures: [GlucoseForecastMLHealthKind?] = [nil, .glucose, .insulin, .carbohydrates]
+        for failedKind in failures {
+            let query = FakeHistoryHealthQuery(glucoseSamples: [],
+                failSources: failedKind == nil, failKind: failedKind)
+            let loader = GlucoseForecastMLHistoryLoader(coreDataManager: core,
+                therapyManager: manager, healthImporter: importer, healthQuery: query)
+            let cancellation = GlucoseForecastMLHistoryCancellation()
+            let result = await loader.load(days: 2, at: reference.addingTimeInterval(2 * 3600),
+                policy: policy, settings: settings, sensitivityMgdlPerUnit: 40,
+                carbohydrateRatioGramsPerUnit: 10, calendar: utcCalendar,
+                cancellation: cancellation)
+            XCTAssertNil(result, "\(String(describing: failedKind)) must be a read failure, not zero usable days")
+            XCTAssertTrue(cancellation.readFailure?.contains("Sundhed ") == true)
+        }
+    }
+
     private enum FakeReadError: Error { case unavailable }
 
     private final class FakeHistoryHealthQuery: GlucoseForecastMLHealthQuerying {
         let glucoseSamples: [GlucoseForecastMLHealthSample]
+        let insulinSamples: [GlucoseForecastMLHealthSample]
+        let carbohydrateSamples: [GlucoseForecastMLHealthSample]
+        let failSources: Bool
+        let failKind: GlucoseForecastMLHealthKind?
 
-        init(glucoseSamples: [GlucoseForecastMLHealthSample]) {
+        init(glucoseSamples: [GlucoseForecastMLHealthSample],
+             insulinSamples: [GlucoseForecastMLHealthSample] = [],
+             carbohydrateSamples: [GlucoseForecastMLHealthSample] = [],
+             failSources: Bool = false, failKind: GlucoseForecastMLHealthKind? = nil) {
             self.glucoseSamples = glucoseSamples
+            self.insulinSamples = insulinSamples
+            self.carbohydrateSamples = carbohydrateSamples
+            self.failSources = failSources
+            self.failKind = failKind
         }
 
         func sources(for kind: GlucoseForecastMLHealthKind,
                      completion: @escaping (Result<[GlucoseForecastMLHealthSource], Error>) -> Void)
             -> GlucoseForecastMLHealthQueryTicket {
-            completion(.success([GlucoseForecastMLHealthSource(
-                bundleIdentifier: "com.xdrip.glucose", name: "xDrip4iOS")]))
+            if failSources {
+                completion(.failure(FakeReadError.unavailable))
+            } else {
+                completion(.success([GlucoseForecastMLHealthSource(
+                    bundleIdentifier: "com.xdrip.glucose", name: "xDrip4iOS")]))
+            }
             return GlucoseForecastMLHealthQueryTicket()
         }
 
@@ -610,10 +724,20 @@ final class GlucoseForecastMLReplayTests: XCTestCase {
                      sourceBundleIdentifier: String,
                      completion: @escaping (Result<[GlucoseForecastMLHealthSample], Error>) -> Void)
             -> GlucoseForecastMLHealthQueryTicket {
-            completion(.success(kind == .glucose ? glucoseSamples.filter {
-                $0.startDate >= start && $0.startDate <= end &&
+            if failKind == kind {
+                completion(.failure(FakeReadError.unavailable))
+                return GlucoseForecastMLHealthQueryTicket()
+            }
+            let values: [GlucoseForecastMLHealthSample]
+            switch kind {
+            case .glucose: values = glucoseSamples
+            case .insulin: values = insulinSamples
+            case .carbohydrates: values = carbohydrateSamples
+            }
+            completion(.success(values.filter {
+                $0.startDate >= start && $0.startDate < end &&
                     $0.sourceBundleIdentifier == sourceBundleIdentifier
-            } : []))
+            }))
             return GlucoseForecastMLHealthQueryTicket()
         }
     }
