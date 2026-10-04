@@ -23,6 +23,75 @@ enum GlucoseForecastMLTrainingFailure: String, Error, Sendable {
     case io
 }
 
+/// A count or freshness gate is reported with the exact period and horizon
+/// that failed. This is deliberately separate from the legacy error codes so
+/// a user never sees five different causes as one "not enough history" error.
+struct GlucoseForecastMLTrainingIssue: Error, Sendable {
+    enum Phase: Sendable, Equatable {
+        case history, training, walkForward, calibration, selfCheck, freshness
+    }
+    enum Unit: Sendable, Equatable {
+        case usableDays, rows, residuals, calibrationPredictions, ageHours, spanDays
+    }
+
+    let phase: Phase
+    let horizonMinutes: Int?
+    let fold: Int?
+    let actual: Int
+    let required: Int
+    let unit: Unit
+    let periodStart: Date?
+    let periodEnd: Date?
+
+    init(_ phase: Phase, horizonMinutes: Int? = nil, fold: Int? = nil,
+         actual: Int, required: Int, unit: Unit,
+         periodStart: Date? = nil, periodEnd: Date? = nil) {
+        self.phase = phase
+        self.horizonMinutes = horizonMinutes
+        self.fold = fold
+        self.actual = actual
+        self.required = required
+        self.unit = unit
+        self.periodStart = periodStart
+        self.periodEnd = periodEnd
+    }
+
+    var danishMessage: String {
+        let name: String
+        switch phase {
+        case .history: name = "Historik"
+        case .training: name = "Træning"
+        case .walkForward: name = "Tidsopdelt træning"
+        case .calibration: name = "Kalibrering"
+        case .selfCheck: name = "Selvtjek"
+        case .freshness: name = "Datafriskhed"
+        }
+        var label = name
+        if let horizonMinutes { label += " (+\(horizonMinutes))" }
+        if let fold { label += " · fold \(fold)" }
+        let quantity: String
+        switch unit {
+        case .usableDays: quantity = "\(actual) af \(required) brugbare dage"
+        case .rows: quantity = "\(actual) af \(required) rækker"
+        case .residuals: quantity = "\(actual) af \(required) residualer"
+        case .calibrationPredictions: quantity = "\(actual) af \(required) gyldige kalibreringsprognoser"
+        case .ageHours: quantity = "seneste anker er \(actual) timer gammelt (højst \(required) timer)"
+        case .spanDays: quantity = "kalibrering og selvtjek spænder over \(actual) kalenderdage (højst \(required))"
+        }
+        let dates: String
+        if let periodStart {
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "da_DK")
+            formatter.timeZone = .current
+            formatter.dateFormat = "dd.MM.yyyy"
+            dates = " (\(formatter.string(from: periodStart))–\(formatter.string(from: periodEnd ?? periodStart)))"
+        } else {
+            dates = ""
+        }
+        return "\(label): \(quantity)\(dates)."
+    }
+}
+
 struct GlucoseForecastMLContext: Codable, Equatable, Sendable {
     let engineVersion: String
     let featureVersion: String
@@ -88,7 +157,7 @@ struct GlucoseForecastMLSelfCheck: Codable, Sendable {
 struct GlucoseForecastMLModelMetadata: Codable, Sendable {
     // Historical input formation changed: older model packages and checkpoints
     // can include treatment windows whose availability was not established.
-    static let schemaVersion = 2
+    static let schemaVersion = 3
     let schemaVersion: Int
     let modelID: String
     let trainedAt: Date
@@ -108,8 +177,9 @@ struct GlucoseForecastMLModelMetadata: Codable, Sendable {
     let retrospectiveUnknownCount: Int
 }
 
-/// Split by whole local calendar days. A target that reaches into B or C is
-/// excluded from the earlier period, including the allowed ±2-minute target join.
+/// Split by complete usable anchors, then by whole local calendar days. A
+/// target that reaches into B or C is excluded from the earlier period,
+/// including the allowed ±2-minute target join.
 enum GlucoseForecastMLChronology {
     static let horizons = [30, 60, 120]
     static let minimumUsableDays = 60
@@ -120,6 +190,36 @@ enum GlucoseForecastMLChronology {
     static let correctionLimitMgdl = 27.0
     static let errorFloorMgdl = 1.0
     static let modelAgeLimit: TimeInterval = 7 * 24 * 60 * 60
+    static let maximumRecentAnchorAge: TimeInterval = 48 * 60 * 60
+    static let maximumBCSpanDays = 60
+
+    struct CompleteAnchor {
+        let rows: [Int: GlucoseForecastMLReplayExample]
+        let engineTrajectory: [Double]
+
+        var referenceDate: Date { rows[30]!.row.referenceDate }
+        func example(at horizon: Int) -> GlucoseForecastMLReplayExample { rows[horizon]! }
+    }
+
+    /// A single reference is usable only when all three horizons originate
+    /// from the same source, sensor segment and engine trajectory. This one
+    /// definition is used for period selection and the actual model replay.
+    static func completeAnchors(_ examples: [GlucoseForecastMLReplayExample]) -> [CompleteAnchor] {
+        let grouped = Dictionary(grouping: examples, by: { $0.row.referenceDate })
+        return grouped.keys.sorted().compactMap { referenceDate in
+            guard let rows = grouped[referenceDate], rows.count == horizons.count,
+                  Set(rows.map { $0.row.horizonMinutes }) == Set(horizons),
+                  let first = rows.first,
+                  rows.allSatisfy({ $0.sourceIdentity == first.sourceIdentity
+                      && $0.row.sensorID == first.row.sensorID
+                      && $0.engineTrajectoryMgdl == first.engineTrajectoryMgdl }) else {
+                return nil
+            }
+            return CompleteAnchor(rows: Dictionary(uniqueKeysWithValues:
+                rows.map { ($0.row.horizonMinutes, $0) }),
+                engineTrajectory: first.engineTrajectoryMgdl)
+        }
+    }
 
     struct Knot {
         let minute: Int
@@ -176,7 +276,7 @@ enum GlucoseForecastMLChronology {
     }
 
     static func split(_ examples: [GlucoseForecastMLReplayExample],
-                      calendar: Calendar = .current) throws -> Split {
+                      calendar: Calendar = .current, now: Date = .now) throws -> Split {
         let featureCount = GlucoseForecastMLFeatures.featureNames.count
         guard featureCount == 16 else { throw GlucoseForecastMLTrainingFailure.invalidFeatureRow }
         let valid = examples.filter { example in
@@ -195,60 +295,98 @@ enum GlucoseForecastMLChronology {
                 && abs(example.targetDate.timeIntervalSince(row.referenceDate)
                        - Double(row.horizonMinutes * 60)) <= 120
         }
-        var daysByHorizon = [Int: Set<Date>]()
-        for horizon in horizons { daysByHorizon[horizon] = [] }
-        for example in valid {
-            daysByHorizon[example.row.horizonMinutes, default: []].insert(
-                calendar.startOfDay(for: example.row.referenceDate))
+        let anchors = completeAnchors(valid)
+        let byDay = Dictionary(grouping: anchors, by: { calendar.startOfDay(for: $0.referenceDate) })
+        let days = byDay.keys.sorted()
+        let historyStart = days.first
+        let historyEnd = days.last
+        guard days.count >= minimumUsableDays else {
+            throw GlucoseForecastMLTrainingIssue(.history, actual: days.count,
+                required: minimumUsableDays, unit: .usableDays,
+                periodStart: historyStart, periodEnd: historyEnd)
         }
-        let commonDays = horizons.dropFirst().reduce(daysByHorizon[horizons[0]] ?? []) {
-            $0.intersection(daysByHorizon[$1] ?? [])
+
+        // C and B choose the latest distinct days with a complete three-knot
+        // anchor. A gap in calendar time does not consume a usable day. The
+        // B candidate immediately before C can lose all anchors to the target
+        // embargo, so select its replacement farther back before fixing B.
+        let cDays = Array(days.suffix(14))
+        let cStart = cDays[0]
+        let latestCAnchor = cDays.compactMap { byDay[$0]?.last?.referenceDate }.max()!
+        let age = now.timeIntervalSince(latestCAnchor)
+        if !age.isFinite || age < 0 || age > maximumRecentAnchorAge {
+            throw GlucoseForecastMLTrainingIssue(.freshness,
+                actual: age.isFinite ? max(0, Int(ceil(age / 3600))) : Int.max,
+                required: 48,
+                unit: .ageHours, periodStart: cStart, periodEnd: cDays.last)
         }
-        guard commonDays.count >= minimumUsableDays, let lastDay = commonDays.max(),
-              let cStart = calendar.date(byAdding: .day, value: -13, to: lastDay),
-              let bStart = calendar.date(byAdding: .day, value: -14, to: cStart) else {
-            throw GlucoseForecastMLTrainingFailure.insufficientHistory
+        let cAnchors = cDays.flatMap { byDay[$0] ?? [] }
+        let eligibleBDays = days.filter { day in
+            day < cStart && (byDay[day] ?? []).contains {
+                $0.referenceDate.addingTimeInterval(120 * 60 + 120) < cStart
+            }
+        }
+        let bDays = Array(eligibleBDays.suffix(14))
+        guard let bStart = bDays.first else {
+            throw GlucoseForecastMLTrainingIssue(.calibration,
+                actual: 0, required: 10, unit: .usableDays,
+                periodStart: historyStart, periodEnd: cStart)
+        }
+        let bAnchors = bDays.flatMap { byDay[$0] ?? [] }.filter {
+            $0.referenceDate.addingTimeInterval(120 * 60 + 120) < cStart
+        }
+        let aAnchors = anchors.filter {
+            $0.referenceDate < bStart
+                && $0.referenceDate.addingTimeInterval(120 * 60 + 120) < bStart
+        }
+        let retainedAnchors = aAnchors + bAnchors + cAnchors
+        let retainedDays = Set(retainedAnchors.map { calendar.startOfDay(for: $0.referenceDate) })
+        guard retainedDays.count >= minimumUsableDays else {
+            throw GlucoseForecastMLTrainingIssue(.history, actual: retainedDays.count,
+                required: minimumUsableDays, unit: .usableDays,
+                periodStart: retainedDays.min(), periodEnd: retainedDays.max())
+        }
+        let bcSpan = calendar.dateComponents([.day], from: bStart, to: cDays.last!).day! + 1
+        guard bcSpan <= maximumBCSpanDays else {
+            throw GlucoseForecastMLTrainingIssue(.freshness, actual: bcSpan,
+                required: maximumBCSpanDays, unit: .spanDays,
+                periodStart: bStart, periodEnd: cDays.last)
         }
         var a = [Int: [GlucoseForecastMLReplayExample]]()
         var b = [Int: [GlucoseForecastMLReplayExample]]()
         var c = [Int: [GlucoseForecastMLReplayExample]]()
         for horizon in horizons { a[horizon] = []; b[horizon] = []; c[horizon] = [] }
-        for example in valid {
-            let horizon = example.row.horizonMinutes
-            let reference = example.row.referenceDate
-            let latestPermittedTarget = reference.addingTimeInterval(Double(horizon * 60 + 120))
-            if reference < bStart && latestPermittedTarget < bStart {
-                a[horizon, default: []].append(example)
-            } else if reference >= bStart && reference < cStart && latestPermittedTarget < cStart {
-                b[horizon, default: []].append(example)
-            } else if reference >= cStart {
-                c[horizon, default: []].append(example)
+        for (periodAnchors, period) in [(aAnchors, 0), (bAnchors, 1), (cAnchors, 2)] {
+            for anchor in periodAnchors {
+                for horizon in horizons {
+                    switch period {
+                    case 0: a[horizon, default: []].append(anchor.example(at: horizon))
+                    case 1: b[horizon, default: []].append(anchor.example(at: horizon))
+                    default: c[horizon, default: []].append(anchor.example(at: horizon))
+                    }
+                }
             }
         }
         for horizon in horizons {
-            a[horizon]?.sort { $0.row.referenceDate < $1.row.referenceDate }
-            b[horizon]?.sort { $0.row.referenceDate < $1.row.referenceDate }
-            c[horizon]?.sort { $0.row.referenceDate < $1.row.referenceDate }
-            guard (a[horizon]?.count ?? 0) >= minimumTrainingRows else {
-                throw GlucoseForecastMLTrainingFailure.insufficientTrainingRows
-            }
-            guard (b[horizon]?.count ?? 0) >= minimumCalibrationRows else {
-                throw GlucoseForecastMLTrainingFailure.insufficientCalibrationRows
-            }
-            guard (c[horizon]?.count ?? 0) >= minimumSelfCheckRows else {
-                throw GlucoseForecastMLTrainingFailure.insufficientSelfCheckRows
-            }
-            let countDays: ([GlucoseForecastMLReplayExample]) -> Int = {
-                Set($0.map { calendar.startOfDay(for: $0.row.referenceDate) }).count
-            }
-            guard countDays(a[horizon] ?? []) >= 30 else {
-                throw GlucoseForecastMLTrainingFailure.insufficientTrainingRows
-            }
-            guard countDays(b[horizon] ?? []) >= 10 else {
-                throw GlucoseForecastMLTrainingFailure.insufficientCalibrationRows
-            }
-            guard countDays(c[horizon] ?? []) >= 10 else {
-                throw GlucoseForecastMLTrainingFailure.insufficientSelfCheckRows
+            for (phase, period, minimumDays, minimumRows) in [
+                (GlucoseForecastMLTrainingIssue.Phase.training, a[horizon] ?? [], 30, minimumTrainingRows),
+                (.calibration, b[horizon] ?? [], 10, minimumCalibrationRows),
+                (.selfCheck, c[horizon] ?? [], 10, minimumSelfCheckRows)
+            ] {
+                let periodDays = Set(period.map { calendar.startOfDay(for: $0.row.referenceDate) })
+                let periodStart = period.first?.row.referenceDate ??
+                    (phase == .calibration ? bStart : phase == .selfCheck ? cStart : historyStart)
+                let periodEnd = period.last?.row.referenceDate
+                guard periodDays.count >= minimumDays else {
+                    throw GlucoseForecastMLTrainingIssue(phase, horizonMinutes: horizon,
+                        actual: periodDays.count, required: minimumDays,
+                        unit: .usableDays, periodStart: periodStart, periodEnd: periodEnd)
+                }
+                guard period.count >= minimumRows else {
+                    throw GlucoseForecastMLTrainingIssue(phase, horizonMinutes: horizon,
+                        actual: period.count, required: minimumRows,
+                        unit: .rows, periodStart: periodStart, periodEnd: periodEnd)
+                }
             }
         }
         let retained = horizons.flatMap { (a[$0] ?? []) + (b[$0] ?? []) + (c[$0] ?? []) }
@@ -257,7 +395,7 @@ enum GlucoseForecastMLChronology {
                 || $0.settingsAvailability == .retrospectiveUnknown
         }.count
         return Split(a: a, b: b, c: c, bStart: bStart, cStart: cStart,
-                     usableDayCount: commonDays.count, retrospectiveUnknownCount: unknown)
+                     usableDayCount: retainedDays.count, retrospectiveUnknownCount: unknown)
     }
 
     static func clampedCorrection(_ value: Double) -> Double? {
@@ -303,14 +441,7 @@ enum GlucoseForecastMLTrainer {
 
     static func key(_ kind: String, _ horizon: Int) -> String { "\(kind)_\(horizon)" }
 
-    private struct ReplayAnchor {
-        let rows: [Int: GlucoseForecastMLReplayExample]
-        let engineTrajectory: [Double]
-
-        func example(at horizon: Int) -> GlucoseForecastMLReplayExample {
-            rows[horizon]!
-        }
-    }
+    private typealias ReplayAnchor = GlucoseForecastMLChronology.CompleteAnchor
 
     private struct ReplayLine {
         let overlay: GlucoseForecastMLChronology.Overlay
@@ -325,21 +456,8 @@ enum GlucoseForecastMLTrainer {
     /// reference and the same engine run.
     private static func completeAnchors(_ period: [Int: [GlucoseForecastMLReplayExample]])
         -> [ReplayAnchor] {
-        let grouped = Dictionary(grouping: GlucoseForecastMLChronology.horizons.flatMap {
-            period[$0] ?? []
-        }, by: { $0.row.referenceDate })
-        return grouped.keys.sorted().compactMap { referenceDate in
-            guard let examples = grouped[referenceDate], examples.count == 3,
-                  Set(examples.map { $0.row.horizonMinutes }) == Set(GlucoseForecastMLChronology.horizons),
-                  let first = examples.first,
-                  examples.allSatisfy({ $0.sourceIdentity == first.sourceIdentity
-                      && $0.row.sensorID == first.row.sensorID
-                      && $0.engineTrajectoryMgdl == first.engineTrajectoryMgdl }) else {
-                return nil
-            }
-            let rows = Dictionary(uniqueKeysWithValues: examples.map { ($0.row.horizonMinutes, $0) })
-            return ReplayAnchor(rows: rows, engineTrajectory: first.engineTrajectoryMgdl)
-        }
+        GlucoseForecastMLChronology.completeAnchors(
+            GlucoseForecastMLChronology.horizons.flatMap { period[$0] ?? [] })
     }
 
     /// This follows live inference: validate each needed correction and error,
@@ -381,7 +499,7 @@ enum GlucoseForecastMLTrainer {
                       now: Date = .now,
                       onProgress: @escaping @Sendable (GlucoseForecastMLTrainingProgress) -> Void = { _ in })
         async throws -> GlucoseForecastMLTrainedCandidate {
-        let split = try GlucoseForecastMLChronology.split(examples)
+        let split = try GlucoseForecastMLChronology.split(examples, now: now)
         try GlucoseForecastMLStoragePolicy.secureDirectory(sessionsDirectory)
         var models = [String: MLBoostedTreeRegressor]()
         var walkCounts = [Int: Int]()
@@ -405,7 +523,11 @@ enum GlucoseForecastMLTrainer {
         // the resulting out-of-sample residual, including any engine fallback.
         let aAnchors = completeAnchors(split.a)
         guard aAnchors.count >= GlucoseForecastMLChronology.minimumTrainingRows else {
-            throw GlucoseForecastMLTrainingFailure.insufficientWalkForwardRows
+            throw GlucoseForecastMLTrainingIssue(.walkForward,
+                actual: aAnchors.count,
+                required: GlucoseForecastMLChronology.minimumTrainingRows,
+                unit: .rows, periodStart: aAnchors.first?.referenceDate,
+                periodEnd: split.bStart)
         }
         let foldDates = [0.5, 0.75].map { fraction in
             aAnchors[Int(Double(aAnchors.count - 1) * fraction)]
@@ -422,7 +544,11 @@ enum GlucoseForecastMLTrainer {
                     $0.row.referenceDate.addingTimeInterval(Double(horizon * 60 + 120)) < origin
                 }
                 guard prefix.count >= 200 else {
-                    throw GlucoseForecastMLTrainingFailure.insufficientWalkForwardRows
+                    throw GlucoseForecastMLTrainingIssue(.walkForward,
+                        horizonMinutes: horizon, fold: index + 1,
+                        actual: prefix.count, required: 200, unit: .rows,
+                        periodStart: aAnchors.first?.referenceDate,
+                        periodEnd: origin)
                 }
                 foldModels[horizon] = try await fit(prefix,
                     targets: prefix.map { $0.targetGlucoseMgdl - $0.engineTargetGlucoseMgdl },
@@ -435,7 +561,9 @@ enum GlucoseForecastMLTrainer {
                     && reference.addingTimeInterval(120 * 60 + 120) < end
             }
             guard !holdout.isEmpty else {
-                throw GlucoseForecastMLTrainingFailure.insufficientWalkForwardRows
+                throw GlucoseForecastMLTrainingIssue(.walkForward,
+                    fold: index + 1, actual: 0, required: 1, unit: .rows,
+                    periodStart: origin, periodEnd: end)
             }
             let foldPrediction: (String, Int, GlucoseForecastMLFeatureRow) -> Double? = {
                 kind, horizon, row in
@@ -463,7 +591,11 @@ enum GlucoseForecastMLTrainer {
             let a = split.a[horizon] ?? []
             let residuals = outOfSample[horizon] ?? []
             guard residuals.count >= GlucoseForecastMLChronology.minimumWalkForwardRows else {
-                throw GlucoseForecastMLTrainingFailure.insufficientWalkForwardRows
+                throw GlucoseForecastMLTrainingIssue(.walkForward,
+                    horizonMinutes: horizon, actual: residuals.count,
+                    required: GlucoseForecastMLChronology.minimumWalkForwardRows,
+                    unit: .residuals, periodStart: aAnchors.first?.referenceDate,
+                    periodEnd: split.bStart)
             }
             trainingCounts[horizon] = a.count
             walkCounts[horizon] = residuals.count
@@ -481,10 +613,18 @@ enum GlucoseForecastMLTrainer {
         let bAnchors = completeAnchors(split.b)
         let cAnchors = completeAnchors(split.c)
         guard bAnchors.count >= GlucoseForecastMLChronology.minimumCalibrationRows else {
-            throw GlucoseForecastMLTrainingFailure.insufficientCalibrationRows
+            throw GlucoseForecastMLTrainingIssue(.calibration,
+                actual: bAnchors.count,
+                required: GlucoseForecastMLChronology.minimumCalibrationRows,
+                unit: .rows, periodStart: split.bStart,
+                periodEnd: split.cStart)
         }
         guard cAnchors.count >= GlucoseForecastMLChronology.minimumSelfCheckRows else {
-            throw GlucoseForecastMLTrainingFailure.insufficientSelfCheckRows
+            throw GlucoseForecastMLTrainingIssue(.selfCheck,
+                actual: cAnchors.count,
+                required: GlucoseForecastMLChronology.minimumSelfCheckRows,
+                unit: .rows, periodStart: split.cStart,
+                periodEnd: cAnchors.last?.referenceDate)
         }
         let candidatePrediction: (String, Int, GlucoseForecastMLFeatureRow) -> Double? = {
             kind, horizon, row in
@@ -515,7 +655,12 @@ enum GlucoseForecastMLTrainer {
             let values = ratios[horizon] ?? []
             guard values.count >= GlucoseForecastMLChronology.minimumCalibrationRows,
                   let percentile = GlucoseForecastMLChronology.percentile80(values) else {
-                throw GlucoseForecastMLTrainingFailure.insufficientCalibrationRows
+                throw GlucoseForecastMLTrainingIssue(.calibration,
+                    horizonMinutes: horizon, actual: values.count,
+                    required: GlucoseForecastMLChronology.minimumCalibrationRows,
+                    unit: .calibrationPredictions,
+                    periodStart: split.bStart,
+                    periodEnd: bAnchors.last?.referenceDate)
             }
             calibrationCounts[horizon] = values.count
             calibrations[horizon] = GlucoseForecastMLCalibration(
@@ -623,7 +768,9 @@ enum GlucoseForecastMLTrainer {
               let calibrationStart = bAnchors.first?.example(at: 30).row.referenceDate,
               let calibrationEnd = bAnchors.flatMap({ $0.rows.values }).map({ $0.targetDate }).max(),
               let testEnd = cAnchors.flatMap({ $0.rows.values }).map({ $0.targetDate }).max() else {
-            throw GlucoseForecastMLTrainingFailure.insufficientHistory
+            throw GlucoseForecastMLTrainingIssue(.history,
+                actual: 0, required: 1, unit: .rows,
+                periodStart: split.bStart, periodEnd: split.cStart)
         }
         let report = GlucoseForecastMLSelfCheck(
             startedAt: split.cStart, endedAt: testEnd, horizons: metrics,

@@ -16,6 +16,7 @@ struct GlucoseForecastMLStatusSummary: Sendable {
     let trainedAt: Date?
     let lastAttempt: Date?
     let lastOutcome: String?
+    let lastIssue: GlucoseForecastMLTrainingIssue?
     let lastSelfCheck: GlucoseForecastMLSelfCheck?
 }
 
@@ -433,6 +434,7 @@ final class GlucoseForecastMLManager: @unchecked Sendable {
     private var trainingTask: Task<Void, Never>?
     private var lastAttempt: Date?
     private var lastOutcome: String?
+    private var lastIssue: GlucoseForecastMLTrainingIssue?
     private var lastSelfCheck: GlucoseForecastMLSelfCheck?
     private var lifecycleObservers: [NSObjectProtocol] = []
     private var appHasResignedActive = false
@@ -477,7 +479,7 @@ final class GlucoseForecastMLManager: @unchecked Sendable {
             isTraining: isTraining, progress: progress,
             activeModelID: loaded?.metadata.modelID,
             trainedAt: loaded?.metadata.trainedAt, lastAttempt: lastAttempt,
-            lastOutcome: lastOutcome, lastSelfCheck: lastSelfCheck)
+            lastOutcome: lastOutcome, lastIssue: lastIssue, lastSelfCheck: lastSelfCheck)
     }
 
     func shouldTrain(context: GlucoseForecastMLContext, now: Date = .now) -> Bool {
@@ -507,6 +509,7 @@ final class GlucoseForecastMLManager: @unchecked Sendable {
         progress = .trainingModels(completed: 0, total: 12)
         lastAttempt = .now
         lastOutcome = nil
+        lastIssue = nil
         let active = loaded
         lock.unlock()
         notifyStatus()
@@ -557,6 +560,9 @@ final class GlucoseForecastMLManager: @unchecked Sendable {
                 }
             } catch is CancellationError {
                 self.finish(outcome: "backgroundCancelled", report: nil, attemptID: attemptID)
+            } catch let issue as GlucoseForecastMLTrainingIssue {
+                self.finish(outcome: "trainingIssue", report: nil, attemptID: attemptID,
+                            issue: issue)
             } catch let failure as GlucoseForecastMLTrainingFailure {
                 self.finish(outcome: failure.rawValue, report: nil, attemptID: attemptID)
             } catch {
@@ -639,7 +645,7 @@ final class GlucoseForecastMLManager: @unchecked Sendable {
     }
 
     private func finish(outcome: String, report: GlucoseForecastMLSelfCheck?,
-                        attemptID: UUID) {
+                        attemptID: UUID, issue: GlucoseForecastMLTrainingIssue? = nil) {
         lock.lock()
         guard activeAttemptID == attemptID else { lock.unlock(); return }
         isTraining = false
@@ -647,6 +653,7 @@ final class GlucoseForecastMLManager: @unchecked Sendable {
         activeAttemptID = nil
         trainingTask = nil
         lastOutcome = outcome
+        lastIssue = issue
         if let report { lastSelfCheck = report }
         lock.unlock()
         notifyStatus()

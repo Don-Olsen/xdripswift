@@ -31,8 +31,11 @@ enum GlucoseForecastMLStatusPresentation {
     }
 
     static func outcome(_ code: String?, report: GlucoseForecastMLSelfCheck? = nil,
+                        issue: GlucoseForecastMLTrainingIssue? = nil,
                         localize: Localize) -> String? {
         guard let code else { return nil }
+        if code == "trainingIssue" { return issue?.danishMessage ??
+            localize("forecast.mlFailed", "Training could not finish. The forecast engine remains available.") }
         switch code {
         case "activated":
             return localize("forecast.mlActivated", "Training finished. The checked model is now active.")
@@ -116,10 +119,13 @@ struct GlucoseForecastMLSettingsView: View {
                     Text(t("forecast.mlKeepOpen", "Keep the app open until training and the self-check finish."))
                         .font(.footnote)
                         .foregroundStyle(.secondary)
+                } else if status.lastOutcome == "trainingIssue", let issue = status.lastIssue {
+                    Text(issue.danishMessage).foregroundStyle(.secondary)
                 } else if !preparationStatus.isEmpty {
                     Text(preparationStatus).foregroundStyle(.secondary)
                 } else if let outcome = GlucoseForecastMLStatusPresentation.outcome(
-                    status.lastOutcome, report: status.lastSelfCheck, localize: t) {
+                    status.lastOutcome, report: status.lastSelfCheck,
+                    issue: status.lastIssue, localize: t) {
                     Text(outcome).foregroundStyle(.secondary)
                 }
                 if !coverageText.isEmpty {

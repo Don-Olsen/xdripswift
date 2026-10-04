@@ -174,6 +174,128 @@ final class GlucoseForecastMLReplayTests: XCTestCase {
         XCTAssertEqual(conflict.conflicts, [reference])
     }
 
+    func testHealthSameTimestampMergesSmallDifferencesBySourceMedian() {
+        let samples = [
+            healthSample(0, value: 100, bundle: "com.xdrip.one"),
+            healthSample(0, value: 102, bundle: "com.xdrip.one"),
+            healthSample(0, value: 103, bundle: "com.xdrip.two")
+        ]
+        let normalized = GlucoseForecastMLHistoryCoverageRules.normalizeHealthGlucose(samples)
+        XCTAssertTrue(normalized.conflicts.isEmpty)
+        XCTAssertEqual(normalized.mergedTimestamps, 1)
+        XCTAssertEqual(normalized.observationsByBundle["com.xdrip.one"]?.first?.glucoseMgdl, 101)
+        XCTAssertEqual(normalized.observationsByBundle["com.xdrip.two"]?.first?.glucoseMgdl, 103)
+        XCTAssertTrue(GlucoseForecastMLHistoryCoverageRules.conflictingHealthDates(samples).isEmpty)
+        let selected = GlucoseForecastMLHistoryCoverageRules.normalizedHealthGlucose(
+            samples, sourceBundleIdentifier: "com.xdrip.one")
+        XCTAssertEqual(selected.observations.first?.glucoseMgdl, 101)
+        XCTAssertEqual(selected.observations.count, 1)
+    }
+
+    func testHealthGlobalConflictCannotBeHiddenByPerSourceMedianOrUnequalCopyCounts() {
+        // The first bundle's median is 102; the second bundle's median is also
+        // 102. Checking medians first would hide the raw 100...104 disagreement.
+        let concealedByMedians = [
+            healthSample(0, value: 100, bundle: "com.xdrip.one"),
+            healthSample(0, value: 104, bundle: "com.xdrip.one"),
+            healthSample(0, value: 102, bundle: "com.xdrip.two")
+        ]
+        let normalized = GlucoseForecastMLHistoryCoverageRules.normalizeHealthGlucose(
+            concealedByMedians)
+        XCTAssertEqual(normalized.conflicts, [reference])
+        XCTAssertEqual(normalized.mergedTimestamps, 0)
+        XCTAssertTrue(normalized.observationsByBundle.isEmpty)
+        XCTAssertEqual(GlucoseForecastMLHistoryCoverageRules.conflictingHealthDates(
+            concealedByMedians), [reference])
+        XCTAssertTrue(GlucoseForecastMLHistoryCoverageRules.normalizedHealthGlucose(
+            concealedByMedians, sourceBundleIdentifier: "com.xdrip.one").observations.isEmpty)
+
+        let unbalanced = Array(repeating: healthSample(1, value: 120,
+            bundle: "com.xdrip.one"), count: 30) +
+            [healthSample(1, value: 123, bundle: "com.xdrip.two")]
+        let clean = GlucoseForecastMLHistoryCoverageRules.normalizeHealthGlucose(unbalanced)
+        XCTAssertTrue(clean.conflicts.isEmpty)
+        XCTAssertEqual(clean.observationsByBundle["com.xdrip.one"]?.first?.glucoseMgdl, 120)
+        XCTAssertEqual(clean.observationsByBundle["com.xdrip.two"]?.first?.glucoseMgdl, 123)
+        XCTAssertEqual(clean.mergedTimestamps, 1)
+    }
+
+    func testHealthInvalidRawValuesAreIgnoredAndValidOnlyRuleKeepsThresholdInclusive() {
+        let date = reference
+        let invalid = GlucoseForecastMLHealthSample(uuid: UUID(),
+            sourceBundleIdentifier: "com.xdrip.one", startDate: date,
+            endDate: date.addingTimeInterval(60), value: 6000, insulinReason: nil,
+            hasUndeterminedDuration: false, sampleCount: 1)
+        let values = [invalid, healthSample(0, value: 120), healthSample(0, value: 123.6)]
+        let clean = GlucoseForecastMLHistoryCoverageRules.normalizeHealthGlucose(values)
+        XCTAssertTrue(clean.conflicts.isEmpty)
+        XCTAssertEqual(clean.observationsByBundle["com.xdrip.one"]?.first?.glucoseMgdl ?? -1,
+                       121.8, accuracy: 0.000001)
+        let invalidDate = reference.addingTimeInterval(60)
+        let invalidBetweenReadings = GlucoseForecastMLHealthSample(uuid: UUID(),
+            sourceBundleIdentifier: "com.xdrip.one", startDate: invalidDate,
+            endDate: invalidDate.addingTimeInterval(60), value: 6000,
+            insulinReason: nil, hasUndeterminedDuration: false, sampleCount: 1)
+        let invalidOnly = GlucoseForecastMLHistoryCoverageRules.normalizeHealthGlucose(
+            [invalidBetweenReadings])
+        XCTAssertTrue(invalidOnly.observationsByBundle.isEmpty)
+        XCTAssertTrue(invalidOnly.conflicts.isEmpty)
+        XCTAssertEqual(invalidOnly.invalidOnlyDates, [invalidDate])
+        let adjacent = [0, 2].map { minute in
+            GlucoseForecastMLHistoryTaggedObservation(observation: observation(minute),
+                source: .healthKit, sourceBundleIdentifier: "com.xdrip.one")
+        }
+        XCTAssertEqual(GlucoseForecastMLHistoryCoverageRules.segments(adjacent,
+            blockedDates: invalidOnly.invalidOnlyDates).count, 2)
+        let over = [healthSample(0, value: 120), healthSample(0, value: 123.601)]
+        XCTAssertEqual(GlucoseForecastMLHistoryCoverageRules.conflictingHealthDates(over), [date])
+    }
+
+    func testTaggedHealthSelectionKeepsSourceAcrossSmallDisagreementsAndBreaksOnSwitch() {
+        let one = [0, 1].map { minute in
+            GlucoseForecastMLHistoryTaggedObservation(observation: observation(minute, value: 120),
+                source: .healthKit, sourceBundleIdentifier: "com.xdrip.one")
+        }
+        let two = [1, 2].map { minute in
+            GlucoseForecastMLHistoryTaggedObservation(observation: observation(minute, value: 122),
+                source: .healthKit, sourceBundleIdentifier: "com.xdrip.two")
+        }
+        let selected = GlucoseForecastMLHistoryCoverageRules.deduplicatedHealthTagged(
+            two.reversed() + one.reversed())
+        XCTAssertEqual(selected.map(\.sourceBundleIdentifier),
+                       ["com.xdrip.one", "com.xdrip.one", "com.xdrip.two"])
+        XCTAssertEqual(selected.map { $0.observation.glucoseMgdl }, [120, 120, 122])
+        XCTAssertEqual(GlucoseForecastMLHistoryCoverageRules.segments(selected, blockedDates: [])
+            .count, 2)
+        let conflict = one + [GlucoseForecastMLHistoryTaggedObservation(
+            observation: observation(1, value: 124), source: .healthKit,
+            sourceBundleIdentifier: "com.xdrip.two")]
+        XCTAssertEqual(GlucoseForecastMLHistoryCoverageRules.deduplicatedHealthTagged(conflict)
+            .map(\.observation.date), [reference])
+    }
+
+    func testHealthCoreDataComparisonUsesExactOverlapsAndReportsMedianAndP95() {
+        let health = (0..<20).map { minute in
+            GlucoseForecastMLHistoryTaggedObservation(observation: observation(minute,
+                value: 100 + Double(minute)), source: .healthKit,
+                sourceBundleIdentifier: "com.xdrip.one")
+        }
+        let local = (0..<20).map { minute in
+            GlucoseForecastMLHistoryTaggedObservation(observation: observation(minute,
+                value: 100 + Double(minute) + (minute == 19 ? 10 : 2)),
+                source: .local, sourceBundleIdentifier: nil)
+        }
+        let result = GlucoseForecastMLHistoryCoverageRules.compareHealthWithLocal(
+            health: health, local: local)
+        XCTAssertEqual(result.count, 20)
+        XCTAssertEqual(result.medianAbsoluteDifferenceMgdl, 2)
+        XCTAssertEqual(result.p95AbsoluteDifferenceMgdl, 2)
+        let noOverlap = GlucoseForecastMLHistoryCoverageRules.compareHealthWithLocal(
+            health: health, local: [])
+        XCTAssertEqual(noOverlap.count, 0)
+        XCTAssertNil(noOverlap.medianAbsoluteDifferenceMgdl)
+    }
+
     func testHealthSegmentsHaveDistinctSyntheticIDsAndNeverBridgeGlucoseGap() {
         let first = stride(from: -45, through: 0, by: 5).map {
             GlucoseForecastMLHistoryTaggedObservation(observation: observation($0),

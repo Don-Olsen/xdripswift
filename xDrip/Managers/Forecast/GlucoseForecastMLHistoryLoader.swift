@@ -137,6 +137,8 @@ final class GlucoseForecastMLHistoryLoader {
         var allLocalCarbsDates = [Date]()
         var ambiguousInsulinDates = [Date]()
         var ambiguousCarbsDates = [Date]()
+        var mergedHealthGlucoseTimestamps = 0
+        var discardedHealthGlucoseTimestamps = 0
         var completed = 0
         var dayStart = firstDay
         while dayStart < endDate {
@@ -156,29 +158,31 @@ final class GlucoseForecastMLHistoryLoader {
             allLocalInsulinDates.append(contentsOf: local.insulinDates)
             allLocalCarbsDates.append(contentsOf: local.carbohydrateDates)
 
-            var byBundle = [String: [GlucoseForecastGlucoseObservation]]()
             var allHealthSamples = [GlucoseForecastMLHealthSample]()
-            var healthConflicts = Set<Date>()
+            var allGlucoseSourcesRead = true
             for bundle in glucoseBundles {
                 if let values = queryValue(cancellation: cancellation, start: { completion in
                     healthQuery.samples(for: .glucose, from: dayStart, to: dayEnd,
                                         sourceBundleIdentifier: bundle, completion: completion)
                 }) {
-                    let bounded = values.filter { $0.startDate >= dayStart && $0.startDate < dayEnd }
+                    let bounded = values.filter {
+                        $0.sourceBundleIdentifier == bundle &&
+                            $0.startDate >= dayStart && $0.startDate < dayEnd
+                    }
                     allHealthSamples.append(contentsOf: bounded)
-                    let cleaned = GlucoseForecastMLHistoryCoverageRules.normalizedHealthGlucose(
-                        bounded, sourceBundleIdentifier: bundle)
-                    byBundle[bundle] = cleaned.observations
-                    healthConflicts.formUnion(cleaned.conflicts)
+                } else {
+                    // A partial set of frozen bundles cannot establish whether
+                    // another bundle disagrees at the same instant. Fall back to
+                    // separately covered local history for this day.
+                    allGlucoseSourcesRead = false
                 }
             }
-            // Conflict detection spans all locked source bundles, including a
-            // bundle that will not supply this day's selected segment.
-            healthConflicts.formUnion(
-                GlucoseForecastMLHistoryCoverageRules.conflictingHealthDates(allHealthSamples))
-            for bundle in byBundle.keys {
-                byBundle[bundle]?.removeAll { healthConflicts.contains($0.date) }
-            }
+            let normalizedHealth = GlucoseForecastMLHistoryCoverageRules.normalizeHealthGlucose(
+                allGlucoseSourcesRead ? allHealthSamples : [])
+            let byBundle = normalizedHealth.observationsByBundle
+            let healthConflicts = normalizedHealth.conflicts.union(normalizedHealth.invalidOnlyDates)
+            mergedHealthGlucoseTimestamps += normalizedHealth.mergedTimestamps
+            discardedHealthGlucoseTimestamps += normalizedHealth.conflicts.count
             if insulinEnabled, let insulinBundle,
                let values = queryValue(cancellation: cancellation, start: { completion in
                    healthQuery.samples(for: .insulin, from: dayStart, to: dayEnd,
@@ -277,8 +281,12 @@ final class GlucoseForecastMLHistoryLoader {
             if !insulinCovered { unknownInsulinDays += 1 }
             if !carbsCovered { unknownCarbsDays += 1 }
         }
+        let chosenHealthReadings = GlucoseForecastMLHistoryCoverageRules.deduplicatedHealthTagged(
+            healthTagged)
+        let healthLocalComparison = GlucoseForecastMLHistoryCoverageRules.compareHealthWithLocal(
+            health: chosenHealthReadings, local: localTagged)
         let healthSegments = GlucoseForecastMLHistoryCoverageRules.segments(
-            GlucoseForecastMLHistoryCoverageRules.deduplicatedHealthTagged(healthTagged),
+            chosenHealthReadings,
             blockedDates: blockedHealth)
         let localSegments = GlucoseForecastMLHistoryCoverageRules.segments(
             localTagged, blockedDates: blockedLocal)
@@ -351,6 +359,12 @@ final class GlucoseForecastMLHistoryLoader {
         // HealthKit receives priority at every covered anchor. A local anchor is
         // fallback only when no fully covered Health anchor lies within ten minutes.
         // Each candidate was replayed with one source's complete windows.
+        let healthCandidateDays = Set(healthCandidates.map {
+            calendar.startOfDay(for: $0.row.referenceDate)
+        }).count
+        let localCandidateDays = Set(localCandidates.map {
+            calendar.startOfDay(for: $0.row.referenceDate)
+        }).count
         let chosenHealth = spacedTriples(healthCandidates, excluding: [])
         let chosenLocal = spacedTriples(localCandidates,
             excluding: chosenHealth.map { $0.row.referenceDate })
@@ -372,9 +386,18 @@ final class GlucoseForecastMLHistoryLoader {
         let coverage = GlucoseForecastMLHistoryCoverage(requestedDays: days,
             completedDays: completed, usableDays: usableDays,
             healthKitDays: healthDays, localFallbackDays: localDays,
+            healthCandidateDays: healthCandidateDays,
+            localCandidateDays: localCandidateDays,
             unknownInsulinDays: unknownInsulinDays,
             unknownCarbohydrateDays: unknownCarbsDays,
             conflictingGlucoseTimestamps: blockedHealth.union(blockedLocal).count,
+            mergedHealthGlucoseTimestamps: mergedHealthGlucoseTimestamps,
+            discardedHealthGlucoseTimestamps: discardedHealthGlucoseTimestamps,
+            healthLocalComparisonCount: healthLocalComparison.count,
+            healthLocalAbsoluteDifferenceMedianMgdl:
+                healthLocalComparison.medianAbsoluteDifferenceMgdl,
+            healthLocalAbsoluteDifferenceP95Mgdl:
+                healthLocalComparison.p95AbsoluteDifferenceMgdl,
             exampleCountsByHorizon: counts)
         return GlucoseForecastMLHistoryLoadResult(examples: orderedExamples, coverage: coverage,
             segments: separated.map(\.0))

@@ -109,6 +109,38 @@ final class GlucoseForecastMLTrainerTests: XCTestCase {
         XCTAssertFalse(files.fileExists(atPath: models.appendingPathComponent(newerOrphanID).path))
     }
 
+    #if canImport(CreateML)
+    func testFailedCandidateInstallLeavesPreviousActiveModelUntouched() async throws {
+        let files = FileManager.default
+        let root = files.temporaryDirectory.appendingPathComponent(UUID().uuidString,
+                                                                     isDirectory: true)
+        defer { try? files.removeItem(at: root) }
+        let previousID = UUID().uuidString.lowercased()
+        let previous = root.appendingPathComponent("models", isDirectory: true)
+            .appendingPathComponent(previousID, isDirectory: true)
+        try files.createDirectory(at: previous, withIntermediateDirectories: true)
+        let marker = previous.appendingPathComponent("previous-model-marker")
+        let markerData = Data("keep previous model".utf8)
+        try markerData.write(to: marker)
+        let pointer = root.appendingPathComponent("active.json")
+        let pointerData = Data("{\"modelID\":\"\(previousID)\"}".utf8)
+        try pointerData.write(to: pointer)
+
+        let incomplete = GlucoseForecastMLTrainedCandidate(
+            models: [:], metadata: reviewMetadata())
+        do {
+            _ = try await GlucoseForecastMLModelStore(directory: root).install(incomplete)
+            XCTFail("An incomplete training candidate must never replace the active model")
+        } catch GlucoseForecastMLTrainingFailure.packageInvalid {
+            // A failed training/install attempt must not move the active pointer.
+        }
+        XCTAssertEqual(try Data(contentsOf: pointer), pointerData)
+        XCTAssertEqual(try Data(contentsOf: marker), markerData)
+        XCTAssertFalse(files.fileExists(atPath: root.appendingPathComponent("models", isDirectory: true)
+            .appendingPathComponent(incomplete.metadata.modelID, isDirectory: true).path))
+    }
+    #endif
+
     func testPriorModelAndDataGenerationCannotBeUsed() async throws {
         let current = reviewMetadata()
         XCTAssertTrue(GlucoseForecastMLModelCompatibility.isUsable(current))
@@ -185,6 +217,15 @@ final class GlucoseForecastMLTrainerTests: XCTestCase {
         XCTAssertEqual(GlucoseForecastMLStatusPresentation.progress(
             .installing, localize: fallback), "Saving and checking the model package…")
         XCTAssertNil(GlucoseForecastMLStatusPresentation.outcome("training", localize: fallback))
+        let issue = GlucoseForecastMLTrainingIssue(.calibration,
+            horizonMinutes: 60, actual: 9, required: 10,
+            unit: .usableDays,
+            periodStart: Date(timeIntervalSince1970: 1_700_000_000),
+            periodEnd: Date(timeIntervalSince1970: 1_700_086_400))
+        XCTAssertEqual(GlucoseForecastMLStatusPresentation.outcome(
+            "trainingIssue", issue: issue, localize: fallback), issue.danishMessage)
+        XCTAssertTrue(issue.danishMessage.contains("Kalibrering (+60): 9 af 10 brugbare dage"))
+        XCTAssertTrue(issue.danishMessage.contains("2023"))
         XCTAssertEqual(GlucoseForecastMLStatusPresentation.outcome(
             GlucoseForecastMLTrainingFailure.insufficientSelfCheckRows.rawValue,
             localize: fallback),
@@ -250,6 +291,26 @@ final class GlucoseForecastMLTrainerTests: XCTestCase {
         }
     }
 
+    private func chronologyNow(_ rows: [GlucoseForecastMLReplayExample]) -> Date {
+        rows.map { $0.row.referenceDate }.max()!.addingTimeInterval(4 * 3600)
+    }
+
+    private func completeAnchor(at reference: Date) -> [GlucoseForecastMLReplayExample] {
+        [30, 60, 120].map { horizon in
+            let row = GlucoseForecastMLFeatureRow(
+                horizonMinutes: horizon, referenceDate: reference,
+                engineValue: 150, glucose: 145, sensorID: "sensor-a",
+                values: Array(repeating: 1, count: 16))
+            return GlucoseForecastMLReplayExample(
+                row: row, targetDate: reference.addingTimeInterval(Double(horizon * 60)),
+                targetGlucoseMgdl: 155, engineTargetGlucoseMgdl: 150,
+                engineTrajectoryMgdl: Array(repeating: 150, count: 25),
+                sourceIdentity: "sensor:sensor-a",
+                treatmentAvailability: .retrospectiveUnknown,
+                settingsAvailability: .retrospectiveUnknown)
+        }
+    }
+
     func testChronologyKeepsThreeDisjointPeriodsAndEmbargoesCrossBoundaryTarget() throws {
         var calendar = utc
         calendar.timeZone = TimeZone(secondsFromGMT: 0)!
@@ -266,7 +327,8 @@ final class GlucoseForecastMLTrainerTests: XCTestCase {
             sourceIdentity: "sensor:sensor-a", treatmentAvailability: .retrospectiveUnknown,
             settingsAvailability: .retrospectiveUnknown)
         rows.append(crossing)
-        let split = try GlucoseForecastMLChronology.split(rows, calendar: calendar)
+        let split = try GlucoseForecastMLChronology.split(rows, calendar: calendar,
+                                                          now: chronologyNow(rows))
         XCTAssertEqual(split.usableDayCount, 60)
         XCTAssertEqual(split.bStart, bStart)
         for horizon in [30, 60, 120] {
@@ -287,10 +349,119 @@ final class GlucoseForecastMLTrainerTests: XCTestCase {
         let curtailed = examples().filter { example in
             !(example.row.horizonMinutes == 120 && example.row.referenceDate >=
               cStart
-              && calendar.component(.hour, from: example.row.referenceDate) == 12
-              && calendar.component(.minute, from: example.row.referenceDate) >= 10)
+              && !(calendar.component(.hour, from: example.row.referenceDate) == 12
+                   && calendar.component(.minute, from: example.row.referenceDate) == 0))
         }
-        XCTAssertThrowsError(try GlucoseForecastMLChronology.split(curtailed, calendar: calendar))
+        XCTAssertThrowsError(try GlucoseForecastMLChronology.split(
+            curtailed, calendar: calendar, now: chronologyNow(curtailed))) { error in
+            let issue = error as? GlucoseForecastMLTrainingIssue
+            XCTAssertEqual(issue?.phase, .selfCheck)
+            XCTAssertEqual(issue?.horizonMinutes, 30)
+            XCTAssertEqual(issue?.actual, 14)
+            XCTAssertEqual(issue?.required, 100)
+            XCTAssertTrue(issue?.danishMessage.contains("14 af 100 rækker") == true)
+        }
+    }
+
+    func testLatestFourteenUsableDaysSkipTwoWeekCalendarHole() throws {
+        var calendar = utc
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        let start = calendar.date(from: DateComponents(year: 2026, month: 1, day: 1))!
+        let all = examples(days: 88)
+        let withHole = all.filter { example in
+            let day = calendar.dateComponents([.day], from: start,
+                to: example.row.referenceDate).day!
+            return !(60..<74).contains(day)
+        }
+        let split = try GlucoseForecastMLChronology.split(withHole,
+            calendar: calendar, now: chronologyNow(withHole))
+        XCTAssertEqual(split.cStart, calendar.date(byAdding: .day, value: 74, to: start))
+        XCTAssertEqual(split.bStart, calendar.date(byAdding: .day, value: 46, to: start))
+        XCTAssertEqual(split.usableDayCount, 74)
+        for horizon in [30, 60, 120] {
+            XCTAssertEqual(split.a[horizon]?.count, 460)
+            XCTAssertEqual(split.b[horizon]?.count, 140)
+            XCTAssertEqual(split.c[horizon]?.count, 140)
+        }
+    }
+
+    func testFourteenUsableSelfCheckDaysStillNeedOneHundredRows() {
+        var calendar = utc
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        let all = examples()
+        let cStart = calendar.date(from: DateComponents(year: 2026, month: 2, day: 16))!
+        let sparseC = all.filter { example in
+            let reference = example.row.referenceDate
+            guard reference >= cStart else { return true }
+            let hour = calendar.component(.hour, from: reference)
+            let minute = calendar.component(.minute, from: reference)
+            return hour == 12 || (hour == 13 && minute == 0)
+        }
+        XCTAssertThrowsError(try GlucoseForecastMLChronology.split(sparseC,
+            calendar: calendar, now: chronologyNow(sparseC))) { error in
+            let issue = error as? GlucoseForecastMLTrainingIssue
+            XCTAssertEqual(issue?.phase, .selfCheck)
+            XCTAssertEqual(issue?.actual, 98)
+            XCTAssertEqual(issue?.required, 100)
+            XCTAssertTrue(issue?.danishMessage.contains("98 af 100 rækker") == true)
+        }
+    }
+
+    func testStaleSelfCheckAndExcessiveCalibrationSpanExplainActualLimits() {
+        var calendar = utc
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        let all = examples()
+        let staleNow = all.map { $0.row.referenceDate }.max()!
+            .addingTimeInterval(48 * 3600 + 60)
+        XCTAssertThrowsError(try GlucoseForecastMLChronology.split(all,
+            calendar: calendar, now: staleNow)) { error in
+            let issue = error as? GlucoseForecastMLTrainingIssue
+            XCTAssertEqual(issue?.phase, .freshness)
+            XCTAssertEqual(issue?.unit, .ageHours)
+            XCTAssertEqual(issue?.actual, 49)
+            XCTAssertEqual(issue?.required, 48)
+            XCTAssertTrue(issue?.danishMessage.contains("49 timer") == true)
+        }
+
+        let start = calendar.date(from: DateComponents(year: 2026, month: 1, day: 1))!
+        let longHistory = examples(days: 150).filter { example in
+            let day = calendar.dateComponents([.day], from: start,
+                to: example.row.referenceDate).day!
+            return !(60..<130).contains(day)
+        }
+        XCTAssertThrowsError(try GlucoseForecastMLChronology.split(longHistory,
+            calendar: calendar, now: chronologyNow(longHistory))) { error in
+            let issue = error as? GlucoseForecastMLTrainingIssue
+            XCTAssertEqual(issue?.phase, .freshness)
+            XCTAssertEqual(issue?.unit, .spanDays)
+            XCTAssertEqual(issue?.actual, 98)
+            XCTAssertEqual(issue?.required, 60)
+            XCTAssertTrue(issue?.danishMessage.contains("98 kalenderdage") == true)
+        }
+    }
+
+    func testDetailedIssueMessagesNamePhaseHorizonFoldAndCounts() {
+        let cases: [(GlucoseForecastMLTrainingIssue, String)] = [
+            (.init(.history, actual: 58, required: 60, unit: .usableDays),
+             "Historik: 58 af 60 brugbare dage"),
+            (.init(.training, horizonMinutes: 120, actual: 28, required: 30,
+                   unit: .usableDays), "Træning (+120): 28 af 30 brugbare dage"),
+            (.init(.walkForward, horizonMinutes: 30, fold: 2,
+                   actual: 199, required: 200, unit: .rows),
+             "Tidsopdelt træning (+30) · fold 2: 199 af 200 rækker"),
+            (.init(.walkForward, horizonMinutes: 60,
+                   actual: 99, required: 100, unit: .residuals),
+             "Tidsopdelt træning (+60): 99 af 100 residualer"),
+            (.init(.calibration, horizonMinutes: 60,
+                   actual: 99, required: 100, unit: .calibrationPredictions),
+             "Kalibrering (+60): 99 af 100 gyldige kalibreringsprognoser"),
+            (.init(.selfCheck, horizonMinutes: 120,
+                   actual: 99, required: 100, unit: .rows),
+             "Selvtjek (+120): 99 af 100 rækker")
+        ]
+        for (issue, expected) in cases {
+            XCTAssertTrue(issue.danishMessage.hasPrefix(expected), issue.danishMessage)
+        }
     }
 
     func testCorrectionLimitAndUnsafeCenterUseWholeEngineFallback() {
@@ -412,30 +583,25 @@ final class GlucoseForecastMLTrainerTests: XCTestCase {
         var calendar = utc
         calendar.timeZone = TimeZone(secondsFromGMT: 0)!
         let base = examples()
-        let baseline = try GlucoseForecastMLChronology.split(base, calendar: calendar)
-        let acceptedA = baseline.bStart.addingTimeInterval(-32 * 60 - 1)
-        let embargoedA = baseline.bStart.addingTimeInterval(-32 * 60)
-        let acceptedB = baseline.cStart.addingTimeInterval(-32 * 60 - 1)
-        let embargoedB = baseline.cStart.addingTimeInterval(-32 * 60)
-        let additional = [acceptedA, embargoedA, acceptedB, embargoedB].map { reference in
-            GlucoseForecastMLReplayExample(
-                row: GlucoseForecastMLFeatureRow(horizonMinutes: 30,
-                    referenceDate: reference, engineValue: 150, glucose: 145,
-                    sensorID: "sensor-a", values: Array(repeating: 1, count: 16)),
-                targetDate: reference.addingTimeInterval(30 * 60),
-                targetGlucoseMgdl: 155, engineTargetGlucoseMgdl: 150,
-                engineTrajectoryMgdl: Array(repeating: 150, count: 25),
-                sourceIdentity: "sensor:sensor-a", treatmentAvailability: .retrospectiveUnknown,
-                settingsAvailability: .retrospectiveUnknown)
+        let baseline = try GlucoseForecastMLChronology.split(base, calendar: calendar,
+                                                              now: chronologyNow(base))
+        let acceptedA = baseline.bStart.addingTimeInterval(-122 * 60 - 1)
+        let embargoedA = baseline.bStart.addingTimeInterval(-122 * 60)
+        let acceptedB = baseline.cStart.addingTimeInterval(-122 * 60 - 1)
+        let embargoedB = baseline.cStart.addingTimeInterval(-122 * 60)
+        let additional = [acceptedA, embargoedA, acceptedB, embargoedB]
+            .flatMap { completeAnchor(at: $0) }
+        let split = try GlucoseForecastMLChronology.split(base + additional,
+            calendar: calendar, now: chronologyNow(base))
+        for horizon in [30, 60, 120] {
+            XCTAssertEqual(split.a[horizon]?.count, baseline.a[horizon]!.count + 1)
+            XCTAssertEqual(split.b[horizon]?.count, baseline.b[horizon]!.count + 1)
+            XCTAssertEqual(split.c[horizon]?.count, baseline.c[horizon]!.count)
+            XCTAssertTrue(split.a[horizon]!.contains { $0.row.referenceDate == acceptedA })
+            XCTAssertTrue(split.b[horizon]!.contains { $0.row.referenceDate == acceptedB })
+            XCTAssertFalse(split.a[horizon]!.contains { $0.row.referenceDate == embargoedA })
+            XCTAssertFalse(split.b[horizon]!.contains { $0.row.referenceDate == embargoedB })
+            XCTAssertFalse(split.c[horizon]!.contains { $0.row.referenceDate == embargoedB })
         }
-        let split = try GlucoseForecastMLChronology.split(base + additional, calendar: calendar)
-        XCTAssertEqual(split.a[30]?.count, baseline.a[30]!.count + 1)
-        XCTAssertEqual(split.b[30]?.count, baseline.b[30]!.count + 1)
-        XCTAssertEqual(split.c[30]?.count, baseline.c[30]!.count)
-        XCTAssertTrue(split.a[30]!.contains { $0.row.referenceDate == acceptedA })
-        XCTAssertTrue(split.b[30]!.contains { $0.row.referenceDate == acceptedB })
-        XCTAssertFalse(split.a[30]!.contains { $0.row.referenceDate == embargoedA })
-        XCTAssertFalse(split.b[30]!.contains { $0.row.referenceDate == embargoedB })
-        XCTAssertFalse(split.c[30]!.contains { $0.row.referenceDate == embargoedB })
     }
 }

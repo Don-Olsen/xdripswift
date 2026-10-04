@@ -8,6 +8,47 @@
 - Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
 <!-- testflight-7.1.1-4293:end -->
 
+## Lokal kandidat efter 4293 — træningsperioder og årsagsdiagnostik
+
+På brugerens iPhone viste 4293 **330 brugbare dage** og **31.699 eksempler
+ved hver af +30/+60/+120 minutter**, men afviste træningen med den generiske
+`forecast.mlNotEnoughHistory`-tekst. Den konkrete gate kan ikke fastslås fra
+denne tekst alene. De faste kalenderperioder i 4293 kunne efter den oplyste
+Sundhed-eksport efterlade kalibreringen med for få brugbare dage; det er en
+hypotese, indtil den nye status er set på iPhone.
+
+Den lokale rettelse vælger C som de seneste 14 **brugbare** dage med komplette
+ankre for alle tre horisonter, B som de foregående 14 brugbare dage og A som
+ældre ankre. Kronologien og målbufferen på horisont plus to minutter bevares
+ved periode- og walk-forward-grænser. Det seneste C-anker skal være højst
+48 timer gammelt, og B+C må spænde højst 60 kalenderdage. Kravene på
+60 brugbare dage samlet, A: 30 dage/300 rækker pr. horisont, B og C:
+ti dage/100 rækker pr. horisont, samt walk-forward- og kalibreringsminimum
+er ikke sænket. En afvisning skal nu vise fase, horisont, eventuelt fold,
+datointerval og faktiske/krævede tal i stedet for én fælles fejltekst.
+
+Alle gyldige xDrip-Sundhedsværdier på præcis samme tidspunkt sammenlignes
+på tværs af de fastlåste kilder. Er spændet over 3,6 mg/dL, kasseres
+tidspunktet for alle; ellers samles kopier til medianen **inden for hver
+kilde**, hvorefter det eksisterende kildevalg og segmentbrud gælder.
+Indstillinger skal skelne brugbare dage fra Sundhed og apphistorik samt
+vise antal sammenlagte og konfliktkasserede tidspunkter. De rensede
+Sundhedsværdier sammenlignes med overlappende Core Data-`finalValue`;
+antal samt median og 95-percentil af absolut forskel er diagnostik, ikke
+ændringer af målinger. Årsagen til eventuelle forskelle kan ikke fastslås
+uden de faktiske data. Den ændrede datadannelse får ny kompatibilitetsversion,
+så ældre modeller og checkpoints ikke bruges. Modellerne, som består
+kalibrering og selvtjek, aktiveres uden efterfølgende gen-træning.
+
+**Lokal validering bestod 4. oktober 2026.** Hele XCTest-suiten: 1.255/1.255
+bestået; projektets Python-kontroller: bestået; iPhone- og Watch-simulatorbuilds:
+bestået. En særskilt usigneret iPhoneOS-build bestod og producerede en arm64-app;
+Create ML-træningsfilerne blev kompileret i den. Første fulde gennemløb havde
+én fejl i en ny testopstilling; den blev rettet, og hele suiten bestod ved
+ny kørsel. Der er endnu ingen dokumenteret træningskørsel på den fysiske
+iPhone og ingen påvist forbedring af prognosepræcision. Release-processens
+egne tests på det præcise kildecheckpoint, upload og Apple-status afventer.
+
 De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
 
 <!-- testflight-7.1.1-4292:start -->

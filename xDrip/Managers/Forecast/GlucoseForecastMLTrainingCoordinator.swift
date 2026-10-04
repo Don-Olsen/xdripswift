@@ -265,7 +265,20 @@ final class GlucoseForecastMLTrainingCoordinator: @unchecked Sendable {
         guard preparationInProgress, preparationCancellation === cancellation,
               !cancellation.isCancelled else { lock.unlock(); return }
         let counts = coverage.exampleCountsByHorizon
-        preparationCoverage = "\(coverage.usableDays) brugbare dage · +30: \(counts[30, default: 0]) · +60: \(counts[60, default: 0]) · +120: \(counts[120, default: 0]) eksempler"
+        var lines = [
+            "\(coverage.usableDays) brugbare dage · Sundhed: \(coverage.healthKitDays) · app: \(coverage.localFallbackDays)",
+            "Kandidatdage før kildevalg: Sundhed \(coverage.healthCandidateDays) · app \(coverage.localCandidateDays)",
+            "+30: \(counts[30, default: 0]) · +60: \(counts[60, default: 0]) · +120: \(counts[120, default: 0]) eksempler",
+            "Sundhed-tidspunkter: \(coverage.mergedHealthGlucoseTimestamps) samlet fra kopier · \(coverage.discardedHealthGlucoseTimestamps) kasseret ved konflikt"
+        ]
+        if let median = coverage.healthLocalAbsoluteDifferenceMedianMgdl,
+           let p95 = coverage.healthLocalAbsoluteDifferenceP95Mgdl {
+            let numberLocale = Locale(identifier: "da_DK")
+            let medianText = median.formatted(.number.precision(.fractionLength(2)).locale(numberLocale))
+            let p95Text = p95.formatted(.number.precision(.fractionLength(2)).locale(numberLocale))
+            lines.append("Sundhed/app finalValue (\(coverage.healthLocalComparisonCount) fælles tidspunkter): median \(medianText), 95-percentil \(p95Text) mg/dL forskel")
+        }
+        preparationCoverage = lines.joined(separator: "\n")
         lock.unlock()
         NotificationCenter.default.post(name: Self.statusDidChange, object: nil)
     }

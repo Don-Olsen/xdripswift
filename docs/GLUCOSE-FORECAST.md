@@ -186,6 +186,67 @@ verified before upload, and Apple confirmed **Internal / Testing** on
 iPhone, so future personal accuracy and the 80% interval target remain
 unverified in physical use.
 
+## Local follow-up after 4293: usable-day training periods and diagnostics
+
+In 4293, a large annual example count could still end in the generic
+`mlNotEnoughHistory` message: its fixed 14-calendar-day B and C periods each
+needed ten usable days, and the reason for rejection was hidden. This local
+follow-up does **not** relax the minimum number of days, rows, walk-forward
+residuals or calibration predictions. It reports the failing phase, horizon,
+fold where applicable, actual and required counts, and the period's dates in
+Danish. The preparation summary separates usable Health and app-history days
+and reports same-time Health glucose timestamps merged or discarded as
+conflicts. Thus an overall count such as 330 days cannot be mistaken for
+proof that every training, calibration and self-check gate passed.
+
+A usable day contains at least one complete valid training anchor with +30,
++60 and +120 targets after row-validity and boundary filtering. The latest
+14 such days form C (self-check), the preceding 14 form B (band calibration),
+and older days form A (training). Empty calendar days between selected days
+are skipped, but the order is never shuffled. Targets must remain in their
+anchor's period: the horizon **plus the existing two-minute match allowance**
+is reserved at A/B and B/C boundaries and within chronological walk-forward
+folds. Historical input windows may extend backward into the previous period;
+targets may not extend forward into the next. The last C anchor must be at
+most 48 hours old, and B plus C may span at most 60 calendar days. If either
+freshness check fails, training is deferred with its measured limit shown.
+The existing minimums remain 60 usable days overall; A needs at least 30
+days and 300 rows per horizon, and B and C each need at least ten days and
+100 rows per horizon. The separate walk-forward and valid calibration-output
+minimums still apply.
+
+For frozen xDrip Health sources, every otherwise valid raw glucose value at
+the *same exact timestamp* is considered before choosing a source. If the
+global maximum minus minimum exceeds **3.6 mg/dL**, that timestamp is
+discarded for all sources. Otherwise, copies within each source bundle are
+collapsed to that bundle's median; the number of repeated copies cannot
+give one source more weight. The existing deterministic source choice and
+segment boundary at a source change remain. Point-sample, single-reading,
+finite-value and 20–600 mg/dL checks still apply. The data-generation/
+feature version is advanced so packages and training checkpoints based on
+the earlier duplicate policy cannot be reused.
+
+The cleaned Health readings are compared at exactly overlapping timestamps
+with Core Data's stored `finalValue`. Diagnostics report the comparison count
+and the median and 95th percentile of the **absolute** difference in mg/dL;
+neither dataset is changed. Differences alone cannot establish whether later
+smoothing, recalibration or another cause is responsible. No personal
+comparison statistic or training result is claimed until collected from the
+user's iPhone. The correction model remains trained on A, and the error
+model on chronological out-of-sample A residuals. Precisely those fitted
+models are calibrated on B and evaluated on C; activation never retrains
+them on either held-out period after the self-check. At the next weekly
+training, previously held-out days may enter the then-current A period.
+
+Local validation on 4 October 2026 passed **1,255/1,255 XCTest tests**, all
+project Python controls, both iPhone and Watch simulator builds, and a separate
+unsigned iPhoneOS/arm64 build that compiled the Create ML training path. The
+latter produced an arm64 Mach-O iPhone app. The first full run had one faulty
+new test fixture; the fixture was corrected and the entire suite passed on
+rerun. Passing software checks does not prove that the original iPhone failure
+is resolved or that personal accuracy has improved; the specific on-device
+gate and outcome must be read from the new status display.
+
 ## Validation boundary
 
 Unit tests cover model curves, timing, units, stale and gapped data, treatment selection, source ownership and missing settings. Real-world accuracy must be assessed at +30, +60 and +120 minutes separately against measured glucose, an unchanged-value baseline and a simple short trend. Inputs must be frozen at prediction time; later meals, insulin, corrections and changed settings must be reported separately. Historical xDrip treatment rows do not consistently retain a “known to the app at this time” timestamp, so a retrospective replay cannot prove that it avoided future information. Prospective snapshots or an external dataset with that provenance are needed before reporting comparative accuracy.
