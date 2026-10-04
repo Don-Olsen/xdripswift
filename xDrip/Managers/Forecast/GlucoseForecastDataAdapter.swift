@@ -9,23 +9,8 @@
 import CoreData
 import Foundation
 
-/// A refresh hint accompanies an unavailable calculation; it is never logged as a valid result.
-struct GlucoseForecastRefreshReference: Equatable, Sendable {
-    let date: Date
-    let sensorID: String
-    let glucoseMgdl: Double
-    let treatmentRevision: Int
-    let inputSignature: String
-
-    func matches(_ result: GlucoseForecastResult) -> Bool {
-        result.reason == nil && result.referenceDate == date && result.referenceSensorID == sensorID
-            && result.points.first?.date == date && result.points.first?.glucoseMgdl == glucoseMgdl
-    }
-}
-
 struct GlucoseForecastPresentationOutcome: Sendable {
     let result: GlucoseForecastResult
-    var refreshReference: GlucoseForecastRefreshReference? = nil
 }
 
 /// Core Data reads run on a serial worker. Home can cancel or supersede its awaiting Task
@@ -125,27 +110,11 @@ final class GlucoseForecastDataAdapter {
             .init(result: record(Self.unavailable(reason), horizonMinutes: horizonMinutes,
                                  knownReference: knownReference, settings: settings))
         }
-        let treatmentRevision = therapyManager.forecastInputChangeRevision
         guard !Task.isCancelled else { return unavailable(.dataUnavailable) }
         guard let glucose = recentGlucose(at: now) else { return unavailable(.dataUnavailable) }
         knownReference = glucose.last
         guard let referenceDate = glucose.last?.date else { return unavailable(.missingGlucose) }
         let importer = healthImporter
-        // This distinct outcome is allowed only for a previously complete source's active read.
-        // All calculation guards below remain unchanged, including generic read failures.
-        if !therapyManager.hasUncommittedForecastInputChanges,
-           importer.isRefreshingPreviouslyCompleteInputs(at: now),
-           let latest = glucose.last, let sensorID = latest.sensorID, !sensorID.isEmpty,
-           latest.glucoseMgdl.isFinite, latest.glucoseMgdl > 0,
-           now >= latest.date, now.timeIntervalSince(latest.date) <= GlucoseForecastEngine.maximumGlucoseAge,
-           treatmentRevision == therapyManager.forecastInputChangeRevision,
-           inputSignature == Self.presentationInputSignature(horizonMinutes: horizonMinutes,
-                                                            defaults: defaults, importer: importer) {
-            var outcome = unavailable(.dataUnavailable)
-            outcome.refreshReference = GlucoseForecastRefreshReference(date: latest.date, sensorID: sensorID,
-                glucoseMgdl: latest.glucoseMgdl, treatmentRevision: treatmentRevision, inputSignature: inputSignature)
-            return outcome
-        }
         guard !therapyManager.hasUncommittedForecastInputChanges,
               !importer.localInputIsIncomplete(.insulin),
               !importer.localInputIsIncomplete(.carbohydrates)

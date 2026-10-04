@@ -33,6 +33,14 @@ struct HealthTherapyImportStatus {
     let isIncomplete: Bool
 }
 
+/// Presentation-only proof for a routine anchored reread. Calculations must continue to use
+/// `localInputIsIncomplete`; this never makes a partial page or pending save authoritative.
+struct HealthTherapyRoutineRefreshState {
+    let generation: Int
+    let startedAt: Date
+    let allEnabledKindsCommitted: Bool
+}
+
 /// Value-only query data allows the import and persistence rules to be tested without a real
 /// Health database. HealthKit objects never leave the query adapter.
 struct HealthTherapyIncomingSample {
@@ -233,7 +241,15 @@ final class HealthKitTherapyImportManager {
     private var active = Set<HealthTherapyImportKind>()
     private var pending = Set<HealthTherapyImportKind>()
     private let presentationLock = NSLock()
-    private var previouslyCompleteRefreshes: [HealthTherapyImportKind: (source: String, lastSync: Date)] = [:]
+    private struct RoutineRefresh {
+        let generation: Int
+        let startedAt: Date
+        let sources: [HealthTherapyImportKind: String]
+        let lastSyncs: [HealthTherapyImportKind: Date]
+        var waitingFor: Set<HealthTherapyImportKind>
+    }
+    private var routineRefresh: RoutineRefresh?
+    private var nextRoutineRefreshGeneration = 0
     private var observerInstalled = Set<HealthTherapyImportKind>()
     private var observerCompletions: [HealthTherapyImportKind: [() -> Void]] = [:]
     /// Injected only by isolated tests to fail one parent-store save at a precise boundary.
@@ -268,6 +284,11 @@ final class HealthKitTherapyImportManager {
             name: defaults.string(forKey: key(kind, "sourceName")) ?? id)
     }
 
+    /// The existing bounded-import cutoff, exposed read-only for historical coverage checks.
+    func historyStart(_ kind: HealthTherapyImportKind) -> Date? {
+        defaults.object(forKey: key(kind, "historyStart")) as? Date
+    }
+
     func discoveredSources(_ kind: HealthTherapyImportKind,
                            completion: @escaping ([HealthTherapyImportSource], Error?) -> Void) {
         query.discoverSources(for: kind, completion: completion)
@@ -278,6 +299,9 @@ final class HealthKitTherapyImportManager {
         guard enabled else {
             defaults.set(false, forKey: key(kind, "enabled"))
             defaults.removeObject(forKey: key(kind, "syncInProgress"))
+            presentationLock.lock()
+            routineRefresh = nil
+            presentationLock.unlock()
             queue.async {
                 if self.observerInstalled.remove(kind) != nil { self.query.stopObserving(kind) }
             }
@@ -309,6 +333,9 @@ final class HealthKitTherapyImportManager {
 
     func selectSource(_ source: HealthTherapyImportSource, kind: HealthTherapyImportKind) {
         guard !source.bundleIdentifier.isEmpty else { return }
+        presentationLock.lock()
+        routineRefresh = nil
+        presentationLock.unlock()
         defaults.set(source.bundleIdentifier, forKey: key(kind, "sourceBundleID"))
         defaults.set(source.name, forKey: key(kind, "sourceName"))
         defaults.removeObject(forKey: key(kind, "observedSelectedSource"))
@@ -365,29 +392,30 @@ final class HealthKitTherapyImportManager {
         isEnabled(kind) && status(kind).isIncomplete
     }
 
-    /// Read-only presentation hint. It never makes incomplete inputs usable for calculations.
-    /// Every enabled source must have a recent, unambiguous successful import; only a new
-    /// anchored read may be in progress. First imports, source changes and failures stay unknown.
-    func isRefreshingPreviouslyCompleteInputs(at now: Date = Date()) -> Bool {
+    /// A fixed 30-second Home display window. Its source and completeness proof is captured
+    /// before the first read starts, and callbacks cannot move the deadline forward.
+    func routineRefreshState(at now: Date = Date()) -> HealthTherapyRoutineRefreshState? {
         presentationLock.lock()
-        let refreshProof = previouslyCompleteRefreshes
+        let refresh = routineRefresh
         presentationLock.unlock()
-        var refreshing = false
-        for kind in HealthTherapyImportKind.allCases where isEnabled(kind) {
-            guard selectedSource(kind) != nil,
+        guard let refresh, (0..<30).contains(now.timeIntervalSince(refresh.startedAt)) else { return nil }
+        for (kind, source) in refresh.sources {
+            guard isEnabled(kind), selectedSource(kind)?.bundleIdentifier == source,
                   defaults.string(forKey: key(kind, "error")) == nil,
-                  let lastSync = defaults.object(forKey: key(kind, "lastSync")) as? Date,
-                  now.timeIntervalSince(lastSync) >= 0,
-                  now.timeIntervalSince(lastSync) <= TherapyModelSettings.visibilityInterval,
+                  !defaults.bool(forKey: key(kind, "hasAmbiguousSelectedSource")),
                   defaults.bool(forKey: key(kind, "observedSelectedSource")),
-                  !defaults.bool(forKey: key(kind, "hasAmbiguousSelectedSource")) else { return false }
-            if defaults.bool(forKey: key(kind, "syncInProgress")) {
-                guard let proof = refreshProof[kind], proof.lastSync == lastSync,
-                      proof.source == selectedSource(kind)?.bundleIdentifier else { return false }
-                refreshing = true
-            }
+                  let priorSync = refresh.lastSyncs[kind],
+                  let currentSync = defaults.object(forKey: key(kind, "lastSync")) as? Date,
+                  currentSync >= priorSync,
+                  now.timeIntervalSince(priorSync) >= 0,
+                  now.timeIntervalSince(priorSync) <= TherapyModelSettings.visibilityInterval,
+                  now.timeIntervalSince(currentSync) >= 0,
+                  now.timeIntervalSince(currentSync) <= TherapyModelSettings.visibilityInterval else { return nil }
         }
-        return refreshing
+        let enabled = Set(HealthTherapyImportKind.allCases.filter(isEnabled))
+        guard enabled == Set(refresh.sources.keys) else { return nil }
+        return HealthTherapyRoutineRefreshState(generation: refresh.generation,
+            startedAt: refresh.startedAt, allEnabledKindsCommitted: refresh.waitingFor.isEmpty)
     }
 
     @objc private func retryEnabledImports() {
@@ -412,7 +440,12 @@ final class HealthKitTherapyImportManager {
     private func setStatus(_ kind: HealthTherapyImportKind, message: String?) {
         if let message { defaults.set(message, forKey: key(kind, "error")) }
         else { defaults.removeObject(forKey: key(kind, "error")) }
-        TherapyMetricsManager.shared.invalidate()
+        if message != nil {
+            presentationLock.lock()
+            routineRefresh = nil
+            presentationLock.unlock()
+        }
+        TherapyMetricsManager.shared.publishStatusChange()
         notifyStatusChanged()
     }
 
@@ -421,9 +454,39 @@ final class HealthKitTherapyImportManager {
         query.observe(kind) { completion in
             self.queue.async {
                 self.observerCompletions[kind, default: []].append(completion)
-                self.startSync(kind)
+                // A Home snapshot contains both local metrics. Drain both enabled kinds for
+                // one coherent completion even if Health notified only one sample type.
+                for enabledKind in HealthTherapyImportKind.allCases where self.isEnabled(enabledKind) {
+                    self.startSync(enabledKind)
+                }
             }
         }
+    }
+
+    private func beginRoutineRefreshIfEligible(_ kind: HealthTherapyImportKind, at now: Date) {
+        presentationLock.lock()
+        if var existing = routineRefresh,
+           (0..<30).contains(now.timeIntervalSince(existing.startedAt)) {
+            existing.waitingFor.insert(kind)
+            routineRefresh = existing
+            presentationLock.unlock()
+            return
+        }
+        presentationLock.unlock()
+        let enabled = HealthTherapyImportKind.allCases.filter(isEnabled)
+        guard !enabled.isEmpty, enabled.allSatisfy({ !status($0).isIncomplete }) else { return }
+        let sources = Dictionary(uniqueKeysWithValues: enabled.compactMap { value in
+            selectedSource(value).map { (value, $0.bundleIdentifier) }
+        })
+        let lastSyncs = Dictionary(uniqueKeysWithValues: enabled.compactMap { value in
+            status(value).lastSync.map { (value, $0) }
+        })
+        guard sources.count == enabled.count, lastSyncs.count == enabled.count else { return }
+        presentationLock.lock()
+        nextRoutineRefreshGeneration &+= 1
+        routineRefresh = RoutineRefresh(generation: nextRoutineRefreshGeneration, startedAt: now,
+            sources: sources, lastSyncs: lastSyncs, waitingFor: Set(enabled))
+        presentationLock.unlock()
     }
 
     private func startSync(_ kind: HealthTherapyImportKind) {
@@ -437,18 +500,10 @@ final class HealthKitTherapyImportManager {
             return
         }
         guard active.insert(kind).inserted else { pending.insert(kind); return }
-        // Capture before clearing an earlier error or changing sync state. This hint does not
-        // authorize calculations and cannot survive a failed read, source switch or app restart.
-        let previousStatus = status(kind)
-        presentationLock.lock()
-        previouslyCompleteRefreshes[kind] = !previousStatus.isIncomplete
-            ? selectedSource(kind).flatMap { source in
-                previousStatus.lastSync.map { (source.bundleIdentifier, $0) }
-            } : nil
-        presentationLock.unlock()
+        beginRoutineRefreshIfEligible(kind, at: Date())
         defaults.set(true, forKey: key(kind, "syncInProgress"))
         defaults.removeObject(forKey: key(kind, "error"))
-        TherapyMetricsManager.shared.invalidate(treatmentsChanged: false)
+        TherapyMetricsManager.shared.publishStatusChange()
         notifyStatusChanged()
         let startKey = key(kind, "historyStart")
         let since: Date
@@ -464,10 +519,10 @@ final class HealthKitTherapyImportManager {
             self.queue.async {
                 guard saved else {
                     self.setStatus(kind, message: "Local storage failed. Import will retry without moving its checkpoint.")
-                    self.complete(kind)
+                    self.complete(kind, succeeded: false)
                     return
                 }
-                guard self.isEnabled(kind) else { self.complete(kind); return }
+                guard self.isEnabled(kind) else { self.complete(kind, succeeded: false); return }
                 self.drain(kind, since: since)
             }
         }
@@ -477,7 +532,7 @@ final class HealthKitTherapyImportManager {
         let anchor = defaults.data(forKey: key(kind, "anchor"))
         query.page(for: kind, since: since, anchor: anchor, limit: Self.pageLimit) { result in
             self.queue.async {
-                guard self.isEnabled(kind) else { self.complete(kind); return }
+                guard self.isEnabled(kind) else { self.complete(kind, succeeded: false); return }
                 switch result {
                 case let .failure(error):
                     if case HealthTherapyImportError.invalidAnchor = error, anchor != nil {
@@ -488,16 +543,16 @@ final class HealthKitTherapyImportManager {
                         return
                     }
                     self.setStatus(kind, message: "Apple Health could not be read. Existing values may be incomplete; import will retry.")
-                    self.complete(kind)
+                    self.complete(kind, succeeded: false)
                 case let .success(page):
                     self.persist(page, kind: kind) { saved in
                         self.queue.async {
                             guard saved else {
                                 self.setStatus(kind, message: "Local storage failed. Import will retry without moving its checkpoint.")
-                                self.complete(kind)
+                                self.complete(kind, succeeded: false)
                                 return
                             }
-                            guard self.isEnabled(kind) else { self.complete(kind); return }
+                            guard self.isEnabled(kind) else { self.complete(kind, succeeded: false); return }
                             self.defaults.set(page.nextAnchor, forKey: self.key(kind, "anchor"))
                             if page.hasMore {
                                 self.drain(kind, since: since)
@@ -507,7 +562,7 @@ final class HealthKitTherapyImportManager {
                                 self.defaults.set(Date(), forKey: self.key(kind, "lastSync"))
                                 self.defaults.removeObject(forKey: self.key(kind, "syncInProgress"))
                                 self.setStatus(kind, message: nil)
-                                self.complete(kind)
+                                self.complete(kind, succeeded: true)
                             }
                         }
                     }
@@ -516,13 +571,21 @@ final class HealthKitTherapyImportManager {
         }
     }
 
-    private func complete(_ kind: HealthTherapyImportKind) {
+    private func complete(_ kind: HealthTherapyImportKind, succeeded: Bool) {
         presentationLock.lock()
-        previouslyCompleteRefreshes.removeValue(forKey: kind)
+        if var refresh = routineRefresh {
+            if succeeded {
+                if !pending.contains(kind) { refresh.waitingFor.remove(kind) }
+                routineRefresh = refresh
+            } else {
+                routineRefresh = nil
+            }
+        }
         presentationLock.unlock()
         active.remove(kind)
         finishObserverCallbacks(kind)
         if pending.remove(kind) != nil { startSync(kind) }
+        else { notifyStatusChanged() }
     }
 
     private func finishObserverCallbacks(_ kind: HealthTherapyImportKind) {
@@ -591,6 +654,9 @@ final class HealthKitTherapyImportManager {
                 }
                 let hasRecentAmbiguity = try self.hasRecentAmbiguity(
                     kind: kind, sourceBundleIdentifier: selected, in: context)
+                let changedTreatments = context.insertedObjects.contains { $0 is TreatmentEntry }
+                    || context.updatedObjects.contains { $0 is TreatmentEntry }
+                    || context.deletedObjects.contains { $0 is TreatmentEntry }
                 if context.hasChanges { try context.save() }
                 // The child save is not durable. Do not advance the anchor until the parent
                 // private context has reached the persistent store.
@@ -604,7 +670,7 @@ final class HealthKitTherapyImportManager {
                                 self.defaults.set(true, forKey: self.key(kind, "observedSelectedSource"))
                             }
                         }
-                        TherapyMetricsManager.shared.invalidate()
+                        if changedTreatments { TherapyMetricsManager.shared.invalidate() }
                     }
                     completion(saved)
                 }
@@ -651,6 +717,9 @@ final class HealthKitTherapyImportManager {
                 }
                 let hasRecentAmbiguity = try self.hasRecentAmbiguity(
                     kind: kind, sourceBundleIdentifier: selected, in: context)
+                let changedTreatments = context.insertedObjects.contains { $0 is TreatmentEntry }
+                    || context.updatedObjects.contains { $0 is TreatmentEntry }
+                    || context.deletedObjects.contains { $0 is TreatmentEntry }
                 if context.hasChanges { try context.save() }
                 let didSave: (Bool) -> Void = { saved in
                     if saved {
@@ -661,7 +730,7 @@ final class HealthKitTherapyImportManager {
                                 self.defaults.set(true, forKey: self.key(kind, "observedSelectedSource"))
                             }
                         }
-                        TherapyMetricsManager.shared.invalidate()
+                        if changedTreatments { TherapyMetricsManager.shared.invalidate() }
                     }
                     completion(saved)
                 }

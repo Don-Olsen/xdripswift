@@ -11,6 +11,61 @@ import SwiftUI
 @testable import xdrip
 
 final class TherapyMetricsTests: XCTestCase {
+    func testHomeRoutineRefreshAgesLastCompleteTreatmentsWithoutPartialInputs() throws {
+        let at = Date(timeIntervalSince1970: 1_800_000_000)
+        let inputs = [TherapyTreatment(date: at.addingTimeInterval(-3600), amount: 100, isIOB: true),
+                      TherapyTreatment(date: at.addingTimeInterval(-3600), amount: 500, isIOB: false)]
+        let settings = TherapyModelSettings()
+        let startingIOB = TherapyMetricsManager.localMetric(entries: inputs, isIOB: true,
+            date: at, settings: settings).formatted(isIOB: true, at: at)
+        let startingCOB = TherapyMetricsManager.localMetric(entries: inputs, isIOB: false,
+            date: at, settings: settings).formatted(isIOB: false, at: at)
+        var presentation = RootHomeTherapyRefreshPresentation()
+        presentation.record(iob: RootHomeMetricState(title: "IOB", value: startingIOB),
+            cob: RootHomeMetricState(title: "COB", value: startingCOB),
+            showsIOB: true, showsCOB: true, iobIsLocal: true, cobIsLocal: true,
+            treatments: inputs, settings: settings, sourceSignature: "same-source",
+            nonHealthRevision: 4, at: at)
+        let refresh = HealthTherapyRoutineRefreshState(generation: 1, startedAt: at,
+            allEnabledKindsCommitted: false)
+        let advanced = at.addingTimeInterval(20)
+        let held = try XCTUnwrap(presentation.retained(refresh: refresh, metricsReady: false,
+            pendingCommit: nil, sourceSignature: "same-source", nonHealthRevision: 4, at: advanced))
+        XCTAssertEqual(held.iob.value, TherapyMetricsManager.localMetric(entries: inputs, isIOB: true,
+            date: advanced, settings: settings).formatted(isIOB: true, at: advanced))
+        XCTAssertEqual(held.cob.value, TherapyMetricsManager.localMetric(entries: inputs, isIOB: false,
+            date: advanced, settings: settings).formatted(isIOB: false, at: advanced))
+        XCTAssertNotEqual(held.cob.value, startingCOB, "normal time decay continues from frozen complete inputs")
+        XCTAssertEqual(held.calculatedAt, at, "the displayed provenance stays dated to the complete snapshot")
+        XCTAssertNil(presentation.retained(refresh: .init(generation: 1, startedAt: at,
+            allEnabledKindsCommitted: true), metricsReady: true, pendingCommit: nil,
+            sourceSignature: "same-source", nonHealthRevision: 4, at: advanced))
+        XCTAssertNil(presentation.retained(refresh: refresh, metricsReady: false,
+            pendingCommit: nil, sourceSignature: "changed-source", nonHealthRevision: 4, at: advanced))
+    }
+
+    func testManualPendingCommitProofEndsOnWriterFailureAndSuccessfulRetry() throws {
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let manager = TherapyMetricsManager()
+        manager.configure(coreDataManager: core, externalStatus: { nil })
+        let entry = TreatmentEntry(date: Date(), value: 2, treatmentType: .Insulin,
+            nightscoutEventType: nil, enteredBy: nil, nsManagedObjectContext: core.mainManagedObjectContext)
+        XCTAssertTrue(core.saveChangesSynchronously())
+        entry.value = 3
+        try core.mainManagedObjectContext.save()
+        let pending = try XCTUnwrap(manager.pendingHomeTreatmentCommitState())
+        XCTAssertTrue(manager.hasUncommittedForecastInputChanges)
+        XCTAssertNil(manager.pendingHomeTreatmentCommitState(at: pending.startedAt.addingTimeInterval(30)))
+        NotificationCenter.default.post(name: .coreDataContextSaveFailed,
+                                        object: core.privateManagedObjectContext)
+        XCTAssertNil(manager.pendingHomeTreatmentCommitState())
+        XCTAssertTrue(manager.hasUncommittedForecastInputChanges,
+                      "a failed save remains unavailable to strict therapy calculations")
+        XCTAssertTrue(core.saveChangesSynchronously())
+        XCTAssertNil(manager.pendingHomeTreatmentCommitState())
+        XCTAssertFalse(manager.hasUncommittedForecastInputChanges)
+    }
+
     func testTreatmentMasterPreservesSummaryAndCurvePreferences() throws {
         let defaults = UserDefaults.standard
         let previous = (defaults.showTreatmentsOnChart, defaults.showTherapySummary, defaults.showIOBCOB)

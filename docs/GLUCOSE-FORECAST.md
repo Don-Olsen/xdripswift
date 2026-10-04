@@ -13,9 +13,9 @@ treatments and IOB/COB curves. Turning the forecast off, viewing history or usin
 the night layout removes this reservation. Compact/Watch/widget charts do not
 opt into it. An empty reserved area is not a prediction: the existing freshness,
 sensor, treatment and settings checks still decide whether forecast points can
-be drawn. HealthKit synchronization can briefly make treatment inputs incomplete
-on reentry; the estimate can remain hidden until that check succeeds. This change
-does not change forecasting, import behavior or its availability log.
+be drawn. The historical 4289 behavior still allowed HealthKit synchronization
+to make treatment inputs briefly incomplete on reentry. The post-4292 bounded
+complete-snapshot rule is described below.
 
 The local follow-up to 4289 passed 1,184/1,184 XCTest tests, all Python checks
 and both simulator builds on 2026-10-03. The new presentation regression tests
@@ -24,7 +24,7 @@ non-main exclusions. Device logs establish transient input unavailability, but
 physical observation of the corrected UI still requires a separately authorized
 release. This follow-up has not been uploaded or installed on the user's devices.
 
-## Follow-up to 4290: foreground reload presentation
+## Historical follow-up to 4290: foreground reload presentation
 
 The iPhone was read over the paired network connection and confirmed on 4290.
 Its retained log contained a `dataUnavailable` result followed by a valid result
@@ -55,13 +55,37 @@ runtime, alarms and evidence-log schema are unchanged. A one-shot expiry for
 the short presentation state is not polling or a background forecast. Actual
 validation and physical-check limitations are recorded in PROJECT-STATUS.md.
 
+## Post-4292 foreground treatment and forecast presentation
+
+The older two-second exception above is historical. A routine reread of an
+already complete and recent Apple Health import may now retain the last
+validated Home display for no more than 30 seconds. The same selected sources
+must remain enabled, with no error or ambiguous records. Home keeps the last
+complete treatment input snapshot while the import writes pages; the IOB/COB
+figures continue to age from that snapshot. Partially imported pages and
+uncommitted writes are not treated as a new complete dataset. Once insulin
+and carbohydrate imports have both finished and their writes are durable,
+the new treatment values and curves can advance together. The forecast is
+shown only when it has been recalculated for that complete input generation
+and the current glucose chart tail; otherwise it has an explicit unavailable
+state rather than overlaying an older estimate. A
+reread with no actual treatment change does not clear or rebuild them merely
+because HealthKit checked for updates.
+
+A first import, source change, stale prior sync, error, ambiguity, failed
+save or reread longer than 30 seconds ends retention and shows the normal
+unavailable state. A pending local treatment save retains the prior display
+only until its success or failure is known; failure ends the hold. A newer
+glucose chart tail can never be overlaid with an older forecast. New sensor
+readings and alarms are independent of this presentation rule.
+
 ## Inputs and setup
 
 The calculation starts from the newest downstream-valid CGM reading and a continuous recent history from the same sensor/source. Old readings, gaps, invalid samples, incomplete treatment imports or a pending treatment save make the forecast unavailable; missing data is never treated as zero.
 
 Bolus and carbohydrate inputs come through the existing TherapyMetricsManager treatment selection. This preserves the selected HealthKit import source, Watch treatments once saved on iPhone, exact external identities, corrections, deletions and existing source precedence. Basal insulin recorded as a basal injection, including Tresiba, is not processed as a rapid-acting bolus; Watch now distinguishes **Bolus (hurtigtvirkende)** from **Basal (langtidsvirkende)**. Basal entries accept whole positive units up to the existing 200 U limit, without rounding; bolus still allows fractions. A basal entry is stored as `BasalInjection` and is excluded from bolus, IOB, COB and forecast inputs. The existing local-only durable receipt and UUID deduplication rules still apply. Older apps that cannot decode a new treatment type reject it without a saved receipt; Watch preserves the pending entry and shows that both apps need updating. Unknown persisted types leave the queue file intact and block new writes until a compatible version can read it. If Nightscout AID or CareLink owns an IOB/COB metric, the forecast does not silently substitute local treatment history. When Nightscout treatment import and HealthKit insulin/carbohydrate import are simultaneously enabled, their unrelated IDs cannot reliably prove that one dose has not been imported twice. The forecast is unavailable in that configuration rather than risking a double-counted dose. A treatment recorded after the last CGM measurement temporarily makes the estimate unavailable until a newer CGM reading anchors it.
 
-Enter your own insulin sensitivity (ISF) and carbohydrate ratio in Home Screen settings. ISF is shown in the selected glucose unit and stored internally in mg/dL per unit; carbohydrate ratio is grams per unit. The manual pair is assumed constant over the forecast window; it does not represent a time-of-day profile. No personal value is inferred or supplied by the app. An incomplete pair prevents a forecast. Existing saved Nightscout profile snapshots cannot prove that their declared default profile was the one actually imported, because the profile importer historically allowed a fallback to an arbitrary store entry. This release therefore does not automatically use those snapshots as forecast settings. It does not request new HealthKit types or permissions; the existing optional insulin/carbohydrate import remains configured separately in Apple Health settings.
+Enter your own insulin sensitivity (ISF) and carbohydrate ratio in Home Screen settings. ISF is shown in the selected glucose unit and stored internally in mg/dL per unit; carbohydrate ratio is grams per unit. The manual pair is assumed constant over the forecast window; it does not represent a time-of-day profile. No personal value is inferred or supplied by the app. An incomplete pair prevents a forecast. Existing saved Nightscout profile snapshots cannot prove that their declared default profile was the one actually imported, because the profile importer historically allowed a fallback to an arbitrary store entry. This release therefore does not automatically use those snapshots as forecast settings. The deterministic engine requests no new HealthKit access; optional personal ML training additionally requests read access to historical blood glucose. The existing insulin/carbohydrate import remains configured separately in Apple Health settings.
 
 ## Model and limits
 
@@ -80,7 +104,35 @@ point; otherwise the complete engine forecast remains visible. The engine's stor
 points and its prospective baseline log are unchanged. ML never creates a
 forecast when the engine has rejected its inputs. It does not write measured
 glucose, therapy, alarms, HealthKit, Nightscout or Watch data. There is no model
-import, Mac training pipeline, new permission, background polling or dose advice.
+import, Mac training pipeline, background polling or dose advice.
+
+After 4292, training can read up to 365 days of xDrip glucose history directly
+from Apple Health, in memory and read-only. Sources are discovered by an
+"xDrip" name match and their bundle identifiers are frozen for the run;
+identical same-time readings are deduplicated and conflicting same-time
+readings are excluded. A source switch or a gap above the forecast engine's
+limit divides replay into deterministic segments. A segment identity is
+training provenance, not a physical sensor ID. Sensor changes without a
+recorded source/gap cannot always be detected. Treatment history comes from
+the selected Health insulin and carbohydrate sources, with insulin restricted
+to explicitly classified boluses. Basal and unclassified insulin never become
+bolus features. The first training attempt requests Health blood-glucose
+**read** access; no new Health write access is requested. HealthKit does not
+reveal read authorization, so an empty response is treated as missing data,
+not as proof of denial or of zero treatments. The loader then tries the app's
+own history under the same coverage rules.
+
+Every historical example requires continuous glucose and separately proven
+insulin and carbohydrate coverage for its whole treatment window. A day
+without records from a selected therapy source is unknown coverage, not a
+verified zero. Local fallback requires its full insulin/carbohydrate windows
+to be after the respective Health import historyStart. Missing or unknown
+coverage excludes the example. Historical Health samples are never copied
+into the app's treatment store, BG database, statistics, Nightscout or Watch.
+The model data-generation version changes, so older model packages and
+checkpoints are never used with this history path. Settings shows completed
+history days, completed model fits, self-check progress and usable-day/example
+counts in Danish; final success appears only after the model decision.
 
 The fixed 16-column feature contract uses raw glucose slopes, the existing
 treatment curves, IOB/COB from bolus/carbohydrates only, and the local time at

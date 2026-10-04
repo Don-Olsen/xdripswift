@@ -23,6 +23,12 @@ struct RootHomeForecastContext: Equatable {
     var adjustmentEnabled: Bool
     var smoothingEnabled: Bool
     var presentationInputSignature: String = ""
+
+    func matchesDuringRoutineRefresh(_ other: Self) -> Bool {
+        var comparable = self
+        comparable.therapyRevision = other.therapyRevision
+        return comparable == other
+    }
 }
 
 struct RootHomeCompletedForecast {
@@ -30,51 +36,40 @@ struct RootHomeCompletedForecast {
     let context: RootHomeForecastContext
 }
 
-/// Retains a dated drawing only for a narrowly proven refresh, never an unavailable calculation.
-/// The first refresh deadline is fixed; repeated notifications cannot keep old points alive.
+/// Retains only a dated, previously valid drawing. The importer and pending-commit gates own
+/// the bounded display window; strict forecast calculations still reject incomplete inputs.
 struct RootHomeForecastPresentationState {
-    static let maximumRefreshDuration: TimeInterval = 2
     private(set) var completed: RootHomeCompletedForecast?
-    private(set) var refreshReference: GlucoseForecastRefreshReference?
-    private(set) var refreshDeadline: Date?
 
     mutating func accept(_ outcome: GlucoseForecastPresentationOutcome,
                          context: RootHomeForecastContext, requestedAt: Date) {
-        if let reference = outcome.refreshReference, let completed,
-           completed.context == context, reference.matches(completed.result),
-           reference.treatmentRevision == context.therapyRevision,
-           reference.inputSignature == context.presentationInputSignature {
-            refreshReference = reference
-            if refreshDeadline == nil {
-                refreshDeadline = requestedAt.addingTimeInterval(Self.maximumRefreshDuration)
-            }
-            return
-        }
         completed = RootHomeCompletedForecast(result: outcome.result, context: context)
-        refreshReference = nil
-        refreshDeadline = nil
     }
 
     func displayableResult(context: RootHomeForecastContext, chartState: GlucoseChartState,
-                           refreshInputsAllowed: Bool, currentInputsAvailable: Bool = true,
+                           currentInputsAvailable: Bool = true,
+                           routineRefresh: HealthTherapyRoutineRefreshState? = nil,
+                           pendingCommit: HomeTreatmentCommitDisplayState? = nil,
+                           nonHealthTreatmentUnchanged: Bool = true,
                            at now: Date) -> GlucoseForecastResult? {
-        // An in-flight task has not yet proved that an incomplete input is just a refresh.
-        // Do not expose the old result or its numeric summaries before its explicit hint arrives.
-        guard refreshReference != nil || currentInputsAvailable || completed?.result.reason != nil else { return nil }
-        if let reference = refreshReference {
-            let chartReferenceValues = zip(chartState.bgReadingDates, chartState.bgReadingValues)
-                .filter { $0.0 == reference.date }.map { $0.1 }
-            guard !chartReferenceValues.isEmpty,
-                  chartReferenceValues.allSatisfy({ $0 == reference.glucoseMgdl }),
-                  let deadline = refreshDeadline, now < deadline, refreshInputsAllowed,
-                  reference.treatmentRevision == context.therapyRevision,
-                  reference.inputSignature == context.presentationInputSignature,
-                  chartState.newestBgReadingDate == reference.date,
-                  chartState.newestBgReadingSensorID == reference.sensorID,
-                  chartState.newestBgReadingIsValidForDownstream else {
-                return GlucoseForecastResult(points: [], referenceDate: nil, reason: .dataUnavailable)
-            }
+        let mayHoldRoutine = routineRefresh?.allEnabledKindsCommitted == false
+            && nonHealthTreatmentUnchanged
+        if mayHoldRoutine || pendingCommit != nil,
+           let completed,
+           completed.result.reason == nil,
+           context.matchesDuringRoutineRefresh(completed.context) {
+            // The importer owns the fixed 30-second deadline. The chart-tail gate below still
+            // rejects an old estimate as soon as live glucose advances to a newer reading.
+            let referenceValues = zip(chartState.bgReadingDates, chartState.bgReadingValues)
+                .filter { $0.0 == completed.result.referenceDate }.map { $0.1 }
+            guard chartState.newestBgReadingDate == completed.result.referenceDate,
+                  let forecastReferenceValue = completed.result.points.first?.glucoseMgdl,
+                  !referenceValues.isEmpty,
+                  referenceValues.allSatisfy({ $0 == forecastReferenceValue }) else { return nil }
+            return RootHomeForecastFreshness.displayableResult(completed,
+                context: completed.context, chartState: chartState, at: now)
         }
+        guard currentInputsAvailable || completed?.result.reason != nil else { return nil }
         return RootHomeForecastFreshness.displayableResult(completed, context: context,
                                                           chartState: chartState, at: now)
     }
@@ -205,6 +200,8 @@ struct RootHomeView: View {
     @State private var forecastPresentation = RootHomeForecastPresentationState()
     @State private var forecastDataRevision = 0
     @State private var forecastFreshnessCheckTime = Date()
+    @State private var confirmedForecastNonHealthRevision = 0
+    @State private var forecastReadyTherapyRevision: Int?
     @AppStorage(UserDefaults.Key.glucoseForecastHorizonMinutes.rawValue) private var forecastHorizonMinutes = 60
     @AppStorage(UserDefaults.Key.glucoseForecastManualSensitivityMgdlPerUnit.rawValue) private var forecastManualISF = 0.0
     @AppStorage(UserDefaults.Key.glucoseForecastManualCarbRatioGramsPerUnit.rawValue) private var forecastManualCarbRatio = 0.0
@@ -251,9 +248,17 @@ struct RootHomeView: View {
     }
     /// SwiftUI cancels an older task before publishing a forecast from superseded inputs.
     private var forecastRequestKey: ForecastRequestKey {
-        ForecastRequestKey(chartRevision: state.chartRevision,
+        var context = forecastContext
+        if let completed = forecastPresentation.completed,
+           context.matchesDuringRoutineRefresh(completed.context),
+           (HealthKitTherapyImportManager.shared.routineRefreshState()?.allEnabledKindsCommitted == false
+                && confirmedForecastNonHealthRevision == TherapyMetricsManager.shared.nonHealthTreatmentChangeRevision
+            || TherapyMetricsManager.shared.pendingHomeTreatmentCommitState() != nil) {
+            context.therapyRevision = completed.context.therapyRevision
+        }
+        return ForecastRequestKey(chartRevision: state.chartRevision,
                            refreshRevision: forecastDataRevision,
-                           context: forecastContext,
+                           context: context,
                            sceneIsActive: scenePhase == .active)
     }
     private static let pannedReadingDateFormatter: DateFormatter = {
@@ -328,14 +333,23 @@ struct RootHomeView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: HealthKitTherapyImportManager.statusDidChange)) { _ in
             forecastFreshnessCheckTime = Date()
-            forecastDataRevision &+= 1
             let signature = currentHealthTherapySelectionSignature
-            guard signature != healthTherapySelectionSignature else { return }
-            healthTherapySelectionSignature = signature
-            requestChartState(forceReset: true, showsLoading: false)
+            if signature != healthTherapySelectionSignature {
+                healthTherapySelectionSignature = signature
+                forecastDataRevision &+= 1
+                requestChartState(forceReset: true, showsLoading: false)
+            } else if HealthKitTherapyImportManager.shared.routineRefreshState() == nil
+                        || HealthKitTherapyImportManager.shared.routineRefreshState()?.allEnabledKindsCommitted == true
+                           && forecastPresentation.completed?.context.therapyRevision != forecastContext.therapyRevision {
+                forecastDataRevision &+= 1
+            }
         }
         .onReceive(NotificationCenter.default.publisher(for: TherapyMetricsManager.changed)) { _ in
-            forecastDataRevision &+= 1
+            let routine = HealthKitTherapyImportManager.shared.routineRefreshState()
+            if routine?.allEnabledKindsCommitted != false
+                && TherapyMetricsManager.shared.pendingHomeTreatmentCommitState() == nil {
+                forecastDataRevision &+= 1
+            }
         }
         .onReceive(NotificationCenter.default.publisher(for: GlucoseForecastMLManager.modelDidChange)) { _ in
             // Reuse the cached authoritative engine result with the newly activated
@@ -354,18 +368,50 @@ struct RootHomeView: View {
             let requestedAt = Date()
             let outcome = await forecastDataAdapter.forecastForPresentation(horizonMinutes: context.horizonMinutes)
             guard !Task.isCancelled else { return }
+            let routine = HealthKitTherapyImportManager.shared.routineRefreshState()
+            let pendingCommit = TherapyMetricsManager.shared.pendingHomeTreatmentCommitState()
+            if (routine?.allEnabledKindsCommitted == false || pendingCommit != nil),
+               outcome.result.reason != nil,
+               let completed = forecastPresentation.completed, completed.result.reason == nil,
+               (pendingCommit != nil || confirmedForecastNonHealthRevision
+                    == TherapyMetricsManager.shared.nonHealthTreatmentChangeRevision),
+               context.matchesDuringRoutineRefresh(completed.context) {
+                return
+            }
             forecastPresentation.accept(outcome, context: context, requestedAt: requestedAt)
+            if context == forecastContext,
+               !TherapyMetricsManager.shared.hasUncommittedForecastInputChanges,
+               !HealthKitTherapyImportManager.shared.localInputIsIncomplete(.insulin),
+               !HealthKitTherapyImportManager.shared.localInputIsIncomplete(.carbohydrates) {
+                forecastReadyTherapyRevision = context.therapyRevision
+            }
+            if outcome.result.reason == nil {
+                confirmedForecastNonHealthRevision = TherapyMetricsManager.shared.nonHealthTreatmentChangeRevision
+            }
         }
-        .task(id: scenePhase == .active ? forecastPresentation.refreshDeadline : nil) {
-            guard scenePhase == .active, let deadline = forecastPresentation.refreshDeadline else { return }
-            let remaining = deadline.timeIntervalSinceNow
+        .task(id: scenePhase == .active ? HealthKitTherapyImportManager.shared.routineRefreshState()?.generation : nil) {
+            guard scenePhase == .active,
+                  let refresh = HealthKitTherapyImportManager.shared.routineRefreshState() else { return }
+            let remaining = refresh.startedAt.addingTimeInterval(30).timeIntervalSinceNow
             if remaining > 0 {
                 do { try await Task.sleep(nanoseconds: UInt64(remaining * 1_000_000_000)) }
                 catch { return }
             }
             guard !Task.isCancelled else { return }
-            // A cancellable one-shot redraw expires the hint even without another CGM event.
             forecastFreshnessCheckTime = Date()
+            TherapyMetricsManager.shared.publishStatusChange()
+        }
+        .task(id: scenePhase == .active ? TherapyMetricsManager.shared.pendingHomeTreatmentCommitState()?.generation : nil) {
+            guard scenePhase == .active,
+                  let pending = TherapyMetricsManager.shared.pendingHomeTreatmentCommitState() else { return }
+            let remaining = pending.startedAt.addingTimeInterval(30).timeIntervalSinceNow
+            if remaining > 0 {
+                do { try await Task.sleep(nanoseconds: UInt64(remaining * 1_000_000_000)) }
+                catch { return }
+            }
+            guard !Task.isCancelled else { return }
+            forecastFreshnessCheckTime = Date()
+            TherapyMetricsManager.shared.publishStatusChange()
         }
         .onReceive(clockRefreshTimer) { _ in
             if state.visibility.showsClock {
@@ -936,7 +982,17 @@ struct RootHomeView: View {
             chartState: chartState,
             forecastResult: scrollCoordinator.isShowingCurrentTimeRange && !state.usesScreenLockNightLayout ? displayableForecastResult : nil,
             forecastHorizonMinutes: scrollCoordinator.isShowingCurrentTimeRange && !state.usesScreenLockNightLayout ? effectiveForecastHorizonMinutes : 0,
-            forecastIsUpdating: forecastPresentation.refreshReference != nil,
+            forecastIsUpdating: TherapyMetricsManager.shared.pendingHomeTreatmentCommitState() != nil
+                || (HealthKitTherapyImportManager.shared.routineRefreshState().map {
+                    !$0.allEnabledKindsCommitted
+                        || forecastPresentation.completed?.context.therapyRevision != forecastContext.therapyRevision
+                } ?? false),
+            routineTherapyRefresh: HealthKitTherapyImportManager.shared.routineRefreshState(),
+            pendingTherapyCommit: TherapyMetricsManager.shared.pendingHomeTreatmentCommitState(),
+            forecastReadyTherapyRevision: effectiveForecastHorizonMinutes == 0
+                ? TherapyMetricsManager.shared.forecastInputChangeRevision : forecastReadyTherapyRevision,
+            therapySourceSignature: stateModel.currentLocalTherapySourceSignature(includeTreatmentRevision: false),
+            nonHealthTreatmentRevision: TherapyMetricsManager.shared.nonHealthTreatmentChangeRevision,
             isLoading: isLoadingChart,
             scrollCoordinator: scrollCoordinator,
             yAxisResetRevision: chartYAxisResetRevision,
@@ -1105,11 +1161,13 @@ struct RootHomeView: View {
         return forecastPresentation.displayableResult(
             context: forecastContext,
             chartState: glucoseChartStateManager.state,
-            refreshInputsAllowed: !TherapyMetricsManager.shared.hasUncommittedForecastInputChanges
-                && HealthKitTherapyImportManager.shared.isRefreshingPreviouslyCompleteInputs(),
             currentInputsAvailable: !TherapyMetricsManager.shared.hasUncommittedForecastInputChanges
                 && !HealthKitTherapyImportManager.shared.localInputIsIncomplete(.insulin)
                 && !HealthKitTherapyImportManager.shared.localInputIsIncomplete(.carbohydrates),
+            routineRefresh: HealthKitTherapyImportManager.shared.routineRefreshState(),
+            pendingCommit: TherapyMetricsManager.shared.pendingHomeTreatmentCommitState(),
+            nonHealthTreatmentUnchanged: confirmedForecastNonHealthRevision
+                == TherapyMetricsManager.shared.nonHealthTreatmentChangeRevision,
             at: max(Date(), forecastFreshnessCheckTime)
         )
     }

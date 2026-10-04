@@ -109,6 +109,122 @@ final class GlucoseForecastMLTrainerTests: XCTestCase {
         XCTAssertFalse(files.fileExists(atPath: models.appendingPathComponent(newerOrphanID).path))
     }
 
+    func testPriorModelAndDataGenerationCannotBeUsed() async throws {
+        let current = reviewMetadata()
+        XCTAssertTrue(GlucoseForecastMLModelCompatibility.isUsable(current))
+
+        let oldSchema = reviewMetadata(schemaVersion:
+            GlucoseForecastMLModelMetadata.schemaVersion - 1)
+        XCTAssertFalse(GlucoseForecastMLModelCompatibility.isUsable(oldSchema))
+
+        let encoded = try JSONEncoder().encode(current.context)
+        var contextJSON = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        contextJSON["featureVersion"] = "previous-data-generation"
+        let oldContext = try JSONDecoder().decode(GlucoseForecastMLContext.self,
+            from: JSONSerialization.data(withJSONObject: contextJSON))
+        let oldDataGeneration = reviewMetadata(context: oldContext)
+        XCTAssertFalse(GlucoseForecastMLModelCompatibility.isUsable(oldDataGeneration))
+
+        for metadata in [oldSchema, oldDataGeneration] {
+            let files = FileManager.default
+            let root = files.temporaryDirectory
+                .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            defer { try? files.removeItem(at: root) }
+            let package = root.appendingPathComponent("models", isDirectory: true)
+                .appendingPathComponent(metadata.modelID, isDirectory: true)
+            try files.createDirectory(at: package, withIntermediateDirectories: true)
+            try JSONEncoder().encode(metadata).write(
+                to: package.appendingPathComponent("metadata.json"))
+            let priorSession = root.appendingPathComponent("training-sessions", isDirectory: true)
+                .appendingPathComponent(UUID().uuidString.lowercased(), isDirectory: true)
+            try files.createDirectory(at: priorSession, withIntermediateDirectories: true)
+            try Data("old-checkpoint".utf8).write(
+                to: priorSession.appendingPathComponent("checkpoint"))
+            try Data("{\"modelID\":\"\(metadata.modelID)\"}".utf8)
+                .write(to: root.appendingPathComponent("active.json"))
+            let store = GlucoseForecastMLModelStore(directory: root)
+            let loaded = await store.loadActive()
+            XCTAssertNil(loaded)
+            XCTAssertTrue(files.fileExists(atPath: package.path))
+            XCTAssertFalse(files.fileExists(atPath: priorSession.path))
+            XCTAssertThrowsError(try store.saveReview(metadata))
+        }
+    }
+
+    func testPriorReviewIsHiddenAfterGenerationChange() throws {
+        let files = FileManager.default
+        let root = files.temporaryDirectory.appendingPathComponent(UUID().uuidString,
+                                                                     isDirectory: true)
+        defer { try? files.removeItem(at: root) }
+        try files.createDirectory(at: root, withIntermediateDirectories: true)
+        let store = GlucoseForecastMLModelStore(directory: root)
+        let metadata = reviewMetadata()
+        let reviewURL = root.appendingPathComponent("latest-review.json")
+
+        // The previous app saved a bare report with no generation stamp.
+        try JSONEncoder().encode(metadata.selfCheck).write(to: reviewURL)
+        XCTAssertNil(store.loadReview())
+
+        try store.saveReview(metadata)
+        XCTAssertEqual(store.loadReview()?.promoted, true)
+        var reviewJSON = try XCTUnwrap(JSONSerialization.jsonObject(
+            with: Data(contentsOf: reviewURL)) as? [String: Any])
+        reviewJSON["featureVersion"] = "previous-data-generation"
+        try JSONSerialization.data(withJSONObject: reviewJSON).write(to: reviewURL)
+        XCTAssertNil(store.loadReview())
+    }
+
+    func testTrainingStatusShowsCompletedStepsAndFriendlyResults() {
+        let fallback: GlucoseForecastMLStatusPresentation.Localize = { _, value in value }
+        XCTAssertEqual(GlucoseForecastMLStatusPresentation.progress(
+            .trainingModels(completed: 0, total: 12), localize: fallback),
+            "0 of 12 training runs completed")
+        XCTAssertEqual(GlucoseForecastMLStatusPresentation.progress(
+            .trainingModels(completed: 12, total: 12), localize: fallback),
+            "12 of 12 training runs completed")
+        XCTAssertEqual(GlucoseForecastMLStatusPresentation.progress(
+            .installing, localize: fallback), "Saving and checking the model package…")
+        XCTAssertNil(GlucoseForecastMLStatusPresentation.outcome("training", localize: fallback))
+        XCTAssertEqual(GlucoseForecastMLStatusPresentation.outcome(
+            GlucoseForecastMLTrainingFailure.insufficientSelfCheckRows.rawValue,
+            localize: fallback),
+            "There are not enough usable historical readings to train and check a model yet.")
+        XCTAssertEqual(GlucoseForecastMLStatusPresentation.outcome("activated", localize: fallback),
+                       "Training finished. The checked model is now active.")
+        XCTAssertEqual(GlucoseForecastMLStatusPresentation.maeMmolPerL(18.018018018),
+                       1.0, accuracy: 0.001)
+        let date = Date(timeIntervalSince1970: 1_700_000_000)
+        let rejected = GlucoseForecastMLSelfCheck(startedAt: date, endedAt: date,
+            horizons: [:], activeComparisonWasFair: false, promoted: false,
+            rejectionReasons: ["candidateNotBetterThanEngineAt60"],
+            retrospectiveUnknownCount: 0)
+        XCTAssertEqual(GlucoseForecastMLStatusPresentation.outcome(
+            "rejected", report: rejected, localize: fallback),
+            "Rejected in self-check: ML was not better than the engine at +60 minutes.")
+    }
+
+    private func reviewMetadata(schemaVersion: Int = GlucoseForecastMLModelMetadata.schemaVersion,
+                                context: GlucoseForecastMLContext? = nil)
+        -> GlucoseForecastMLModelMetadata {
+        let date = Date(timeIntervalSince1970: 1_700_000_000)
+        let context = context ?? GlucoseForecastMLContext(
+            sensitivityMgdlPerUnit: 40, carbohydrateRatioGramsPerUnit: 10,
+            settings: TherapyModelSettings(), sourceSignature: "test-source")!
+        let report = GlucoseForecastMLSelfCheck(
+            startedAt: date, endedAt: date, horizons: [:],
+            activeComparisonWasFair: false, promoted: true,
+            rejectionReasons: [], retrospectiveUnknownCount: 0)
+        return GlucoseForecastMLModelMetadata(
+            schemaVersion: schemaVersion, modelID: UUID().uuidString.lowercased(),
+            trainedAt: date, context: context,
+            featureNames: GlucoseForecastMLFeatures.featureNames,
+            trainingStart: date, trainingEnd: date,
+            calibrationStart: date, calibrationEnd: date,
+            usableDayCount: 60, trainingCounts: [:], walkForwardCounts: [:],
+            calibrationCounts: [:], selfCheckCounts: [:], calibrations: [:],
+            selfCheck: report, retrospectiveUnknownCount: 0)
+    }
+
     private func examples(days: Int = 60, anchorsPerDay: Int = 10) -> [GlucoseForecastMLReplayExample] {
         var calendar = utc
         calendar.timeZone = TimeZone(secondsFromGMT: 0)!

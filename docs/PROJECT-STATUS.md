@@ -8,6 +8,52 @@
 - Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
 <!-- testflight-7.1.1-4292:end -->
 
+## Rettelser efter 4292 — releasekandidat 4. oktober 2026
+
+Home bevarer nu et tidligere komplet, valideret behandlingssnapshot under en
+rutinemæssig Sundhed-genlæsning af de samme, friske kilder i højst 30 sekunder.
+IOB/COB fortsætter med at ældes normalt. Delvise importsider offentliggøres
+ikke som et nyt komplet datasæt; insulin og kulhydrat skal begge være afsluttet
+og gemt, før de nye behandlingsværdier og kurver kan skifte samlet. Uændrede
+behandlinger udløser ikke et kunstigt tomt mellemtrin. Første import,
+kildeskift, fejl, tvetydighed, for gammel synkronisering, mislykket gemning og
+udløbet fastholdelse bruger fortsat utilgængelig-tilstand. Den tidligere
+to-sekunders undtagelse for prognosevisning er fjernet. En prognose tegnes
+kun, når dens inputgeneration og reference passer til den aktuelle grafhale;
+nye glukosemålinger og alarmer venter ikke på Sundhed-importen.
+
+Personlig ML-træning kan læse op til 365 dages xDrip-glukose direkte fra
+Sundhed og bolus/kulhydrater fra de allerede valgte importkilder, udelukkende
+i hukommelsen. Første træning kan bede om **læseadgang til blodsukker**;
+HealthKit oplyser ikke, om denne læseadgang blev givet. Tomme svar behandles
+som ukendt dækning og kan kun erstattes af appens egen historik, hvor hele
+behandlingsvinduet er dokumenteret. Glukose opdeles i deterministiske
+replaysegmenter ved kildeskift og huller. Basal og uklassificeret insulin
+bliver ikke bolusinput. Gamle modelpakker og træningscheckpoints er gjort
+inkompatible med den rettede datadannelse. Indstillinger viser dansk fase,
+reelt afsluttede træningstrin, brugbare dage/eksempler og selvtjekresultat.
+Motorens beregning, Bluetooth, Watch, alarmer, Nightscout og gemte
+glukose-/behandlingsdata er uændrede.
+
+Lokal validering på den endelige produktkode: **1.246/1.246 XCTest-tests
+bestået**, nul fejl, i `~/DeveloperBuildData/xDrip/local-runs/xdripswift/20261004T045600Z-56919/`.
+Projektets Python-kontroller bestod i
+`~/DeveloperBuildData/xDrip/local-runs/xdripswift/20261004T045639Z-57032/`.
+Både iPhone- og Watch-simulatorbuilds bestod efter sidste produktrettelse i
+`~/DeveloperBuildData/xDrip/local-runs/xdripswift/20261004T045731Z-59297/`.
+De to forudgående fejlede XCTest-kørsler er bevaret: først en fejl i et nyt
+testkalds argumentrækkefølge, derefter en reel kanttilstand for et forældet
+Sundhed-synkroniseringstidspunkt, som nu er rettet. Den uafhængige
+kodegennemgang fandt ingen resterende blokerende kildefejl.
+
+Den parrede iPhone kunne ikke læses via CoreDevice på netværket under denne
+kontrol, så hverken den visuelle effekt, den første Sundhed-tilladelsesdialog,
+træning eller prognosens faktiske præcision er verificeret fysisk. De beståede
+softwaretests dokumenterer ikke en personlig præcisionsforbedring. Intern
+TestFlight-upload er udtrykkeligt godkendt af brugeren for denne kandidat;
+releaseprocessen skal stadig teste det præcise staged kildegrundlag og
+bekræfte Apples status før udgivelsen meldes færdig.
+
 De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
 
 ## Lokal personlig ML-prognose efter 4291 — før udgivelse

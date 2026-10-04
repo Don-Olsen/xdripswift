@@ -9,6 +9,15 @@
 import SwiftUI
 import Charts
 
+enum RootHomeTherapyChartPublication {
+    static func shouldStage(completedRefresh: Bool, hasPriorSeries: Bool,
+                            priorTreatmentRevision: Int, currentTreatmentRevision: Int,
+                            forecastReadyRevision: Int?, currentForecastRevision: Int) -> Bool {
+        completedRefresh && hasPriorSeries && priorTreatmentRevision != currentTreatmentRevision
+            && forecastReadyRevision != currentForecastRevision
+    }
+}
+
 /// Main interactive chart with loading state and the reading shown at the panned end date.
 struct RootHomeMainChartView: View {
     @AppStorage(UserDefaults.Key.targetMarkValue.rawValue) private var targetValueInMgDl = 0.0
@@ -19,6 +28,11 @@ struct RootHomeMainChartView: View {
     let forecastResult: GlucoseForecastResult?
     let forecastHorizonMinutes: Int
     var forecastIsUpdating = false
+    let routineTherapyRefresh: HealthTherapyRoutineRefreshState?
+    let pendingTherapyCommit: HomeTreatmentCommitDisplayState?
+    let forecastReadyTherapyRevision: Int?
+    let therapySourceSignature: String
+    let nonHealthTreatmentRevision: Int
     let isLoading: Bool
     let scrollCoordinator: GlucoseChartScrollCoordinator
     let yAxisResetRevision: Int
@@ -32,9 +46,39 @@ struct RootHomeMainChartView: View {
     @AppStorage(UserDefaults.Key.renderBasalDownwards.rawValue) private var renderBasalDownwards = true
     @State private var therapySeries = TherapyChartSeries()
     @State private var therapyRevision = 0
+    @State private var completeTherapySeries: TherapyChartSeries?
+    @State private var completeTherapySourceSignature = ""
+    @State private var completeTherapyRangeSignature = ""
+    @State private var completeNonHealthTreatmentRevision = 0
+    @State private var completeTreatmentRevision = 0
+    @State private var heldRefreshGeneration: Int?
+    @State private var stagedTherapySeries: TherapyChartSeries?
+    @State private var stagedForecastRevision: Int?
+    @State private var stagedTreatmentRevision: Int?
     // Hide curves immediately and cancel pending chart work when Treatments is off.
-    private var hasIOB: Bool { showsTreatments && allowsTherapyCharts && showIOBCOB && !therapySeries.iob.isEmpty }
-    private var hasCOB: Bool { showsTreatments && allowsTherapyCharts && showIOBCOB && !therapySeries.cob.isEmpty }
+    private var displayedTherapySeries: TherapyChartSeries {
+        guard completeTherapySourceSignature == therapySourceSignature,
+              completeTherapyRangeSignature == therapyRangeSignature else {
+            return TherapyChartSeries()
+        }
+        if pendingTherapyCommit != nil, let completeTherapySeries { return completeTherapySeries }
+        guard completeNonHealthTreatmentRevision == nonHealthTreatmentRevision else {
+            return TherapyChartSeries()
+        }
+        if routineTherapyRefresh == nil,
+           (TherapyMetricsManager.shared.hasUncommittedForecastInputChanges
+            || HealthKitTherapyImportManager.shared.localInputIsIncomplete(.insulin)
+            || HealthKitTherapyImportManager.shared.localInputIsIncomplete(.carbohydrates)
+            || completeTreatmentRevision != TherapyMetricsManager.shared.treatmentChangeRevision) {
+            return TherapyChartSeries()
+        }
+        guard routineTherapyRefresh != nil,
+              heldRefreshGeneration == nil || heldRefreshGeneration == routineTherapyRefresh?.generation,
+              let completeTherapySeries else { return therapySeries }
+        return completeTherapySeries
+    }
+    private var hasIOB: Bool { showsTreatments && allowsTherapyCharts && showIOBCOB && !displayedTherapySeries.iob.isEmpty }
+    private var hasCOB: Bool { showsTreatments && allowsTherapyCharts && showIOBCOB && !displayedTherapySeries.cob.isEmpty }
     private var displayedForecastPoints: [GlucoseForecastPoint] {
         forecastResult.map { GlucoseForecastMLPresentation.points(in: $0) } ?? []
     }
@@ -48,6 +92,7 @@ struct RootHomeMainChartView: View {
     // not dispatch another fetch and rebuild for each visible-range change.
     private var therapyStart: Date { Date(timeIntervalSince1970: floor(chartState.dataStartDate.timeIntervalSince1970 / 3600) * 3600) }
     private var therapyEnd: Date { Date(timeIntervalSince1970: ceil(chartState.dataEndDate.timeIntervalSince1970 / 3600) * 3600) }
+    private var therapyRangeSignature: String { "\(therapyStart.timeIntervalSince1970)|\(therapyEnd.timeIntervalSince1970)" }
     private var seriesKey: String { scenePhase != .active ? "inactive" : "\(therapyStart)-\(therapyEnd)-\(showIOBCOB)-\(showsTreatments)-\(allowsTherapyCharts)-\(therapyRevision)-\(floor(Date().timeIntervalSince1970 / 60))" }
 
     private enum Layout {
@@ -85,7 +130,8 @@ struct RootHomeMainChartView: View {
                     isLiveViewport: scrollCoordinator.isShowingCurrentTimeRange
                 )
                 .therapyPlots(
-                    TherapyChartSeries(iob: hasIOB ? therapySeries.iob : [], cob: hasCOB ? therapySeries.cob : []),
+                    TherapyChartSeries(iob: hasIOB ? displayedTherapySeries.iob : [],
+                                       cob: hasCOB ? displayedTherapySeries.cob : []),
                     reservesDomainWhileLoading: showsTreatments && allowsTherapyCharts && showIOBCOB
                 )
                 .forecastPlot(
@@ -170,13 +216,104 @@ struct RootHomeMainChartView: View {
             guard scenePhase == .active else { return }
             guard showsTreatments && allowsTherapyCharts && showIOBCOB else {
                 therapySeries = TherapyChartSeries()
+                completeTherapySeries = nil
                 return
             }
-            let result = await TherapyMetricsManager.shared.chart(from: therapyStart, to: therapyEnd)
+            if let refresh = routineTherapyRefresh, !refresh.allEnabledKindsCommitted,
+               completeTherapySeries != nil,
+               completeTherapySourceSignature == therapySourceSignature,
+               completeTherapyRangeSignature == therapyRangeSignature,
+               completeNonHealthTreatmentRevision == nonHealthTreatmentRevision {
+                return
+            }
+            if pendingTherapyCommit != nil, completeTherapySeries != nil,
+               completeTherapySourceSignature == therapySourceSignature,
+               completeTherapyRangeSignature == therapyRangeSignature { return }
+            let result = await TherapyMetricsManager.shared.chartForHome(from: therapyStart, to: therapyEnd)
             guard !Task.isCancelled else { return }
-            therapySeries = result
+            guard result.inputsComplete else {
+                if HealthKitTherapyImportManager.shared.routineRefreshState() == nil {
+                    therapySeries = TherapyChartSeries()
+                    completeTherapySeries = nil
+                }
+                return
+            }
+            guard HealthKitTherapyImportManager.shared.routineRefreshState()?.allEnabledKindsCommitted != false else { return }
+            let currentForecastRevision = TherapyMetricsManager.shared.forecastInputChangeRevision
+            let currentTreatmentRevision = TherapyMetricsManager.shared.treatmentChangeRevision
+            if RootHomeTherapyChartPublication.shouldStage(
+                completedRefresh: HealthKitTherapyImportManager.shared.routineRefreshState()?.allEnabledKindsCommitted == true,
+                hasPriorSeries: completeTherapySeries != nil,
+                priorTreatmentRevision: completeTreatmentRevision,
+                currentTreatmentRevision: currentTreatmentRevision,
+                forecastReadyRevision: forecastReadyTherapyRevision,
+                currentForecastRevision: currentForecastRevision) {
+                stagedTherapySeries = result.series
+                stagedForecastRevision = currentForecastRevision
+                stagedTreatmentRevision = currentTreatmentRevision
+                return
+            }
+            therapySeries = result.series
+            completeTherapySeries = result.series
+            completeTherapySourceSignature = therapySourceSignature
+            completeTherapyRangeSignature = therapyRangeSignature
+            completeNonHealthTreatmentRevision = nonHealthTreatmentRevision
+            completeTreatmentRevision = TherapyMetricsManager.shared.treatmentChangeRevision
+            heldRefreshGeneration = nil
+            stagedTherapySeries = nil
+            stagedForecastRevision = nil
+            stagedTreatmentRevision = nil
         }
-        .onReceive(NotificationCenter.default.publisher(for: TherapyMetricsManager.changed)) { _ in if scenePhase == .active { therapyRevision &+= 1 } }
+        .onChange(of: forecastReadyTherapyRevision) { readyRevision in
+            guard let readyRevision,
+                  readyRevision == stagedForecastRevision,
+                  stagedTreatmentRevision == TherapyMetricsManager.shared.treatmentChangeRevision,
+                  let stagedTherapySeries else { return }
+            guard HealthKitTherapyImportManager.shared.routineRefreshState() != nil else {
+                self.stagedTherapySeries = nil
+                stagedForecastRevision = nil
+                stagedTreatmentRevision = nil
+                therapyRevision &+= 1
+                return
+            }
+            therapySeries = stagedTherapySeries
+            completeTherapySeries = stagedTherapySeries
+            completeTherapySourceSignature = therapySourceSignature
+            completeTherapyRangeSignature = therapyRangeSignature
+            completeNonHealthTreatmentRevision = nonHealthTreatmentRevision
+            completeTreatmentRevision = TherapyMetricsManager.shared.treatmentChangeRevision
+            heldRefreshGeneration = nil
+            self.stagedTherapySeries = nil
+            stagedForecastRevision = nil
+            stagedTreatmentRevision = nil
+        }
+        .onReceive(NotificationCenter.default.publisher(for: TherapyMetricsManager.changed)) { notification in
+            if scenePhase == .active && (notification.userInfo?["statusOnly"] as? Bool != true
+                || TherapyMetricsManager.shared.hasUncommittedForecastInputChanges
+                    && TherapyMetricsManager.shared.pendingHomeTreatmentCommitState() == nil
+                    && HealthKitTherapyImportManager.shared.routineRefreshState() == nil) {
+                therapyRevision &+= 1
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: HealthKitTherapyImportManager.statusDidChange)) { _ in
+            guard scenePhase == .active else { return }
+            if let refresh = HealthKitTherapyImportManager.shared.routineRefreshState() {
+                if let heldRefreshGeneration, heldRefreshGeneration != refresh.generation {
+                    completeTherapySeries = nil
+                } else if heldRefreshGeneration == nil {
+                    heldRefreshGeneration = refresh.generation
+                }
+                if refresh.allEnabledKindsCommitted,
+                   completeTreatmentRevision != TherapyMetricsManager.shared.treatmentChangeRevision {
+                    therapyRevision &+= 1
+                }
+            } else if HealthKitTherapyImportManager.shared.localInputIsIncomplete(.insulin)
+                        || HealthKitTherapyImportManager.shared.localInputIsIncomplete(.carbohydrates) {
+                therapySeries = TherapyChartSeries()
+                completeTherapySeries = nil
+                heldRefreshGeneration = nil
+            }
+        }
         .onDisappear {
             rangeOverlay.cancel()
         }

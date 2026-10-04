@@ -193,7 +193,7 @@ final class RootHomeInteractionTests: XCTestCase {
     }
 
     private func refreshForecastFixture(at now: Date) -> (RootHomeForecastContext, GlucoseForecastResult,
-                                                         GlucoseChartState, GlucoseForecastPresentationOutcome) {
+                                                         GlucoseChartState) {
         var context = forecastContext()
         context.presentationInputSignature = "unchanged-inputs"
         let referenceDate = now.addingTimeInterval(-30)
@@ -207,105 +207,129 @@ final class RootHomeInteractionTests: XCTestCase {
         chart.newestBgReadingDate = referenceDate
         chart.newestBgReadingSensorID = "sensor-a"
         chart.newestBgReadingIsValidForDownstream = true
-        let hint = GlucoseForecastRefreshReference(date: referenceDate, sensorID: "sensor-a", glucoseMgdl: 165,
-            treatmentRevision: context.therapyRevision, inputSignature: context.presentationInputSignature)
-        return (context, valid, chart, .init(result: .init(points: [], referenceDate: nil, reason: .dataUnavailable),
-                                           refreshReference: hint))
+        return (context, valid, chart)
     }
 
-    func testForecastExplicitRefreshRetainsExactDatedPointsForOnlyTwoSeconds() throws {
+    func testRoutineForecastRetainsExactDatedPointsOnlyInsideThirtySecondWindow() {
         let now = Date()
-        let (context, valid, chart, refreshing) = refreshForecastFixture(at: now)
+        let (context, valid, chart) = refreshForecastFixture(at: now)
         var presentation = RootHomeForecastPresentationState()
         presentation.accept(.init(result: valid), context: context, requestedAt: now)
         XCTAssertNil(presentation.displayableResult(context: context, chartState: chart,
-            refreshInputsAllowed: true, currentInputsAvailable: false, at: now))
-        presentation.accept(refreshing, context: context, requestedAt: now)
+            currentInputsAvailable: false, at: now))
+        let routine = HealthTherapyRoutineRefreshState(generation: 1, startedAt: now,
+            allEnabledKindsCommitted: false)
+        var changed = context
+        changed.therapyRevision += 1
         XCTAssertEqual(presentation.displayableResult(context: context, chartState: chart,
-            refreshInputsAllowed: true, currentInputsAvailable: false, at: now.addingTimeInterval(0.5))?.points,
+            currentInputsAvailable: false, routineRefresh: routine,
+            at: now.addingTimeInterval(29))?.points,
             valid.points)
-        let deadline = try XCTUnwrap(presentation.refreshDeadline)
-        XCTAssertEqual(deadline, now.addingTimeInterval(2))
-        presentation.accept(refreshing, context: context, requestedAt: now.addingTimeInterval(1.8))
-        XCTAssertEqual(presentation.refreshDeadline, deadline)
-        XCTAssertTrue(presentation.displayableResult(context: context, chartState: chart,
-            refreshInputsAllowed: true, at: deadline)?.points.isEmpty == true)
-        presentation.accept(refreshing, context: context, requestedAt: now.addingTimeInterval(3))
-        XCTAssertEqual(presentation.refreshDeadline, deadline)
-        presentation.accept(.init(result: valid), context: context, requestedAt: now.addingTimeInterval(3.1))
-        XCTAssertNil(presentation.refreshReference)
-        XCTAssertNil(presentation.refreshDeadline)
-        XCTAssertEqual(presentation.displayableResult(context: context, chartState: chart,
-            refreshInputsAllowed: false, at: now.addingTimeInterval(3.1))?.points, valid.points)
+        XCTAssertEqual(presentation.displayableResult(context: changed, chartState: chart,
+            currentInputsAvailable: false, routineRefresh: routine,
+            at: now.addingTimeInterval(29))?.points, valid.points)
+        XCTAssertNil(presentation.displayableResult(context: changed, chartState: chart,
+            currentInputsAvailable: false, at: now.addingTimeInterval(30)))
     }
 
-    func testForecastRefreshNeverRetainsGenericFailuresOrColdStart() {
+    func testRoutineForecastNeverRetainsColdStartFailuresOrChangedSettings() {
         let now = Date()
-        let (context, valid, chart, refreshing) = refreshForecastFixture(at: now)
+        let (context, valid, chart) = refreshForecastFixture(at: now)
+        let routine = HealthTherapyRoutineRefreshState(generation: 1, startedAt: now,
+            allEnabledKindsCommitted: false)
         var empty = RootHomeForecastPresentationState()
-        empty.accept(refreshing, context: context, requestedAt: now)
-        XCTAssertNil(empty.refreshReference)
-        XCTAssertTrue(empty.displayableResult(context: context, chartState: chart,
-            refreshInputsAllowed: true, at: now)?.points.isEmpty == true)
+        XCTAssertNil(empty.displayableResult(context: context, chartState: chart,
+            currentInputsAvailable: false, routineRefresh: routine, at: now))
+        var presentation = RootHomeForecastPresentationState()
+        presentation.accept(.init(result: valid), context: context, requestedAt: now)
+        var changed = context
+        changed.presentationInputSignature = "different-source-or-settings"
+        XCTAssertNil(presentation.displayableResult(context: changed, chartState: chart,
+            currentInputsAvailable: false, routineRefresh: routine, at: now))
+        XCTAssertNil(presentation.displayableResult(context: context, chartState: chart,
+            currentInputsAvailable: false, routineRefresh: routine,
+            nonHealthTreatmentUnchanged: false, at: now))
         for reason in [GlucoseForecastUnavailableReason.dataUnavailable, .awaitingNextReading,
                        .missingGlucose, .staleGlucose, .ambiguousTreatmentSources, .invalidSettings] {
             var presentation = RootHomeForecastPresentationState()
-            presentation.accept(.init(result: valid), context: context, requestedAt: now)
-            presentation.accept(refreshing, context: context, requestedAt: now)
             presentation.accept(.init(result: .init(points: [], referenceDate: nil, reason: reason)),
                                 context: context, requestedAt: now.addingTimeInterval(0.1))
-            XCTAssertNil(presentation.refreshReference)
             XCTAssertEqual(presentation.displayableResult(context: context, chartState: chart,
-                refreshInputsAllowed: true, currentInputsAvailable: false,
+                currentInputsAvailable: false, routineRefresh: routine,
                 at: now.addingTimeInterval(0.2))?.reason, reason)
         }
     }
 
-    func testForecastRefreshImmediatelyHidesForChangedInputsOrChartProvenance() {
+    func testRoutineForecastHidesWhenChartTailOrReferenceChangesDuringHeldRead() {
         let now = Date()
-        let (context, valid, chart, refreshing) = refreshForecastFixture(at: now)
+        let (context, valid, chart) = refreshForecastFixture(at: now)
+        let routine = HealthTherapyRoutineRefreshState(generation: 1, startedAt: now,
+            allEnabledKindsCommitted: false)
         var presentation = RootHomeForecastPresentationState()
         presentation.accept(.init(result: valid), context: context, requestedAt: now)
-        presentation.accept(refreshing, context: context, requestedAt: now)
         var changed = context
         changed.therapyRevision += 1
-        XCTAssertTrue(presentation.displayableResult(context: changed, chartState: chart,
-            refreshInputsAllowed: true, at: now)?.points.isEmpty == true)
-        changed = context
-        changed.presentationInputSignature = "different-source-or-settings"
-        XCTAssertTrue(presentation.displayableResult(context: changed, chartState: chart,
-            refreshInputsAllowed: true, at: now)?.points.isEmpty == true)
-        XCTAssertTrue(presentation.displayableResult(context: context, chartState: chart,
-            refreshInputsAllowed: false, at: now)?.points.isEmpty == true)
-        for invalidChart in [0, 1, 2, 3] {
+        for invalidChart in [0, 1, 2, 3, 4] {
             var changedChart = chart
             if invalidChart == 0 { changedChart.newestBgReadingSensorID = "sensor-b" }
             if invalidChart == 1 { changedChart.newestBgReadingDate = chart.newestBgReadingDate?.addingTimeInterval(60) }
             if invalidChart == 2 { changedChart.newestBgReadingIsValidForDownstream = false }
             if invalidChart == 3 { changedChart.bgReadingValues = [166] }
-            XCTAssertTrue(presentation.displayableResult(context: context, chartState: changedChart,
-                refreshInputsAllowed: true, at: now)?.points.isEmpty == true)
+            if invalidChart == 4 { changedChart.newestBgReadingDate = chart.newestBgReadingDate?.addingTimeInterval(-60) }
+            XCTAssertNil(presentation.displayableResult(context: changed, chartState: changedChart,
+                currentInputsAvailable: false, routineRefresh: routine, at: now))
         }
     }
 
-    func testForecastRefreshRequiresExactReferenceValueSensorAndContext() {
+    func testJointCommitHidesOldForecastUntilDelayedReplacementIsReady() {
         let now = Date()
-        let (context, valid, _, refreshing) = refreshForecastFixture(at: now)
-        let original = refreshing.refreshReference!
-        for mismatch in 0...4 {
-            let hint = GlucoseForecastRefreshReference(
-                date: original.date.addingTimeInterval(mismatch == 0 ? 1 : 0),
-                sensorID: mismatch == 1 ? "sensor-b" : original.sensorID,
-                glucoseMgdl: mismatch == 2 ? 166 : original.glucoseMgdl,
-                treatmentRevision: original.treatmentRevision + (mismatch == 3 ? 1 : 0),
-                inputSignature: mismatch == 4 ? "changed" : original.inputSignature)
-            var presentation = RootHomeForecastPresentationState()
-            presentation.accept(.init(result: valid), context: context, requestedAt: now)
-            presentation.accept(.init(result: refreshing.result, refreshReference: hint),
-                                context: context, requestedAt: now)
-            XCTAssertNil(presentation.refreshReference)
-            XCTAssertEqual(presentation.completed?.result.reason, .dataUnavailable)
-        }
+        let (context, valid, chart) = refreshForecastFixture(at: now)
+        var presentation = RootHomeForecastPresentationState()
+        presentation.accept(.init(result: valid), context: context, requestedAt: now)
+        var changed = context
+        changed.therapyRevision += 1
+        let completedRead = HealthTherapyRoutineRefreshState(generation: 1, startedAt: now,
+            allEnabledKindsCommitted: true)
+        XCTAssertNil(presentation.displayableResult(context: changed, chartState: chart,
+            currentInputsAvailable: true, routineRefresh: completedRead, at: now))
+        let replacement = GlucoseForecastResult(points: valid.points, referenceDate: valid.referenceDate,
+            reason: nil, parameterSource: .manual, referenceSensorID: "sensor-a")
+        presentation.accept(.init(result: replacement), context: changed, requestedAt: now)
+        XCTAssertEqual(presentation.displayableResult(context: changed, chartState: chart,
+            currentInputsAvailable: true, routineRefresh: completedRead, at: now)?.points,
+            replacement.points)
+    }
+
+    func testChangedTherapyCurvesWaitForMatchingForecastPublication() {
+        XCTAssertTrue(RootHomeTherapyChartPublication.shouldStage(
+            completedRefresh: true, hasPriorSeries: true,
+            priorTreatmentRevision: 4, currentTreatmentRevision: 5,
+            forecastReadyRevision: 10, currentForecastRevision: 11),
+            "a delayed forecast keeps the prior complete curves visible")
+        XCTAssertFalse(RootHomeTherapyChartPublication.shouldStage(
+            completedRefresh: true, hasPriorSeries: true,
+            priorTreatmentRevision: 4, currentTreatmentRevision: 5,
+            forecastReadyRevision: 11, currentForecastRevision: 11),
+            "only the result for this treatment revision publishes the new curves")
+        XCTAssertFalse(RootHomeTherapyChartPublication.shouldStage(
+            completedRefresh: true, hasPriorSeries: true,
+            priorTreatmentRevision: 4, currentTreatmentRevision: 4,
+            forecastReadyRevision: 10, currentForecastRevision: 11),
+            "an unchanged reread does not rebuild or stage the chart")
+    }
+
+    func testPendingCommitHoldsOnlyUntilCommitFailureOrTimeout() {
+        let now = Date()
+        let (context, valid, chart) = refreshForecastFixture(at: now)
+        var presentation = RootHomeForecastPresentationState()
+        presentation.accept(.init(result: valid), context: context, requestedAt: now)
+        var changed = context
+        changed.therapyRevision += 1
+        let pending = HomeTreatmentCommitDisplayState(generation: 3, startedAt: now)
+        XCTAssertEqual(presentation.displayableResult(context: changed, chartState: chart,
+            currentInputsAvailable: false, pendingCommit: pending, at: now)?.points, valid.points)
+        XCTAssertNil(presentation.displayableResult(context: changed, chartState: chart,
+            currentInputsAvailable: false, at: now.addingTimeInterval(30)))
     }
 
     func testForecastPresentationExpiresWithoutAnotherSensorReading() {

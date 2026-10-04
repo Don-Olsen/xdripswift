@@ -8,12 +8,78 @@
 import Combine
 import SwiftUI
 
+enum GlucoseForecastMLStatusPresentation {
+    typealias Localize = (String, String) -> String
+
+    static func maeMmolPerL(_ mgdl: Double) -> Double { mgdl.mgDlToMmol() }
+
+    static func progress(_ progress: GlucoseForecastMLTrainingProgress?,
+                         localize: Localize) -> String {
+        switch progress {
+        case .trainingModels(let completed, let total):
+            let format = localize("forecast.mlFitsCompleted", "%1$d of %2$d training runs completed")
+            return String(format: format, completed, total)
+        case .calibrating:
+            return localize("forecast.mlCalibrating", "Calibrating the uncertainty band…")
+        case .selfChecking:
+            return localize("forecast.mlChecking", "Checking the model on separate historical days…")
+        case .installing:
+            return localize("forecast.mlInstalling", "Saving and checking the model package…")
+        case nil:
+            return localize("forecast.mlTraining", "Training locally on this iPhone…")
+        }
+    }
+
+    static func outcome(_ code: String?, report: GlucoseForecastMLSelfCheck? = nil,
+                        localize: Localize) -> String? {
+        guard let code else { return nil }
+        switch code {
+        case "activated":
+            return localize("forecast.mlActivated", "Training finished. The checked model is now active.")
+        case "rejected":
+            if let reason = report?.rejectionReasons.first {
+                let enginePrefix = "candidateNotBetterThanEngineAt"
+                if reason.hasPrefix(enginePrefix),
+                   let horizon = Int(reason.dropFirst(enginePrefix.count)) {
+                    let message = localize("forecast.mlRejectedEngineAt",
+                        "Rejected in self-check: ML was not better than the engine at +%d minutes.")
+                    return String(format: message, horizon)
+                }
+                let activePrefix = "candidateWorseThanActiveAt"
+                if reason.hasPrefix(activePrefix),
+                   let horizon = Int(reason.dropFirst(activePrefix.count)) {
+                    let message = localize("forecast.mlRejectedActiveAt",
+                        "Rejected in self-check: ML was worse than the previous model at +%d minutes.")
+                    return String(format: message, horizon)
+                }
+            }
+            return localize("forecast.mlRejected", "Training finished, but the model did not pass the historical self-check. The previous forecast remains active.")
+        case "backgroundCancelled":
+            return localize("forecast.mlStopped", "Training stopped when the app left the foreground. You can try again.")
+        case GlucoseForecastMLTrainingFailure.insufficientHistory.rawValue,
+             GlucoseForecastMLTrainingFailure.insufficientTrainingRows.rawValue,
+             GlucoseForecastMLTrainingFailure.insufficientCalibrationRows.rawValue,
+             GlucoseForecastMLTrainingFailure.insufficientSelfCheckRows.rawValue,
+             GlucoseForecastMLTrainingFailure.insufficientWalkForwardRows.rawValue:
+            return localize("forecast.mlNotEnoughHistory", "There are not enough usable historical readings to train and check a model yet.")
+        case GlucoseForecastMLTrainingFailure.trainingUnavailable.rawValue:
+            return localize("forecast.mlUnavailable", "Local model training is unavailable on this device.")
+        case "training":
+            return nil
+        default:
+            return localize("forecast.mlFailed", "Training could not finish. The forecast engine remains available.")
+        }
+    }
+}
+
 struct GlucoseForecastMLSettingsView: View {
     let coreDataManager: CoreDataManager
 
     @State private var status = GlucoseForecastMLManager.shared.statusSummary
     @State private var metadata = GlucoseForecastMLManager.shared.activeModelMetadata
     @State private var preparationStatus = GlucoseForecastMLTrainingCoordinator.shared.statusText
+    @State private var coverageText = GlucoseForecastMLTrainingCoordinator.shared.coverageText
+    @State private var isPreparing = GlucoseForecastMLTrainingCoordinator.shared.isPreparing
     @State private var currentContext: GlucoseForecastMLContext?
 
     private func t(_ key: String, _ fallback: String) -> String {
@@ -25,7 +91,7 @@ struct GlucoseForecastMLSettingsView: View {
             Section {
                 if let metadata {
                     if currentContext.map({ metadata.context == $0 }) == true,
-                       metadata.featureNames == GlucoseForecastMLFeatures.featureNames {
+                       GlucoseForecastMLModelCompatibility.isUsable(metadata) {
                         LabeledContent(t("forecast.mlCompatible", "Model matches current settings"),
                                        value: metadata.trainedAt.formatted())
                     } else {
@@ -40,23 +106,36 @@ struct GlucoseForecastMLSettingsView: View {
                 } else {
                     Text(t("forecast.mlEngineFallback", "The forecast engine is active until a personal model passes every self-check."))
                 }
-                if status.isTraining {
+                if status.isTraining || isPreparing {
                     HStack {
                         ProgressView()
-                        Text(t("forecast.mlTraining", "Training locally on this iPhone…"))
+                        Text(status.isTraining
+                             ? GlucoseForecastMLStatusPresentation.progress(status.progress, localize: t)
+                             : preparationStatus)
                     }
-                }
-                if !preparationStatus.isEmpty {
+                    Text(t("forecast.mlKeepOpen", "Keep the app open until training and the self-check finish."))
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                } else if !preparationStatus.isEmpty {
                     Text(preparationStatus).foregroundStyle(.secondary)
-                }
-                if let outcome = status.lastOutcome, !outcome.isEmpty {
+                } else if let outcome = GlucoseForecastMLStatusPresentation.outcome(
+                    status.lastOutcome, report: status.lastSelfCheck, localize: t) {
                     Text(outcome).foregroundStyle(.secondary)
+                }
+                if !coverageText.isEmpty {
+                    Text(coverageText)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
                 }
                 Button(t("forecast.mlTrainNow", "Træn nu")) {
                     GlucoseForecastMLTrainingCoordinator.shared.trainNow(coreDataManager: coreDataManager)
                     refresh()
                 }
-                .disabled(status.isTraining)
+                .disabled(status.isTraining || isPreparing)
+                Text(t("forecast.mlHealthReadExplanation",
+                       "When personal training first starts, iOS may ask for read access to glucose in Health. Available historical readings are used locally on this iPhone for training. You can change access in Health."))
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
             } header: {
                 Text(t("forecast.personalML", "Personal forecast model"))
             } footer: {
@@ -70,7 +149,7 @@ struct GlucoseForecastMLSettingsView: View {
                             VStack(alignment: .leading, spacing: 4) {
                                 Text("+\(horizon) min · \(metric.count) \(t("forecast.mlPairs", "pairs"))")
                                     .fontWeight(.semibold)
-                                Text("\(t("forecast.mlMAE", "MAE")): \(format(metric.candidateMAE)) / \(format(metric.engineMAE)) mg/dL (ML / \(t("forecast.engineEstimate", "engine")))")
+                                Text("\(t("forecast.mlMAE", "MAE")): \(format(GlucoseForecastMLStatusPresentation.maeMmolPerL(metric.candidateMAE))) / \(format(GlucoseForecastMLStatusPresentation.maeMmolPerL(metric.engineMAE))) mmol/L (ML / \(t("forecast.engineEstimate", "engine")))")
                                 Text("\(t("forecast.mlCoverage", "Observed band coverage")): \(format(metric.candidateCoverage * 100)) %")
                             }
                             .font(.footnote)
@@ -103,6 +182,8 @@ struct GlucoseForecastMLSettingsView: View {
         status = GlucoseForecastMLManager.shared.statusSummary
         metadata = GlucoseForecastMLManager.shared.activeModelMetadata
         preparationStatus = GlucoseForecastMLTrainingCoordinator.shared.statusText
+        coverageText = GlucoseForecastMLTrainingCoordinator.shared.coverageText
+        isPreparing = GlucoseForecastMLTrainingCoordinator.shared.isPreparing
         let defaults = UserDefaults.standard
         if let sensitivity = defaults.glucoseForecastManualSensitivityMgdlPerUnit,
            let ratio = defaults.glucoseForecastManualCarbRatioGramsPerUnit {
@@ -118,6 +199,6 @@ struct GlucoseForecastMLSettingsView: View {
     }
 
     private func format(_ value: Double) -> String {
-        value.isFinite ? String(format: "%.2f", value) : "–"
+        value.isFinite ? value.formatted(.number.precision(.fractionLength(2))) : "–"
     }
 }

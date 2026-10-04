@@ -83,17 +83,17 @@ final class HealthKitTherapyImportTests: XCTestCase {
         return records
     }
 
-    func testForecastRefreshHintRequiresPreviouslyCompleteSameSourceAndClearsAtCompletion() {
+    func testRoutineRefreshRequiresPreviouslyCompleteSameSourceAndClearsOnUnsafeState() {
         let fixture = ImportFixture()
         defer { fixture.close() }
         fixture.query.setPage(page([sample(.insulin, source: sourceA)], next: "ready"), for: .insulin, after: nil)
         enable(.insulin, source: sourceA, fixture: fixture)
         waitUntil("first complete selected source") { !fixture.manager.status(.insulin).isIncomplete }
-        XCTAssertFalse(fixture.manager.isRefreshingPreviouslyCompleteInputs())
+        XCTAssertNil(fixture.manager.routineRefreshState())
         fixture.query.holdPage(for: .insulin, after: anchor("ready"))
         fixture.query.emit(.insulin)
         waitUntil("subsequent read held") { fixture.query.anchors(for: .insulin).count >= 2 }
-        XCTAssertTrue(fixture.manager.isRefreshingPreviouslyCompleteInputs())
+        XCTAssertNotNil(fixture.manager.routineRefreshState())
         XCTAssertTrue(fixture.manager.localInputIsIncomplete(.insulin))
         let prefix = "healthTherapyImport.v1.insulin."
         for (suffix, badValue) in [("error", "read failed" as Any), ("hasAmbiguousSelectedSource", true),
@@ -101,14 +101,95 @@ final class HealthKitTherapyImportTests: XCTestCase {
                                    ("lastSync", Date().addingTimeInterval(-90000))] {
             let original = fixture.defaults.object(forKey: prefix + suffix)
             fixture.defaults.set(badValue, forKey: prefix + suffix)
-            XCTAssertFalse(fixture.manager.isRefreshingPreviouslyCompleteInputs(), suffix)
+            XCTAssertNil(fixture.manager.routineRefreshState(), suffix)
             if let original { fixture.defaults.set(original, forKey: prefix + suffix) }
             else { fixture.defaults.removeObject(forKey: prefix + suffix) }
         }
-        XCTAssertTrue(fixture.manager.isRefreshingPreviouslyCompleteInputs())
+        XCTAssertNotNil(fixture.manager.routineRefreshState())
         fixture.query.releaseHeldPage(for: .insulin, after: anchor("ready"))
-        waitUntil("refresh completed") { !fixture.manager.status(.insulin).isIncomplete }
-        XCTAssertFalse(fixture.manager.isRefreshingPreviouslyCompleteInputs())
+        waitUntil("refresh completed") {
+            !fixture.manager.status(.insulin).isIncomplete
+                && fixture.manager.routineRefreshState()?.allEnabledKindsCommitted == true
+        }
+        XCTAssertEqual(fixture.manager.routineRefreshState()?.allEnabledKindsCommitted, true)
+    }
+
+    func testRoutineRefreshWaitsForBothKindsAndEveryPageWithoutExtendingItsDeadline() throws {
+        let fixture = ImportFixture()
+        defer { fixture.close() }
+        fixture.query.setPage(page([sample(.insulin, source: sourceA)], next: "i0"),
+                              for: .insulin, after: nil)
+        fixture.query.setPage(page([sample(.carbohydrates, source: sourceA)], next: "c0"),
+                              for: .carbohydrates, after: nil)
+        enable(.insulin, source: sourceA, fixture: fixture)
+        enable(.carbohydrates, source: sourceA, fixture: fixture)
+        waitUntil("both initial imports complete") {
+            !fixture.manager.status(.insulin).isIncomplete && !fixture.manager.status(.carbohydrates).isIncomplete
+        }
+        XCTAssertNotNil(fixture.manager.historyStart(.insulin))
+        XCTAssertNotNil(fixture.manager.historyStart(.carbohydrates))
+        fixture.query.setPage(page([sample(.insulin, source: sourceA)], next: "i1", more: true),
+                              for: .insulin, after: anchor("i0"))
+        fixture.query.setPage(page([sample(.insulin, source: sourceA)], next: "i2"),
+                              for: .insulin, after: anchor("i1"))
+        fixture.query.setPage(page([sample(.carbohydrates, source: sourceA)], next: "c1"),
+                              for: .carbohydrates, after: anchor("c0"))
+        fixture.query.holdPage(for: .insulin, after: anchor("i1"))
+        fixture.query.holdPage(for: .carbohydrates, after: anchor("c0"))
+        fixture.query.emit(.insulin)
+        waitUntil("insulin first page saved and both reads held") {
+            fixture.anchor(for: .insulin) == self.anchor("i1") &&
+            fixture.query.anchors(for: .insulin).contains(where: { $0 == self.anchor("i1") }) &&
+            fixture.query.anchors(for: .carbohydrates).contains(where: { $0 == self.anchor("c0") })
+        }
+        let first = try XCTUnwrap(fixture.manager.routineRefreshState())
+        XCTAssertFalse(first.allEnabledKindsCommitted)
+        XCTAssertTrue(fixture.manager.localInputIsIncomplete(.insulin))
+        XCTAssertTrue(fixture.manager.localInputIsIncomplete(.carbohydrates))
+        fixture.query.emit(.insulin)
+        XCTAssertEqual(fixture.manager.routineRefreshState()?.generation, first.generation)
+        XCTAssertNil(fixture.manager.routineRefreshState(at: first.startedAt.addingTimeInterval(30)),
+                     "a delayed callback cannot extend the first 30-second Home window")
+        fixture.query.releaseHeldPage(for: .insulin, after: anchor("i1"))
+        waitUntil("insulin final page saved while carbohydrate callback remains held") {
+            fixture.anchor(for: .insulin) == self.anchor("i2")
+        }
+        XCTAssertFalse(try XCTUnwrap(fixture.manager.routineRefreshState()).allEnabledKindsCommitted)
+        fixture.query.releaseHeldPage(for: .carbohydrates, after: anchor("c0"))
+        waitUntil("both imports complete") {
+            fixture.anchor(for: .carbohydrates) == self.anchor("c1") &&
+            fixture.manager.routineRefreshState()?.allEnabledKindsCommitted == true
+        }
+        XCTAssertFalse(fixture.manager.localInputIsIncomplete(.insulin))
+        XCTAssertFalse(fixture.manager.localInputIsIncomplete(.carbohydrates))
+    }
+
+    func testRoutineRefreshFailureOrSourceChangeRevokesPresentationProof() {
+        let fixture = ImportFixture()
+        defer { fixture.close() }
+        fixture.query.setPage(page([sample(.insulin, source: sourceA)], next: "ready"),
+                              for: .insulin, after: nil)
+        enable(.insulin, source: sourceA, fixture: fixture)
+        waitUntil("complete initial import") { !fixture.manager.status(.insulin).isIncomplete }
+        fixture.query.holdPage(for: .insulin, after: anchor("ready"))
+        fixture.query.emit(.insulin)
+        waitUntil("held routine refresh") { fixture.query.anchors(for: .insulin).count >= 2 }
+        XCTAssertNotNil(fixture.manager.routineRefreshState())
+        fixture.manager.selectSource(sourceB, kind: .insulin)
+        XCTAssertNil(fixture.manager.routineRefreshState())
+        fixture.query.releaseHeldPage(for: .insulin, after: anchor("ready"))
+
+        let failed = ImportFixture()
+        defer { failed.close() }
+        failed.query.setPage(page([sample(.insulin, source: sourceA)], next: "ready"),
+                             for: .insulin, after: nil)
+        enable(.insulin, source: sourceA, fixture: failed)
+        waitUntil("complete prior import") { !failed.manager.status(.insulin).isIncomplete }
+        failed.manager.saveImportedPage = { _, completion in completion(false) }
+        failed.query.emit(.insulin)
+        waitUntil("failed parent save") { failed.manager.status(.insulin).message.contains("storage failed") }
+        XCTAssertNil(failed.manager.routineRefreshState())
+        XCTAssertTrue(failed.manager.localInputIsIncomplete(.insulin))
     }
 
     func testHeldNoOpHealthRefreshProducesOnlyExplicitAdapterHintAndRejectsStaleOrPendingInputs() {
@@ -139,8 +220,8 @@ final class HealthKitTherapyImportTests: XCTestCase {
         XCTAssertEqual(therapy.forecastInputChangeRevision, priorRevision,
                        "Materializing an unchanged source must not look like a treatment mutation")
         XCTAssertEqual(TherapyMetricsManager.shared.forecastInputChangeRevision, sharedActualRevision)
-        XCTAssertGreaterThan(TherapyMetricsManager.shared.treatmentChangeRevision, sharedBroadRevision,
-                             "The importer's real shared cache invalidation must leave forecast provenance stable")
+        XCTAssertEqual(TherapyMetricsManager.shared.treatmentChangeRevision, sharedBroadRevision,
+                       "An unchanged reread must not rebuild confirmed treatment inputs")
         let adapter = GlucoseForecastDataAdapter(coreDataManager: fixture.core, therapyManager: therapy,
             defaults: fixture.defaults, healthImporter: fixture.manager, logForecast: { _ in })
         let checked = expectation(description: "refresh outcomes checked")
@@ -148,10 +229,6 @@ final class HealthKitTherapyImportTests: XCTestCase {
             let refreshing = await adapter.forecastForPresentation(horizonMinutes: 60, at: now)
             XCTAssertEqual(refreshing.result.reason, .dataUnavailable)
             XCTAssertTrue(refreshing.result.points.isEmpty)
-            XCTAssertEqual(refreshing.refreshReference?.date, now)
-            XCTAssertEqual(refreshing.refreshReference?.sensorID, sensor.id)
-            XCTAssertEqual(refreshing.refreshReference?.glucoseMgdl, 165)
-            XCTAssertEqual(refreshing.refreshReference?.treatmentRevision, priorRevision)
             let context = RootHomeForecastContext(therapyRevision: priorRevision, horizonMinutes: 60,
                 manualSensitivityMgdlPerUnit: 36, manualCarbRatioGramsPerUnit: 10, insulinPeak: 75,
                 carbDuration: 240, therapySource: 0, healthTherapySelectionSignature: "selected-source",
@@ -163,7 +240,6 @@ final class HealthKitTherapyImportTests: XCTestCase {
                 reason: nil, parameterSource: .manual, referenceSensorID: sensor.id)
             var presentation = RootHomeForecastPresentationState()
             presentation.accept(.init(result: prior), context: context, requestedAt: now)
-            presentation.accept(refreshing, context: context, requestedAt: now)
             var chart = GlucoseChartState.empty(startDate: now.addingTimeInterval(-10800), endDate: now)
             chart.bgReadingDates = [now]
             chart.bgReadingValues = [165]
@@ -171,23 +247,22 @@ final class HealthKitTherapyImportTests: XCTestCase {
             chart.newestBgReadingSensorID = sensor.id
             chart.newestBgReadingIsValidForDownstream = true
             XCTAssertEqual(presentation.displayableResult(context: context, chartState: chart,
-                refreshInputsAllowed: fixture.manager.isRefreshingPreviouslyCompleteInputs(),
-                currentInputsAvailable: false, at: now.addingTimeInterval(0.5))?.points, prior.points)
+                currentInputsAvailable: false, routineRefresh: fixture.manager.routineRefreshState(),
+                at: now.addingTimeInterval(0.5))?.points, prior.points)
             let stale = await adapter.forecastForPresentation(horizonMinutes: 60,
                 at: now.addingTimeInterval(GlucoseForecastEngine.maximumGlucoseAge + 1))
-            XCTAssertNil(stale.refreshReference)
+            XCTAssertNotNil(stale.result.reason)
             let disabled = await adapter.forecastForPresentation(horizonMinutes: 0, at: now)
-            XCTAssertNil(disabled.refreshReference)
+            XCTAssertNotNil(disabled.result.reason)
             fixture.defaults.set("read failed", forKey: "healthTherapyImport.v1.insulin.error")
             let failed = await adapter.forecastForPresentation(horizonMinutes: 60, at: now)
-            XCTAssertNil(failed.refreshReference)
+            XCTAssertEqual(failed.result.reason, .dataUnavailable)
             fixture.defaults.removeObject(forKey: "healthTherapyImport.v1.insulin.error")
             _ = TreatmentEntry(date: now, value: 1, treatmentType: .Insulin, nightscoutEventType: nil,
                                enteredBy: nil, nsManagedObjectContext: fixture.core.mainManagedObjectContext)
             do { try fixture.core.mainManagedObjectContext.save() }
             catch { XCTFail("Synthetic child save failed: \(error)") }
             let pending = await adapter.forecastForPresentation(horizonMinutes: 60, at: now)
-            XCTAssertNil(pending.refreshReference)
             XCTAssertEqual(pending.result.reason, .dataUnavailable)
             XCTAssertTrue(fixture.core.saveChangesSynchronously())
             checked.fulfill()
@@ -197,7 +272,7 @@ final class HealthKitTherapyImportTests: XCTestCase {
         waitUntil("refresh ended") { !fixture.manager.status(.insulin).isIncomplete }
     }
 
-    func testForecastRefreshHintNeverTreatsFailedRetryOrFirstImportAsComplete() {
+    func testRoutineRefreshNeverTreatsFailedRetryOrFirstImportAsComplete() {
         for previousFailure in [false, true] {
             let fixture = ImportFixture()
             defer { fixture.close() }
@@ -212,7 +287,7 @@ final class HealthKitTherapyImportTests: XCTestCase {
             waitUntil("incomplete read held") { !fixture.query.anchors(for: .insulin).isEmpty }
             // startSync clears the old error, but the captured proof must still reject its retry.
             XCTAssertNil(fixture.defaults.string(forKey: prefix + "error"))
-            XCTAssertFalse(fixture.manager.isRefreshingPreviouslyCompleteInputs())
+            XCTAssertNil(fixture.manager.routineRefreshState())
             fixture.query.releaseHeldPage(for: .insulin, after: nil)
             waitUntil("incomplete read finished") { fixture.anchor(for: .insulin) != nil }
         }

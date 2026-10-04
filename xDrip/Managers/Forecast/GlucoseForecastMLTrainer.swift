@@ -86,7 +86,9 @@ struct GlucoseForecastMLSelfCheck: Codable, Sendable {
 }
 
 struct GlucoseForecastMLModelMetadata: Codable, Sendable {
-    static let schemaVersion = 1
+    // Historical input formation changed: older model packages and checkpoints
+    // can include treatment windows whose availability was not established.
+    static let schemaVersion = 2
     let schemaVersion: Int
     let modelID: String
     let trainedAt: Date
@@ -376,12 +378,20 @@ enum GlucoseForecastMLTrainer {
                       context: GlucoseForecastMLContext,
                       active: GlucoseForecastMLLoadedBundle?,
                       sessionsDirectory: URL,
-                      now: Date = .now) async throws -> GlucoseForecastMLTrainedCandidate {
+                      now: Date = .now,
+                      onProgress: @escaping @Sendable (GlucoseForecastMLTrainingProgress) -> Void = { _ in })
+        async throws -> GlucoseForecastMLTrainedCandidate {
         let split = try GlucoseForecastMLChronology.split(examples)
         try GlucoseForecastMLStoragePolicy.secureDirectory(sessionsDirectory)
         var models = [String: MLBoostedTreeRegressor]()
         var walkCounts = [Int: Int]()
         var trainingCounts = [Int: Int]()
+        var completedModels = 0
+        let totalModels = 12
+        func modelCompleted() {
+            completedModels += 1
+            onProgress(.trainingModels(completed: completedModels, total: totalModels))
+        }
         let fairActive = active.map {
             $0.metadata.context == context
                 && $0.metadata.trainedAt < split.cStart
@@ -417,6 +427,7 @@ enum GlucoseForecastMLTrainer {
                 foldModels[horizon] = try await fit(prefix,
                     targets: prefix.map { $0.targetGlucoseMgdl - $0.engineTargetGlucoseMgdl },
                     sessionDirectory: sessionsDirectory.appendingPathComponent("walk_\(horizon)_\(index)"))
+                modelCompleted()
             }
             let holdout = aAnchors.filter {
                 let reference = $0.example(at: 30).row.referenceDate
@@ -459,11 +470,14 @@ enum GlucoseForecastMLTrainer {
             models[key("correction", horizon)] = try await fit(a,
                 targets: a.map { $0.targetGlucoseMgdl - $0.engineTargetGlucoseMgdl },
                 sessionDirectory: sessionsDirectory.appendingPathComponent("correction_\(horizon)"))
+            modelCompleted()
             models[key("error", horizon)] = try await fit(residuals.map(\.0),
                 targets: residuals.map(\.1),
                 sessionDirectory: sessionsDirectory.appendingPathComponent("error_\(horizon)"))
+            modelCompleted()
         }
 
+        onProgress(.calibrating)
         let bAnchors = completeAnchors(split.b)
         let cAnchors = completeAnchors(split.c)
         guard bAnchors.count >= GlucoseForecastMLChronology.minimumCalibrationRows else {
@@ -531,6 +545,7 @@ enum GlucoseForecastMLTrainer {
                 observedCoverage: Double(coveredOnB[horizon, default: 0]) / Double(calibration.count))
         }
 
+        onProgress(.selfChecking)
         var metrics = [Int: GlucoseForecastMLHorizonMetrics]()
         var selfCheckCounts = [Int: Int]()
         var rejections = [String]()

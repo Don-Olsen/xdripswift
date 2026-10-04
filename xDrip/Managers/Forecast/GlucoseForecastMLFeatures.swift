@@ -12,7 +12,9 @@ struct GlucoseForecastMLFeatureRow: Sendable {
 }
 
 enum GlucoseForecastMLFeatures {
-    static let featureVersion = "glucose-forecast-16-v1"
+    // The feature order is unchanged; the version also binds the corrected
+    // historical data formation used to train the model.
+    static let featureVersion = "glucose-forecast-16-v2"
     static let featureNames = [
         "glucoseMgdl", "rawSlope15MgdlPerMinute", "rawSlope30MgdlPerMinute",
         "engineDeltaMgdl", "insulinNextUnits", "carbsNextGrams", "iobUnits",

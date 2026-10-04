@@ -11,11 +11,36 @@ import CreateML
 
 struct GlucoseForecastMLStatusSummary: Sendable {
     let isTraining: Bool
+    let progress: GlucoseForecastMLTrainingProgress?
     let activeModelID: String?
     let trainedAt: Date?
     let lastAttempt: Date?
     let lastOutcome: String?
     let lastSelfCheck: GlucoseForecastMLSelfCheck?
+}
+
+/// Counts only completed work. Create ML may spend very different amounts of
+/// time on each fit, so the UI reports the completed count rather than an ETA.
+enum GlucoseForecastMLTrainingProgress: Equatable, Sendable {
+    case trainingModels(completed: Int, total: Int)
+    case calibrating
+    case selfChecking
+    case installing
+}
+
+enum GlucoseForecastMLModelCompatibility {
+    static func matchesGeneration(_ metadata: GlucoseForecastMLModelMetadata) -> Bool {
+        metadata.schemaVersion == GlucoseForecastMLModelMetadata.schemaVersion
+            && metadata.featureNames == GlucoseForecastMLFeatures.featureNames
+            && metadata.context.engineVersion == GlucoseForecastEngine.engineVersion
+            && metadata.context.featureVersion == GlucoseForecastMLFeatures.featureVersion
+    }
+
+    static func isUsable(_ metadata: GlucoseForecastMLModelMetadata) -> Bool {
+        matchesGeneration(metadata)
+            && GlucoseForecastMLStoragePolicy.isGeneratedUUID(metadata.modelID)
+            && metadata.selfCheck.promoted
+    }
 }
 
 /// Loaded once on a utility task; runtime prediction only uses these cached models.
@@ -83,6 +108,18 @@ enum GlucoseForecastMLStoragePolicy {
 
 final class GlucoseForecastMLModelStore {
     private struct ActivePointer: Codable { let modelID: String }
+    private struct SavedReview: Codable {
+        let modelSchemaVersion: Int
+        let engineVersion: String
+        let featureVersion: String
+        let report: GlucoseForecastMLSelfCheck
+
+        var matchesCurrentGeneration: Bool {
+            modelSchemaVersion == GlucoseForecastMLModelMetadata.schemaVersion
+                && engineVersion == GlucoseForecastEngine.engineVersion
+                && featureVersion == GlucoseForecastMLFeatures.featureVersion
+        }
+    }
     let directory: URL
     private let fileManager = FileManager.default
     private let sessionLock = NSLock()
@@ -162,25 +199,32 @@ final class GlucoseForecastMLModelStore {
         }
     }
 
-    func saveReview(_ report: GlucoseForecastMLSelfCheck) throws {
+    func saveReview(_ metadata: GlucoseForecastMLModelMetadata) throws {
+        guard GlucoseForecastMLModelCompatibility.matchesGeneration(metadata) else {
+            throw GlucoseForecastMLTrainingFailure.packageInvalid
+        }
         try prepareDirectory()
-        let data = try JSONEncoder().encode(report)
+        let review = SavedReview(
+            modelSchemaVersion: metadata.schemaVersion,
+            engineVersion: metadata.context.engineVersion,
+            featureVersion: metadata.context.featureVersion,
+            report: metadata.selfCheck)
+        let data = try JSONEncoder().encode(review)
         try data.write(to: reviewURL, options: .atomic)
         try protect(reviewURL)
     }
 
     func loadReview() -> GlucoseForecastMLSelfCheck? {
         guard let data = try? Data(contentsOf: reviewURL) else { return nil }
-        return try? JSONDecoder().decode(GlucoseForecastMLSelfCheck.self, from: data)
+        guard let saved = try? JSONDecoder().decode(SavedReview.self, from: data),
+              saved.matchesCurrentGeneration else { return nil }
+        return saved.report
     }
 
     #if canImport(CreateML)
     func install(_ candidate: GlucoseForecastMLTrainedCandidate) async throws -> GlucoseForecastMLLoadedBundle {
         let metadata = candidate.metadata
-        guard metadata.selfCheck.promoted,
-              UUID(uuidString: metadata.modelID) != nil,
-              metadata.schemaVersion == GlucoseForecastMLModelMetadata.schemaVersion,
-              metadata.featureNames == GlucoseForecastMLFeatures.featureNames,
+        guard GlucoseForecastMLModelCompatibility.isUsable(metadata),
               candidate.models.count == 6 else { throw GlucoseForecastMLTrainingFailure.packageInvalid }
         try prepareDirectory()
         let staging = modelsDirectory.appendingPathComponent(metadata.modelID + ".staging", isDirectory: true)
@@ -250,12 +294,7 @@ final class GlucoseForecastMLModelStore {
         let manifest = url.appendingPathComponent("metadata.json")
         let metadata = try JSONDecoder().decode(GlucoseForecastMLModelMetadata.self,
                                                 from: Data(contentsOf: manifest))
-        guard metadata.schemaVersion == GlucoseForecastMLModelMetadata.schemaVersion,
-              UUID(uuidString: metadata.modelID) != nil,
-              metadata.featureNames == GlucoseForecastMLFeatures.featureNames,
-              metadata.context.engineVersion == GlucoseForecastEngine.engineVersion,
-              metadata.context.featureVersion == GlucoseForecastMLFeatures.featureVersion,
-              metadata.selfCheck.promoted else {
+        guard GlucoseForecastMLModelCompatibility.isUsable(metadata) else {
             throw GlucoseForecastMLTrainingFailure.packageInvalid
         }
         var models = [String: MLModel]()
@@ -389,6 +428,8 @@ final class GlucoseForecastMLManager: @unchecked Sendable {
     private var loaded: GlucoseForecastMLLoadedBundle?
     private var loading = true
     private var isTraining = false
+    private var progress: GlucoseForecastMLTrainingProgress?
+    private var activeAttemptID: UUID?
     private var trainingTask: Task<Void, Never>?
     private var lastAttempt: Date?
     private var lastOutcome: String?
@@ -433,7 +474,8 @@ final class GlucoseForecastMLManager: @unchecked Sendable {
     var statusSummary: GlucoseForecastMLStatusSummary {
         lock.lock(); defer { lock.unlock() }
         return GlucoseForecastMLStatusSummary(
-            isTraining: isTraining, activeModelID: loaded?.metadata.modelID,
+            isTraining: isTraining, progress: progress,
+            activeModelID: loaded?.metadata.modelID,
             trainedAt: loaded?.metadata.trainedAt, lastAttempt: lastAttempt,
             lastOutcome: lastOutcome, lastSelfCheck: lastSelfCheck)
     }
@@ -460,8 +502,11 @@ final class GlucoseForecastMLManager: @unchecked Sendable {
             return
         }
         isTraining = true
+        let attemptID = UUID()
+        activeAttemptID = attemptID
+        progress = .trainingModels(completed: 0, total: 12)
         lastAttempt = .now
-        lastOutcome = "training"
+        lastOutcome = nil
         let active = loaded
         lock.unlock()
         notifyStatus()
@@ -469,20 +514,25 @@ final class GlucoseForecastMLManager: @unchecked Sendable {
             guard let self else { return }
             #if canImport(UIKit)
             let foreground = await MainActor.run { UIApplication.shared.applicationState == .active }
-            if !foreground { self.finish(outcome: "backgroundCancelled", report: nil); return }
+            if !foreground {
+                self.finish(outcome: "backgroundCancelled", report: nil, attemptID: attemptID)
+                return
+            }
             #endif
             let sessions: URL
             do {
                 sessions = try self.store.prepareTrainingSession()
             } catch {
-                self.finish(outcome: "trainingFailed", report: nil)
+                self.finish(outcome: "trainingFailed", report: nil, attemptID: attemptID)
                 return
             }
             defer { self.store.finishTrainingSession(sessions) }
             do {
                 let candidate = try await GlucoseForecastMLTrainer.train(
                     examples: examples, context: context, active: active,
-                    sessionsDirectory: sessions)
+                    sessionsDirectory: sessions, onProgress: { [weak self] progress in
+                        self?.recordProgress(progress, attemptID: attemptID)
+                    })
                 try Task.checkCancellation()
                 if candidate.metadata.selfCheck.promoted {
                     #if canImport(UIKit)
@@ -493,21 +543,24 @@ final class GlucoseForecastMLManager: @unchecked Sendable {
                     }
                     guard stillCurrent else { throw CancellationError() }
                     #endif
+                    self.recordProgress(.installing, attemptID: attemptID)
                     let bundle = try await self.store.install(candidate)
                     self.lock.withLock { self.loaded = bundle }
-                    try? self.store.saveReview(candidate.metadata.selfCheck)
+                    try? self.store.saveReview(candidate.metadata)
                     self.notifyModel()
-                    self.finish(outcome: "activated", report: candidate.metadata.selfCheck)
+                    self.finish(outcome: "activated", report: candidate.metadata.selfCheck,
+                                attemptID: attemptID)
                 } else {
-                    try? self.store.saveReview(candidate.metadata.selfCheck)
-                    self.finish(outcome: "rejected", report: candidate.metadata.selfCheck)
+                    try? self.store.saveReview(candidate.metadata)
+                    self.finish(outcome: "rejected", report: candidate.metadata.selfCheck,
+                                attemptID: attemptID)
                 }
             } catch is CancellationError {
-                self.finish(outcome: "backgroundCancelled", report: nil)
+                self.finish(outcome: "backgroundCancelled", report: nil, attemptID: attemptID)
             } catch let failure as GlucoseForecastMLTrainingFailure {
-                self.finish(outcome: failure.rawValue, report: nil)
+                self.finish(outcome: failure.rawValue, report: nil, attemptID: attemptID)
             } catch {
-                self.finish(outcome: "trainingFailed", report: nil)
+                self.finish(outcome: "trainingFailed", report: nil, attemptID: attemptID)
             }
         }
         lock.lock()
@@ -530,7 +583,7 @@ final class GlucoseForecastMLManager: @unchecked Sendable {
         let bundle = loaded
         lock.unlock()
         guard let bundle, bundle.metadata.context == context,
-              bundle.metadata.featureNames == GlucoseForecastMLFeatures.featureNames,
+              GlucoseForecastMLModelCompatibility.isUsable(bundle.metadata),
               let reference = result.referenceDate else { return nil }
         let selected = GlucoseForecastMLChronology.horizons.filter { $0 <= input.horizonMinutes }
         guard !selected.isEmpty else { return nil }
@@ -576,9 +629,22 @@ final class GlucoseForecastMLManager: @unchecked Sendable {
         task?.cancel()
     }
 
-    private func finish(outcome: String, report: GlucoseForecastMLSelfCheck?) {
+    private func recordProgress(_ newProgress: GlucoseForecastMLTrainingProgress,
+                                attemptID: UUID) {
         lock.lock()
+        guard isTraining, activeAttemptID == attemptID else { lock.unlock(); return }
+        progress = newProgress
+        lock.unlock()
+        notifyStatus()
+    }
+
+    private func finish(outcome: String, report: GlucoseForecastMLSelfCheck?,
+                        attemptID: UUID) {
+        lock.lock()
+        guard activeAttemptID == attemptID else { lock.unlock(); return }
         isTraining = false
+        progress = nil
+        activeAttemptID = nil
         trainingTask = nil
         lastOutcome = outcome
         if let report { lastSelfCheck = report }

@@ -1,6 +1,10 @@
 import CoreData
 import os
 
+extension Notification.Name {
+    static let coreDataContextSaveFailed = Notification.Name("CoreDataContextSaveFailed")
+}
+
 /// development as explained in cocoacasts.com https://cocoacasts.com/bring-your-own
 public final class CoreDataManager {
     
@@ -221,6 +225,8 @@ public final class CoreDataManager {
                 }
             } catch {
                 mainContextSaveSucceeded = false
+                NotificationCenter.default.post(name: .coreDataContextSaveFailed,
+                                                object: self.mainManagedObjectContext)
                 trace("in savechanges,  Unable to Save Changes of Main Managed Object Context, error.localizedDescription  = %{public}@", log: log, category: ConstantsLog.categoryCoreDataManager, type: .info, error.localizedDescription)
                 
                 let error = error as NSError
@@ -248,6 +254,8 @@ public final class CoreDataManager {
                     try self.privateManagedObjectContext.save()
                 }
             } catch {
+                NotificationCenter.default.post(name: .coreDataContextSaveFailed,
+                                                object: self.privateManagedObjectContext)
                 trace("in savechanges,  Unable to Save Changes of Private Managed Object Context, error.localizedDescription  = %{public}@", log: self.log, category: ConstantsLog.categoryCoreDataManager, type: .info, error.localizedDescription)
             }
             
@@ -280,6 +288,8 @@ public final class CoreDataManager {
                 }
             } catch {
                 saveSucceeded = false
+                NotificationCenter.default.post(name: .coreDataContextSaveFailed,
+                                                object: self.mainManagedObjectContext)
                 trace("in saveChangesSynchronously, failed to save main context: %{public}@", log: self.log, category: ConstantsLog.categoryCoreDataManager, type: .error, error.localizedDescription)
             }
         }
@@ -293,6 +303,8 @@ public final class CoreDataManager {
                 }
             } catch {
                 saveSucceeded = false
+                NotificationCenter.default.post(name: .coreDataContextSaveFailed,
+                                                object: self.privateManagedObjectContext)
                 trace("in saveChangesSynchronously, failed to save private context: %{public}@", log: self.log, category: ConstantsLog.categoryCoreDataManager, type: .error, error.localizedDescription)
             }
         }
@@ -307,6 +319,8 @@ public final class CoreDataManager {
             do {
                 if self.mainManagedObjectContext.hasChanges { try self.mainManagedObjectContext.save() }
             } catch {
+                NotificationCenter.default.post(name: .coreDataContextSaveFailed,
+                                                object: self.mainManagedObjectContext)
                 completion(false)
                 return
             }
@@ -317,6 +331,8 @@ public final class CoreDataManager {
                     saved = true
                 } catch {
                     saved = false
+                    NotificationCenter.default.post(name: .coreDataContextSaveFailed,
+                                                    object: self.privateManagedObjectContext)
                     let error = error as NSError
                     trace("Watch reading persistence failed domain=%{public}@ code=%{public}d", log: self.log,
                           category: ConstantsLog.categoryCoreDataManager, type: .error, error.domain, error.code)

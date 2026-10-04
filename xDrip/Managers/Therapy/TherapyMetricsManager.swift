@@ -22,6 +22,16 @@ struct TherapyTreatment: Sendable {
     let isIOB: Bool
 }
 
+struct TherapyChartLoad {
+    let series: TherapyChartSeries
+    let inputsComplete: Bool
+}
+
+struct HomeTreatmentCommitDisplayState {
+    let generation: Int
+    let startedAt: Date
+}
+
 /// Forecast-only save provenance. A writer commit can confirm only the mutations forwarded
 /// before that writer save began; newer child/main work must remain unavailable.
 struct ForecastInputCommitState {
@@ -62,10 +72,14 @@ final class TherapyMetricsManager {
     private var treatmentCache: [String: [TherapyTreatment]] = [:]
     private var treatmentRevision = 0
     private var treatmentPresentationRevision = 0
+    /// Separates unrelated/manual treatment edits from HealthKit pages for Home-only continuity.
+    private var nonHealthTreatmentPresentationRevision = 0
     /// Presentation provenance only; cache/status invalidations are not treatment mutations.
     private var forecastInputRevision = 0
     private var forecastCommitState = ForecastInputCommitState()
     private var pendingTreatmentCommit = false
+    private var pendingHomeTreatmentCommit: HomeTreatmentCommitDisplayState?
+    private var nextHomeTreatmentCommitGeneration = 0
     private var pendingReads = Set<String>()
     private var failedReads: [String: Date] = [:]
     private let inputQueue = DispatchQueue(label: "therapy.inputs", qos: .utility)
@@ -107,12 +121,16 @@ final class TherapyMetricsManager {
                     let keys = [NSInsertedObjectsKey, NSUpdatedObjectsKey, NSDeletedObjectsKey]
                     let objects = keys.flatMap { notification.userInfo?[$0] as? Set<NSManagedObject> ?? [] }
                     treatmentsChanged = objects.contains { $0 is TreatmentEntry }
+                    let nonHealthTreatmentChanged = objects.contains {
+                        guard let entry = $0 as? TreatmentEntry else { return false }
+                        return !entry.isHealthKitImported
+                    }
                     if context === self?.coreDataManager?.mainManagedObjectContext {
-                        if treatmentsChanged { self?.markPendingTreatmentCommit() }
+                        if treatmentsChanged { self?.markPendingTreatmentCommit(nonHealthTreatmentChanged: nonHealthTreatmentChanged) }
                         return
                     }
                     if context.parent === self?.coreDataManager?.mainManagedObjectContext {
-                        if treatmentsChanged { self?.markForecastInputMutation() }
+                        if treatmentsChanged { self?.markForecastInputMutation(nonHealthTreatmentChanged: nonHealthTreatmentChanged) }
                         return
                     }
                     guard context === self?.coreDataManager?.privateManagedObjectContext else { return }
@@ -129,6 +147,16 @@ final class TherapyMetricsManager {
                 self?.invalidate(treatmentsChanged: treatmentsChanged, forecastInputsInvalidated: true)
             })
         }
+        observers.append(NotificationCenter.default.addObserver(forName: .coreDataContextSaveFailed,
+            object: nil, queue: nil) { [weak self] notification in
+            guard let self, let context = notification.object as? NSManagedObjectContext,
+                  context === self.coreDataManager?.mainManagedObjectContext
+                    || context === self.coreDataManager?.privateManagedObjectContext else { return }
+            self.lock.lock()
+            self.pendingHomeTreatmentCommit = nil
+            self.lock.unlock()
+            self.publishStatusChange()
+        })
         observers.append(NotificationCenter.default.addObserver(forName: UserDefaults.didChangeNotification, object: nil, queue: nil) { [weak self] _ in
             // Do not make background defaults writers wait for the main queue.
             DispatchQueue.main.async { [weak self] in
@@ -145,20 +173,28 @@ final class TherapyMetricsManager {
 
     /// Import children can publish a known mutation before their main/writer saves run.
     /// Invalidate only forecast presentation here; existing cache and pending-save rules stay intact.
-    private func markForecastInputMutation() {
+    private func markForecastInputMutation(nonHealthTreatmentChanged: Bool) {
         lock.lock()
         forecastCommitState.childDidSave()
         forecastInputRevision &+= 1
+        if nonHealthTreatmentChanged {
+            nonHealthTreatmentPresentationRevision &+= 1
+            beginHomeTreatmentCommit()
+        }
         lock.unlock()
         DispatchQueue.main.async { NotificationCenter.default.post(name: Self.changed, object: self) }
     }
 
-    private func markPendingTreatmentCommit() {
+    private func markPendingTreatmentCommit(nonHealthTreatmentChanged: Bool) {
         lock.lock()
         pendingTreatmentCommit = true
         forecastCommitState.mainDidSave()
         treatmentPresentationRevision &+= 1
         forecastInputRevision &+= 1
+        if nonHealthTreatmentChanged {
+            nonHealthTreatmentPresentationRevision &+= 1
+            beginHomeTreatmentCommit()
+        }
         lock.unlock()
         DispatchQueue.main.async { NotificationCenter.default.post(name: Self.changed, object: self) }
     }
@@ -172,6 +208,7 @@ final class TherapyMetricsManager {
         // a later successful treatment commit rather than confirming old persisted inputs.
         if committedTreatmentSave {
             pendingTreatmentCommit = false
+            if !forecastCommitState.hasPendingChanges { pendingHomeTreatmentCommit = nil }
         }
         if treatmentsChanged {
             treatmentRevision &+= 1
@@ -182,6 +219,15 @@ final class TherapyMetricsManager {
         chartCache.removeAll()
         lock.unlock()
         DispatchQueue.main.async { NotificationCenter.default.post(name: Self.changed, object: self) }
+    }
+
+    /// A Health import phase changed without a treatment write. Rebuild Home's strict status,
+    /// but leave its cached treatment and chart inputs untouched for an unchanged reread.
+    func publishStatusChange() {
+        DispatchQueue.main.async {
+            NotificationCenter.default.post(name: Self.changed, object: self,
+                                            userInfo: ["statusOnly": true])
+        }
     }
 
     /// A child-context save is not confirmed until the private persistent-store save commits.
@@ -199,6 +245,29 @@ final class TherapyMetricsManager {
         return treatmentPresentationRevision
     }
 
+    var nonHealthTreatmentChangeRevision: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return nonHealthTreatmentPresentationRevision
+    }
+
+    private func beginHomeTreatmentCommit() {
+        // Caller holds `lock`. A child and its main-context forwarding are one display window.
+        guard pendingHomeTreatmentCommit == nil else { return }
+        nextHomeTreatmentCommitGeneration &+= 1
+        pendingHomeTreatmentCommit = HomeTreatmentCommitDisplayState(
+            generation: nextHomeTreatmentCommitGeneration, startedAt: Date())
+    }
+
+    func pendingHomeTreatmentCommitState(at now: Date = .now) -> HomeTreatmentCommitDisplayState? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let pendingHomeTreatmentCommit,
+              pendingTreatmentCommit || forecastCommitState.hasPendingChanges,
+              (0..<30).contains(now.timeIntervalSince(pendingHomeTreatmentCommit.startedAt)) else { return nil }
+        return pendingHomeTreatmentCommit
+    }
+
     /// A private import child may have saved before the main/writer chain commits. Forecast
     /// reads remain unavailable across that interval without changing normal snapshot behavior.
     var hasUncommittedForecastInputChanges: Bool {
@@ -213,6 +282,19 @@ final class TherapyMetricsManager {
         lock.lock()
         defer { lock.unlock() }
         return forecastInputRevision
+    }
+
+    /// Detached values from the last complete local read. Home may age these during a brief
+    /// Health reread; this never changes the strict current snapshot used by calculations.
+    func completeLocalTreatmentsForHome(at date: Date = .now) -> [TherapyTreatment]? {
+        guard !hasUncommittedForecastInputChanges,
+              !HealthKitTherapyImportManager.shared.localInputIsIncomplete(.insulin),
+              !HealthKitTherapyImportManager.shared.localInputIsIncomplete(.carbohydrates) else { return nil }
+        let policy = UserDefaults.standard.dataFlowPolicy
+        let settings = TherapyModelSettings(defaults: .standard)
+        return treatments(from: date.addingTimeInterval(-TherapyModelSettings.visibilityInterval),
+            to: min(Date(), date.addingTimeInterval(TherapyModelSettings.visibilityInterval)),
+            policy: policy, settings: settings)
     }
 
     private func key(policy: DataFlowPolicy, settings: TherapyModelSettings) -> String {
@@ -418,6 +500,10 @@ final class TherapyMetricsManager {
     }
 
     func chart(from start: Date, to end: Date) async -> TherapyChartSeries {
+        await chartForHome(from: start, to: end).series
+    }
+
+    func chartForHome(from start: Date, to end: Date) async -> TherapyChartLoad {
         let cancellation = TherapyChartCancellation()
         return await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
@@ -430,23 +516,30 @@ final class TherapyMetricsManager {
         }
     }
 
-    private func buildChart(from start: Date, to end: Date, isCancelled: () -> Bool) -> TherapyChartSeries {
+    private func buildChart(from start: Date, to end: Date, isCancelled: () -> Bool) -> TherapyChartLoad {
         // Serial GCD work does not block Swift concurrency's cooperative executor.
         // Superseded requests leave the queue without fetching or calculating.
-        guard !isCancelled() else { return TherapyChartSeries() }
-        guard let coreDataManager else { return TherapyChartSeries() }
+        let unavailable = TherapyChartLoad(series: TherapyChartSeries(), inputsComplete: false)
+        guard !isCancelled() else { return unavailable }
+        guard let coreDataManager else { return unavailable }
         let end = min(end, Date())
-        guard start < end else { return TherapyChartSeries() }
+        guard start < end else { return unavailable }
         let policy = UserDefaults.standard.dataFlowPolicy
         let settings = TherapyModelSettings(defaults: .standard)
         let cacheKey = "\(key(policy: policy, settings: settings))-\(start.timeIntervalSince1970)-\(floor(end.timeIntervalSince1970 / 300))-\(floor(Date().timeIntervalSince1970 / 60))"
         lock.lock(); let cached = chartCache[cacheKey]; let generation = revision; lock.unlock()
-        if let cached { return cached }
+        let needsLocalInputs = policy.externalIOBSource == nil || policy.externalCOBSource == nil
+        let localEligibilityComplete = !needsLocalInputs || (!hasUncommittedForecastInputChanges
+            && !HealthKitTherapyImportManager.shared.localInputIsIncomplete(.insulin)
+            && !HealthKitTherapyImportManager.shared.localInputIsIncomplete(.carbohydrates))
+        if let cached, localEligibilityComplete {
+            return TherapyChartLoad(series: cached, inputsComplete: true)
+        }
         let currentDate = Date()
         let window = TherapyModelSettings.visibilityInterval
-        let needsLocalInputs = policy.externalIOBSource == nil || policy.externalCOBSource == nil
         let entries = needsLocalInputs ? treatments(from: start.addingTimeInterval(-window), to: min(currentDate, end.addingTimeInterval(window)), policy: policy, settings: settings) : []
         let recentEntries = needsLocalInputs ? treatments(from: currentDate.addingTimeInterval(-window), to: currentDate, policy: policy, settings: settings) : []
+        let localInputsComplete = localEligibilityComplete && (entries != nil && recentEntries != nil)
         let statuses = policy.aidAnalyticsSource.map { source in
             externalHistory.load(key: "\(generation)-\(policy.therapyDataSource.rawValue)-\(policy.nightscoutFollowType.rawValue)",
                 from: start.addingTimeInterval(-TherapyModelSettings.externalChartJoinInterval), to: end) { from, to in
@@ -454,17 +547,22 @@ final class TherapyMetricsManager {
                     .filter { source.ownsDeviceStatus(with: $0.device) }
             }
         } ?? []
-        guard !isCancelled() else { return TherapyChartSeries() }
+        guard !isCancelled() else { return unavailable }
         let result = Self.chartSeries(entries: entries, statuses: statuses, policy: policy, settings: settings, start: start, end: end, currentDate: currentDate, recentEntries: recentEntries,
             localIOBAvailable: !HealthKitTherapyImportManager.shared.localInputIsIncomplete(.insulin),
             localCOBAvailable: !HealthKitTherapyImportManager.shared.localInputIsIncomplete(.carbohydrates),
             isCancelled: isCancelled)
-        guard !isCancelled() else { return TherapyChartSeries() }
+        guard !isCancelled() else { return unavailable }
+        let stillComplete = !needsLocalInputs || (!hasUncommittedForecastInputChanges
+            && !HealthKitTherapyImportManager.shared.localInputIsIncomplete(.insulin)
+            && !HealthKitTherapyImportManager.shared.localInputIsIncomplete(.carbohydrates))
         lock.lock(); defer { lock.unlock() }
-        guard generation == revision else { return TherapyChartSeries() }
-        if chartCache.count > 6 { chartCache.removeAll() }
-        chartCache[cacheKey] = result
-        return result
+        guard generation == revision else { return unavailable }
+        if localInputsComplete && stillComplete {
+            if chartCache.count > 6 { chartCache.removeAll() }
+            chartCache[cacheKey] = result
+        }
+        return TherapyChartLoad(series: result, inputsComplete: localInputsComplete && stillComplete)
     }
     static func chartSeries(entries: [TherapyTreatment]?, statuses: [NightscoutDeviceStatusSnapshot], policy: DataFlowPolicy, settings: TherapyModelSettings, start: Date, end: Date, currentDate: Date? = nil, recentEntries: [TherapyTreatment]? = [], localIOBAvailable: Bool = true, localCOBAvailable: Bool = true, isCancelled: () -> Bool = { false }) -> TherapyChartSeries {
         func series(isIOB: Bool) -> [TherapyChartPoint] {

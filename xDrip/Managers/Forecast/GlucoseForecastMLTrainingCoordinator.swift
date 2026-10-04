@@ -7,6 +7,7 @@
 //
 
 import Foundation
+import HealthKit
 #if canImport(UIKit)
 import UIKit
 #endif
@@ -16,18 +17,22 @@ final class GlucoseForecastMLTrainingCoordinator: @unchecked Sendable {
     static let statusDidChange = Notification.Name("GlucoseForecastMLTrainingPreparationDidChange")
 
     private let lock = NSLock()
-    private var isPreparing = false
+    private var preparationInProgress = false
     private var preparationTask: Task<Void, Never>?
     private var preparationCancellation: GlucoseForecastMLHistoryCancellation?
     private var previousAutomaticAttempt: (context: GlucoseForecastMLContext, date: Date)?
     private var preparationStatus = ""
+    private var preparationCoverage = ""
     private var backgroundObservers: [NSObjectProtocol] = []
     private static let automaticRetryInterval: TimeInterval = 24 * 60 * 60
-    private static let stoppedStatus = "History preparation stopped when the app left the foreground."
+    private static let stoppedStatus = "Historiklæsningen blev stoppet, da appen blev forladt."
 
     private init() {
         #if canImport(UIKit)
-        for name in [UIApplication.willResignActiveNotification, UIApplication.didEnterBackgroundNotification] {
+        // The first Health read authorization sheet may temporarily make the
+        // app inactive without sending it to the background. Keep that user-
+        // initiated training attempt alive until the app actually leaves.
+        for name in [UIApplication.didEnterBackgroundNotification] {
             backgroundObservers.append(NotificationCenter.default.addObserver(forName: name,
                 object: nil, queue: nil) { [weak self] _ in self?.cancelForBackground() })
         }
@@ -42,6 +47,18 @@ final class GlucoseForecastMLTrainingCoordinator: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return preparationStatus
+    }
+
+    var isPreparing: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return preparationInProgress
+    }
+
+    var coverageText: String {
+        lock.lock()
+        defer { lock.unlock() }
+        return preparationCoverage
     }
 
     /// Called only from an active Home forecast or an explicit Settings button.
@@ -59,22 +76,23 @@ final class GlucoseForecastMLTrainingCoordinator: @unchecked Sendable {
               let context = GlucoseForecastMLContext(sensitivityMgdlPerUnit: sensitivity,
                   carbohydrateRatioGramsPerUnit: ratio, settings: settings,
                   sourceSignature: sourceSignature) else {
-            updateStatus("Training needs complete, unambiguous local forecast inputs.")
+            updateStatus("Træning kræver fuldstændige og entydige behandlingskilder.")
             return
         }
         let manager = GlucoseForecastMLManager.shared
         guard force || manager.shouldTrain(context: context, now: now) else { return }
         let cancellation = GlucoseForecastMLHistoryCancellation()
         lock.lock()
-        if isPreparing || (!force && previousAutomaticAttempt?.context == context &&
+        if preparationInProgress || (!force && previousAutomaticAttempt?.context == context &&
             now.timeIntervalSince(previousAutomaticAttempt!.date) < Self.automaticRetryInterval) {
             lock.unlock()
             return
         }
-        isPreparing = true
+        preparationInProgress = true
         preparationCancellation = cancellation
         if !force { previousAutomaticAttempt = (context, now) }
-        preparationStatus = "Preparing local history on this iPhone…"
+        preparationStatus = "Henter historik (0 af 365 dage)… Hold appen åben, mens den træner."
+        preparationCoverage = ""
         lock.unlock()
         NotificationCenter.default.post(name: Self.statusDidChange, object: nil)
 
@@ -86,25 +104,44 @@ final class GlucoseForecastMLTrainingCoordinator: @unchecked Sendable {
                 self.finishPreparation(Self.stoppedStatus, cancellation: cancellation)
                 return
             }
-            // 240 days covers the user's long historical period while bounding memory on phone.
-            // The loader reads one day at a time and yields value-only snapshots.
-            let examples = await loader.load(days: 240, at: now, policy: policy,
+            // A successful HealthKit authorization request does not reveal whether
+            // read access was granted. Empty results are handled as missing data;
+            // the history loader applies the same coverage rules to local fallback.
+            await Self.requestBloodGlucoseReadAccessIfAvailable()
+            guard await Self.waitForActiveAfterAuthorization(cancellation: cancellation),
+                  !Task.isCancelled, !cancellation.isCancelled else {
+                cancellation.cancel()
+                self.finishPreparation(Self.stoppedStatus, cancellation: cancellation)
+                return
+            }
+            let result = await loader.load(days: 365, at: now, policy: policy,
                 settings: settings, sensitivityMgdlPerUnit: sensitivity,
-                carbohydrateRatioGramsPerUnit: ratio, cancellation: cancellation)
+                carbohydrateRatioGramsPerUnit: ratio, cancellation: cancellation,
+                progress: { [weak self] completed, total in
+                    self?.updatePreparationStatus(
+                        "Henter historik (\(completed) af \(total) dage)… Hold appen åben, mens den træner.",
+                        cancellation: cancellation)
+                })
             let foreground = await Self.appIsActive()
             guard foreground, !Task.isCancelled, !cancellation.isCancelled else {
                 cancellation.cancel()
                 self.finishPreparation(Self.stoppedStatus, cancellation: cancellation)
                 return
             }
-            if let examples {
-                manager.requestTraining(examples: examples, context: context, force: force)
-                self.finishPreparation(examples.isEmpty
-                    ? "No usable historical examples were found. The engine remains active."
-                    : "History prepared; model training runs locally in the background.",
-                    cancellation: cancellation)
+            if let result {
+                self.updateCoverage(result.coverage, cancellation: cancellation)
+                if result.coverage.usableDays < GlucoseForecastMLChronology.minimumUsableDays {
+                    self.finishPreparation(
+                        "Ikke nok brugbare data: \(result.coverage.usableDays) af 60 brugbare dage. Prognosemotoren bruges fortsat.",
+                        cancellation: cancellation)
+                } else {
+                    manager.requestTraining(examples: result.examples, context: context, force: force)
+                    self.finishPreparation(manager.statusSummary.isTraining ? "" :
+                        "Modeltræningen kunne ikke startes nu. Prognosemotoren bruges fortsat.",
+                        cancellation: cancellation)
+                }
             } else {
-                self.finishPreparation("Historical inputs changed or could not be read. The engine remains active.",
+                self.finishPreparation("Historikken kunne ikke læses sikkert. Prognosemotoren bruges fortsat.",
                     cancellation: cancellation)
             }
         }
@@ -124,7 +161,7 @@ final class GlucoseForecastMLTrainingCoordinator: @unchecked Sendable {
         let policy = defaults.dataFlowPolicy
         guard let sensitivity = defaults.glucoseForecastManualSensitivityMgdlPerUnit,
               let ratio = defaults.glucoseForecastManualCarbRatioGramsPerUnit else {
-            updateStatus("Set insulin sensitivity and carbohydrate ratio before training.")
+            updateStatus("Angiv insulinfølsomhed og kulhydratfaktor før træning.")
             return
         }
         let sourceSignature = GlucoseForecastDataAdapter.presentationInputSignature(
@@ -142,12 +179,47 @@ final class GlucoseForecastMLTrainingCoordinator: @unchecked Sendable {
         #endif
     }
 
+    /// HealthKit may invoke its authorization callback while its system sheet
+    /// still has the app in `.inactive`. Wait only for that one foreground
+    /// transition; ordinary backgrounding still cancels the attempt.
+    private static func waitForActiveAfterAuthorization(
+        cancellation: GlucoseForecastMLHistoryCancellation) async -> Bool {
+        #if canImport(UIKit)
+        for _ in 0..<300 {
+            if Task.isCancelled || cancellation.isCancelled { return false }
+            let state = await MainActor.run { UIApplication.shared.applicationState }
+            if state == .active { return true }
+            if state == .background { return false }
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        return false
+        #else
+        return true
+        #endif
+    }
+
+    private static func requestBloodGlucoseReadAccessIfAvailable() async {
+        guard HKHealthStore.isHealthDataAvailable(),
+              let glucose = HKObjectType.quantityType(forIdentifier: .bloodGlucose) else { return }
+        let store = HKHealthStore()
+        // HealthKit deliberately does not disclose read authorization. The
+        // completion only tells us that the request was processed, not whether
+        // samples are readable. Never treat it as proof of permission.
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            DispatchQueue.main.async {
+                store.requestAuthorization(toShare: [], read: [glucose]) { _, _ in
+                    continuation.resume()
+                }
+            }
+        }
+    }
+
     private func cancelForBackground() {
         lock.lock()
         // A canceled training run must be eligible again on the next foreground
         // use, even if history preparation had already handed off to Create ML.
         previousAutomaticAttempt = nil
-        guard isPreparing else { lock.unlock(); return }
+        guard preparationInProgress else { lock.unlock(); return }
         preparationCancellation?.cancel()
         let task = preparationTask
         preparationStatus = Self.stoppedStatus
@@ -160,7 +232,7 @@ final class GlucoseForecastMLTrainingCoordinator: @unchecked Sendable {
                                    cancellation: GlucoseForecastMLHistoryCancellation) {
         lock.lock()
         guard preparationCancellation === cancellation else { lock.unlock(); return }
-        isPreparing = false
+        preparationInProgress = false
         preparationTask = nil
         preparationCancellation = nil
         if cancellation.isCancelled { previousAutomaticAttempt = nil }
@@ -172,6 +244,28 @@ final class GlucoseForecastMLTrainingCoordinator: @unchecked Sendable {
     private func updateStatus(_ status: String) {
         lock.lock()
         preparationStatus = status
+        preparationCoverage = ""
+        lock.unlock()
+        NotificationCenter.default.post(name: Self.statusDidChange, object: nil)
+    }
+
+    private func updatePreparationStatus(_ status: String,
+                                         cancellation: GlucoseForecastMLHistoryCancellation) {
+        lock.lock()
+        guard preparationInProgress, preparationCancellation === cancellation,
+              !cancellation.isCancelled else { lock.unlock(); return }
+        preparationStatus = status
+        lock.unlock()
+        NotificationCenter.default.post(name: Self.statusDidChange, object: nil)
+    }
+
+    private func updateCoverage(_ coverage: GlucoseForecastMLHistoryCoverage,
+                                cancellation: GlucoseForecastMLHistoryCancellation) {
+        lock.lock()
+        guard preparationInProgress, preparationCancellation === cancellation,
+              !cancellation.isCancelled else { lock.unlock(); return }
+        let counts = coverage.exampleCountsByHorizon
+        preparationCoverage = "\(coverage.usableDays) brugbare dage · +30: \(counts[30, default: 0]) · +60: \(counts[60, default: 0]) · +120: \(counts[120, default: 0]) eksempler"
         lock.unlock()
         NotificationCenter.default.post(name: Self.statusDidChange, object: nil)
     }

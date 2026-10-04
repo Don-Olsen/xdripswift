@@ -247,6 +247,11 @@ struct RootHomeLocalMetricPresentation {
     private var confirmed: TherapyMetricState?
     private var sourceSignature: String?
 
+    mutating func reset() {
+        confirmed = nil
+        sourceSignature = nil
+    }
+
     mutating func display(_ current: TherapyMetricState, in metric: RootHomeMetricState,
                           sourceSignature: String, isIOB: Bool, at date: Date) -> RootHomeMetricState {
         var result = metric
@@ -281,6 +286,76 @@ struct RootHomeLocalMetricPresentation {
     }
 }
 
+/// A Home-only pair of validated local values. The underlying therapy snapshot remains strict;
+/// this saved drawing is never supplied to forecasts, Watch, alarms or treatment calculations.
+struct RootHomeTherapyRefreshPresentation {
+    struct Confirmed {
+        let iob: RootHomeMetricState
+        let cob: RootHomeMetricState
+        let showsIOB: Bool
+        let showsCOB: Bool
+        let iobIsLocal: Bool
+        let cobIsLocal: Bool
+        let treatments: [TherapyTreatment]
+        let settings: TherapyModelSettings
+        let sourceSignature: String
+        let nonHealthRevision: Int
+        let calculatedAt: Date
+    }
+
+    private(set) var confirmed: Confirmed?
+    private var heldKey: String?
+
+    mutating func record(iob: RootHomeMetricState, cob: RootHomeMetricState,
+                         showsIOB: Bool, showsCOB: Bool, iobIsLocal: Bool, cobIsLocal: Bool,
+                         treatments: [TherapyTreatment], settings: TherapyModelSettings,
+                         sourceSignature: String, nonHealthRevision: Int, at date: Date) {
+        confirmed = Confirmed(iob: iob, cob: cob, showsIOB: showsIOB, showsCOB: showsCOB,
+            iobIsLocal: iobIsLocal, cobIsLocal: cobIsLocal, treatments: treatments, settings: settings,
+            sourceSignature: sourceSignature, nonHealthRevision: nonHealthRevision, calculatedAt: date)
+        heldKey = nil
+    }
+
+    mutating func retained(refresh: HealthTherapyRoutineRefreshState?, metricsReady: Bool,
+                           pendingCommit: HomeTreatmentCommitDisplayState?,
+                           sourceSignature: String, nonHealthRevision: Int, at date: Date) -> Confirmed? {
+        let key: String
+        if let refresh, !(refresh.allEnabledKindsCommitted && metricsReady),
+           confirmed?.nonHealthRevision == nonHealthRevision {
+            key = "health:\(refresh.generation)"
+        } else if let pendingCommit {
+            key = "commit:\(pendingCommit.generation)"
+        } else {
+            return nil
+        }
+        guard let confirmed, confirmed.sourceSignature == sourceSignature,
+              (heldKey == nil || heldKey == key) else { return nil }
+        heldKey = key
+        let iobState = confirmed.iobIsLocal
+            ? TherapyMetricsManager.localMetric(entries: confirmed.treatments, isIOB: true,
+                date: date, settings: confirmed.settings, currentDate: date, recentEntries: []) : nil
+        let cobState = confirmed.cobIsLocal
+            ? TherapyMetricsManager.localMetric(entries: confirmed.treatments, isIOB: false,
+                date: date, settings: confirmed.settings, currentDate: date, recentEntries: []) : nil
+        var iob = confirmed.iob
+        var cob = confirmed.cob
+        if let iobState { iob.value = iobState.formatted(isIOB: true, at: date) }
+        if let cobState { cob.value = cobState.formatted(isIOB: false, at: date) }
+        return Confirmed(iob: iob, cob: cob,
+            showsIOB: iobState?.isVisible(at: date) ?? confirmed.showsIOB,
+            showsCOB: cobState?.isVisible(at: date) ?? confirmed.showsCOB,
+            iobIsLocal: confirmed.iobIsLocal, cobIsLocal: confirmed.cobIsLocal,
+            treatments: confirmed.treatments, settings: confirmed.settings,
+            sourceSignature: confirmed.sourceSignature,
+            nonHealthRevision: confirmed.nonHealthRevision, calculatedAt: confirmed.calculatedAt)
+    }
+
+    mutating func clear() {
+        confirmed = nil
+        heldKey = nil
+    }
+}
+
 // MARK: - State Model
 
 /// Main state model for the SwiftUI home screen.
@@ -302,6 +377,7 @@ final class RootHomeStateModel: ObservableObject {
     private var bgPostProcessingManager: BgPostProcessingManager?
     private var localIOBPresentation = RootHomeLocalMetricPresentation()
     private var localCOBPresentation = RootHomeLocalMetricPresentation()
+    private var therapyRefreshPresentation = RootHomeTherapyRefreshPresentation()
 
     // MARK: - Configuration and Refresh
 
@@ -434,8 +510,18 @@ final class RootHomeStateModel: ObservableObject {
         // Capture the source identity before reading inputs. If a treatment save races with this
         // snapshot, its later notification will use a new signature and clear any old amount.
         let sourceSignature = historical ? "" : currentLocalTherapySourceSignature()
+        let configurationSignature = historical ? "" : currentLocalTherapySourceSignature(includeTreatmentRevision: false)
+        let nonHealthRevision = TherapyMetricsManager.shared.nonHealthTreatmentChangeRevision
+        let health = HealthKitTherapyImportManager.shared
+        let importerIncomplete = !historical && (health.localInputIsIncomplete(.insulin)
+            || health.localInputIsIncomplete(.carbohydrates))
+        let refresh = historical ? nil : health.routineRefreshState(at: date)
+        let pendingCommit = historical ? nil : TherapyMetricsManager.shared.pendingHomeTreatmentCommitState(at: date)
+        let uncommitted = !historical && TherapyMetricsManager.shared.hasUncommittedForecastInputChanges
         var metrics = TherapyMetricsManager.shared.snapshot(at: date, external: external, historical: historical)
-        if !historical {
+        let pairReady = !importerIncomplete && !uncommitted
+            && metrics.iob.reason != .readFailed && metrics.cob.reason != .readFailed
+        if !historical && !importerIncomplete && !uncommitted {
             metrics.iob = Self.retainingConfirmedLocalVisibility(metrics.iob, from: previous?.iob, at: date)
             metrics.cob = Self.retainingConfirmedLocalVisibility(metrics.cob, from: previous?.cob, at: date)
         }
@@ -449,17 +535,49 @@ final class RootHomeStateModel: ObservableObject {
             loop.iob.lastCalculatedAt = nil
             loop.cob.lastCalculatedAt = nil
         } else {
+            if let held = therapyRefreshPresentation.retained(refresh: refresh, metricsReady: pairReady,
+                    pendingCommit: pendingCommit, sourceSignature: configurationSignature,
+                    nonHealthRevision: nonHealthRevision, at: date) {
+                if held.iobIsLocal {
+                    loop.iob = held.iob
+                    loop.iob.valueColor = ConstantsAppColors.secondaryText
+                    loop.iob.lastCalculatedAt = held.calculatedAt
+                    loop.showsIOB = held.showsIOB
+                }
+                if held.cobIsLocal {
+                    loop.cob = held.cob
+                    loop.cob.valueColor = ConstantsAppColors.secondaryText
+                    loop.cob.lastCalculatedAt = held.calculatedAt
+                    loop.showsCOB = held.showsCOB
+                }
+                return
+            }
+            if importerIncomplete || uncommitted {
+                therapyRefreshPresentation.clear()
+                localIOBPresentation.reset()
+                localCOBPresentation.reset()
+            }
             loop.iob = localIOBPresentation.display(metrics.iob, in: loop.iob,
                 sourceSignature: sourceSignature, isIOB: true, at: date)
             loop.cob = localCOBPresentation.display(metrics.cob, in: loop.cob,
                 sourceSignature: sourceSignature, isIOB: false, at: date)
+            if pairReady,
+               let treatments = TherapyMetricsManager.shared.completeLocalTreatmentsForHome(at: date) {
+                therapyRefreshPresentation.record(iob: loop.iob, cob: loop.cob,
+                    showsIOB: loop.showsIOB, showsCOB: loop.showsCOB,
+                    iobIsLocal: metrics.iob.source == .local,
+                    cobIsLocal: metrics.cob.source == .local,
+                    treatments: treatments, settings: TherapyModelSettings(defaults: .standard),
+                    sourceSignature: configurationSignature, nonHealthRevision: nonHealthRevision,
+                    at: date)
+            }
         }
     }
 
-    func currentLocalTherapySourceSignature() -> String {
+    func currentLocalTherapySourceSignature(includeTreatmentRevision: Bool = true) -> String {
         let policy = UserDefaults.standard.dataFlowPolicy
         let health = HealthKitTherapyImportManager.shared
-        return [
+        var components = [
             String(describing: policy.isMaster),
             String(describing: policy.therapyDataSourceSelection.rawValue),
             String(describing: policy.therapyDataSource.rawValue),
@@ -468,9 +586,12 @@ final class RootHomeStateModel: ObservableObject {
             String(describing: health.isEnabled(.insulin)),
             health.selectedSource(.insulin)?.bundleIdentifier ?? "",
             String(describing: health.isEnabled(.carbohydrates)),
-            health.selectedSource(.carbohydrates)?.bundleIdentifier ?? "",
-            String(TherapyMetricsManager.shared.treatmentChangeRevision)
-        ].joined(separator: "|")
+            health.selectedSource(.carbohydrates)?.bundleIdentifier ?? ""
+        ]
+        if includeTreatmentRevision {
+            components.append(String(TherapyMetricsManager.shared.treatmentChangeRevision))
+        }
+        return components.joined(separator: "|")
     }
 
     /// A transient local cache miss must not collapse an already visible Home strip. Retain only

@@ -94,7 +94,7 @@
 	<key>NSContactsUsageDescription</key>
 	<string>To update the contact photo with an image showing the current BG values</string>
 	<key>NSHealthShareUsageDescription</key>
-	<string>Read bolus insulin doses and carbohydrate entries from the Apple Health sources you choose to calculate IOB and COB in xDrip.</string>
+	<string>xDrip læser blodsukkerhistorik fra Sundhed til lokal træning af prognosen samt bolusinsulin og kulhydrater fra dine valgte kilder til IOB og COB. Oplysningerne sendes ikke ud af telefonen af prognosefunktionen.</string>
 	<key>NSHealthUpdateUsageDescription</key>
 	<string>Store bloodglucose readings</string>
 	<key>NSSupportsLiveActivities</key>
