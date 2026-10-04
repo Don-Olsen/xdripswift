@@ -8,6 +8,37 @@
 - Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
 <!-- testflight-7.1.1-4295:end -->
 
+## Kandidat efter 4295 — penberegner og måltidsplaner
+
+Beregnerens skærm samler kulhydrat, madtype, spisetid og en eksplicit kopierbar
+insulinanbefaling. Regnestykket vises fra ét fast beregningssnapshot i ⓘ.
+Log registrerer de faktisk indtastede mængder uafhængigt af nye CGM-målinger
+og ændret IOB/COB; insulin uden et aktuelt kontrolleret forslag kræver særskilt
+bekræftelse. Den eksisterende journal og idempotens beskytter mod dobbelt
+registrering, og lagringen kontrollerer pen-trin og maksimum igen. Den
+eksisterende dosisformel og dens sikkerhedsgrænser er uændrede, bortset fra
+de udtrykkeligt ønskede planlagte nye kulhydrater, 🍕-deling på planer og
+eksplicit valg af konkret CGM-værdi uden trend.
+
+Planlagte måltider har nu stabile lokale koblinger og engangsnotifikationer
+for spisetid, eventuel opfølgning og senere 🍕-revurdering. Bekræftelse kræver
+faktisk spisetid; annullering bevarer en allerede registreret bolus. En
+fejlet påmindelse ændrer ikke en verificeret behandlingsregistrering.
+Automatiske beregninger ændrer aldrig de indtastede mængder. Manuel
+glukose eller eksplicit valgt CGM uden trend ændrer ikke sensorhistorik,
+prognosemotor, alarmer eller ML.
+
+Den forberedende lokale `release-test` den 4. oktober bestod 1.346/1.346
+XCTest-tests, 157 Python-tests, de syntetiske Watch-kontroller og begge
+simulatorbuilds. En separat usigneret iPhoneOS-build frembragte et arm64-
+program med Xcode som også byggede den indlejrede Watch-app. En efterfølgende
+isoleringsoprydning i Swift-parametre ændrede ikke funktionen, men kræver
+friske kontroller på det præcise release-checkpoint; disse registreres af
+releaseproceduren. Simulatorbilleder gemmes uden for Git. Koden er ikke
+verificeret på en fysisk iPhone; faktisk notifikationslevering og brug i
+hverdagen kan ikke udledes af simulatortests. Ingen klinisk præcision eller
+sikker dosis er dokumenteret.
+
 De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
 
 <!-- testflight-7.1.1-4294:start -->

@@ -18,6 +18,7 @@ struct TreatmentsView: View {
     @State private var treatmentEditorState: TreatmentEditorState?
     @State private var showsPenCalculator = false
     @State private var calculatorReminderMealUUID: String?
+    @State private var mealNotice: String?
 
     // MARK: - initialization
 
@@ -76,13 +77,38 @@ struct TreatmentsView: View {
         .onReceive(NotificationCenter.default.publisher(for: PizzaSplitReminder.openRequested)) { _ in
             openRequestedPizzaRecalculation()
         }
+        .onReceive(NotificationCenter.default.publisher(for: MealReminderIssueCenter.reported)) { notification in
+            mealNotice = notification.object as? String
+        }
+        .alert("Måltidsplan", isPresented: Binding(
+            get: { mealNotice != nil },
+            set: { if !$0 { mealNotice = nil } }
+        )) {
+            Button("OK") { mealNotice = nil }
+        } message: {
+            Text(mealNotice ?? "")
+        }
     }
 
     private func openRequestedPlannedMeal() {
         guard let uuid = PlannedMealReminder.pendingOpenUUID else { return }
+        let status = MealPlanReminderCoordinator.status(coreDataManager: viewModel.coreDataManager, uuid: uuid)
+        switch status {
+        case .planned: break
+        case .confirmed: mealNotice = "Måltidet er allerede bekræftet."
+        case .cancelled: mealNotice = "Måltidsplanen er annulleret."
+        case .deleted: mealNotice = "Måltidsplanen er slettet."
+        case .unavailable: mealNotice = "Måltidsstatus kunne ikke læses. Prøv igen i behandlingshistorikken."
+        }
+        guard case .planned = status else {
+            PlannedMealReminder.clearPendingOpenUUID(uuid)
+            return
+        }
         viewModel.reloadTreatments()
         if let meal = viewModel.plannedMealSnapshot(uuid: uuid) {
             treatmentEditorState = .edit(meal)
+        } else {
+            mealNotice = "Måltidsplanen kunne ikke åbnes. Kontrollér behandlingshistorikken."
         }
         PlannedMealReminder.clearPendingOpenUUID(uuid)
     }

@@ -121,6 +121,8 @@ import OSLog
         allTreatments = treatments.map { TreatmentSnapshot(treatmentEntry: $0) }
 
         applyFilters()
+        MealPlanReminderCoordinator.reconcile(coreDataManager: coreDataManager,
+            journal: localSaveJournal, onIssue: MealReminderIssueCenter.report)
     }
 
     func plannedMealSnapshot(uuid: String) -> TreatmentSnapshot? {
@@ -214,7 +216,16 @@ import OSLog
             return false
         }
         deletionFailureMessage = nil
-        if let uuid = treatmentEntry.localTreatmentUUID { PlannedMealReminder.cancel(uuid: uuid) }
+        if let uuid = treatmentEntry.localTreatmentUUID {
+            if treatmentEntry.treatmentType == .Carbs {
+                let warning = MealPlanReminderCoordinator.refresh(coreDataManager: coreDataManager,
+                    mealUUID: uuid, onIssue: MealReminderIssueCenter.report)
+                if let warning { MealReminderIssueCenter.report(warning) }
+            } else if treatmentEntry.treatmentType == .Insulin {
+                MealPlanReminderCoordinator.refreshLinkedMeals(coreDataManager: coreDataManager,
+                    bolusUUID: uuid, onIssue: MealReminderIssueCenter.report)
+            }
+        }
 
         // Swipe deletion and editor deletion use the same typed fact. Emit it only after the local
         // save succeeds, and keep all treatment values, notes and identifiers in private app data.

@@ -12,6 +12,39 @@ import CoreData
 @testable import xdrip
 
 final class TherapyMetricsTests: XCTestCase {
+    func testPenProfileDanishDraftPreservesQuarterStepAndPreciseConfirmedValues() {
+        var profile = PenDoseProfile.prefilledUnconfirmed
+        profile.settings.penStepUnits = 0.25
+        profile.settings.targetsMmol[0].value = 6.123456789012345
+        profile.settings.targetsMmol[1].value = 7.750000000000001
+        profile.settings.correctionMmolPerUnit = 0.12345678901234568
+        profile.settings.carbohydrateRatios[1].value = 5.123456789012345
+        XCTAssertTrue(profile.confirm())
+
+        let draft = PenDoseProfileDraft(profile: profile)
+        XCTAssertEqual(draft.step, "0,25")
+        XCTAssertEqual(draft.targetDay, "6,123456789012345")
+        XCTAssertEqual(draft.targetNight, "7,750000000000001")
+        XCTAssertEqual(draft.correction, "0,12345678901234568")
+        XCTAssertEqual(draft.settings, profile.settings,
+                       "Opening and confirming without editing must not alter any profile value")
+        XCTAssertEqual(draft.settings, profile.confirmedSettings)
+    }
+
+    func testPenDoseDanishDisplayAndCopyKeepQuarterUnitsAndUnknownValuesDistinct() {
+        XCTAssertEqual(PenDoseDisplayFormatter.insulinInput(0), "0,0")
+        XCTAssertEqual(PenDoseDisplayFormatter.insulinInput(2), "2,0")
+        XCTAssertEqual(PenDoseDisplayFormatter.insulinInput(0.25), "0,25")
+        XCTAssertEqual(PenDoseDisplayFormatter.insulinInput(2.75), "2,75")
+        XCTAssertEqual(PenDoseDisplayFormatter.insulin(0.25), "0,25")
+        XCTAssertEqual(PenDoseDisplayFormatter.carbs(32.5), "32,5")
+        XCTAssertEqual(PenDoseDisplayFormatter.glucose(
+            7.2 * PenBolusCalculator.mgdlPerMmol, mgdl: false), "7,2 mmol/L")
+        XCTAssertEqual(PenDoseDisplayFormatter.glucose(100, mgdl: true), "100 mg/dL")
+        XCTAssertEqual(PenDoseDisplayFormatter.number(.nan, maxDecimals: 3), "—")
+        XCTAssertEqual(PenDoseDisplayFormatter.insulinInput(.infinity), "")
+    }
+
     func testV34TreatmentStoreMigratesToV35WithLegacyMealDefaults() throws {
         let bundle = Bundle(for: TreatmentEntry.self)
         let modelDirectory = try XCTUnwrap(bundle.url(
@@ -1303,16 +1336,100 @@ final class PenBolusCalculatorTests: XCTestCase {
         XCTAssertTrue(manual.trendWasIntentionallyZero)
         XCTAssertEqual(manual.lines?.trendUnits, 0)
         XCTAssertNotNil(manual.suggestedUnits)
+        XCTAssertNil(manual.glucoseSensorID)
         if case .forecastUnchecked = manual.safety {} else { XCTFail("manual requires warning") }
         let old = PenBolusCalculator.calculate(snapshot: snapshot, profile: profile(),
-            glucose: .confirmedStale(valueMgdl: 100, measuredAt: now.addingTimeInterval(-3600)),
+            glucose: .confirmedStale(valueMgdl: 100, measuredAt: now.addingTimeInterval(-3600),
+                sensorID: "sensor-a"),
             newCarbs: .alreadyRecorded, safetyForecast: nil, at: now)
         XCTAssertTrue(old.trendWasIntentionallyZero)
+        XCTAssertEqual(old.glucoseSensorID, "sensor-a")
         XCTAssertNotNil(old.suggestedUnits)
         let current = PenBolusCalculator.calculate(snapshot: snapshot, profile: profile(),
             glucose: .currentCGM, newCarbs: .alreadyRecorded,
             safetyForecast: nil, at: now)
         XCTAssertEqual(current.unavailableReason, .missingGlucose)
+    }
+
+    func testPinnedCGMDoesNotMoveToNewerReadingWithoutTrend() throws {
+        let readings = glucose()
+        let pinned = readings[2] // Twenty minutes old; newer readings remain in the snapshot.
+        let pinnedSensorID = try XCTUnwrap(pinned.sensorID)
+        let newer = try XCTUnwrap(readings.last)
+        let incompleteTrend = [pinned, newer]
+        XCTAssertNil(PenBolusCalculator.twentyMinuteChange(incompleteTrend, at: now))
+        let irrelevantForecast = GlucoseForecastResult(points: [
+            GlucoseForecastPoint(date: now, glucoseMgdl: pinned.glucoseMgdl),
+            GlucoseForecastPoint(date: now.addingTimeInterval(120 * 60), glucoseMgdl: 50)
+        ], referenceDate: now, reason: nil, referenceSensorID: pinnedSensorID)
+        let calculated = PenBolusCalculator.calculate(snapshot: try snapshot(glucose: incompleteTrend),
+            profile: profile(),
+            glucose: .confirmedStale(valueMgdl: pinned.glucoseMgdl, measuredAt: pinned.date,
+                sensorID: pinnedSensorID),
+            newCarbs: .alreadyRecorded, safetyForecast: irrelevantForecast, at: now)
+        XCTAssertEqual(calculated.glucoseMgdl, pinned.glucoseMgdl)
+        XCTAssertEqual(calculated.glucoseMeasuredAt, pinned.date)
+        XCTAssertEqual(calculated.glucoseSensorID, pinned.sensorID)
+        XCTAssertNotEqual(calculated.glucoseMgdl, readings.last?.glucoseMgdl)
+        XCTAssertTrue(calculated.trendWasIntentionallyZero)
+        XCTAssertEqual(calculated.lines?.trendUnits, 0)
+        XCTAssertNotNil(calculated.suggestedUnits)
+        if case .forecastUnchecked = calculated.safety {} else {
+            XCTFail("pinned CGM must not use a forecast safety result")
+        }
+
+        // A limited snapshot may no longer contain the explicitly selected
+        // sample; a newer same-sensor reading must not replace it implicitly.
+        let outsideWindow = PenBolusCalculator.calculate(snapshot: try snapshot(glucose: [newer]),
+            profile: profile(),
+            glucose: .confirmedStale(valueMgdl: pinned.glucoseMgdl, measuredAt: pinned.date,
+                sensorID: pinnedSensorID),
+            newCarbs: .alreadyRecorded, safetyForecast: nil, at: now)
+        XCTAssertEqual(outsideWindow.glucoseMgdl, pinned.glucoseMgdl)
+        XCTAssertEqual(outsideWindow.glucoseMeasuredAt, pinned.date)
+        XCTAssertNotNil(outsideWindow.suggestedUnits)
+    }
+
+    func testPinnedCGMRejectsChangedSampleOrSensorWithoutFallback() throws {
+        let readings = glucose()
+        let pinned = readings[2]
+        let input = try snapshot(glucose: readings)
+        let changedValue = PenBolusCalculator.calculate(snapshot: input, profile: profile(),
+            glucose: .confirmedStale(valueMgdl: pinned.glucoseMgdl + 1,
+                measuredAt: pinned.date, sensorID: "sensor-a"),
+            newCarbs: .alreadyRecorded, safetyForecast: nil, at: now)
+        XCTAssertEqual(changedValue.unavailableReason, .invalidGlucose)
+        XCTAssertNil(changedValue.suggestedUnits)
+
+        let differentSensor = readings.map { sample in
+            GlucoseForecastSample(date: sample.date, glucoseMgdl: sample.glucoseMgdl,
+                sensorID: "sensor-b")
+        }
+        let switched = PenBolusCalculator.calculate(snapshot: try snapshot(glucose: differentSensor),
+            profile: profile(),
+            glucose: .confirmedStale(valueMgdl: pinned.glucoseMgdl,
+                measuredAt: pinned.date, sensorID: "sensor-a"),
+            newCarbs: .alreadyRecorded, safetyForecast: nil, at: now)
+        XCTAssertEqual(switched.unavailableReason, .invalidGlucose)
+        XCTAssertNil(switched.suggestedUnits)
+
+        let emptyID = PenBolusCalculator.calculate(snapshot: input, profile: profile(),
+            glucose: .confirmedStale(valueMgdl: pinned.glucoseMgdl,
+                measuredAt: pinned.date, sensorID: ""),
+            newCarbs: .alreadyRecorded, safetyForecast: nil, at: now)
+        XCTAssertEqual(emptyID.unavailableReason, .invalidGlucose)
+    }
+
+    func testPinnedLowGlucoseStillBlocksInsulinWithoutForecast() throws {
+        let pinnedLow = PenBolusCalculator.calculate(snapshot: try snapshot(glucose: []),
+            profile: profile(),
+            glucose: .confirmedStale(valueMgdl: 53,
+                measuredAt: now.addingTimeInterval(-20 * 60), sensorID: "sensor-a"),
+            newCarbs: .unrecorded(grams: 30), safetyForecast: nil, at: now)
+        XCTAssertNil(pinnedLow.suggestedUnits)
+        if case .blockedCurrentLow = pinnedLow.safety {} else {
+            XCTFail("pinning must not bypass the current severe-low guard")
+        }
     }
 
     func testExistingMealIsNotAddedAgainAndDoseFloorsAtCap() throws {
@@ -1453,5 +1570,146 @@ final class PenBolusCalculatorTests: XCTestCase {
         XCTAssertNotNil(result.value(atMinutes: 120))
         XCTAssertEqual(defaults.glucoseForecastHorizonMinutes, 0,
             "Home chart setting must not govern the safety engine")
+    }
+}
+
+private actor PenDoseSnapshotFeed {
+    private var samples: [GlucoseForecastSample]
+
+    init(samples: [GlucoseForecastSample]) { self.samples = samples }
+
+    func replace(with samples: [GlucoseForecastSample]) { self.samples = samples }
+
+    func snapshot(at date: Date) -> Result<PenDoseInputSnapshot, PenDoseUnavailableReason> {
+        PenDoseInputSnapshot.make(capturedAt: date, glucose: samples, treatments: [],
+            therapySettings: TherapyModelSettings(), treatmentRevision: 1)
+    }
+}
+
+private actor DelayedPenDoseSnapshotFeed {
+    private let samples: [GlucoseForecastSample]
+    private var calls = 0
+    private var firstRequest: CheckedContinuation<Void, Never>?
+    private var enteredWaiter: CheckedContinuation<Void, Never>?
+
+    init(samples: [GlucoseForecastSample]) { self.samples = samples }
+
+    func snapshot(at date: Date) async -> Result<PenDoseInputSnapshot, PenDoseUnavailableReason> {
+        calls += 1
+        if calls == 1 {
+            await withCheckedContinuation { continuation in
+                firstRequest = continuation
+                enteredWaiter?.resume()
+                enteredWaiter = nil
+            }
+        }
+        return PenDoseInputSnapshot.make(capturedAt: date, glucose: samples, treatments: [],
+            therapySettings: TherapyModelSettings(), treatmentRevision: 1)
+    }
+
+    func waitForFirstRequest() async {
+        if calls > 0 { return }
+        await withCheckedContinuation { enteredWaiter = $0 }
+    }
+
+    func releaseFirstRequest() {
+        firstRequest?.resume()
+        firstRequest = nil
+    }
+}
+
+@MainActor final class PenDoseCalculatorViewModelTests: XCTestCase {
+    private func confirmedProfile() -> PenDoseProfile {
+        var result = PenDoseProfile.prefilledUnconfirmed
+        XCTAssertTrue(result.confirm())
+        return result
+    }
+
+    private func sample(_ minutesAgo: Double, value: Double,
+                        sensorID: String = "sensor-a", at now: Date) -> GlucoseForecastSample {
+        GlucoseForecastSample(date: now.addingTimeInterval(-minutesAgo * 60),
+            glucoseMgdl: value, sensorID: sensorID)
+    }
+
+    func testExplicitCGMPinSurvivesNewReadingWithoutTrendAndResetsAfterValidTrend() async throws {
+        let now = Date()
+        let initial = sample(5, value: 120, at: now)
+        let feed = PenDoseSnapshotFeed(samples: [initial])
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let profile = confirmedProfile()
+        let viewModel = PenDoseCalculatorViewModel(coreDataManager: core,
+            profileProvider: { profile }, sourceReadyOverride: { true },
+            snapshotProvider: { date, _ in await feed.snapshot(at: date) })
+        await viewModel.calculate()
+        XCTAssertEqual(viewModel.calculation?.unavailableReason, .missingTwentyMinuteTrend)
+
+        viewModel.selectDisplayedCGMWithoutTrend()
+        await viewModel.calculate()
+        XCTAssertEqual(viewModel.glucoseChoice, .confirmStaleCGM)
+        XCTAssertEqual(viewModel.calculation?.glucoseMgdl, initial.glucoseMgdl)
+        XCTAssertEqual(viewModel.calculation?.glucoseMeasuredAt, initial.date)
+        XCTAssertEqual(viewModel.calculation?.glucoseSensorID, initial.sensorID)
+        XCTAssertTrue(viewModel.calculation?.trendWasIntentionallyZero == true)
+
+        let newWithoutTrend = sample(1, value: 145, at: now)
+        await feed.replace(with: [initial, newWithoutTrend])
+        await viewModel.calculate()
+        XCTAssertEqual(viewModel.glucoseChoice, .confirmStaleCGM)
+        XCTAssertEqual(viewModel.displayedGlucoseValueMgdl, initial.glucoseMgdl)
+        XCTAssertEqual(viewModel.displayedGlucoseDate, initial.date)
+        XCTAssertEqual(viewModel.calculation?.glucoseMgdl, initial.glucoseMgdl)
+
+        let continuous = [21.0, 16, 11, 6, 1].map { minutes in
+            sample(minutes, value: 145 - minutes, at: now)
+        }
+        await feed.replace(with: continuous)
+        await viewModel.calculate()
+        XCTAssertEqual(viewModel.glucoseChoice, .currentCGM)
+        await viewModel.calculate()
+        XCTAssertEqual(viewModel.calculation?.glucoseMgdl, continuous.last?.glucoseMgdl)
+        XCTAssertFalse(viewModel.calculation?.trendWasIntentionallyZero ?? true)
+    }
+
+    func testOlderAsyncCalculationCannotOverwriteNewerChangedDraft() async throws {
+        let now = Date()
+        let readings = [21.0, 16, 11, 6, 1].map { minutes in
+            sample(minutes, value: 140 - minutes, at: now)
+        }
+        let feed = DelayedPenDoseSnapshotFeed(samples: readings)
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let profile = confirmedProfile()
+        let viewModel = PenDoseCalculatorViewModel(coreDataManager: core,
+            profileProvider: { profile }, sourceReadyOverride: { true },
+            snapshotProvider: { date, _ in await feed.snapshot(at: date) })
+        viewModel.carbohydratesText = "10"
+        let older = Task { await viewModel.calculate() }
+        await feed.waitForFirstRequest()
+        viewModel.carbohydratesText = "20"
+        await viewModel.calculate()
+        XCTAssertEqual(viewModel.calculationDetails?.newCarbsGrams, 20)
+        await feed.releaseFirstRequest()
+        await older.value
+        XCTAssertEqual(viewModel.calculationDetails?.newCarbsGrams, 20)
+        XCTAssertFalse(viewModel.isCalculating)
+    }
+
+    func testClockMinuteBoundaryInvalidatesSuggestionWithoutNewSensorEvent() async throws {
+        let now = Date()
+        let feed = PenDoseSnapshotFeed(samples: [sample(5, value: 120, at: now)])
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let profile = confirmedProfile()
+        let viewModel = PenDoseCalculatorViewModel(coreDataManager: core,
+            profileProvider: { profile }, sourceReadyOverride: { true },
+            snapshotProvider: { date, _ in await feed.snapshot(at: date) })
+        viewModel.start()
+        await viewModel.calculate()
+        viewModel.selectDisplayedCGMWithoutTrend()
+        await viewModel.calculate()
+        XCTAssertTrue(viewModel.isReviewCurrent)
+        viewModel.refreshClock(now: now.addingTimeInterval(65))
+        XCTAssertTrue(viewModel.isCalculating,
+            "The existing 15-second clock must invalidate a dose at the next minute boundary")
+        XCTAssertFalse(viewModel.isReviewCurrent)
+        viewModel.stop()
     }
 }

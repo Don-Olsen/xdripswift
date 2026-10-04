@@ -377,6 +377,38 @@ the recorded ML model.
 
 ## Validation boundary
 
+### Pen calculator and planned meals after 4295
+
+The iPhone pen calculator recalculates its existing suggestion when its inputs change and
+on the existing screen clock as treatment effects and the time-based profile age. A
+suggestion is copied into the insulin field only by an explicit tap. Logging records the
+user-entered insulin and carbohydrate amounts independently of whether a current
+suggestion exists; insulin under a warning or without a completed calculation needs an
+explicit confirmation. The local write-ahead journal binds each attempt's UUIDs to its
+amounts and timestamps, so an uncertain save cannot be retried as a different dose.
+The calculator does not deliver insulin.
+
+New, unrecorded carbohydrates contribute to the existing dose calculation even when
+the meal is planned for later. They do not become consumed COB, ML input or a safety
+forecast treatment until the user confirms eating. Insulin logged with a plan is an
+actual bolus at registration time and continues to contribute to IOB if the plan is
+cancelled. A planned 🍕 meal uses the already configured percentage only for the
+suggestion; after meal confirmation a new calculation uses the meal through COB and
+does not add the original grams again. Meal linkage, the selected 🍕 reminder interval
+and stable one-time notification identities are kept in local Application Support
+metadata; Core Data remains the treatment source. Notification scheduling failures
+are reported separately from a verified treatment save. Scheduling is not proof of
+delivery or of the person seeing a reminder.
+
+An explicit selection can use a particular CGM reading without a reliable 20-minute
+trend, or a manual glucose value, with trend contribution zero and without the
+existing forecast check. This does not make unknown IOB/COB equal zero. The selected
+reading keeps its original measurement time and sensor identity. The pinned-CGM
+choice resets when a newer fresh reading has a usable trend; a manual entry remains
+selected until the user chooses CGM or closes the calculator.
+This fallback is local to the calculator and does not change stored CGM readings,
+forecast history, ML or alarms. It does not establish that a dose is clinically safe.
+
 Unit tests cover model curves, timing, units, stale and gapped data, treatment selection, source ownership and missing settings. Real-world accuracy must be assessed at +30, +60 and +120 minutes separately against measured glucose, an unchanged-value baseline and a simple short trend. Inputs must be frozen at prediction time; later meals, insulin, corrections and changed settings must be reported separately. Historical xDrip treatment rows do not consistently retain a “known to the app at this time” timestamp, so a retrospective replay cannot prove that it avoided future information. Prospective snapshots or an external dataset with that provenance are needed before reporting comparative accuracy.
 
 Future extensions may evaluate proven profile provenance, activity, heart rate, sleep and medication effects. The Watch workout that keeps the sensor connection alive must not be interpreted as exercise.

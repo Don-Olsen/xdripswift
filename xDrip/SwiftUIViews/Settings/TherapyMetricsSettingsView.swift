@@ -153,6 +153,14 @@ struct PenDoseSettingsView: View {
     @State private var percentageText = String(PizzaSplitSettings.load().percentageNow)
     @State private var reminderText = String(PizzaSplitSettings.load().reminderMinutes)
     @State private var statusMessage: String?
+    @FocusState private var fieldIsFocused: Bool
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+
+    private var hasUnconfirmedChanges: Bool { draft.settings != profile.settings }
+    private var pizzaInputIsValid: Bool {
+        guard let percentage = Int(percentageText), let minutes = Int(reminderText) else { return false }
+        return (10...100).contains(percentage) && (15...240).contains(minutes)
+    }
 
     var body: some View {
         Form {
@@ -166,27 +174,36 @@ struct PenDoseSettingsView: View {
                 }
             }
             Section {
-                Label(profile.isConfirmed ? "Profil bekræftet" : "Profilen skal bekræftes",
-                      systemImage: profile.isConfirmed ? "checkmark.circle.fill" : "exclamationmark.triangle")
-                    .foregroundStyle(profile.isConfirmed ? .green : .orange)
+                Label(profile.isConfirmed && !hasUnconfirmedChanges ? "Profil bekræftet" : "Profilen skal bekræftes",
+                      systemImage: profile.isConfirmed && !hasUnconfirmedChanges ? "checkmark.circle.fill" : "exclamationmark.triangle")
+                    .foregroundStyle(profile.isConfirmed && !hasUnconfirmedChanges ? .green : .orange)
                 Text("Tallene er forudfyldt fra dine oplyste mySugr-værdier. Kontrollér dem, før beregneren bruges.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
-            Section("Kulhydratfaktor · g/E") {
+            Section {
                 decimalField("00.00–04.30", text: $draft.ratioNight)
                 decimalField("04.30–09.30", text: $draft.ratioMorning)
                 decimalField("09.30–24.00", text: $draft.ratioDay)
+            } header: {
+                Label("Kulhydratfaktor · g/E", systemImage: "fork.knife")
+            } footer: {
+                Text("Gram kulhydrat pr. enhed insulin. Tidspunkterne følger den lokale tid.")
             }
-            Section("Målblodsukker · mmol/L") {
+            Section {
                 decimalField("00.00–21.30", text: $draft.targetDay)
                 decimalField("21.30–24.00", text: $draft.targetNight)
+            } header: {
+                Label("Målblodsukker · mmol/L", systemImage: "target")
             }
             Section("Pen og korrektion") {
                 decimalField("Korrektionsfaktor · mmol/L pr. E", text: $draft.correction)
                 decimalField("Pennens trin · E", text: $draft.step)
                 decimalField("Maksimalt forslag · E", text: $draft.maximum)
-                Button("Jeg har kontrolleret og bekræftet profilen") {
+            }
+            Section {
+                Button {
+                    fieldIsFocused = false
                     guard let settings = draft.settings else {
                         statusMessage = "Kontrollér alle tal og prøv igen."
                         return
@@ -196,9 +213,20 @@ struct PenDoseSettingsView: View {
                         statusMessage = "Profilen kunne ikke gemmes. Beregneren forbliver utilgængelig."
                         return
                     }
+                    NotificationCenter.default.post(name: .penDoseSettingsChanged, object: nil)
                     statusMessage = "Profilen er gemt og bekræftet."
+                } label: {
+                    Label("Bekræft profil", systemImage: "checkmark.shield")
+                        .frame(maxWidth: .infinity).padding(.vertical, 6)
                 }
+                .buttonStyle(.borderedProminent)
                 .disabled(draft.settings == nil)
+                if draft.settings == nil {
+                    Text("Kontrollér alle profilens tal, før du bekræfter.")
+                        .font(.footnote).foregroundStyle(.orange)
+                }
+            } footer: {
+                Text("Ved at bekræfte gemmer du tallene som din doseringsprofil. De ændrer ikke prognosens separate indstillinger.")
             }
             Section("🍕 Fed/langsom mad") {
                 Toggle("Del forslaget og mind mig om en ny beregning", isOn: $pizza.isEnabled)
@@ -206,6 +234,7 @@ struct PenDoseSettingsView: View {
                     decimalField("Andel nu · %", text: $percentageText)
                     decimalField("Påmindelse efter · minutter", text: $reminderText)
                     Button("Gem indstillinger") {
+                        fieldIsFocused = false
                         guard let percent = Int(percentageText), let delay = Int(reminderText) else {
                             statusMessage = "Vælg en andel og et antal minutter."
                             return
@@ -213,10 +242,16 @@ struct PenDoseSettingsView: View {
                         pizza.percentageNow = percent
                         pizza.reminderMinutes = delay
                         if pizza.persist() {
+                            NotificationCenter.default.post(name: .penDoseSettingsChanged, object: nil)
                             statusMessage = "Indstillingerne er gemt."
                         } else {
                             statusMessage = "Andelen skal være 10–100 %, og påmindelsen 15–240 minutter."
                         }
+                    }
+                    .disabled(!pizzaInputIsValid)
+                    if !pizzaInputIsValid {
+                        Text("Vælg 10–100 % og 15–240 minutter.")
+                            .font(.footnote).foregroundStyle(.orange)
                     }
                 }
                 Text("Påmindelsen lover ingen restdosis. Den åbner en helt ny beregning med aktuelle data.")
@@ -227,21 +262,89 @@ struct PenDoseSettingsView: View {
                 Section { Text(statusMessage).foregroundStyle(.secondary) }
             }
         }
-        .navigationTitle("Bolusberegner")
+        .navigationTitle("Doseringsprofil")
+        .navigationBarTitleDisplayMode(.inline)
+        .scrollDismissesKeyboard(.interactively)
+        .toolbar {
+            ToolbarItemGroup(placement: .keyboard) {
+                Spacer()
+                Button("Færdig") { fieldIsFocused = false }
+            }
+        }
         .onChange(of: pizza.isEnabled) { enabled in
             var changed = pizza
             changed.isEnabled = enabled
-            if changed.persist() { pizza = changed }
+            if changed.persist() {
+                pizza = changed
+                NotificationCenter.default.post(name: .penDoseSettingsChanged, object: nil)
+            }
         }
     }
 
     private func decimalField(_ title: String, text: Binding<String>) -> some View {
-        LabeledContent(title) {
-            TextField("Tal", text: text)
-                .keyboardType(.decimalPad)
-                .multilineTextAlignment(.trailing)
-                .frame(maxWidth: 85)
+        Group {
+            if dynamicTypeSize.isAccessibilitySize {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(title)
+                    decimalInput(title, text: text)
+                }
+            } else {
+                HStack(alignment: .firstTextBaseline, spacing: 12) {
+                    Text(title)
+                    Spacer(minLength: 8)
+                    decimalInput(title, text: text)
+                        .multilineTextAlignment(.trailing)
+                        .frame(minWidth: 70, maxWidth: 110)
+                }
+            }
         }
+    }
+
+    private func decimalInput(_ title: String, text: Binding<String>) -> some View {
+        TextField("Tal", text: text)
+            .keyboardType(.decimalPad)
+            .monospacedDigit()
+            .focused($fieldIsFocused)
+            .accessibilityLabel(title)
+    }
+}
+
+extension Notification.Name {
+    static let penDoseSettingsChanged = Notification.Name("xdrip.penDose.settingsChanged")
+}
+
+/// Danish display only. Parsing and calculator precision remain independent of presentation.
+enum PenDoseDisplayFormatter {
+    static func insulin(_ value: Double) -> String { number(value, maxDecimals: 3) }
+    static func carbs(_ value: Double) -> String { number(value, maxDecimals: 3) }
+
+    /// Preserve every valid profile value when opening and saving without an edit.
+    static func profileInput(_ value: Double) -> String {
+        guard value.isFinite else { return "" }
+        return value.formatted(.number.locale(Locale(identifier: "da_DK"))
+            .precision(.fractionLength(0...17)).grouping(.never))
+    }
+
+    static func insulinInput(_ value: Double) -> String {
+        guard value.isFinite else { return "" }
+        let text = number(value, maxDecimals: 15)
+        return text.contains(",") ? text : text + ",0"
+    }
+
+    static func glucose(_ valueMgdl: Double, mgdl: Bool) -> String {
+        let value = mgdl ? valueMgdl : valueMgdl / PenBolusCalculator.mgdlPerMmol
+        return "\(number(value, maxDecimals: mgdl ? 0 : 1)) \(mgdl ? "mg/dL" : "mmol/L")"
+    }
+
+    static func number(_ value: Double, maxDecimals: Int) -> String {
+        guard value.isFinite else { return "—" }
+        let formatter = NumberFormatter()
+        formatter.locale = Locale(identifier: "da_DK")
+        formatter.numberStyle = .decimal
+        formatter.usesGroupingSeparator = false
+        formatter.minimumFractionDigits = 0
+        formatter.maximumFractionDigits = max(0, maxDecimals)
+        return formatter.string(from: NSNumber(value: value)) ?? "—"
     }
 }
 
@@ -297,7 +400,9 @@ struct PenDoseProfileDraft {
         return result.isValid ? result : nil
     }
 
-    private static func text(_ number: Double) -> String { number.stringWithoutTrailingZeroes }
+    private static func text(_ number: Double) -> String {
+        PenDoseDisplayFormatter.profileInput(number)
+    }
     private static func number(_ text: String) -> Double? {
         let normalized = text.trimmingCharacters(in: .whitespacesAndNewlines)
             .replacingOccurrences(of: ",", with: ".")

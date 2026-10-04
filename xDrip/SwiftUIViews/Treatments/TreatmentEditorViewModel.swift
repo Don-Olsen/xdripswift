@@ -43,7 +43,9 @@ import UserNotifications
     private let originalTreatment: TreatmentEntry?
     private let initialTreatmentState: TreatmentEditorInitialState?
     private let localSaveJournal: PenDoseLogJournal
+    private let mealMetadataStore: MealPlanMetadataStore
     private let localSaveOperation = PenDoseLogOperation()
+    private let localSaveStartedAt = Date()
     private let localSaveOverride: (() -> Bool)?
     private var requestedExistingMealState: TreatmentMealState?
     private let log = OSLog(subsystem: ConstantsLog.subSystem, category: ConstantsLog.categoryApplicationDataTreatments)
@@ -52,13 +54,14 @@ import UserNotifications
 
     init(coreDataManager: CoreDataManager?, treatmentToEdit: TreatmentEntry?, initialType: TreatmentType = .Carbs,
          quickCarbohydrateGrams: Double? = nil, localSaveJournal: PenDoseLogJournal? = nil,
-         localSaveOverride: (() -> Bool)? = nil) {
+         localSaveOverride: (() -> Bool)? = nil, mealMetadataStore: MealPlanMetadataStore? = nil) {
         let localSaveJournal = localSaveJournal ?? .shared
         self.didPrefillBasalInjection = treatmentToEdit == nil && initialType == .BasalInjection
             && UserDefaults.standard.lastBasalInjectionUnits > 0
             && !UserDefaults.standard.lastBasalInjectionInsulinDescription.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         self.coreDataManager = coreDataManager
         self.localSaveJournal = localSaveJournal
+        self.mealMetadataStore = mealMetadataStore ?? .shared
         self.localSaveOverride = localSaveOverride
         self.localSaveGateState = coreDataManager.map { localSaveJournal.recoveryState(coreDataManager: $0) } ?? .ready
         self.originalTreatment = treatmentToEdit
@@ -119,6 +122,9 @@ import UserNotifications
 
     var isExistingPlannedMeal: Bool { originalTreatment?.isPlannedMeal == true }
     var isExistingCancelledMeal: Bool { originalTreatment?.isCancelledMeal == true }
+    var canConfirmWithSelectedDate: Bool {
+        isExistingPlannedMeal && selectedDate != originalTreatment?.date && selectedDate <= Date()
+    }
     var selectedCarbohydrateDurationMinutes: Double { selectedMealKind.durationMinutes }
     var deletionMayLeaveHealthCopy: Bool {
         guard let originalTreatment else { return false }
@@ -240,11 +246,32 @@ import UserNotifications
         let treatmentToEdit = treatmentToEdit(in: coreDataManager)
         // An edit whose target was deleted or detached must never fall through to insertion.
         guard isAddMode || treatmentToEdit != nil else { return false }
+        let now = Date()
+        if isAddMode && selectedType == .Carbs {
+            let metadata = MealPlanMetadata(mealUUID: localSaveOperation.mealUUID,
+                bolusUUID: nil, loggedAt: localSaveStartedAt,
+                plannedAt: selectedMealStateForSave == .planned ? selectedDate : nil,
+                grams: storedValue,
+                pizzaSettings: nil, mealKind: selectedMealKind)
+            do { try mealMetadataStore.stage(metadata) }
+            catch {
+                alertMessage = TreatmentEditorAlertMessage(title: Texts_Common.warning,
+                    message: "Måltidsplanens metadata kunne ikke gemmes. Prøv igen.")
+                return false
+            }
+        }
         if requiresDurableLocalInsert {
             localSaveGateState = localSaveJournal.recoveryState(coreDataManager: coreDataManager)
+            let intent = PenDoseLogIntent(
+                insulinUnits: selectedType == .Insulin ? storedValue : 0,
+                carbohydrateGrams: selectedType == .Carbs ? storedValue : 0,
+                mealKind: selectedType == .Carbs ? selectedMealKind : nil,
+                insulinDate: selectedType == .Insulin ? selectedDate : nil,
+                mealDate: selectedType == .Carbs ? selectedDate : nil)
             guard localSaveGateState == .ready,
                   localSaveJournal.begin(localSaveOperation,
-                    expectsBolus: selectedType == .Insulin, expectsMeal: selectedType == .Carbs) else {
+                    expectsBolus: selectedType == .Insulin, expectsMeal: selectedType == .Carbs,
+                    intent: intent) else {
                 localSaveGateState = localSaveJournal.recoveryState(coreDataManager: coreDataManager)
                 alertMessage = TreatmentEditorAlertMessage(title: Texts_Common.warning,
                     message: localSaveGateState.message.isEmpty ?
@@ -272,7 +299,6 @@ import UserNotifications
                 return false
             }
         }
-        let now = Date()
         let mealState = selectedType == .Carbs ? selectedMealStateForSave : nil
         var savedTreatment: TreatmentEntry?
 
@@ -428,10 +454,14 @@ import UserNotifications
         }
 
         if let savedTreatment, let uuid = savedTreatment.localTreatmentUUID {
-            if savedTreatment.isPlannedMeal {
-                PlannedMealReminder.schedule(uuid: uuid, at: savedTreatment.date)
-            } else {
-                PlannedMealReminder.cancel(uuid: uuid)
+            if savedTreatment.treatmentType == .Carbs || initialTreatmentState?.selectedType == .Carbs {
+                let warning = MealPlanReminderCoordinator.refresh(coreDataManager: coreDataManager,
+                    mealUUID: uuid, confirmedAt: mealState == .confirmed ? now : nil,
+                    store: mealMetadataStore, onIssue: MealReminderIssueCenter.report)
+                if let warning { MealReminderIssueCenter.report(warning) }
+            } else if savedTreatment.treatmentType == .Insulin {
+                MealPlanReminderCoordinator.refreshLinkedMeals(coreDataManager: coreDataManager,
+                    bolusUUID: uuid, store: mealMetadataStore, onIssue: MealReminderIssueCenter.report)
             }
         }
         requestedExistingMealState = nil
@@ -449,11 +479,10 @@ import UserNotifications
     /// Confirmation is a separate user action. Opening an overdue plan or reaching its time
     /// never changes it into a meal that was actually eaten.
     func confirmPlannedMeal() -> Bool {
-        guard isExistingPlannedMeal else { return false }
-        guard selectedDate <= Date() else {
+        guard canConfirmWithSelectedDate else {
             alertMessage = TreatmentEditorAlertMessage(
                 title: Texts_Common.warning,
-                message: "Måltidet ligger stadig i fremtiden. Ret tidspunktet til det tidspunkt, hvor du spiste, før du bekræfter."
+                message: "Vælg det faktiske spisetidspunkt, eller brug 'Jeg spiser nu'."
             )
             return false
         }
@@ -461,6 +490,12 @@ import UserNotifications
         let saved = saveTreatment()
         if !saved { requestedExistingMealState = nil }
         return saved
+    }
+
+    func confirmPlannedMealNow() -> Bool {
+        guard isExistingPlannedMeal else { return false }
+        selectedDate = Date()
+        return confirmPlannedMeal()
     }
 
     func cancelPlannedMeal() -> Bool {
@@ -507,7 +542,16 @@ import UserNotifications
         }
         if durableMutation { localSaveGateState = .ready }
 
-        if let uuid = treatmentToEdit.localTreatmentUUID { PlannedMealReminder.cancel(uuid: uuid) }
+        if let uuid = treatmentToEdit.localTreatmentUUID {
+            if treatmentToEdit.treatmentType == .Carbs {
+                let warning = MealPlanReminderCoordinator.refresh(coreDataManager: coreDataManager,
+                    mealUUID: uuid, store: mealMetadataStore, onIssue: MealReminderIssueCenter.report)
+                if let warning { MealReminderIssueCenter.report(warning) }
+            } else if treatmentToEdit.treatmentType == .Insulin {
+                MealPlanReminderCoordinator.refreshLinkedMeals(coreDataManager: coreDataManager,
+                    bolusUUID: uuid, store: mealMetadataStore, onIssue: MealReminderIssueCenter.report)
+            }
+        }
 
         trace(
             "deleted %{public}@ treatment at %{public}@",
@@ -692,125 +736,6 @@ struct TreatmentEditorAlertMessage: Identifiable {
     let message: String
 }
 
-/// The notification is a prompt to confirm, never evidence that a planned meal was eaten.
-/// Identifiers remain separate from glucose alerts so alarm refreshes cannot cancel them.
-enum PlannedMealReminder {
-    static let identifierPrefix = "xdrip.plannedMeal."
-    static let openRequested = Notification.Name("xdrip.plannedMeal.openRequested")
-    static let uuidUserInfoKey = "plannedMealUUID"
-    private static let pendingOpenKey = "plannedMealPendingOpenUUID"
-
-    static func identifier(for uuid: String) -> String { identifierPrefix + uuid }
-
-    static func request(uuid: String, at date: Date, now: Date = Date()) -> UNNotificationRequest? {
-        let interval = date.timeIntervalSince(now)
-        guard !uuid.isEmpty, interval > 0, interval <= TreatmentEditorViewModel.maximumFutureTreatmentInterval else {
-            return nil
-        }
-        let content = UNMutableNotificationContent()
-        content.title = "Planlagt måltid"
-        content.body = "Har du spist? Åbn xDrip og bekræft, ret eller annullér kulhydraterne."
-        content.sound = .default
-        content.userInfo = [uuidUserInfoKey: uuid]
-        return UNNotificationRequest(
-            identifier: identifier(for: uuid), content: content,
-            trigger: UNTimeIntervalNotificationTrigger(timeInterval: interval, repeats: false)
-        )
-    }
-
-    static func schedule(uuid: String, at date: Date) {
-        guard let reminder = request(uuid: uuid, at: date) else {
-            cancel(uuid: uuid)
-            return
-        }
-        // The stable identifier replaces an earlier pending reminder after a plan edit.
-        UNUserNotificationCenter.current().add(reminder) { _ in
-            // A notification error never changes the persisted planned/confirmed state.
-        }
-    }
-
-    static func cancel(uuid: String) {
-        let identifier = identifier(for: uuid)
-        UNUserNotificationCenter.current().removePendingNotificationRequests(withIdentifiers: [identifier])
-        UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [identifier])
-    }
-
-    static func tappedUUID(from request: UNNotificationRequest) -> String? {
-        guard request.identifier.hasPrefix(identifierPrefix),
-              let uuid = request.content.userInfo[uuidUserInfoKey] as? String,
-              request.identifier == identifier(for: uuid) else { return nil }
-        return uuid
-    }
-
-    static func recordTap(uuid: String) {
-        UserDefaults.standard.set(uuid, forKey: pendingOpenKey)
-        NotificationCenter.default.post(name: openRequested, object: nil)
-    }
-
-    static var pendingOpenUUID: String? { UserDefaults.standard.string(forKey: pendingOpenKey) }
-
-    static func clearPendingOpenUUID(_ uuid: String) {
-        guard pendingOpenUUID == uuid else { return }
-        UserDefaults.standard.removeObject(forKey: pendingOpenKey)
-    }
-}
-
-/// A pizza notification opens a new calculation. It never carries a promised remaining dose.
-enum PizzaSplitReminder {
-    static let identifierPrefix = "xdrip.pizzaSplit."
-    static let uuidUserInfoKey = "pizzaMealUUID"
-    static let openRequested = Notification.Name("xdrip.pizzaSplit.openRequested")
-    private static let pendingOpenKey = "pizzaSplitPendingOpenUUID"
-
-    static func identifier(for uuid: String) -> String { identifierPrefix + uuid }
-
-    static func request(uuid: String, after minutes: Int, now: Date = Date()) -> UNNotificationRequest? {
-        guard !uuid.isEmpty, (15...240).contains(minutes) else { return nil }
-        let content = UNMutableNotificationContent()
-        content.title = "Tid til ny vurdering"
-        content.body = "Åbn xDrip og beregn igen med aktuelle målinger. Tidligere forslag gælder ikke."
-        content.sound = .default
-        content.userInfo = [uuidUserInfoKey: uuid]
-        return UNNotificationRequest(
-            identifier: identifier(for: uuid),
-            content: content,
-            trigger: UNTimeIntervalNotificationTrigger(timeInterval: TimeInterval(minutes * 60), repeats: false)
-        )
-    }
-
-    static func schedule(uuid: String, after minutes: Int) {
-        guard let reminder = request(uuid: uuid, after: minutes) else { return }
-        UNUserNotificationCenter.current().add(reminder) { _ in
-            // The treatment is already durable; a notification failure must not alter it.
-        }
-    }
-
-    static func cancel(uuid: String) {
-        let id = identifier(for: uuid)
-        UNUserNotificationCenter.current().removePendingNotificationRequests(withIdentifiers: [id])
-        UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [id])
-    }
-
-    static func tappedUUID(from request: UNNotificationRequest) -> String? {
-        guard request.identifier.hasPrefix(identifierPrefix),
-              let uuid = request.content.userInfo[uuidUserInfoKey] as? String,
-              request.identifier == identifier(for: uuid) else { return nil }
-        return uuid
-    }
-
-    static func recordTap(uuid: String) {
-        UserDefaults.standard.set(uuid, forKey: pendingOpenKey)
-        NotificationCenter.default.post(name: openRequested, object: nil)
-    }
-
-    static var pendingOpenUUID: String? { UserDefaults.standard.string(forKey: pendingOpenKey) }
-
-    static func clearPendingOpenUUID(_ uuid: String) {
-        guard pendingOpenUUID == uuid else { return }
-        UserDefaults.standard.removeObject(forKey: pendingOpenKey)
-    }
-}
-
 /// This is a calculator input only; it is never a CGM reading, treatment or alarm input.
 struct ManualDoseGlucoseRecord: Codable, Equatable {
     let valueMgdl: Double
@@ -879,19 +804,56 @@ enum PenDoseGlucoseChoice: String, CaseIterable {
     case manual
 }
 
-/// UI state for a read-only pen suggestion. A draft edit invalidates the displayed suggestion.
+/// One immutable user registration. The proposal is deliberately absent from this record.
+struct PenDoseLogDraft {
+    let loggedAt: Date
+    let insulinUnits: Double
+    let carbohydrateGrams: Double
+    let mealKind: TreatmentMealKind
+    let plannedDate: Date?
+    let operation: PenDoseLogOperation
+    let pizzaSettings: PizzaSplitSettings
+}
+
+/// Values captured with the calculation; an open explanation never mixes newer inputs in.
+struct PenDoseCalculationDetails {
+    let calculation: PenDoseCalculation
+    let calculatedAt: Date
+    let glucoseMgdl: Double?
+    let glucoseMeasuredAt: Date?
+    let iobUnits: Double
+    let cobGrams: Double
+    let newCarbsGrams: Double
+    let carbohydrateRatio: Double
+    let targetMmol: Double
+    let correctionMmolPerUnit: Double
+    let penStepUnits: Double
+    let maximumUnits: Double
+    let pizzaPercentageNow: Int?
+    let pizzaReminderMinutes: Int?
+    let suggestedNowUnits: Double?
+}
+
+/// UI state for a read-only pen suggestion and an independent local treatment log.
 @MainActor final class PenDoseCalculatorViewModel: ObservableObject {
-    @Published var carbohydratesText = "0"
-    @Published var mealKind: TreatmentMealKind = .normal
-    @Published var isPlannedMeal = false
-    @Published var plannedDate = Date().addingTimeInterval(15 * 60)
-    @Published var glucoseChoice: PenDoseGlucoseChoice = .currentCGM
-    @Published var manualGlucoseText = ""
-    @Published var manualGlucoseDate = Date()
+    @Published var carbohydratesText = "" { didSet { scheduleCalculation() } }
+    @Published var mealKind: TreatmentMealKind = .normal { didSet { scheduleCalculation() } }
+    @Published var isPlannedMeal = false { didSet { scheduleCalculation() } }
+    @Published var plannedDate = Date().addingTimeInterval(15 * 60) { didSet { scheduleCalculation() } }
+    @Published var glucoseChoice: PenDoseGlucoseChoice = .currentCGM { didSet { scheduleCalculation() } }
+    @Published var manualGlucoseText = "" { didSet { scheduleCalculation() } }
+    @Published var manualGlucoseDate = Date() { didSet { scheduleCalculation() } }
     @Published var insulinToLogText = ""
     @Published private(set) var calculation: PenDoseCalculation?
+    @Published private(set) var calculationDetails: PenDoseCalculationDetails?
     @Published private(set) var latestGlucoseDate: Date?
-    @Published private(set) var isWorking = false
+    @Published private(set) var latestGlucoseValueMgdl: Double?
+    @Published private(set) var isCalculating = false
+    @Published private(set) var isSaving = false
+    @Published private(set) var currentTime = Date()
+    @Published private(set) var confirmationDraft: PenDoseLogDraft?
+    @Published private(set) var expiredPlan = false
+    @Published private(set) var postSaveReminderWarning: String?
     @Published private(set) var storageGateState: PenDoseLogJournal.RecoveryState = .ready
     @Published var statusMessage: String?
 
@@ -899,164 +861,433 @@ enum PenDoseGlucoseChoice: String, CaseIterable {
     private let coreDataManager: CoreDataManager
     private let glucoseStore: ManualDoseGlucoseStore
     private let logJournal: PenDoseLogJournal
+    private let metadataStore: MealPlanMetadataStore
+    private let profileProvider: () -> PenDoseProfile
+    private let sourceReadyOverride: (() -> Bool)?
+    private let snapshotProvider: ((Date, Bool) async -> Result<PenDoseInputSnapshot, PenDoseUnavailableReason>)?
     private var calculatedDraftSignature: String?
     private var snapshotAtCalculation: PenDoseInputSnapshot?
     private var calculatedAt: Date?
     private var logOperation: PenDoseLogOperation?
     private var selectedManualRecord: ManualDoseGlucoseRecord?
+    private var pinnedCGM: (value: Double, date: Date, sensorID: String)?
+    private var latestGlucoseSamples: [GlucoseForecastSample] = []
+    private var calculationGeneration = 0
+    private var debounceTask: Task<Void, Never>?
+    private var isOpen = false
 
     init(coreDataManager: CoreDataManager, reminderMealUUID: String? = nil,
          glucoseStore: ManualDoseGlucoseStore = .shared,
-         logJournal: PenDoseLogJournal? = nil) {
+         logJournal: PenDoseLogJournal? = nil,
+         metadataStore: MealPlanMetadataStore? = nil,
+         profileProvider: @escaping () -> PenDoseProfile = { PenDoseProfile.load() },
+         sourceReadyOverride: (() -> Bool)? = nil,
+         snapshotProvider: ((Date, Bool) async -> Result<PenDoseInputSnapshot, PenDoseUnavailableReason>)? = nil) {
         let logJournal = logJournal ?? .shared
         self.coreDataManager = coreDataManager
         self.reminderMealUUID = reminderMealUUID
         self.glucoseStore = glucoseStore
         self.logJournal = logJournal
+        self.metadataStore = metadataStore ?? .shared
+        self.profileProvider = profileProvider
+        self.sourceReadyOverride = sourceReadyOverride
+        self.snapshotProvider = snapshotProvider
         self.storageGateState = logJournal.recoveryState(coreDataManager: coreDataManager)
         if storageGateState != .ready { statusMessage = storageGateState.message }
     }
 
-    var profile: PenDoseProfile { PenDoseProfile.load() }
+    var profile: PenDoseProfile { profileProvider() }
     var glucoseUnitIsMgdl: Bool { UserDefaults.standard.bloodGlucoseUnitIsMgDl }
     var isReviewCurrent: Bool {
-        calculation?.unavailableReason == nil && calculation != nil &&
+        !isCalculating && calculation?.unavailableReason == nil && calculation != nil &&
             calculatedDraftSignature == draftSignature
     }
     var suggestedUnits: Double? {
-        guard isReviewCurrent, let calculation, let suggestion = calculation.suggestedUnits else { return nil }
-        let pizza = PizzaSplitSettings.load()
-        guard pizza.isEnabled, mealKind == .slow, !isPlannedMeal,
-              reminderMealUUID == nil, (parsedCarbs ?? 0) > 0 else { return suggestion }
-        let step = profile.settings.penStepUnits
-        return floor((suggestion * Double(pizza.percentageNow) / 100) / step + 1e-10) * step
+        guard isReviewCurrent else { return nil }
+        return calculationDetails?.suggestedNowUnits
+    }
+    var latestGlucoseAgeMinutes: Int? {
+        latestGlucoseDate.map { max(0, Int(currentTime.timeIntervalSince($0) / 60)) }
+    }
+    var displayedGlucoseValueMgdl: Double? {
+        glucoseChoice == .confirmStaleCGM ? pinnedCGM?.value : latestGlucoseValueMgdl
+    }
+    var displayedGlucoseDate: Date? {
+        glucoseChoice == .confirmStaleCGM ? pinnedCGM?.date : latestGlucoseDate
+    }
+    var displayedGlucoseSource: String {
+        switch glucoseChoice {
+        case .currentCGM: return "CGM"
+        case .confirmStaleCGM: return "Valgt CGM · uden trend"
+        case .manual: return "Manuel · uden trend"
+        }
+    }
+    var glucoseStatusMessage: String? {
+        guard glucoseChoice == .currentCGM else { return nil }
+        guard let latest = latestGlucoseSamples.last else { return "Ingen CGM-måling" }
+        if currentTime.timeIntervalSince(latest.date) > PenBolusCalculator.freshCGMSeconds {
+            return "Seneste måling er \(latestGlucoseAgeMinutes ?? 0) min gammel"
+        }
+        if PenBolusCalculator.twentyMinuteChange(latestGlucoseSamples, at: latest.date) == nil {
+            let from = latest.date.addingTimeInterval(-PenBolusCalculator.trendWindowSeconds)
+            let sameSensor = latestGlucoseSamples.filter {
+                $0.sensorID == latest.sensorID && $0.date >= from && $0.date <= latest.date
+            }
+            let span = sameSensor.first.map { latest.date.timeIntervalSince($0.date) } ?? 0
+            return span < PenBolusCalculator.minimumTrendSpanSeconds
+                ? "Ingen trend – ikke nok CGM-historik endnu"
+                : "Ingen trend – huller i CGM de sidste 20 min"
+        }
+        return nil
+    }
+    private var localLoggingIsActive: Bool {
+        if let sourceReadyOverride { return sourceReadyOverride() }
+        let defaults = UserDefaults.standard
+        return TherapyMetricsManager.doseSourceIsReady(defaults.dataFlowPolicy,
+            cutover: TreatmentSourceCutover.current(defaults: defaults), defaults: defaults)
+    }
+    var logValidationMessage: String? {
+        if isSaving || confirmationDraft != nil { return "Registrerer…" }
+        guard storageGateState == .ready,
+              logJournal.recoveryState(coreDataManager: coreDataManager) == .ready else {
+            return storageGateState.message
+        }
+        guard localLoggingIsActive else { return "Lokal logning er ikke klar" }
+        let settings = profile.settings
+        guard settings.isValid else { return "Kontrollér pen-trin og maksimum" }
+        guard let units = parsedUnits else { return "Ugyldig insulinmængde" }
+        guard units >= 0 else { return "Ugyldig insulinmængde" }
+        guard units <= settings.maximumSuggestionUnits else {
+            return "Max \(settings.maximumSuggestionUnits) E"
+        }
+        guard unitsAreOnPenStep(units) else {
+            return "Brug \(settings.penStepUnits) E-trin"
+        }
+        guard let carbs = parsedCarbs else { return "Kulhydrat skal være 0–500 g" }
+        guard units > 0 || carbs > 0 else { return "Indtast kulhydrater eller insulin" }
+        if isPlannedMeal {
+            guard reminderMealUUID == nil, carbs > 0 else { return "Vælg kulhydrater til planen" }
+            guard plannedDate > currentTime else { return "Tidspunktet er passeret" }
+            guard plannedDate <= currentTime.addingTimeInterval(60 * 60) else {
+                return "Vælg højst 60 minutter frem"
+            }
+        }
+        return nil
+    }
+    var logButtonTitle: String {
+        if let reason = logValidationMessage { return reason }
+        guard let units = parsedUnits, let carbs = parsedCarbs, units > 0 || carbs > 0 else {
+            return "Indtast kulhydrater eller insulin"
+        }
+        let insulin = units > 0 ? "\(PenDoseDisplayFormatter.insulin(units)) E" : nil
+        let food = carbs > 0 && reminderMealUUID == nil
+            ? "\(PenDoseDisplayFormatter.carbs(carbs)) g" : nil
+        if isPlannedMeal, let food {
+            let time = plannedDate.formatted(date: .omitted, time: .shortened)
+            return insulin.map { "Log \($0) · planlæg \(food) kl. \(time)" }
+                ?? "Planlæg \(food) · kl. \(time)"
+        }
+        if let insulin, let food { return "Log \(food) og \(insulin)" }
+        return "Log \(food ?? insulin ?? "")"
     }
     var canLog: Bool {
-        guard storageGateState == .ready,
-              logJournal.recoveryState(coreDataManager: coreDataManager) == .ready,
-              isReviewCurrent, let calculation,
-              calculation.unavailableReason == nil,
-              let units = parsedUnits, units >= 0, units <= profile.settings.maximumSuggestionUnits,
-              unitsAreOnPenStep(units) else { return false }
-        switch calculation.safety {
-        case .blockedCurrentLow, .blockedForecastLow: if units > 0 { return false }
-        default: break
+        logValidationMessage == nil
+    }
+
+    func start() {
+        isOpen = true
+        scheduleCalculation()
+    }
+
+    func stop() {
+        isOpen = false
+        calculationGeneration &+= 1
+        debounceTask?.cancel()
+        debounceTask = nil
+        isCalculating = false
+        pinnedCGM = nil
+        glucoseChoice = .currentCGM
+    }
+
+    /// Reuse the UI clock to age inputs and refresh the time-dependent IOB, COB and profile.
+    func refreshClock(now: Date = .now) {
+        let crossedMinute = Int(currentTime.timeIntervalSince1970 / 60) !=
+            Int(now.timeIntervalSince1970 / 60)
+        let wasFresh = latestGlucoseDate.map {
+            currentTime.timeIntervalSince($0) <= PenBolusCalculator.freshCGMSeconds
+        } ?? false
+        currentTime = now
+        if isPlannedMeal && plannedDate <= now { expiredPlan = true }
+        let isFresh = latestGlucoseDate.map {
+            now.timeIntervalSince($0) <= PenBolusCalculator.freshCGMSeconds
+        } ?? false
+        if crossedMinute || (wasFresh && !isFresh && glucoseChoice == .currentCGM) {
+            scheduleCalculation()
         }
-        guard let carbs = parsedCarbs else { return false }
-        if isPlannedMeal {
-            guard carbs > 0, reminderMealUUID == nil,
-                  plannedDate > Date(), plannedDate <= Date().addingTimeInterval(60 * 60) else { return false }
+    }
+
+    /// Debounced input changes invalidate the copyable suggestion immediately. A slow older
+    /// calculation may finish, but only the newest generation can publish it.
+    func scheduleCalculation() {
+        guard isOpen else { return }
+        calculationGeneration &+= 1
+        let generation = calculationGeneration
+        calculatedDraftSignature = nil
+        isCalculating = true
+        debounceTask?.cancel()
+        debounceTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(400))
+            guard !Task.isCancelled else { return }
+            await self?.calculateForGeneration(generation)
         }
-        return units > 0 || (carbs > 0 && reminderMealUUID == nil)
     }
 
     func calculate() async {
-        guard !isWorking else { return }
-        storageGateState = logJournal.recoveryState(coreDataManager: coreDataManager)
-        guard storageGateState == .ready else {
-            clearCalculation(storageGateState.message)
-            return
-        }
-        isWorking = true
-        defer { isWorking = false }
-        statusMessage = nil
+        calculationGeneration &+= 1
+        debounceTask?.cancel()
+        calculatedDraftSignature = nil
+        isCalculating = true
+        await calculateForGeneration(calculationGeneration)
+    }
+
+    private func calculateForGeneration(_ generation: Int) async {
+        guard generation == calculationGeneration else { return }
         let signature = draftSignature
         let now = Date()
+        storageGateState = logJournal.recoveryState(coreDataManager: coreDataManager)
         guard profile.isConfirmed else {
-            clearCalculation("Bekræft først doseringsprofilen i indstillingerne.")
+            clearCalculation("Bekræft først doseringsprofilen i indstillingerne.", generation: generation)
             return
         }
         guard let newCarbs = newCarbsInput() else {
-            clearCalculation("Indtast en gyldig mængde kulhydrat.")
+            clearCalculation("Indtast en gyldig mængde kulhydrat.", generation: generation)
             return
         }
-        let inputResult = await TherapyMetricsManager.shared.penDoseSnapshot(at: now)
-        guard signature == draftSignature else { return }
+        let inputResult: Result<PenDoseInputSnapshot, PenDoseUnavailableReason>
+        if let snapshotProvider {
+            inputResult = await snapshotProvider(now, glucoseChoice != .currentCGM)
+        } else {
+            inputResult = await TherapyMetricsManager.shared.penDoseSnapshot(at: now,
+                allowMissingGlucose: glucoseChoice != .currentCGM)
+        }
+        guard generation == calculationGeneration, signature == draftSignature else { return }
         guard case .success(let snapshot) = inputResult else {
             if case .failure(let reason) = inputResult {
-                clearCalculation(Self.unavailableText(reason))
+                if reason == .missingGlucose {
+                    latestGlucoseSamples = []
+                    latestGlucoseDate = nil
+                    latestGlucoseValueMgdl = nil
+                }
+                clearCalculation(Self.unavailableText(reason), generation: generation)
             }
             return
         }
+        latestGlucoseSamples = snapshot.glucose
         latestGlucoseDate = snapshot.glucose.last?.date
-        guard let glucose = await glucoseInput(snapshot: snapshot, now: now) else {
-            clearCalculation("Indtast og vælg en gyldig blodsukkerværdi.")
+        latestGlucoseValueMgdl = snapshot.glucose.last?.glucoseMgdl
+        if glucoseChoice == .confirmStaleCGM, let pinnedCGM,
+           let latest = snapshot.glucose.last, latest.date > pinnedCGM.date,
+           now.timeIntervalSince(latest.date) <= PenBolusCalculator.freshCGMSeconds,
+           PenBolusCalculator.twentyMinuteChange(snapshot.glucose, at: latest.date) != nil {
+            self.pinnedCGM = nil
+            glucoseChoice = .currentCGM
             return
         }
-        guard signature == draftSignature else { return }
+        guard let glucose = await glucoseInput(snapshot: snapshot, now: now) else {
+            clearCalculation("Indtast og vælg en gyldig blodsukkerværdi.", generation: generation)
+            return
+        }
+        guard generation == calculationGeneration, signature == draftSignature else { return }
+        let chosenProfile = profile
         let safety = glucoseChoice == .currentCGM
             ? PenBolusCalculator.safetyForecast(snapshot: snapshot, at: now) : nil
-        let result = PenBolusCalculator.calculate(snapshot: snapshot, profile: profile,
+        let result = PenBolusCalculator.calculate(snapshot: snapshot, profile: chosenProfile,
             glucose: glucose, newCarbs: newCarbs, safetyForecast: safety, at: now)
+        guard generation == calculationGeneration, signature == draftSignature else { return }
+        let pizza = PizzaSplitSettings.load()
+        let pizzaApplies = pizza.isEnabled && mealKind == .slow && reminderMealUUID == nil &&
+            (parsedCarbs ?? 0) > 0
+        let suggestionNow = result.suggestedUnits.map { suggestion in
+            pizzaApplies ? floor((suggestion * Double(pizza.percentageNow) / 100) /
+                chosenProfile.settings.penStepUnits + 1e-10) * chosenProfile.settings.penStepUnits
+                : suggestion
+        }
+        let values = chosenProfile.values(at: now)
         calculation = result
         snapshotAtCalculation = snapshot
         calculatedAt = now
         calculatedDraftSignature = signature
-        if let reason = result.unavailableReason {
-            statusMessage = Self.unavailableText(reason)
-            insulinToLogText = ""
-        } else if result.suggestedUnits == nil {
-            statusMessage = "Sikkerhedstjekket blokerer insulin. Du kan stadig registrere kulhydrater uden insulin."
-            insulinToLogText = "0"
+        if let values {
+            calculationDetails = PenDoseCalculationDetails(calculation: result, calculatedAt: now,
+                glucoseMgdl: result.glucoseMgdl, glucoseMeasuredAt: result.glucoseMeasuredAt,
+                iobUnits: snapshot.iobUnits, cobGrams: snapshot.cobGrams,
+                newCarbsGrams: reminderMealUUID == nil ? (parsedCarbs ?? 0) : 0,
+                carbohydrateRatio: values.carbohydrateRatio, targetMmol: values.targetMmol,
+                correctionMmolPerUnit: values.correctionMmolPerUnit,
+                penStepUnits: chosenProfile.settings.penStepUnits,
+                maximumUnits: chosenProfile.settings.maximumSuggestionUnits,
+                pizzaPercentageNow: pizzaApplies ? pizza.percentageNow : nil,
+                pizzaReminderMinutes: pizzaApplies ? pizza.reminderMinutes : nil,
+                suggestedNowUnits: suggestionNow)
         } else {
-            insulinToLogText = (suggestedUnits ?? 0).stringWithoutTrailingZeroes
+            calculationDetails = nil
         }
+        statusMessage = result.unavailableReason.map(Self.unavailableText)
+        isCalculating = false
     }
 
-    /// Re-read every input before a user-confirmed log. If the calculation changed, require
-    /// another review instead of persisting the previously displayed amount.
-    func logReviewedTreatment() async -> Bool {
-        guard canLog, !isWorking, let previous = calculation,
-              let original = snapshotAtCalculation, let calculatedAt,
-              let units = parsedUnits, let carbs = parsedCarbs,
-              let newCarbs = newCarbsInput() else { return false }
-        isWorking = true
-        defer { isWorking = false }
-        let now = Date()
-        let input = await TherapyMetricsManager.shared.penDoseSnapshot(at: now)
-        guard case .success(let fresh) = input,
-              let glucose = await glucoseInput(snapshot: fresh, now: now) else {
-            clearCalculation("Grundlaget er ændret eller ufuldstændigt. Beregn igen.")
-            return false
-        }
-        let safety = glucoseChoice == .currentCGM
-            ? PenBolusCalculator.safetyForecast(snapshot: fresh, at: now) : nil
-        let current = PenBolusCalculator.calculate(snapshot: fresh, profile: profile,
-            glucose: glucose, newCarbs: newCarbs, safetyForecast: safety, at: now)
-        guard Self.reviewInputsMatch(original, fresh),
-              previous.suggestedUnits == current.suggestedUnits,
-              Self.safetyIdentity(previous.safety) == Self.safetyIdentity(current.safety),
-              now.timeIntervalSince(calculatedAt) <= 120,
-              calculatedDraftSignature == draftSignature else {
-            calculation = current
-            snapshotAtCalculation = fresh
-            self.calculatedAt = now
-            calculatedDraftSignature = draftSignature
-            insulinToLogText = current.suggestedUnits.map { $0.stringWithoutTrailingZeroes } ?? "0"
-            statusMessage = "Nye data er kommet til. Gennemgå beregningen og tryk Log igen."
-            return false
-        }
-        let operation = logOperation ?? PenDoseLogOperation()
+    /// Copy is explicit. Recalculation never touches the user's dose field.
+    func copySuggestion() {
+        guard let units = suggestedUnits else { return }
+        insulinToLogText = PenDoseDisplayFormatter.insulinInput(units)
+    }
+
+    /// Capture the actual quantities once. Returns true only when the red/orange or missing
+    /// calculation confirmation must be presented before confirmLog().
+    @discardableResult func requestLog() -> Bool {
+        guard confirmationDraft == nil, !isSaving, logValidationMessage == nil,
+              let units = parsedUnits, let carbs = parsedCarbs else { return false }
+        let operation = PenDoseLogOperation()
         logOperation = operation
-        let result = PenDoseTreatmentLogger.log(coreDataManager: coreDataManager,
-            insulinUnits: units, carbohydrateGrams: reminderMealUUID == nil ? carbs : 0,
+        confirmationDraft = PenDoseLogDraft(loggedAt: Date(), insulinUnits: units,
+            carbohydrateGrams: reminderMealUUID == nil ? carbs : 0,
             mealKind: mealKind, plannedDate: isPlannedMeal ? plannedDate : nil,
-            operation: operation, now: now, journal: logJournal)
+            operation: operation, pizzaSettings: PizzaSplitSettings.load())
+        let safe: Bool
+        if isReviewCurrent, case .checked = calculation?.safety { safe = true }
+        else { safe = false }
+        requiresLogConfirmation = units > 0 && !safe
+        return requiresLogConfirmation
+    }
+
+    @Published private(set) var requiresLogConfirmation = false
+
+    func cancelLogConfirmation() {
+        guard !isSaving else { return }
+        confirmationDraft = nil
+        requiresLogConfirmation = false
+        logOperation = nil
+    }
+
+    /// Uses only the frozen registration; no glucose, IOB, COB or suggestion read occurs here.
+    func confirmLog(at now: Date = Date()) async -> Bool {
+        guard !isSaving, let draft = confirmationDraft else { return false }
+        // A confirmation left open for a long time cannot establish when insulin was taken.
+        // Keep the user's fields, but require a new explicit Log action with a new timestamp.
+        if now.timeIntervalSince(draft.loggedAt) > 5 * 60 {
+            statusMessage = "Bekræftelsen er udløbet. Tryk Log igen med det aktuelle tidspunkt."
+            cancelLogConfirmation()
+            return false
+        }
+        guard storageGateState == .ready,
+              logJournal.recoveryState(coreDataManager: coreDataManager) == .ready,
+              localLoggingIsActive, profile.settings.isValid,
+              draft.insulinUnits >= 0,
+              draft.insulinUnits <= profile.settings.maximumSuggestionUnits,
+              unitsAreOnPenStep(draft.insulinUnits),
+              (0...500).contains(draft.carbohydrateGrams),
+              draft.insulinUnits > 0 || draft.carbohydrateGrams > 0 else {
+            statusMessage = "Registreringen kan ikke gemmes med de aktuelle indstillinger."
+            cancelLogConfirmation()
+            return false
+        }
+        if let date = draft.plannedDate,
+           date <= now || date > now.addingTimeInterval(60 * 60) {
+            expiredPlan = true
+            statusMessage = "Tidspunktet er passeret. Vælg, om du spiser nu eller et nyt tidspunkt."
+            cancelLogConfirmation()
+            return false
+        }
+        isSaving = true
+        defer { isSaving = false }
+        let result = PenDoseTreatmentLogger.log(coreDataManager: coreDataManager,
+            insulinUnits: draft.insulinUnits, carbohydrateGrams: draft.carbohydrateGrams,
+            mealKind: draft.mealKind, plannedDate: draft.plannedDate,
+            operation: draft.operation, now: draft.loggedAt, journal: logJournal,
+            penSettings: profile.settings,
+            pizzaSettings: draft.pizzaSettings,
+            metadataStore: metadataStore,
+            onReminderIssue: { [weak self] message in
+                Task { @MainActor in
+                    self?.postSaveReminderWarning = message
+                    self?.statusMessage = "Registreret – påmindelsen kunne ikke oprettes"
+                    MealReminderIssueCenter.report(message)
+                }
+            })
         switch result {
         case .success(let receipt):
-            if let mealUUID = receipt.confirmedMealUUID, mealKind == .slow,
-               PizzaSplitSettings.load().isEnabled, reminderMealUUID == nil {
-                PizzaSplitReminder.schedule(uuid: mealUUID, after: PizzaSplitSettings.load().reminderMinutes)
-            }
-            calculation = nil
-            calculatedDraftSignature = nil
-            statusMessage = "Behandlingen er registreret."
+            confirmationDraft = nil
+            requiresLogConfirmation = false
+            logOperation = nil
+            insulinToLogText = ""
+            carbohydratesText = ""
+            postSaveReminderWarning = receipt.reminderWarning
+            statusMessage = postSaveReminderWarning == nil
+                ? "Behandlingen er registreret." : "Registreret – påmindelsen kunne ikke oprettes"
             return true
-        case .failure:
+        case .failure(.invalidInput):
+            statusMessage = "Registreringen er ikke gyldig. Kontrollér mængder og spisetid."
+            cancelLogConfirmation()
+            return false
+        case .failure(.metadataFailed):
+            statusMessage = "Måltidsplanen kunne ikke sikres. Ingen behandling er registreret."
+            cancelLogConfirmation()
+            return false
+        case .failure(.storageFailed):
             storageGateState = .awaitingRestart
             clearCalculation("Lagring kunne ikke bekræftes. Kontrollér behandlingshistorikken. Denne beregner kan ikke logge igen, før du åbner den på ny.")
             return false
         }
+    }
+
+    /// Compatibility entry point for existing callers; the new screen calls requestLog first.
+    func logReviewedTreatment() async -> Bool {
+        guard !requestLog() else { return false }
+        return await confirmLog()
+    }
+
+    func selectCurrentCGM() {
+        pinnedCGM = nil
+        glucoseChoice = .currentCGM
+    }
+
+    func selectDisplayedCGMWithoutTrend() {
+        guard let latest = latestGlucoseSamples.last,
+              let sensorID = latest.sensorID, !sensorID.isEmpty,
+              latest.glucoseMgdl.isFinite, (20...600).contains(latest.glucoseMgdl) else { return }
+        pinnedCGM = (latest.glucoseMgdl, latest.date, sensorID)
+        glucoseChoice = .confirmStaleCGM
+    }
+
+    func selectManual() {
+        manualGlucoseDate = Date()
+        glucoseChoice = .manual
+    }
+
+    func shiftPlannedMeal(byMinutes minutes: Int) {
+        guard reminderMealUUID == nil else { return }
+        let base = isPlannedMeal ? plannedDate : Date()
+        let proposed = base.addingTimeInterval(Double(minutes) * 60)
+        let now = Date()
+        if proposed <= now { isPlannedMeal = false; expiredPlan = false }
+        else if proposed <= now.addingTimeInterval(60 * 60) {
+            plannedDate = proposed
+            isPlannedMeal = true
+            expiredPlan = false
+        }
+    }
+
+    func resolveExpiredPlanEatNow() {
+        isPlannedMeal = false
+        expiredPlan = false
+        statusMessage = nil
+    }
+
+    func resolveExpiredPlanNewTime() {
+        plannedDate = Date().addingTimeInterval(15 * 60)
+        isPlannedMeal = true
+        expiredPlan = false
+        statusMessage = nil
     }
 
     func acknowledgePreviouslyFoundTreatment() {
@@ -1072,12 +1303,14 @@ enum PenDoseGlucoseChoice: String, CaseIterable {
         guard reminderMealUUID == nil else { return 0 }
         let text = carbohydratesText.trimmingCharacters(in: .whitespacesAndNewlines)
             .replacingOccurrences(of: ",", with: ".")
+        if text.isEmpty { return 0 }
         guard let value = Double(text), value.isFinite, (0...500).contains(value) else { return nil }
         return value
     }
     private var parsedUnits: Double? {
         let text = insulinToLogText.trimmingCharacters(in: .whitespacesAndNewlines)
             .replacingOccurrences(of: ",", with: ".")
+        if text.isEmpty { return 0 }
         guard let value = Double(text), value.isFinite else { return nil }
         return value
     }
@@ -1088,10 +1321,10 @@ enum PenDoseGlucoseChoice: String, CaseIterable {
     private func newCarbsInput() -> PenDoseNewCarbs? {
         guard let grams = parsedCarbs else { return nil }
         return reminderMealUUID == nil
-            ? .unrecorded(grams: isPlannedMeal ? 0 : grams) : .alreadyRecorded
+            ? .unrecorded(grams: grams) : .alreadyRecorded
     }
     private var draftSignature: String {
-        let profile = PenDoseProfile.load()
+        let profile = profileProvider()
         let pizza = PizzaSplitSettings.load()
         let forecastInputSignature = GlucoseForecastDataAdapter.presentationInputSignature(
             horizonMinutes: 120)
@@ -1108,8 +1341,9 @@ enum PenDoseGlucoseChoice: String, CaseIterable {
         switch glucoseChoice {
         case .currentCGM: return .currentCGM
         case .confirmStaleCGM:
-            guard let latest = snapshot.glucose.last else { return nil }
-            return .confirmedStale(valueMgdl: latest.glucoseMgdl, measuredAt: latest.date)
+            guard let pinnedCGM else { return nil }
+            return .confirmedStale(valueMgdl: pinnedCGM.value,
+                measuredAt: pinnedCGM.date, sensorID: pinnedCGM.sensorID)
         case .manual:
             let text = manualGlucoseText.trimmingCharacters(in: .whitespacesAndNewlines)
                 .replacingOccurrences(of: ",", with: ".")
@@ -1125,13 +1359,14 @@ enum PenDoseGlucoseChoice: String, CaseIterable {
             return .manual(valueMgdl: record.valueMgdl, measuredAt: record.measuredAt)
         }
     }
-    private func clearCalculation(_ message: String) {
+    private func clearCalculation(_ message: String, generation: Int? = nil) {
+        if let generation, generation != calculationGeneration { return }
         calculation = nil
+        calculationDetails = nil
         snapshotAtCalculation = nil
         calculatedDraftSignature = nil
-        latestGlucoseDate = nil
-        insulinToLogText = ""
         statusMessage = message
+        isCalculating = false
     }
     private static func safetyIdentity(_ state: PenDoseSafetyState?) -> String {
         switch state {
@@ -1183,9 +1418,10 @@ enum PenDoseGlucoseChoice: String, CaseIterable {
 
 struct PenDoseLogReceipt {
     let confirmedMealUUID: String?
+    let reminderWarning: String?
 }
 
-enum PenDoseLogError: Error { case invalidInput, storageFailed }
+enum PenDoseLogError: Error { case invalidInput, storageFailed, metadataFailed }
 
 /// Stable IDs for one reviewed Log action, retained across an uncertain save result.
 struct PenDoseLogOperation: Codable, Equatable {
@@ -1194,6 +1430,25 @@ struct PenDoseLogOperation: Codable, Equatable {
     init(bolusUUID: String = UUID().uuidString, mealUUID: String = UUID().uuidString) {
         self.bolusUUID = bolusUUID
         self.mealUUID = mealUUID
+    }
+}
+
+/// Values bound to a journal identity before any treatment is written. An uncertain attempt
+/// cannot later reuse its UUIDs for another amount, meal kind or treatment time.
+struct PenDoseLogIntent: Codable, Equatable {
+    let insulinUnits: Double
+    let carbohydrateGrams: Double
+    let mealKindRaw: String?
+    let insulinDate: Date?
+    let mealDate: Date?
+
+    init(insulinUnits: Double, carbohydrateGrams: Double, mealKind: TreatmentMealKind?,
+         insulinDate: Date?, mealDate: Date?) {
+        self.insulinUnits = insulinUnits
+        self.carbohydrateGrams = carbohydrateGrams
+        self.mealKindRaw = carbohydrateGrams > 0 ? mealKind?.rawValue : nil
+        self.insulinDate = insulinUnits > 0 ? insulinDate : nil
+        self.mealDate = carbohydrateGrams > 0 ? mealDate : nil
     }
 }
 
@@ -1235,6 +1490,7 @@ struct PenDoseLogOperation: Codable, Equatable {
         let expectsBolus: Bool
         let expectsMeal: Bool
         let processToken: String
+        let intent: PenDoseLogIntent?
     }
     private struct PendingMutation: Codable {
         let objectURI: String
@@ -1291,16 +1547,17 @@ struct PenDoseLogOperation: Codable, Equatable {
             .appendingPathComponent("pending-mutation.json")
     }
 
-    func begin(_ operation: PenDoseLogOperation, expectsBolus: Bool, expectsMeal: Bool) -> Bool {
+    func begin(_ operation: PenDoseLogOperation, expectsBolus: Bool, expectsMeal: Bool,
+               intent: PenDoseLogIntent? = nil) -> Bool {
         guard !fileManager.fileExists(atPath: mutationFileURL.path) else { return false }
         if fileManager.fileExists(atPath: fileURL.path) {
             guard let pending = try? readPending() else { return false }
             return pending.operation == operation && pending.expectsBolus == expectsBolus &&
-                pending.expectsMeal == expectsMeal &&
+                pending.expectsMeal == expectsMeal && pending.intent == intent &&
                 pending.processToken == processToken
         }
         let pending = Pending(operation: operation, expectsBolus: expectsBolus,
-                              expectsMeal: expectsMeal, processToken: processToken)
+                              expectsMeal: expectsMeal, processToken: processToken, intent: intent)
         do {
             let folder = fileURL.deletingLastPathComponent()
             try fileManager.createDirectory(at: folder, withIntermediateDirectories: true)
@@ -1469,18 +1726,43 @@ struct PenDoseLogOperation: Codable, Equatable {
                     carbohydrateGrams: Double, mealKind: TreatmentMealKind,
                     plannedDate: Date?, operation: PenDoseLogOperation = .init(),
                     now: Date = .now, journal: PenDoseLogJournal? = nil,
+                    penSettings: PenDoseProfile.Settings? = nil,
+                    pizzaSettings: PizzaSplitSettings = .load(),
+                    metadataStore: MealPlanMetadataStore? = nil,
+                    onReminderIssue: ((String) -> Void)? = nil,
                     saveOverride: (() -> Bool)? = nil)
         -> Result<PenDoseLogReceipt, PenDoseLogError> {
         let journal = journal ?? .shared
+        let metadataStore = metadataStore ?? .shared
+        let settings = penSettings ?? PenDoseProfile.load().settings
+        guard settings.isValid else { return .failure(.invalidInput) }
+        let penSteps = insulinUnits / settings.penStepUnits
         guard insulinUnits.isFinite, carbohydrateGrams.isFinite,
-              (0...25).contains(insulinUnits), (0...500).contains(carbohydrateGrams),
+              (0...settings.maximumSuggestionUnits).contains(insulinUnits),
+              penSteps.isFinite, abs(penSteps - penSteps.rounded()) < 1e-8,
+              (0...500).contains(carbohydrateGrams),
               insulinUnits > 0 || carbohydrateGrams > 0 else { return .failure(.invalidInput) }
         if let plannedDate {
             guard carbohydrateGrams > 0, plannedDate > now,
                   plannedDate <= now.addingTimeInterval(60 * 60) else { return .failure(.invalidInput) }
         }
+        if carbohydrateGrams > 0 {
+            let metadata = MealPlanMetadata(mealUUID: operation.mealUUID,
+                bolusUUID: insulinUnits > 0 ? operation.bolusUUID : nil,
+                loggedAt: now, plannedAt: plannedDate,
+                grams: carbohydrateGrams,
+                pizzaSettings: pizzaSettings, mealKind: mealKind)
+            do { try metadataStore.stage(metadata) }
+            catch MealPlanMetadataStore.StoreError.conflictingOperation { return .failure(.invalidInput) }
+            catch { return .failure(.metadataFailed) }
+        }
+        let intent = PenDoseLogIntent(insulinUnits: insulinUnits,
+            carbohydrateGrams: carbohydrateGrams,
+            mealKind: carbohydrateGrams > 0 ? mealKind : nil,
+            insulinDate: insulinUnits > 0 ? now : nil,
+            mealDate: carbohydrateGrams > 0 ? (plannedDate ?? now) : nil)
         guard journal.begin(operation, expectsBolus: insulinUnits > 0,
-                            expectsMeal: carbohydrateGrams > 0) else {
+                            expectsMeal: carbohydrateGrams > 0, intent: intent) else {
             return .failure(.storageFailed)
         }
         let context = coreDataManager.mainManagedObjectContext
@@ -1489,9 +1771,11 @@ struct PenDoseLogOperation: Codable, Equatable {
         let priorBolus = existing.first { $0.localTreatmentUUID == operation.bolusUUID }
         let priorMeal = existing.first { $0.localTreatmentUUID == operation.mealUUID }
         guard priorBolus == nil || (insulinUnits > 0 && priorBolus?.treatmentType == .Insulin &&
-                  priorBolus?.value == insulinUnits && priorBolus?.treatmentdeleted == false),
+                  priorBolus?.value == insulinUnits && priorBolus?.date == now &&
+                  priorBolus?.treatmentdeleted == false),
               priorMeal == nil || (carbohydrateGrams > 0 && priorMeal?.treatmentType == .Carbs &&
-                  priorMeal?.value == carbohydrateGrams && priorMeal?.treatmentdeleted == false) else {
+                  priorMeal?.value == carbohydrateGrams && priorMeal?.date == (plannedDate ?? now) &&
+                  priorMeal?.mealKind == mealKind && priorMeal?.treatmentdeleted == false) else {
             return .failure(.invalidInput)
         }
         if insulinUnits > 0 && priorBolus == nil {
@@ -1527,10 +1811,12 @@ struct PenDoseLogOperation: Codable, Equatable {
                 insulinUnits: insulinUnits, carbohydrateGrams: carbohydrateGrams) else {
             return .failure(.storageFailed)
         }
-        if carbohydrateGrams > 0, let plannedDate {
-            PlannedMealReminder.schedule(uuid: operation.mealUUID, at: plannedDate)
-        }
+        let reminderWarning = carbohydrateGrams > 0 ? MealPlanReminderCoordinator.refresh(
+            coreDataManager: coreDataManager, mealUUID: operation.mealUUID,
+            confirmedAt: plannedDate == nil ? now : nil, now: now,
+            store: metadataStore, onIssue: onReminderIssue) : nil
         return .success(PenDoseLogReceipt(confirmedMealUUID:
-            plannedDate == nil && carbohydrateGrams > 0 ? operation.mealUUID : nil))
+            plannedDate == nil && carbohydrateGrams > 0 ? operation.mealUUID : nil,
+            reminderWarning: reminderWarning))
     }
 }

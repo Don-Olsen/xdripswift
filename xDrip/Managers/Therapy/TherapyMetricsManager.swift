@@ -314,16 +314,17 @@ final class TherapyMetricsManager {
 
     /// A fresh, immutable dosing input. This never borrows the Home display cache: a loaded
     /// empty treatment window is known zero, while an incomplete import or save is unknown.
-    func penDoseSnapshot(at date: Date = .now) async
+    func penDoseSnapshot(at date: Date = .now, allowMissingGlucose: Bool = false) async
         -> Result<PenDoseInputSnapshot, PenDoseUnavailableReason> {
         await withCheckedContinuation { continuation in
             inputQueue.async { [self] in
-                continuation.resume(returning: makePenDoseSnapshot(at: date))
+                continuation.resume(returning: makePenDoseSnapshot(at: date,
+                    allowMissingGlucose: allowMissingGlucose))
             }
         }
     }
 
-    private func makePenDoseSnapshot(at date: Date)
+    private func makePenDoseSnapshot(at date: Date, allowMissingGlucose: Bool)
         -> Result<PenDoseInputSnapshot, PenDoseUnavailableReason> {
         guard let coreDataManager else { return .failure(.treatmentReadFailed) }
         let defaults = UserDefaults.standard
@@ -353,7 +354,8 @@ final class TherapyMetricsManager {
         // a save or arriving minute cannot make a mixed, apparently fresh dosing snapshot.
         let glucoseReader = GlucoseForecastDataAdapter(coreDataManager: coreDataManager,
             therapyManager: self, defaults: defaults, healthImporter: importer)
-        guard let firstGlucose = glucoseReader.recentGlucose(at: date) else {
+        let firstGlucose = glucoseReader.recentGlucose(at: date)
+        guard firstGlucose != nil || allowMissingGlucose else {
             return .failure(.missingGlucose)
         }
         let windowMinutes = max(settings.insulinDuration, 480)
@@ -361,8 +363,9 @@ final class TherapyMetricsManager {
                                            to: date, policy: policy, settings: settings) else {
             return .failure(.treatmentReadFailed)
         }
-        guard let finalGlucose = glucoseReader.recentGlucose(at: date),
-              firstGlucose == finalGlucose,
+        let finalGlucose = glucoseReader.recentGlucose(at: date)
+        guard firstGlucose == finalGlucose,
+              finalGlucose != nil || allowMissingGlucose,
               abs(Date().timeIntervalSince(date)) <= 30,
               revision == treatmentChangeRevision,
               !hasUncommittedForecastInputChanges,
@@ -374,7 +377,7 @@ final class TherapyMetricsManager {
                   horizonMinutes: 120, defaults: defaults, importer: importer) else {
             return .failure(.treatmentChangedDuringRead)
         }
-        return PenDoseInputSnapshot.make(capturedAt: date, glucose: finalGlucose,
+        return PenDoseInputSnapshot.make(capturedAt: date, glucose: finalGlucose ?? [],
             treatments: treatments.filter { $0.date <= date }, therapySettings: settings,
             treatmentRevision: revision)
     }

@@ -636,12 +636,31 @@ final class LocalTreatmentPlanningTests: XCTestCase {
     func testReminderRequiresFuturePlanAndCannotBeClearedAsGlucoseAlert() throws {
         let now = Date(timeIntervalSince1970: 1_800_000_000)
         let uuid = UUID().uuidString
-        let reminder = try XCTUnwrap(PlannedMealReminder.request(uuid: uuid, at: now.addingTimeInterval(600), now: now))
+        let reminder = try XCTUnwrap(PlannedMealReminder.request(uuid: uuid, grams: 45,
+            bolusUnits: 4, at: now.addingTimeInterval(600), now: now, locale: Locale(identifier: "da_DK")))
         XCTAssertEqual(reminder.identifier, PlannedMealReminder.identifier(for: uuid))
         XCTAssertEqual(PlannedMealReminder.tappedUUID(from: reminder), uuid)
-        XCTAssertNil(PlannedMealReminder.request(uuid: uuid, at: now, now: now))
-        XCTAssertNil(PlannedMealReminder.request(uuid: uuid, at: now.addingTimeInterval(61 * 60), now: now))
+        XCTAssertEqual(reminder.content.title, "Tid til at spise")
+        XCTAssertEqual(reminder.content.body,
+            "Du har registreret 4,0 E til 45 g. Tryk og bekræft, når du spiser.")
+        let withoutBolus = try XCTUnwrap(PlannedMealReminder.request(uuid: uuid, grams: 45,
+            bolusUnits: nil, at: now.addingTimeInterval(600), now: now, locale: Locale(identifier: "da_DK")))
+        XCTAssertEqual(withoutBolus.content.body,
+            "45 g er planlagt nu. Tryk og bekræft, når du spiser.")
+        let followup = try XCTUnwrap(PlannedMealReminder.followupRequest(uuid: uuid,
+            bolusUnits: 4, at: now.addingTimeInterval(25 * 60), now: now,
+            locale: Locale(identifier: "da_DK")))
+        XCTAssertEqual(followup.identifier, PlannedMealReminder.followupIdentifier(for: uuid))
+        XCTAssertEqual(PlannedMealReminder.tappedUUID(from: followup), uuid)
+        XCTAssertEqual(followup.content.title, "Har du spist?")
+        XCTAssertEqual(followup.content.body,
+            "Du har registreret 4,0 E, men måltidet er ikke bekræftet. Åbn xDrip og kontrollér planen.")
+        XCTAssertNotEqual(followup.identifier, reminder.identifier)
+        XCTAssertNil(PlannedMealReminder.request(uuid: uuid, grams: 45, bolusUnits: 4, at: now, now: now))
+        XCTAssertNil(PlannedMealReminder.request(uuid: uuid, grams: 45, bolusUnits: 4,
+            at: now.addingTimeInterval(61 * 60), now: now))
         XCTAssertFalse(AlertManager.ownedPendingNotificationIdentifiers.contains(reminder.identifier))
+        XCTAssertFalse(AlertManager.ownedPendingNotificationIdentifiers.contains(followup.identifier))
         XCTAssertTrue(AlertManager.ownedPendingNotificationIdentifiers.contains(AlertKind.missedreading.notificationIdentifier()))
     }
 
@@ -763,6 +782,318 @@ final class LocalTreatmentPlanningTests: XCTestCase {
         guard case .failure(.invalidInput) = invalid else {
             return XCTFail("A planned date without food must be rejected")
         }
+    }
+
+    @MainActor func testPlannedPizzaKeepsLinkAndSettingsUntilActualMealConfirmation() throws {
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = MealPlanMetadataStore(directory: directory)
+        let journal = PenDoseLogJournal(directory: directory)
+        let operation = PenDoseLogOperation()
+        let loggedAt = Date()
+        let plannedAt = loggedAt.addingTimeInterval(15 * 60)
+        let pizza = PizzaSplitSettings(isEnabled: true, percentageNow: 70, reminderMinutes: 90)
+        let result = PenDoseTreatmentLogger.log(coreDataManager: core, insulinUnits: 4,
+            carbohydrateGrams: 45, mealKind: .slow, plannedDate: plannedAt,
+            operation: operation, now: loggedAt, journal: journal,
+            pizzaSettings: pizza, metadataStore: store)
+        guard case .success = result else { return XCTFail("Planned 🍕 treatment should save") }
+        let initial = try XCTUnwrap(store.metadata(for: operation.mealUUID))
+        XCTAssertEqual(initial.bolusUUID, operation.bolusUUID)
+        XCTAssertEqual(initial.plannedAt, plannedAt)
+        XCTAssertEqual(initial.followupAt, plannedAt.addingTimeInterval(15 * 60))
+        XCTAssertEqual(initial.pizzaPercentageNow, 70)
+        XCTAssertEqual(initial.pizzaReminderMinutes, 90)
+        XCTAssertNil(initial.pizzaReminderAt, "A planned meal must not start the 🍕 reevaluation timer")
+
+        let entries = TreatmentEntryAccessor(coreDataManager: core).getLatestTreatments(howOld: nil)
+        let meal = try XCTUnwrap(entries.first { $0.localTreatmentUUID == operation.mealUUID })
+        let bolus = try XCTUnwrap(entries.first { $0.localTreatmentUUID == operation.bolusUUID })
+        XCTAssertEqual(bolus.date, loggedAt, "Pre-bolus time is registration time")
+        XCTAssertTrue(meal.isPlannedMeal)
+        let editor = TreatmentEditorViewModel(coreDataManager: core, treatmentToEdit: meal,
+            localSaveJournal: journal, mealMetadataStore: store)
+        XCTAssertFalse(editor.confirmPlannedMeal(), "The planned time is not actual eating time")
+        XCTAssertTrue(editor.confirmPlannedMealNow())
+        XCTAssertTrue(meal.isConfirmedMeal)
+        XCTAssertEqual(TreatmentEntryAccessor(coreDataManager: core)
+            .getLatestTreatments(howOld: nil).filter { $0.treatmentType == .Carbs }.count, 1)
+        let confirmed = try XCTUnwrap(store.metadata(for: operation.mealUUID))
+        let due = try XCTUnwrap(confirmed.pizzaReminderAt)
+        let expectedDue = MealPlanMetadata.pizzaDueAt(actualMealAt: meal.date,
+            confirmedAt: meal.modifiedAt ?? .distantPast, intervalMinutes: 90)
+        XCTAssertEqual(due.timeIntervalSince(expectedDue), 0, accuracy: 2)
+        XCTAssertEqual(confirmed.pizzaReminderMinutes, 90,
+            "Later global settings must not replace the logged meal's choice")
+    }
+
+    @MainActor func testCancellingPlanKeepsBolusAndRemovesOnlyMealMetadata() throws {
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = MealPlanMetadataStore(directory: directory)
+        let journal = PenDoseLogJournal(directory: directory)
+        let operation = PenDoseLogOperation()
+        let now = Date()
+        let plannedAt = now.addingTimeInterval(20 * 60)
+        let result = PenDoseTreatmentLogger.log(coreDataManager: core, insulinUnits: 2,
+            carbohydrateGrams: 30, mealKind: .normal, plannedDate: plannedAt,
+            operation: operation, now: now, journal: journal, metadataStore: store)
+        guard case .success = result else { return XCTFail("Planned meal should save") }
+        let entries = TreatmentEntryAccessor(coreDataManager: core).getLatestTreatments(howOld: nil)
+        let meal = try XCTUnwrap(entries.first { $0.localTreatmentUUID == operation.mealUUID })
+        let editor = TreatmentEditorViewModel(coreDataManager: core, treatmentToEdit: meal,
+            localSaveJournal: journal, mealMetadataStore: store)
+        XCTAssertTrue(editor.cancelPlannedMeal())
+        XCTAssertTrue(meal.isCancelledMeal)
+        XCTAssertNil(try store.metadata(for: operation.mealUUID))
+        let bolus = try XCTUnwrap(entries.first { $0.localTreatmentUUID == operation.bolusUUID })
+        XCTAssertFalse(bolus.treatmentdeleted)
+        XCTAssertEqual(bolus.value, 2)
+    }
+
+    @MainActor func testBolusDeletionRemovesInsulinFollowupButKeepsFoodPlan() throws {
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = MealPlanMetadataStore(directory: directory)
+        let journal = PenDoseLogJournal(directory: directory)
+        let operation = PenDoseLogOperation()
+        let now = Date()
+        let result = PenDoseTreatmentLogger.log(coreDataManager: core, insulinUnits: 3,
+            carbohydrateGrams: 35, mealKind: .normal, plannedDate: now.addingTimeInterval(20 * 60),
+            operation: operation, now: now, journal: journal, metadataStore: store)
+        guard case .success = result else { return XCTFail("Planned meal should save") }
+        let entries = TreatmentEntryAccessor(coreDataManager: core).getLatestTreatments(howOld: nil)
+        let bolus = try XCTUnwrap(entries.first { $0.localTreatmentUUID == operation.bolusUUID })
+        let meal = try XCTUnwrap(entries.first { $0.localTreatmentUUID == operation.mealUUID })
+        let editor = TreatmentEditorViewModel(coreDataManager: core, treatmentToEdit: bolus,
+            localSaveJournal: journal, mealMetadataStore: store)
+        XCTAssertTrue(editor.deleteTreatment())
+        let metadata = try XCTUnwrap(store.metadata(for: operation.mealUUID))
+        XCTAssertNil(metadata.bolusUUID)
+        XCTAssertNil(metadata.followupAt)
+        XCTAssertTrue(meal.isPlannedMeal)
+        XCTAssertFalse(meal.treatmentdeleted)
+    }
+
+    @MainActor func testReminderMetadataFailureAfterVerifiedSaveCannotDuplicateTreatment() throws {
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = MealPlanMetadataStore(directory: directory)
+        let journal = PenDoseLogJournal(directory: directory)
+        let operation = PenDoseLogOperation()
+        let now = Date()
+        let result = PenDoseTreatmentLogger.log(coreDataManager: core, insulinUnits: 2,
+            carbohydrateGrams: 25, mealKind: .slow, plannedDate: now.addingTimeInterval(15 * 60),
+            operation: operation, now: now, journal: journal, metadataStore: store,
+            saveOverride: {
+                guard core.saveChangesSynchronously() else { return false }
+                let url = directory.appendingPathComponent("PenDose/MealPlans/\(operation.mealUUID).json")
+                try? Data("damaged metadata".utf8).write(to: url, options: .atomic)
+                return true
+            })
+        guard case .success(let receipt) = result else {
+            return XCTFail("Verified treatment must not be reported as a failed log")
+        }
+        XCTAssertNotNil(receipt.reminderWarning)
+        XCTAssertEqual(TreatmentEntryAccessor(coreDataManager: core)
+            .getLatestTreatments(howOld: nil).filter { !$0.treatmentdeleted }.count, 2)
+        XCTAssertEqual(journal.recoveryState(coreDataManager: core), .ready)
+    }
+
+    @MainActor func testJournalIdentityCannotBeRetriedWithDifferentAmountsOrTime() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let journal = PenDoseLogJournal(directory: directory)
+        let operation = PenDoseLogOperation()
+        let now = Date()
+        let original = PenDoseLogIntent(insulinUnits: 2, carbohydrateGrams: 30,
+            mealKind: .slow, insulinDate: now, mealDate: now.addingTimeInterval(15 * 60))
+        XCTAssertTrue(journal.begin(operation, expectsBolus: true, expectsMeal: true, intent: original))
+        XCTAssertTrue(journal.begin(operation, expectsBolus: true, expectsMeal: true, intent: original))
+        let changedAmount = PenDoseLogIntent(insulinUnits: 2.5, carbohydrateGrams: 30,
+            mealKind: .slow, insulinDate: now, mealDate: now.addingTimeInterval(15 * 60))
+        XCTAssertFalse(journal.begin(operation, expectsBolus: true, expectsMeal: true,
+            intent: changedAmount))
+        let changedTime = PenDoseLogIntent(insulinUnits: 2, carbohydrateGrams: 30,
+            mealKind: .slow, insulinDate: now.addingTimeInterval(10),
+            mealDate: now.addingTimeInterval(15 * 60))
+        XCTAssertFalse(journal.begin(operation, expectsBolus: true, expectsMeal: true,
+            intent: changedTime))
+    }
+
+    @MainActor func testLoggerChecksConfiguredPenMaximumAndStepBeforeStoreWrite() throws {
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        var settings = PenDoseProfile.prefilledUnconfirmed.settings
+        settings.penStepUnits = 0.25
+        settings.maximumSuggestionUnits = 3
+        let journal = PenDoseLogJournal(directory: directory)
+        let store = MealPlanMetadataStore(directory: directory)
+        let tooHigh = PenDoseTreatmentLogger.log(coreDataManager: core, insulinUnits: 3.25,
+            carbohydrateGrams: 0, mealKind: .normal, plannedDate: nil, journal: journal,
+            penSettings: settings, metadataStore: store)
+        guard case .failure(.invalidInput) = tooHigh else { return XCTFail("Configured maximum must apply") }
+        let offStep = PenDoseTreatmentLogger.log(coreDataManager: core, insulinUnits: 2.3,
+            carbohydrateGrams: 0, mealKind: .normal, plannedDate: nil, journal: journal,
+            penSettings: settings, metadataStore: store)
+        guard case .failure(.invalidInput) = offStep else { return XCTFail("Configured pen step must apply") }
+        XCTAssertTrue(TreatmentEntryAccessor(coreDataManager: core).getLatestTreatments(howOld: nil).isEmpty)
+        let valid = PenDoseTreatmentLogger.log(coreDataManager: core, insulinUnits: 2.25,
+            carbohydrateGrams: 0, mealKind: .normal, plannedDate: nil, journal: journal,
+            penSettings: settings, metadataStore: store)
+        guard case .success = valid else { return XCTFail("An exact 0.25 E step must be accepted") }
+        XCTAssertEqual(TreatmentEntryAccessor(coreDataManager: core)
+            .getLatestTreatments(howOld: nil).first?.value, 2.25)
+    }
+
+    @MainActor func testConfirmedPizzaEditUpdatesFutureReminderWithoutRevivingPastOne() throws {
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = MealPlanMetadataStore(directory: directory)
+        let journal = PenDoseLogJournal(directory: directory)
+        let operation = PenDoseLogOperation()
+        let now = Date()
+        let pizza = PizzaSplitSettings(isEnabled: true, percentageNow: 70, reminderMinutes: 90)
+        let logged = PenDoseTreatmentLogger.log(coreDataManager: core, insulinUnits: 2,
+            carbohydrateGrams: 45, mealKind: .slow, plannedDate: nil,
+            operation: operation, now: now, journal: journal,
+            pizzaSettings: pizza, metadataStore: store)
+        guard case .success = logged else { return XCTFail("Pizza treatment should save") }
+        let originalDue = try XCTUnwrap(store.metadata(for: operation.mealUUID)?.pizzaReminderAt)
+        let meal = try XCTUnwrap(TreatmentEntryAccessor(coreDataManager: core)
+            .getLatestTreatments(howOld: nil).first { $0.localTreatmentUUID == operation.mealUUID })
+        let editor = TreatmentEditorViewModel(coreDataManager: core, treatmentToEdit: meal,
+            localSaveJournal: journal, mealMetadataStore: store)
+        editor.selectedDate = now.addingTimeInterval(-10 * 60)
+        editor.enteredValue = "50"
+        XCTAssertTrue(editor.saveTreatment())
+        let edited = try XCTUnwrap(store.metadata(for: operation.mealUUID))
+        let editedDue = try XCTUnwrap(edited.pizzaReminderAt)
+        XCTAssertLessThan(editedDue, originalDue)
+        XCTAssertEqual(edited.lastStoredMealGrams, 50)
+        XCTAssertEqual(edited.lastStoredMealDate, meal.date)
+        meal.date = now.addingTimeInterval(-15 * 60)
+        XCTAssertTrue(core.saveChangesSynchronously())
+        let warning = MealPlanReminderCoordinator.refresh(coreDataManager: core,
+            mealUUID: operation.mealUUID, now: editedDue.addingTimeInterval(1), store: store)
+        XCTAssertNil(warning)
+        XCTAssertEqual(try store.metadata(for: operation.mealUUID)?.pizzaReminderAt, editedDue,
+            "A due reminder must never be recreated with a new deadline")
+        meal.mealKindRaw = TreatmentMealKind.normal.rawValue
+        XCTAssertTrue(core.saveChangesSynchronously())
+        XCTAssertNil(MealPlanReminderCoordinator.refresh(coreDataManager: core,
+            mealUUID: operation.mealUUID, store: store))
+        XCTAssertNil(try store.metadata(for: operation.mealUUID)?.pizzaReminderAt)
+        meal.mealKindRaw = TreatmentMealKind.slow.rawValue
+        XCTAssertTrue(core.saveChangesSynchronously())
+        XCTAssertNil(MealPlanReminderCoordinator.refresh(coreDataManager: core,
+            mealUUID: operation.mealUUID, store: store))
+        XCTAssertNil(try store.metadata(for: operation.mealUUID)?.pizzaReminderAt,
+            "Changing the kind back must not revive an obsolete split reminder")
+    }
+
+    @MainActor func testManualInsulinCanLogWithNoCalculationAfterSingleConfirmation() async throws {
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        var profile = PenDoseProfile.prefilledUnconfirmed
+        XCTAssertTrue(profile.confirm())
+        let vm = PenDoseCalculatorViewModel(coreDataManager: core,
+            logJournal: PenDoseLogJournal(directory: directory),
+            metadataStore: MealPlanMetadataStore(directory: directory),
+            profileProvider: { profile }, sourceReadyOverride: { true },
+            snapshotProvider: { _, _ in .failure(.missingGlucose) })
+        vm.insulinToLogText = "2,0"
+        XCTAssertEqual(vm.carbohydratesText, "")
+        XCTAssertTrue(vm.canLog)
+        XCTAssertTrue(vm.requestLog(), "Missing calculation requires one confirmation")
+        XCTAssertEqual(vm.confirmationDraft?.insulinUnits, 2)
+        XCTAssertEqual(vm.confirmationDraft?.carbohydrateGrams, 0)
+        XCTAssertFalse(vm.canLog, "The same registration cannot start twice")
+        let saved = await vm.confirmLog()
+        XCTAssertTrue(saved)
+        XCTAssertNil(vm.confirmationDraft)
+        XCTAssertEqual(TreatmentEntryAccessor(coreDataManager: core)
+            .getLatestTreatments(howOld: nil).filter { $0.treatmentType == .Insulin }.count, 1)
+    }
+
+    @MainActor func testStaleConfirmationDoesNotBackdateInsulinOrClearEnteredDose() async throws {
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let vm = PenDoseCalculatorViewModel(coreDataManager: core,
+            logJournal: PenDoseLogJournal(directory: directory),
+            metadataStore: MealPlanMetadataStore(directory: directory),
+            sourceReadyOverride: { true },
+            snapshotProvider: { _, _ in .failure(.missingGlucose) })
+        vm.insulinToLogText = "2,0"
+        XCTAssertTrue(vm.requestLog())
+        let requestedAt = try XCTUnwrap(vm.confirmationDraft?.loggedAt)
+        let saved = await vm.confirmLog(at: requestedAt.addingTimeInterval(6 * 60))
+        XCTAssertFalse(saved)
+        XCTAssertNil(vm.confirmationDraft)
+        XCTAssertEqual(vm.insulinToLogText, "2,0")
+        XCTAssertTrue(TreatmentEntryAccessor(coreDataManager: core)
+            .getLatestTreatments(howOld: nil).isEmpty)
+        XCTAssertTrue(vm.requestLog(), "A new tap creates a fresh registration attempt")
+    }
+
+    @MainActor func testEmptyAmountsAndCalculationFailurePreserveUserFields() async throws {
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        var profile = PenDoseProfile.prefilledUnconfirmed
+        XCTAssertTrue(profile.confirm())
+        let vm = PenDoseCalculatorViewModel(coreDataManager: core,
+            logJournal: PenDoseLogJournal(directory: directory),
+            metadataStore: MealPlanMetadataStore(directory: directory),
+            profileProvider: { profile }, sourceReadyOverride: { true },
+            snapshotProvider: { _, _ in .failure(.missingGlucose) })
+        XCTAssertFalse(vm.canLog)
+        vm.carbohydratesText = "45"
+        XCTAssertTrue(vm.canLog)
+        XCTAssertFalse(vm.requestLog(), "Carbohydrates alone need no insulin warning")
+        XCTAssertEqual(vm.confirmationDraft?.insulinUnits, 0)
+        vm.cancelLogConfirmation()
+        vm.insulinToLogText = "2"
+        await vm.calculate()
+        XCTAssertEqual(vm.carbohydratesText, "45")
+        XCTAssertEqual(vm.insulinToLogText, "2")
+        XCTAssertNil(vm.suggestedUnits)
+        vm.carbohydratesText = "0"
+        vm.insulinToLogText = "0"
+        XCTAssertFalse(vm.canLog)
+        vm.carbohydratesText = "abc"
+        XCTAssertFalse(vm.canLog, "Invalid nonempty text is never zero")
+    }
+
+    @MainActor func testExpiredPlanDuringConfirmationDoesNotSaveOrConsumeFood() async throws {
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        var profile = PenDoseProfile.prefilledUnconfirmed
+        XCTAssertTrue(profile.confirm())
+        let vm = PenDoseCalculatorViewModel(coreDataManager: core,
+            logJournal: PenDoseLogJournal(directory: directory),
+            metadataStore: MealPlanMetadataStore(directory: directory),
+            profileProvider: { profile }, sourceReadyOverride: { true })
+        vm.carbohydratesText = "45"
+        vm.insulinToLogText = "2"
+        vm.isPlannedMeal = true
+        vm.plannedDate = Date().addingTimeInterval(1.5)
+        XCTAssertTrue(vm.requestLog())
+        try await Task.sleep(for: .seconds(1.7))
+        let saved = await vm.confirmLog()
+        XCTAssertFalse(saved)
+        XCTAssertTrue(vm.expiredPlan)
+        XCTAssertTrue(TreatmentEntryAccessor(coreDataManager: core)
+            .getLatestTreatments(howOld: nil).isEmpty)
     }
 
     @MainActor func testPenDoseRetryAfterUncertainSaveReusesStableTreatmentIDs() throws {

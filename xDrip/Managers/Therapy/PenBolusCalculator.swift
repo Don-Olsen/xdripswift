@@ -125,7 +125,9 @@ struct PenDoseProfile: Codable, Equatable, Sendable {
 
 enum PenDoseGlucoseInput: Sendable {
     case currentCGM
-    case confirmedStale(valueMgdl: Double, measuredAt: Date)
+    /// The exact CGM sample explicitly chosen by the user. A subsequent sample
+    /// must not silently replace this value while its trend remains unavailable.
+    case confirmedStale(valueMgdl: Double, measuredAt: Date, sensorID: String)
     case manual(valueMgdl: Double, measuredAt: Date)
 }
 
@@ -226,6 +228,7 @@ struct PenDoseCalculation: Sendable {
     let unavailableReason: PenDoseUnavailableReason?
     let glucoseMgdl: Double?
     let glucoseMeasuredAt: Date?
+    let glucoseSensorID: String?
     let trendWasIntentionallyZero: Bool
     let forecastMinimumMgdl: Double?
     var isAvailable: Bool { suggestedUnits != nil && unavailableReason == nil }
@@ -284,6 +287,7 @@ enum PenBolusCalculator {
         func unavailable(_ reason: PenDoseUnavailableReason) -> PenDoseCalculation {
             PenDoseCalculation(suggestedUnits: nil, lines: nil, safety: nil,
                 unavailableReason: reason, glucoseMgdl: nil, glucoseMeasuredAt: nil,
+                glucoseSensorID: nil,
                 trendWasIntentionallyZero: false, forecastMinimumMgdl: nil)
         }
         guard profile.settings.isValid else { return unavailable(.invalidProfile) }
@@ -304,6 +308,7 @@ enum PenBolusCalculator {
         }
         let glucoseValue: Double
         let glucoseDate: Date
+        let glucoseSensorID: String?
         let trendMgdl: Double
         let zeroTrend: Bool
         let canCheckForecast: Bool
@@ -312,6 +317,7 @@ enum PenBolusCalculator {
             guard let latest = snapshot.glucose.last else { return unavailable(.missingGlucose) }
             glucoseValue = latest.glucoseMgdl
             glucoseDate = latest.date
+            glucoseSensorID = latest.sensorID
             let age = now.timeIntervalSince(latest.date)
             guard age >= -30 else { return unavailable(.invalidGlucose) }
             guard age <= freshCGMSeconds else { return unavailable(.glucoseNeedsConfirmation) }
@@ -321,9 +327,22 @@ enum PenBolusCalculator {
             trendMgdl = trend
             zeroTrend = false
             canCheckForecast = true
-        case .confirmedStale(let value, let date), .manual(let value, let date):
+        case .confirmedStale(let value, let date, let sensorID):
+            guard !sensorID.isEmpty,
+                  snapshot.glucose.last.map({ $0.sensorID == sensorID && $0.date >= date }) ?? true,
+                  !snapshot.glucose.contains(where: {
+                      $0.sensorID == sensorID && $0.date == date && $0.glucoseMgdl != value
+                  }) else { return unavailable(.invalidGlucose) }
             glucoseValue = value
             glucoseDate = date
+            glucoseSensorID = sensorID
+            trendMgdl = 0
+            zeroTrend = true
+            canCheckForecast = false
+        case .manual(let value, let date):
+            glucoseValue = value
+            glucoseDate = date
+            glucoseSensorID = nil
             trendMgdl = 0
             zeroTrend = true
             canCheckForecast = false
@@ -378,6 +397,7 @@ enum PenBolusCalculator {
         return PenDoseCalculation(suggestedUnits: blocks ? nil : roundedDown,
             lines: lines, safety: safety, unavailableReason: nil,
             glucoseMgdl: glucoseValue, glucoseMeasuredAt: glucoseDate,
+            glucoseSensorID: glucoseSensorID,
             trendWasIntentionallyZero: zeroTrend, forecastMinimumMgdl: forecastMinimum)
     }
 
