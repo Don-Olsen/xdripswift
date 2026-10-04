@@ -17,12 +17,12 @@ be drawn. The historical 4289 behavior still allowed HealthKit synchronization
 to make treatment inputs briefly incomplete on reentry. The post-4292 bounded
 complete-snapshot rule is described below.
 
-The local follow-up to 4289 passed 1,184/1,184 XCTest tests, all Python checks
-and both simulator builds on 2026-10-03. The new presentation regression tests
-cover 60/120-minute loading/valid/unavailable transitions and the off/history/
-non-main exclusions. Device logs establish transient input unavailability, but
-physical observation of the corrected UI still requires a separately authorized
-release. This follow-up has not been uploaded or installed on the user's devices.
+The original local follow-up to 4289 passed 1,184/1,184 XCTest tests, all
+Python checks and both simulator builds on 2026-10-03. Its presentation
+regression tests cover 60/120-minute loading/valid/unavailable transitions
+and the off/history/non-main exclusions. Device logs establish transient
+input unavailability; the visual result of the later 4293 fix still requires
+direct observation on the user's iPhone.
 
 ## Historical follow-up to 4290: foreground reload presentation
 
@@ -95,7 +95,7 @@ For each five-minute point, bolus and carbohydrate effects are the difference be
 
 The model assumes stable unmodeled background glucose/long-acting basal action. Missed or changed Tresiba, exercise, illness, stress, sensor lag and new food or insulin can invalidate that assumption. The forecast is exploratory until prospective device data establishes its error and coverage. No claim of Trio-equivalent accuracy is made.
 
-## Local personal ML candidate after 4291 (pre-release validation)
+## Personal ML model and corrected historical inputs in 4293
 
 This local candidate keeps the existing Swift forecast engine authoritative. When a
 validated device-local model is compatible with the current treatment sources and
@@ -179,14 +179,12 @@ while unknown directories are preserved.
 These checks are software safeguards, not an observed improvement for this
 person. A physical run must compare newly collected predictions with later
 measured glucose and document any intervening meals, boluses or setting changes.
-The exact local candidate passed 1,227/1,227 XCTest tests (zero failed or
-skipped), all existing Python controls, both iPhone/Watch simulator builds and
-a separate unsigned iPhoneOS arm64 compile of the Create ML path on
-2026-10-03. The local result bundle is under
-`~/DeveloperBuildData/xDrip/local-runs/xdripswift/20261003T214314Z-23236/`.
-No model has been trained or exercised on the user's actual iPhone, so the
-self-check promotion and claimed 80% interval target remain unverified in
-physical use. The user authorized internal TestFlight upload on 2026-10-04; release validation remains required.
+The exact tagged 4293 source passed 1,246/1,246 XCTest tests, all existing
+Python controls and both iPhone/Watch simulator builds. Its signed IPA was
+verified before upload, and Apple confirmed **Internal / Testing** on
+2026-10-04. No model has yet been trained or exercised on the user's actual
+iPhone, so future personal accuracy and the 80% interval target remain
+unverified in physical use.
 
 ## Validation boundary
 

@@ -20,7 +20,7 @@ De følgende afsnit bevarer integrations- og testhistorikken før denne udgivels
 - Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
 <!-- testflight-7.1.1-4292:end -->
 
-## Rettelser efter 4292 — releasekandidat 4. oktober 2026
+## Rettelser i 4293 — 4. oktober 2026
 
 Home bevarer nu et tidligere komplet, valideret behandlingssnapshot under en
 rutinemæssig Sundhed-genlæsning af de samme, friske kilder i højst 30 sekunder.
@@ -61,10 +61,10 @@ kodegennemgang fandt ingen resterende blokerende kildefejl.
 Den parrede iPhone kunne ikke læses via CoreDevice på netværket under denne
 kontrol, så hverken den visuelle effekt, den første Sundhed-tilladelsesdialog,
 træning eller prognosens faktiske præcision er verificeret fysisk. De beståede
-softwaretests dokumenterer ikke en personlig præcisionsforbedring. Intern
-TestFlight-upload er udtrykkeligt godkendt af brugeren for denne kandidat;
-releaseprocessen skal stadig teste det præcise staged kildegrundlag og
-bekræfte Apples status før udgivelsen meldes færdig.
+softwaretests dokumenterer ikke en personlig præcisionsforbedring. Den præcise
+taggede 4293-kilde bestod igen 1.246/1.246 XCTest-tests, Python-kontroller og
+begge simulatorbuilds i releaseprocessen. Den verificerede IPA blev uploadet,
+og Apple bekræftede Internal / Testing for den eksisterende Ole Internal-gruppe.
 
 De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
 
