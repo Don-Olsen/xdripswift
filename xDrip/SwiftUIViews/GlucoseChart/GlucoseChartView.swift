@@ -251,6 +251,7 @@ struct GlucoseChartView: View {
     private var renderBasalDownwards = false
     /// A separate presentation series. These values never enter GlucoseChartState or measured BG.
     private var forecastPoints = [GlucoseChartForecastPoint]()
+    private var conditionalPlannedMealPoints = [GlucoseChartForecastPoint]()
     private var forecastBandPoints = [GlucoseChartForecastBandPoint]()
     private var forecastIsML = false
     private var forecastReferenceDate: Date?
@@ -469,6 +470,21 @@ struct GlucoseChartView: View {
         view.forecastReferenceDate = referenceDate
         view.forecastHorizonMinutes = horizonMinutes
         return view
+    }
+
+    /// A separate what-if line. It never enters measured glucose or forecast state.
+    func conditionalPlannedMealPlot(_ points: [GlucoseChartForecastPoint]) -> Self {
+        var view = self
+        view.conditionalPlannedMealPoints = points
+        return view
+    }
+
+    private var visibleConditionalPlannedMealPoints: [GlucoseChartForecastPoint] {
+        GlucoseChartForecastPresentation.visiblePoints(
+            conditionalPlannedMealPoints, referenceDate: forecastReferenceDate,
+            visibleStartDate: visibleStartDate, visibleEndDate: visibleEndDate,
+            isMainChart: usesMainChartYAxisContext
+        )
     }
 
     private var visibleForecastPoints: [GlucoseChartForecastPoint] {
@@ -821,6 +837,7 @@ struct GlucoseChartView: View {
         let treatmentValues = visibleCalibrationPoints.map { $0.value } + visibleTreatmentPoints.nonBasalRenderableValues
             + (downwardBasal ? [] : basalValues)
         let visibleForecast = visibleForecastPoints
+        let visibleConditionalPlannedMeal = visibleConditionalPlannedMealPoints
         let visibleForecastBand = visibleForecastBandPoints
         let allBgValues = bgReadingValues + additionalValues + treatmentValues
         // Keep geometry separate from visibility: unavailable estimates and treatments stay hidden.
@@ -835,7 +852,7 @@ struct GlucoseChartView: View {
             start: visibleStartDate, end: visibleEndDate)
         let forecastDomainValues = currentGeometry.forecastBounds.map { [$0.values.lowerBound, $0.values.upperBound] }
             ?? visibleForecast.map(\.glucoseMgdl)
-        let renderableYValues = allBgValues + forecastDomainValues
+        let renderableYValues = allBgValues + forecastDomainValues + visibleConditionalPlannedMeal.map(\.glucoseMgdl)
         let cachedBasalBaseline = chartState?.minimumChartValueInMgDl ?? ConstantsGlucoseChartSwiftUI.yAxisAbsoluteMinimumChartValueInMgDl
         let basalMinimumChartValue = showsTreatments && !basalValues.isEmpty && !downwardBasal
             ? chartState?.minimumChartValueInMgDl ?? ConstantsGlucoseChartSwiftUI.yAxisAbsoluteMinimumChartValueInMgDl
@@ -1103,6 +1120,17 @@ struct GlucoseChartView: View {
                                              : StrokeStyle(lineWidth: 2.5, dash: [5, 4]))
                     .foregroundStyle(Color.cyan)
                     .accessibilityLabel(forecastIsML ? "ML estimate" : Bundle.main.localizedString(forKey: "forecast.estimate", value: "Estimate", table: "SettingsViews"))
+                    .accessibilityValue(point.glucoseMgdl.mgDlToMmolAndToString(mgDl: isMgDl))
+            }
+
+            ForEach(visibleConditionalPlannedMeal, id: \.date) { point in
+                LineMark(x: .value("If eaten time", point.date),
+                         y: .value("If eaten estimate", point.glucoseMgdl),
+                         series: .value("Series", "planned-meal-if-eaten"))
+                    .interpolationMethod(.linear)
+                    .lineStyle(StrokeStyle(lineWidth: 1.8, dash: [2, 5]))
+                    .foregroundStyle(.orange)
+                    .accessibilityLabel("Hvis spist · betinget prognose")
                     .accessibilityValue(point.glucoseMgdl.mgDlToMmolAndToString(mgDl: isMgDl))
             }
 

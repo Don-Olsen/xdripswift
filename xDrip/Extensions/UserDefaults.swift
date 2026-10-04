@@ -226,6 +226,8 @@ extension UserDefaults {
         case lastBasalInjectionUnits = "lastBasalInjectionUnits"
         /// last saved insulin type used to prefill a new basal injection
         case lastBasalInjectionInsulinDescription = "lastBasalInjectionInsulinDescription"
+        /// User-chosen amount for the Treatment tab's rapid carbohydrate shortcut.
+        case quickCarbohydrateGrams = "quickCarbohydrateGrams"
         /// override the default canula age value (CAGE = time since site change)?
         case CAGEMaxHours = "CAGEMaxHours"
 
@@ -1716,6 +1718,22 @@ extension UserDefaults {
     var lastBasalInjectionInsulinDescription: String {
         get { string(forKey: Key.lastBasalInjectionInsulinDescription.rawValue) ?? "" }
         set { set(newValue, forKey: Key.lastBasalInjectionInsulinDescription.rawValue) }
+    }
+
+    /// No prefilled amount: the shortcut stays disabled until the user chooses a valid dose.
+    var quickCarbohydrateGrams: Double? {
+        get {
+            guard let value = object(forKey: Key.quickCarbohydrateGrams.rawValue) as? Double,
+                  value.isFinite, value > 0 else { return nil }
+            return value
+        }
+        set {
+            if let newValue, newValue.isFinite, newValue > 0 {
+                set(newValue, forKey: Key.quickCarbohydrateGrams.rawValue)
+            } else {
+                removeObject(forKey: Key.quickCarbohydrateGrams.rawValue)
+            }
+        }
     }
 
     /// Invert the stored flag so injections are visible before a filter preference has been saved.

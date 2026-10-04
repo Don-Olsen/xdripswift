@@ -28,6 +28,8 @@ enum ConstantsNotifications {
         static let notLoopingAlert = "notLoopingAlert"
         /// manufacturer-reported terminal sensor or transmitter failure
         static let sensorTransmitterFailure = "sensorTransmitterFailure"
+        /// Forecast-based warning, owned separately from the normal glucose alert rebuild.
+        static let lowSoon = "lowSoonAlert"
     }
     
     /// identifiers for calibration requests

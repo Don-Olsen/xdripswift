@@ -48,7 +48,9 @@ struct GlucoseForecastMLHealthSample: Sendable {
             guard insulinReason == HKInsulinDeliveryReason.bolus.rawValue else { return nil }
             return TherapyTreatment(date: startDate, amount: value, isIOB: true)
         case .carbohydrates:
-            return TherapyTreatment(date: startDate, amount: value, isIOB: false)
+            // Imported/legacy meals have no per-entry type and are normal 240-minute meals.
+            return TherapyTreatment(date: startDate, amount: value, isIOB: false,
+                carbohydrateDurationMinutes: TreatmentMealKind.normal.durationMinutes)
         case .glucose:
             return nil
         }

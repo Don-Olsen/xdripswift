@@ -8,6 +8,98 @@
 - Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
 <!-- testflight-7.1.1-4294:end -->
 
+## Trin A efter 4294 — fair prognosemåling (lokalt, ikke udgivet)
+
+Selvtjekket måler nu motor, ML og uændret glukose på præcis samme C-ankre
+for hver af +30/+60/+120 minutter. Det viser antal, referenceperiode,
+MAE, signeret fejl (prognose minus faktisk) og ML's forskel mod uændret
+glukose. Den eksisterende regel for, om en ML-model må aktiveres, er
+uændret. En afsluttet selvtjekkørsel kan deles som lokal CSV med én række
+pr. anker, også når modellen afvises. Rækkerne indeholder kilde- og
+indstillingskontekst, motor-/ML-/faktiske værdier, IOB/COB og summer af
+behandlingerne i motorens vindue. Filen sendes kun ved brugerens egen
+handling og gemmes ikke i Git.
+
+Replay og live bruger samme event-time-filter før motoren. Syntetiske
+tests dækker desuden kildevalg og dubletter med fælles oprindelses-id.
+Den historiske loader vælger bevidst direkte Sundhed-behandlinger fra de
+valgte kilder, mens live-målingen bruger importerede Core Data-poster med
+lokal/ekstern oprindelsesprioritet. Paritet i den syntetiske motortest
+beviser derfor ikke kildeparitet på brugerens faktiske telefon. Historiske
+Sundhedsværdier og den aktuelle Core Data-visning kan også være forskellige,
+og historisk tidspunkt for import af behandlinger er ofte ukendt.
+Den oplyste forskel mellem brugerens eksterne replay og
+selvtjekkets MAE er derfor **ikke forklaret** uden de enkelte replayrækker.
+Der er ikke ændret dosering, alarmer, Bluetooth eller glukoselagring.
+
+Første lokale A-validering: `scripts/local-build.sh test-all` bestod
+**1.259/1.259 XCTest-tests**, nul fejl, med resultater i
+`~/DeveloperBuildData/xDrip/local-runs/xdripswift/20261004T110830Z-1974/`.
+Efter denne test bestod `scripts/local-build.sh release-test` med
+**1.259/1.259 XCTest-tests**, projektets Python-kontroller og begge
+simulatorbuilds i
+`~/DeveloperBuildData/xDrip/local-runs/xdripswift/20261004T111118Z-2389/`.
+En efterfølgende fail-safe-rettelse beskytter CSV ved fejlet filskrivning.
+Den endelige A-kode bestod derefter **1.260/1.260 XCTest-tests**, Python-
+kontroller og begge simulatorbuilds i
+`~/DeveloperBuildData/xDrip/local-runs/xdripswift/20261004T112226Z-5773/`.
+Fysisk iPhone/Watch er ikke kontrolleret for denne kandidat. Intet blev
+uploadet i trin A.
+
+## Trin B efter 4294 — lokal behandling som primær kilde (lokalt, ikke udgivet)
+
+Den eksisterende Treatment-fane kan gemme bekræftede lokale insulin- og
+kulhydratposter med madtype, varighed og kendt oprettelses-/ændringstid.
+Planlagte måltider forbliver ubekræftede, indtil brugeren markerer dem spist;
+de indgår ikke i faktisk COB, ML eller advarsler. Det eksplicitte kildeskift
+afslutter først den valgte Sundhed-import, bevarer ældre mySugr-poster efter
+deres hændelsestid og bruger lokal logning fra skiftet. Lokale poster skrives
+til Sundhed via stabilt sync-id/version uden at miste posten ved skrivefejl.
+Sundhed-kopien af en senere slettet post fjernes ikke automatisk; se
+`docs/HEALTHKIT-THERAPY-IMPORT.md`.
+
+Trin B bestod **1.287/1.287 XCTest-tests**, Python-kontroller og iPhone-/
+Watch-simulatorbuilds i
+`~/DeveloperBuildData/xDrip/local-runs/xdripswift/20261004T122918Z-21209/`.
+Denne kvittering gælder B før tilføjelsen af doserings- og alarmkoden i C.
+Ingen fysisk enhed eller klinisk effekt er verificeret. Intet blev uploadet
+i trin B.
+
+## Trin C efter 4294 — bolusforslag og “Lavt om lidt” (release-kandidat)
+
+Den lokale penberegner viser formelens led særskilt og kræver, at brugeren
+bekræfter sin forudfyldte doseringsprofil. Den læser et nyt, sammenhængende
+glukose- og behandlingssnapshot ved beregning og igen før registrering. Ukendt
+eller ufuldstændigt IOB/COB-grundlag giver “Kan ikke beregne”. Den separate
+motorprognose kan blokere et insulin-forslag ved beregnet glukose under
+3,0 mmol/L; når prognosen ikke kan beregnes, vises en tydelig advarsel om det.
+Appen giver kun forslag og registrerer brugerens faktisk tagne insulin.
+En ubekræftet måltidsplan tæller ikke som spist. Den nye, valgfri
+“Lavt om lidt”-advarsel beregnes ved nye iPhone-målinger, uafhængigt af
+Home-visningen; dens journal skelner mellem anmodet notifikation og ukendt
+faktisk levering. De eksisterende Libre-/Bluetooth- og Watch-forløb er ikke
+ændret i denne kandidat.
+
+Lagring af lokale insulin-/kulhydratposter er beskyttet af en holdbar
+operationsmarkør. Hvis en gemning, redigering eller sletning ikke kan
+bekræftes i det permanente lager, blokeres ny doseringsregistrering, indtil
+brugeren efter genstart har kontrolleret historikken. En senere Core Data-
+gemning må dermed ikke lydløst gøre en tidligere fejlet ændring gældende.
+Sundhed-kopier slettes ikke automatisk ved lokal sletning; se
+`docs/HEALTHKIT-THERAPY-IMPORT.md`.
+
+Den endelige lokale C-kode bestod **1.327/1.327 XCTest-tests**, projektets
+Python-kontroller og både iPhone- og Watch-simulatorbuilds i
+`~/DeveloperBuildData/xDrip/local-runs/xdripswift/20261004T134340Z-33896/`.
+En særskilt usigneret iPhoneOS-build bestod og producerede en arm64-app;
+Create ML-træningsstien, bolusberegneren og alarmkoden blev kompileret.
+Den oprindelige hardwarekommando tvang iPhone-SDK på Watch-undermålet og
+fejlede; gentagelsen med korrekt platformvalg bestod. Ingen fysisk iPhone
+eller Watch er testet for denne kandidat. Den oplyste forskel mellem
+eksternt replay og appens selvtjek er fortsat uafklaret uden replayrækker;
+hverken prognosepræcision, dosisforslagenes kliniske egnethed eller faktisk
+modtagelse af advarsler er verificeret på brugerens enheder.
+
 De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
 
 <!-- testflight-7.1.1-4293:start -->

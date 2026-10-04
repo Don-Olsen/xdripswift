@@ -1177,16 +1177,22 @@ final class GlucoseChartStateManager: ObservableObject, @unchecked Sendable {
 
         context.performAndWait {
             let importer = HealthKitTherapyImportManager.shared
-            let eligibleHealthIDs = Set(TherapyMetricsManager.eligibleTreatments(
+            // Actual bolus/carbohydrate markers use the same cutover, source and dedup rules
+            // as the therapy calculation. Planned/cancelled meals never become consumed markers.
+            let eligibleActualIDs = Set(TherapyMetricsManager.eligibleTreatments(
                 treatments.filter { !$0.treatmentdeleted && ($0.treatmentType == .Insulin || $0.treatmentType == .Carbs) },
                 policy: UserDefaults.standard.dataFlowPolicy,
                 insulinSource: importer.selectedSource(.insulin)?.bundleIdentifier,
                 carbsSource: importer.selectedSource(.carbohydrates)?.bundleIdentifier,
                 insulinEnabled: importer.isEnabled(.insulin),
-                carbsEnabled: importer.isEnabled(.carbohydrates)
-            ).compactMap(\.healthKitSampleUUID))
+                carbsEnabled: importer.isEnabled(.carbohydrates),
+                cutover: TreatmentSourceCutover.current()
+            ).map(\.objectID))
             mapped = treatments.filter { entry in
-                !entry.isHealthKitImported || (entry.healthKitSampleUUID.map { eligibleHealthIDs.contains($0) } ?? false)
+                if entry.treatmentType == .Insulin || entry.treatmentType == .Carbs {
+                    return entry.treatmentdeleted || eligibleActualIDs.contains(entry.objectID)
+                }
+                return !entry.isHealthKitImported
             }.map {
                 CachedTreatment(date: $0.date, value: $0.value, valueSecondary: $0.valueSecondary, type: $0.treatmentType, isDeleted: $0.treatmentdeleted, notes: $0.notes)
             }.sorted { $0.date < $1.date }

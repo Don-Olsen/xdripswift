@@ -106,13 +106,20 @@ final class SettingsViewDataSourceSettingsViewModel: NSObject, SettingsViewModel
             ]
         })
 
-        let therapySources = defaults.dataFlowPolicy.availableTherapyDataSources
+        let localTreatmentCutoverActive = TreatmentSourceCutover.current() != nil
+        let therapySources = localTreatmentCutoverActive
+            ? [TherapyDataSourceType.none]
+            : defaults.dataFlowPolicy.availableTherapyDataSources
         var therapyRow = nativeSettingsRow(
             id: "dataSource.therapyDataSource",
             index: DataSourceSetting.therapyDataSource.rawValue,
             sectionID: primarySectionID
         )
         therapyRow.accessory = .none
+        therapyRow.isEnabled = !localTreatmentCutoverActive
+        if localTreatmentCutoverActive {
+            therapyRow.detail = "xDrip er behandlingskilde efter skift til lokal registrering"
+        }
         therapyRow.control = .menuWithSelectionTitle(
             options: {
                 let stored = defaults.therapyDataSourceType
@@ -125,6 +132,7 @@ final class SettingsViewDataSourceSettingsViewModel: NSObject, SettingsViewModel
                 }
             },
             selectionTitle: {
+                if TreatmentSourceCutover.current() != nil { return TherapyDataSourceType.none.description }
                 let selected = defaults.therapyDataSourceType
                 if selected == .automatic { return TherapyDataSourceType.automatic.description }
                 if selected == .nightscout && !defaults.nightscoutEnabled {
@@ -294,6 +302,8 @@ final class SettingsViewDataSourceSettingsViewModel: NSObject, SettingsViewModel
     }
 
     private func applyTherapyDataSourceType(_ newType: TherapyDataSourceType) {
+        // A stale menu action must not restore a remote treatment owner after local cutover.
+        guard TreatmentSourceCutover.current() == nil else { return }
         let oldType = UserDefaults.standard.therapyDataSourceType
         guard newType != oldType else { return }
         UserDefaults.standard.therapyDataSourceType = newType
@@ -403,6 +413,9 @@ final class SettingsViewDataSourceSettingsViewModel: NSObject, SettingsViewModel
         case .followerStatus:
             return FollowerConnectionPresentation.resolve(source: validatedFollowerSource()).title
         case .therapyDataSource:
+            if TreatmentSourceCutover.current() != nil {
+                return TherapyDataSourceType.none.description
+            }
             let policy = UserDefaults.standard.dataFlowPolicy
             if UserDefaults.standard.therapyDataSourceType == .automatic {
                 return "\(policy.therapyDataSource.description) (\(Texts_SettingsView.therapyDataSourceAutomatic))"
@@ -450,7 +463,9 @@ final class SettingsViewDataSourceSettingsViewModel: NSObject, SettingsViewModel
         }
     }
 
-    func isEnabled(index: Int) -> Bool { true }
+    func isEnabled(index: Int) -> Bool {
+        index != DataSourceSetting.therapyDataSource.rawValue || TreatmentSourceCutover.current() == nil
+    }
 
     func completeSettingsViewRefreshNeeded(index: Int) -> Bool {
         index == DataSourceSetting.bloodGlucoseUnit.rawValue

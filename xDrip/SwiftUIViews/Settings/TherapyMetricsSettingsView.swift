@@ -143,3 +143,190 @@ struct TherapyMetricDetailsView: View {
         .navigationTitle(isIOB ? "IOB" : "COB")
     }
 }
+
+/// A suggested dose is unavailable until the user has checked these pen-specific values.
+/// They never change the glucose forecast's separate ISF and carbohydrate ratio.
+struct PenDoseSettingsView: View {
+    @State private var profile = PenDoseProfile.load()
+    @State private var draft = PenDoseProfileDraft(profile: .load())
+    @State private var pizza = PizzaSplitSettings.load()
+    @State private var percentageText = String(PizzaSplitSettings.load().percentageNow)
+    @State private var reminderText = String(PizzaSplitSettings.load().reminderMinutes)
+    @State private var statusMessage: String?
+
+    var body: some View {
+        Form {
+            if TreatmentSourceCutover.current() == nil ||
+                UserDefaults.standard.dataFlowPolicy.therapyDataSource != .none {
+                Section {
+                    Label("Bolusberegner og “Lavt om lidt” er ikke klar", systemImage: "exclamationmark.triangle")
+                        .foregroundStyle(.orange)
+                    Text("Gennemfør først “Log behandlinger i xDrip” med afsluttet Sundhed-synk. Indtil da kan appen ikke sikre ét komplet behandlingsgrundlag.")
+                        .font(.footnote)
+                }
+            }
+            Section {
+                Label(profile.isConfirmed ? "Profil bekræftet" : "Profilen skal bekræftes",
+                      systemImage: profile.isConfirmed ? "checkmark.circle.fill" : "exclamationmark.triangle")
+                    .foregroundStyle(profile.isConfirmed ? .green : .orange)
+                Text("Tallene er forudfyldt fra dine oplyste mySugr-værdier. Kontrollér dem, før beregneren bruges.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+            Section("Kulhydratfaktor · g/E") {
+                decimalField("00.00–04.30", text: $draft.ratioNight)
+                decimalField("04.30–09.30", text: $draft.ratioMorning)
+                decimalField("09.30–24.00", text: $draft.ratioDay)
+            }
+            Section("Målblodsukker · mmol/L") {
+                decimalField("00.00–21.30", text: $draft.targetDay)
+                decimalField("21.30–24.00", text: $draft.targetNight)
+            }
+            Section("Pen og korrektion") {
+                decimalField("Korrektionsfaktor · mmol/L pr. E", text: $draft.correction)
+                decimalField("Pennens trin · E", text: $draft.step)
+                decimalField("Maksimalt forslag · E", text: $draft.maximum)
+                Button("Jeg har kontrolleret og bekræftet profilen") {
+                    guard let settings = draft.settings else {
+                        statusMessage = "Kontrollér alle tal og prøv igen."
+                        return
+                    }
+                    profile.settings = settings
+                    guard profile.confirm(), profile.persist() else {
+                        statusMessage = "Profilen kunne ikke gemmes. Beregneren forbliver utilgængelig."
+                        return
+                    }
+                    statusMessage = "Profilen er gemt og bekræftet."
+                }
+                .disabled(draft.settings == nil)
+            }
+            Section("🍕 Fed/langsom mad") {
+                Toggle("Del forslaget og mind mig om en ny beregning", isOn: $pizza.isEnabled)
+                if pizza.isEnabled {
+                    decimalField("Andel nu · %", text: $percentageText)
+                    decimalField("Påmindelse efter · minutter", text: $reminderText)
+                    Button("Gem indstillinger") {
+                        guard let percent = Int(percentageText), let delay = Int(reminderText) else {
+                            statusMessage = "Vælg en andel og et antal minutter."
+                            return
+                        }
+                        pizza.percentageNow = percent
+                        pizza.reminderMinutes = delay
+                        if pizza.persist() {
+                            statusMessage = "Indstillingerne er gemt."
+                        } else {
+                            statusMessage = "Andelen skal være 10–100 %, og påmindelsen 15–240 minutter."
+                        }
+                    }
+                }
+                Text("Påmindelsen lover ingen restdosis. Den åbner en helt ny beregning med aktuelle data.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+            if let statusMessage {
+                Section { Text(statusMessage).foregroundStyle(.secondary) }
+            }
+        }
+        .navigationTitle("Bolusberegner")
+        .onChange(of: pizza.isEnabled) { enabled in
+            var changed = pizza
+            changed.isEnabled = enabled
+            if changed.persist() { pizza = changed }
+        }
+    }
+
+    private func decimalField(_ title: String, text: Binding<String>) -> some View {
+        LabeledContent(title) {
+            TextField("Tal", text: text)
+                .keyboardType(.decimalPad)
+                .multilineTextAlignment(.trailing)
+                .frame(maxWidth: 85)
+        }
+    }
+}
+
+struct PenDoseProfileDraft {
+    var ratioNight: String
+    var ratioMorning: String
+    var ratioDay: String
+    var targetDay: String
+    var targetNight: String
+    var correction: String
+    var step: String
+    var maximum: String
+
+    init(profile: PenDoseProfile) {
+        let settings = profile.settings
+        let fallback = PenDoseProfile.prefilledUnconfirmed.settings
+        func scheduled(_ values: [PenDoseProfile.ScheduleValue], minute: Int, fallback: Double) -> Double {
+            values.first(where: { $0.startMinute == minute })?.value ?? fallback
+        }
+        ratioNight = Self.text(scheduled(settings.carbohydrateRatios, minute: 0,
+                                        fallback: fallback.carbohydrateRatios[0].value))
+        ratioMorning = Self.text(scheduled(settings.carbohydrateRatios, minute: 270,
+                                          fallback: fallback.carbohydrateRatios[1].value))
+        ratioDay = Self.text(scheduled(settings.carbohydrateRatios, minute: 570,
+                                      fallback: fallback.carbohydrateRatios[2].value))
+        targetDay = Self.text(scheduled(settings.targetsMmol, minute: 0,
+                                       fallback: fallback.targetsMmol[0].value))
+        targetNight = Self.text(scheduled(settings.targetsMmol, minute: 1290,
+                                         fallback: fallback.targetsMmol[1].value))
+        correction = Self.text(settings.correctionMmolPerUnit)
+        step = Self.text(settings.penStepUnits)
+        maximum = Self.text(settings.maximumSuggestionUnits)
+    }
+
+    var settings: PenDoseProfile.Settings? {
+        let values = [ratioNight, ratioMorning, ratioDay, targetDay, targetNight,
+                      correction, step, maximum].compactMap(Self.number)
+        guard values.count == 8 else { return nil }
+        let result = PenDoseProfile.Settings(
+            carbohydrateRatios: [
+                .init(startMinute: 0, value: values[0]),
+                .init(startMinute: 270, value: values[1]),
+                .init(startMinute: 570, value: values[2])
+            ],
+            targetsMmol: [
+                .init(startMinute: 0, value: values[3]),
+                .init(startMinute: 1290, value: values[4])
+            ],
+            correctionMmolPerUnit: values[5],
+            penStepUnits: values[6],
+            maximumSuggestionUnits: values[7]
+        )
+        return result.isValid ? result : nil
+    }
+
+    private static func text(_ number: Double) -> String { number.stringWithoutTrailingZeroes }
+    private static func number(_ text: String) -> Double? {
+        let normalized = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: ",", with: ".")
+        guard let value = Double(normalized), value.isFinite else { return nil }
+        return value
+    }
+}
+
+struct PizzaSplitSettings: Equatable {
+    static let enabledKey = "penPizzaSplitEnabled"
+    static let percentageKey = "penPizzaSplitPercentageNow"
+    static let reminderKey = "penPizzaSplitReminderMinutes"
+
+    var isEnabled: Bool = true
+    var percentageNow: Int = 70
+    var reminderMinutes: Int = 90
+
+    static func load(defaults: UserDefaults = .standard) -> Self {
+        Self(isEnabled: defaults.object(forKey: enabledKey) as? Bool ?? true,
+             percentageNow: defaults.object(forKey: percentageKey) as? Int ?? 70,
+             reminderMinutes: defaults.object(forKey: reminderKey) as? Int ?? 90)
+    }
+
+    @discardableResult
+    func persist(defaults: UserDefaults = .standard) -> Bool {
+        guard (10...100).contains(percentageNow), (15...240).contains(reminderMinutes) else { return false }
+        defaults.set(isEnabled, forKey: Self.enabledKey)
+        defaults.set(percentageNow, forKey: Self.percentageKey)
+        defaults.set(reminderMinutes, forKey: Self.reminderKey)
+        return true
+    }
+}

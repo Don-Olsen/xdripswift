@@ -2,8 +2,8 @@
 //  GlucoseForecastEngine.swift
 //  xdrip
 //
-//  A local, display-only estimate. It never changes stored glucose, treatment,
-//  alarm, or dosing state.
+//  A local estimate used for display and read-only alert/dose safety checks.
+//  It never changes stored glucose, treatment, alarm, or dosing state.
 //
 
 import Foundation
@@ -148,7 +148,7 @@ struct GlucoseForecastEngineConfiguration: Codable, Sendable, Equatable {
 /// (MIT; Copyright 2015 Nathan Racklyeft, 2016 LoopKit Authors).
 /// See docs/GLUCOSE-FORECAST.md for attribution and modeling limitations.
 enum GlucoseForecastEngine {
-    static let engineVersion = "local-residual-momentum10-v2"
+    static let engineVersion = "local-residual-momentum10-mealduration-v3"
     static let configuration = GlucoseForecastEngineConfiguration(
         historyWindowMinutes: 30, historyMinimumSamples: 6, historyMinimumSpanMinutes: 25,
         momentumRegressionMinutes: 15, momentumMinimumSamples: 4, momentumMinimumSpanMinutes: 10,
@@ -178,7 +178,11 @@ enum GlucoseForecastEngine {
         guard sensitivity.isFinite, ratio.isFinite, sensitivity > 0, ratio > 0 else {
             return unavailable(.invalidProfile)
         }
-        guard input.treatments.allSatisfy({ $0.amount.isFinite && $0.amount >= 0 }) else {
+        guard input.treatments.allSatisfy({
+            let duration = $0.carbohydrateDuration(or: input.settings.carbDuration)
+            return $0.amount.isFinite && $0.amount >= 0 &&
+                ($0.isIOB || (duration.isFinite && (30...480).contains(duration)))
+        }) else {
             return unavailable(.invalidTreatment)
         }
 
@@ -222,7 +226,7 @@ enum GlucoseForecastEngine {
                 ? TherapyCalculations.insulinRemaining(units: treatment.amount, minutes: elapsed,
                     duration: input.settings.insulinDuration, peak: input.settings.insulinPeak)
                 : TherapyCalculations.carbsRemaining(grams: treatment.amount, minutes: elapsed,
-                    duration: input.settings.carbDuration)
+                    duration: treatment.carbohydrateDuration(or: input.settings.carbDuration))
             return treatment.amount - remaining
         }
         func modeledChange(from start: Date, to end: Date) -> Double {
@@ -269,6 +273,43 @@ enum GlucoseForecastEngine {
             points.append(GlucoseForecastPoint(date: date, glucoseMgdl: value))
         }
         return GlucoseForecastResult(points: points, referenceDate: latest.date, reason: nil)
+    }
+
+    /// Display-only what-if curve. These proposed carbohydrates never enter the engine
+    /// input, ML, IOB/COB, safety checks, or the measured glucose store.
+    static func conditionalPlannedCarbohydratePoints(
+        base: GlucoseForecastResult, planned: [TherapyTreatment],
+        sensitivityMgdlPerUnit: Double, carbohydrateRatioGramsPerUnit: Double,
+        settings: TherapyModelSettings
+    ) -> [GlucoseForecastPoint]? {
+        guard base.reason == nil, let referenceDate = base.referenceDate,
+              !base.points.isEmpty, sensitivityMgdlPerUnit.isFinite,
+              carbohydrateRatioGramsPerUnit.isFinite,
+              sensitivityMgdlPerUnit > 0, carbohydrateRatioGramsPerUnit > 0,
+              planned.allSatisfy({
+                  let duration = $0.carbohydrateDuration(or: settings.carbDuration)
+                  return !$0.isIOB && $0.amount.isFinite && $0.amount > 0 &&
+                      $0.date >= referenceDate && duration.isFinite &&
+                      (30...480).contains(duration)
+              }) else { return nil }
+        let scale = sensitivityMgdlPerUnit / carbohydrateRatioGramsPerUnit
+        let validGlucose = configuration.minimumGlucoseMgdl...configuration.maximumGlucoseMgdl
+        var conditional = [GlucoseForecastPoint]()
+        conditional.reserveCapacity(base.points.count)
+        for point in base.points {
+            let additional = planned.reduce(0.0) { total, treatment in
+                guard point.date >= treatment.date else { return total }
+                let elapsed = point.date.timeIntervalSince(treatment.date) / 60
+                let remaining = TherapyCalculations.carbsRemaining(
+                    grams: treatment.amount, minutes: elapsed,
+                    duration: treatment.carbohydrateDuration(or: settings.carbDuration))
+                return total + (treatment.amount - remaining) * scale
+            }
+            let value = point.glucoseMgdl + additional
+            guard value.isFinite, validGlucose.contains(value) else { return nil }
+            conditional.append(GlucoseForecastPoint(date: point.date, glucoseMgdl: value))
+        }
+        return conditional
     }
 
     private static func regressionRate(_ samples: [(date: Date, value: Double)],

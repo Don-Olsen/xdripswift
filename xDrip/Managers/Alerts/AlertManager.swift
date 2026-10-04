@@ -52,6 +52,13 @@ public class AlertManager: NSObject {
     
     /// helper array with all alert notification identifiers
     private var alertNotificationIdentifers = [String]()
+    /// Identifiers owned by glucose/alarm evaluation. Treatment reminders are deliberately absent.
+    static var ownedPendingNotificationIdentifiers: [String] {
+        // The prospective low warning is evaluated asynchronously after a durable CGM save.
+        // A normal alert pass must never erase a request that it did not rebuild.
+        AlertKind.allCases.filter { $0 != .notlooping && $0 != .lowSoon }
+            .map { $0.notificationIdentifier() }
+    }
     
     /// permanent reference to notificationcenter
     private let uNUserNotificationCenter: UNUserNotificationCenter
@@ -122,9 +129,10 @@ public class AlertManager: NSObject {
     /// - returns:
     ///     - if true then an immediate notification is created (immediate being not a future planned, like missed reading), which contains the bg reading in the text - so there's no need to create an additional notificationwith the text in it
     public func checkAlerts(maxAgeOfLastBgReadingInSeconds: Double) -> Bool {
-        // first of all remove all existing notifications, there should be only one open alert on the home screen. The most relevant one will be reraised
+        // Clear only glucose alert requests. Other features (for example a planned meal
+        // reminder) own their notifications and must survive a new sensor reading.
         uNUserNotificationCenter.removeDeliveredNotifications(withIdentifiers: alertNotificationIdentifers)
-        uNUserNotificationCenter.removeAllPendingNotificationRequests()
+        uNUserNotificationCenter.removePendingNotificationRequests(withIdentifiers: alertNotificationIdentifers)
         
         // Do not return early for Snooze All. Each enabled alert must still evaluate its condition so
         // the consumer log can explain that a real alarm condition was suppressed by the snooze.
@@ -204,6 +212,102 @@ public class AlertManager: NSObject {
         }
         
         return immediateNotificationCreated
+    }
+
+    /// Evaluates only the unchanged forecast engine's +30-minute point. This is intentionally
+    /// independent of Home's visibility, ML correction, planned meals and the chart horizon.
+    /// The caller must first confirm that the reference reading was durably saved and is still
+    /// the latest accepted reading. Existing measured-low alarms run on their original path.
+    @MainActor
+    func checkLowSoon(_ outcome: GlucoseForecastSafetyOutcome,
+                      expectedReferenceDate: Date, expectedSensorID: String?,
+                      expectedGlucoseMgdl: Double,
+                      at now: Date = .now) {
+        let result = outcome.result
+        func record(_ status: LowSoonEvaluationRecord.Status, detail: String? = nil,
+                    prediction: Double? = nil) {
+            LowSoonEvaluationJournal.shared.enqueue(.init(
+                referenceDate: expectedReferenceDate, computedAt: now,
+                currentMgdl: outcome.referenceGlucoseMgdl,
+                predicted30Mgdl: prediction, iobUnits: outcome.activeInsulinUnits,
+                sensorID: expectedSensorID, status: status, detail: detail
+            ))
+        }
+
+        guard let validated = LowSoonAlertPolicy.validatedPrediction(
+            from: outcome, expectedReferenceDate: expectedReferenceDate,
+            expectedSensorID: expectedSensorID,
+            expectedGlucoseMgdl: expectedGlucoseMgdl, at: now
+        ) else {
+            record(.unavailable, detail: result.reason?.rawValue ?? "invalidSafetyInput")
+            return
+        }
+
+        let predicted = validated.predicted30Mgdl
+        let kind = AlertKind.lowSoon
+        let (entry, _) = alertEntriesAccessor.getCurrentAndNextAlertEntry(
+            forAlertKind: kind, forWhen: now, alertTypesAccessor: alertTypesAccessor)
+        guard !entry.isDisabled, entry.alertType.enabled else {
+            record(.suppressed, detail: "disabled", prediction: predicted)
+            return
+        }
+        guard !(UserDefaults.standard.snoozeAllAlertsUntilDate.map { $0 > now } ?? false),
+              !getSnoozeParameters(alertKind: kind).getSnoozeValue().isSnoozed else {
+            record(.suppressed, detail: "snoozed", prediction: predicted)
+            return
+        }
+        // A disabled or snoozed rule is not an evaluated opportunity, even when this particular
+        // prediction would have been above the warning threshold. Keep that distinction in the
+        // prospective journal so the 30-day false-warning denominator is not diluted.
+        guard LowSoonAlertPolicy.condition(currentMgdl: validated.currentMgdl,
+                                           predicted30Mgdl: predicted) else {
+            record(.noWarning, prediction: predicted)
+            return
+        }
+        guard LowSoonAlertPolicy.maySchedule(
+            lastScheduled: UserDefaults.standard.object(forKey: LowSoonAlertState.lastScheduledDefaultsKey) as? Date,
+            at: now
+        ) else {
+            record(.suppressed, detail: "thirtyMinuteLimit", prediction: predicted)
+            return
+        }
+
+        let usesMgDl = UserDefaults.standard.bloodGlucoseUnitIsMgDl
+        let glucoseText = predicted.mgDlToMmolAndToString(mgDl: usesMgDl)
+        let unit = usesMgDl ? "mg/dL" : "mmol/L"
+        let insulinText = String(format: "%.1f", validated.activeInsulinUnits)
+        let content = UNMutableNotificationContent()
+        content.title = Texts_Alerts.lowSoonAlertTitle
+        content.body = "Ca. \(glucoseText) \(unit) om 30 min · aktiv insulin \(insulinText) E"
+        content.categoryIdentifier = entry.alertType.snooze
+            ? textOnlySnoozeCategoryIdentifier : dismissCategoryIdentifier
+        applyImmediatePresentation(from: entry.alertType, to: content)
+        let request = UNNotificationRequest(identifier: kind.notificationIdentifier(),
+                                            content: content, trigger: nil)
+
+        // Reserve the time before the asynchronous system call. A rapid second CGM callback or
+        // app restart cannot schedule a second alert while the first request is in flight.
+        UserDefaults.standard.set(now, forKey: LowSoonAlertState.lastScheduledDefaultsKey)
+        uNUserNotificationCenter.add(request) { [weak self] error in
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                if let error {
+                    if (UserDefaults.standard.object(forKey: LowSoonAlertState.lastScheduledDefaultsKey) as? Date) == now {
+                        UserDefaults.standard.removeObject(forKey: LowSoonAlertState.lastScheduledDefaultsKey)
+                    }
+                    record(.warningSchedulingFailed, detail: "notificationRequestFailed", prediction: predicted)
+                    let nsError = error as NSError
+                    trace("Low-soon request failed domain=%{public}@ code=%{public}d",
+                          log: self.log, category: ConstantsLog.categoryAlertManager,
+                          type: .error, nsError.domain, nsError.code)
+                } else {
+                    record(.warningRequested, prediction: predicted)
+                    trace("Low-soon warning request accepted", log: self.log,
+                          category: ConstantsLog.categoryAlertManager, type: .info,
+                          troubleshooting: .standard(.alert(kindRawValue: kind.rawValue, activity: .raised)))
+                }
+            }
+        }
     }
 
     /// Raises the only sensor-health event that belongs in the alarm system.
@@ -895,7 +999,8 @@ public class AlertManager: NSObject {
             case .verylow, .low, .high, .veryhigh, .fastdrop, .fastrise:
                 includesGlucose = true
             case .missedreading, .calibration, .batterylow, .phonebatterylow, .notlooping,
-                 .sensorTransmitterFailure, .dexcomG5BatteryLow, .dexcomG7BatteryLow:
+                 .sensorTransmitterFailure, .dexcomG5BatteryLow, .dexcomG7BatteryLow,
+                 .lowSoon:
                 includesGlucose = false
             }
 
@@ -1138,10 +1243,7 @@ public class AlertManager: NSObject {
     
     // helper method used during intialization of AlertManager
     private func initAlertNotificationIdentiferArray() {
-        for alertKind in AlertKind.allCases {
-            guard alertKind != .notlooping else { continue }
-            alertNotificationIdentifers.append(alertKind.notificationIdentifier())
-        }
+        alertNotificationIdentifers = Self.ownedPendingNotificationIdentifiers
     }
     
     /// adds the alert notification categories to the existing categories

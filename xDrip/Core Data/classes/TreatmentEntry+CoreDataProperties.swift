@@ -65,10 +65,65 @@ extension TreatmentEntry {
     /// Stable identity of a manual Watch entry across transport retries and restores.
     @NSManaged public var watchSourceUUID: String?
 
+    /// Stable identity and knowledge time for a treatment entered in this app.
+    @NSManaged public var localTreatmentUUID: String?
+    @NSManaged public var createdAt: Date?
+    @NSManaged public var modifiedAt: Date?
+
+    /// Nil denotes the legacy normal, confirmed carbohydrate entry.
+    @NSManaged public var mealKindRaw: String?
+    @NSManaged public var carbohydrateDurationMinutes: NSNumber?
+    @NSManaged public var plannedMealStateRaw: String?
+
+    /// Durable HealthKit write queue metadata. Nil means this version has not written the entry.
+    @NSManaged public var healthKitSyncVersion: NSNumber?
+    @NSManaged public var healthKitSyncStateRaw: String?
+
     /// HealthKit imports are read-only and must never be forwarded to Nightscout.
     public var isHealthKitImported: Bool { healthKitSampleUUID != nil }
     /// Manual entries received from Watch stay local unless the user explicitly chooses
     /// an external export for them in a future release.
     public var isWatchLocalOnly: Bool { watchSourceUUID != nil }
+
+    /// Existing carbohydrate rows predate meal metadata and mean a confirmed normal meal.
+    var mealKind: TreatmentMealKind {
+        mealKindRaw.flatMap(TreatmentMealKind.init(rawValue:)) ?? .normal
+    }
+
+    var hasValidMealMetadata: Bool {
+        guard treatmentType == .Carbs else { return true }
+        if let mealKindRaw, TreatmentMealKind(rawValue: mealKindRaw) == nil { return false }
+        if let plannedMealStateRaw, TreatmentMealState(rawValue: plannedMealStateRaw) == nil { return false }
+        guard let stored = carbohydrateDurationMinutes?.doubleValue else { return true }
+        return stored.isFinite && (30...480).contains(stored)
+    }
+
+    var effectiveCarbohydrateDurationMinutes: Double {
+        carbohydrateDurationMinutes?.doubleValue ?? mealKind.durationMinutes
+    }
+
+    var isPlannedMeal: Bool {
+        treatmentType == .Carbs && plannedMealStateRaw == TreatmentMealState.planned.rawValue
+    }
+
+    var isConfirmedMeal: Bool {
+        treatmentType == .Carbs
+            && (plannedMealStateRaw == nil || plannedMealStateRaw == TreatmentMealState.confirmed.rawValue)
+            && hasValidMealMetadata
+    }
+
+    var isCancelledMeal: Bool {
+        treatmentType == .Carbs && plannedMealStateRaw == TreatmentMealState.cancelled.rawValue
+    }
+
+    var isAppLocalTreatment: Bool {
+        !isHealthKitImported && (localTreatmentUUID?.isEmpty == false || watchSourceUUID?.isEmpty == false)
+    }
+
+    /// A current edited row must not leak its later contents into an earlier replay anchor.
+    var knownAtForCurrentRevision: Date? {
+        guard let createdAt else { return nil }
+        return max(createdAt, modifiedAt ?? createdAt)
+    }
     
 }

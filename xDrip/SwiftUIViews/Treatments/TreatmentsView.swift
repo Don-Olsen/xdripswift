@@ -16,6 +16,8 @@ struct TreatmentsView: View {
 
     @StateObject private var viewModel: TreatmentsViewModel
     @State private var treatmentEditorState: TreatmentEditorState?
+    @State private var showsPenCalculator = false
+    @State private var calculatorReminderMealUUID: String?
 
     // MARK: - initialization
 
@@ -30,6 +32,13 @@ struct TreatmentsView: View {
             viewModel: viewModel,
             onAddTreatment: {
                 treatmentEditorState = .add
+            },
+            onQuickCarbs: { grams in
+                treatmentEditorState = .quickCarbs(grams)
+            },
+            onPenCalculator: {
+                calculatorReminderMealUUID = nil
+                showsPenCalculator = true
             },
             onSelectTreatment: { treatment in
                 treatmentEditorState = .edit(treatment)
@@ -48,6 +57,46 @@ struct TreatmentsView: View {
                 }
             )
         }
+        .sheet(isPresented: $showsPenCalculator, onDismiss: {
+            calculatorReminderMealUUID = nil
+        }) {
+            PenDoseCalculatorScreen(coreDataManager: viewModel.coreDataManager,
+                reminderMealUUID: calculatorReminderMealUUID,
+                onSave: {
+                    viewModel.reloadTreatments()
+                    showsPenCalculator = false
+                },
+                onCancel: { showsPenCalculator = false })
+        }
+        .onAppear(perform: openRequestedPlannedMeal)
+        .onReceive(NotificationCenter.default.publisher(for: PlannedMealReminder.openRequested)) { _ in
+            openRequestedPlannedMeal()
+        }
+        .onAppear(perform: openRequestedPizzaRecalculation)
+        .onReceive(NotificationCenter.default.publisher(for: PizzaSplitReminder.openRequested)) { _ in
+            openRequestedPizzaRecalculation()
+        }
+    }
+
+    private func openRequestedPlannedMeal() {
+        guard let uuid = PlannedMealReminder.pendingOpenUUID else { return }
+        viewModel.reloadTreatments()
+        if let meal = viewModel.plannedMealSnapshot(uuid: uuid) {
+            treatmentEditorState = .edit(meal)
+        }
+        PlannedMealReminder.clearPendingOpenUUID(uuid)
+    }
+
+    private func openRequestedPizzaRecalculation() {
+        guard let uuid = PizzaSplitReminder.pendingOpenUUID else { return }
+        defer { PizzaSplitReminder.clearPendingOpenUUID(uuid) }
+        let meal = TreatmentEntryAccessor(coreDataManager: viewModel.coreDataManager)
+            .getLatestTreatments(howOld: 4 * 60 * 60)
+            .first { $0.localTreatmentUUID == uuid && $0.isConfirmedMeal &&
+                !$0.treatmentdeleted && $0.mealKind == .slow }
+        guard meal != nil else { return }
+        calculatorReminderMealUUID = uuid
+        showsPenCalculator = true
     }
 }
 
@@ -58,10 +107,13 @@ struct TreatmentsListView: View {
     @ObservedObject var viewModel: TreatmentsViewModel
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @State private var showScrollToTopButton = false
+    @State private var pendingLocalDeletion: TreatmentSnapshot?
     private let topScrollAnchorID = "treatmentsTop"
     private let scrollToTopButtonThresholdIndex = 4
 
     let onAddTreatment: () -> Void
+    let onQuickCarbs: (Double) -> Void
+    let onPenCalculator: () -> Void
     let onSelectTreatment: (TreatmentSnapshot) -> Void
 
     // MARK: - SwiftUI views
@@ -113,6 +165,13 @@ struct TreatmentsListView: View {
                 ToolbarItemGroup(placement: .navigationBarTrailing) {
                     OnlineHelpButton(topic: .treatments)
 
+                    NavigationLink {
+                        PenDoseSettingsView()
+                    } label: {
+                        Image(systemName: "slider.horizontal.3")
+                    }
+                    .accessibilityLabel("Bolusberegnerens profil og indstillinger")
+
                     Button(action: onAddTreatment) {
                         Image(systemName: "plus")
                     }
@@ -136,6 +195,12 @@ struct TreatmentsListView: View {
                 .padding(.horizontal, 16)
                 .padding(.top, 8)
 
+            quickCarbohydrateButton
+                .padding(.horizontal, 16)
+
+            penCalculatorButton
+                .padding(.horizontal, 16)
+
             treatmentList(horizontalPadding: 16)
         }
     }
@@ -144,6 +209,8 @@ struct TreatmentsListView: View {
         HStack(alignment: .top, spacing: 18) {
             VStack(spacing: 16) {
                 controlsCard
+                quickCarbohydrateButton
+                penCalculatorButton
 
                 VStack(alignment: .leading, spacing: 8) {
                     Label(
@@ -179,6 +246,39 @@ struct TreatmentsListView: View {
             .onAppear { showScrollToTopButton = false }
     }
 
+    private var quickCarbohydrateButton: some View {
+        let amount = UserDefaults.standard.quickCarbohydrateGrams
+        return Button {
+            if let amount { onQuickCarbs(amount) }
+        } label: {
+            HStack {
+                Text("🍭 Hurtige kulhydrater")
+                Spacer()
+                Text(amount.map { "\(GlucoseForecastSettingsInput.displayNumber($0)) g" } ?? "Indstil antal gram")
+                    .foregroundStyle(Color(.colorSecondary))
+            }
+            .padding(14)
+            .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 14))
+        }
+        .buttonStyle(.plain)
+        .disabled(amount == nil)
+        .accessibilityHint(amount == nil ? "Vælg først antal gram under Hjemskærm-indstillinger" : "Åbner en forudfyldt registrering, som du kan kontrollere før gemning")
+    }
+
+    private var penCalculatorButton: some View {
+        Button(action: onPenCalculator) {
+            HStack {
+                Label("Bolusberegner", systemImage: "function")
+                Spacer()
+                Image(systemName: "chevron.right")
+                    .foregroundStyle(Color(.colorSecondary))
+            }
+            .padding(14)
+            .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 14))
+        }
+        .buttonStyle(.plain)
+    }
+
     private func treatmentList(horizontalPadding: CGFloat) -> some View {
         List {
             if !viewModel.filteredTreatments.isEmpty {
@@ -195,7 +295,11 @@ struct TreatmentsListView: View {
                         .swipeActions(edge: .trailing, allowsFullSwipe: true) {
                             if !treatment.isHealthKitImported {
                                 Button(role: .destructive) {
-                                    viewModel.deleteTreatment(treatment)
+                                    if treatment.deletionMayLeaveHealthCopy {
+                                        pendingLocalDeletion = treatment
+                                    } else {
+                                        viewModel.deleteTreatment(treatment)
+                                    }
                                 } label: {
                                     Label(Texts_Common.delete, systemImage: "trash")
                                 }
@@ -216,6 +320,25 @@ struct TreatmentsListView: View {
         .background(Color(.systemGroupedBackground))
         .padding(.horizontal, horizontalPadding)
         .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .confirmationDialog("Slet denne behandling?", isPresented: Binding(
+            get: { pendingLocalDeletion != nil },
+            set: { if !$0 { pendingLocalDeletion = nil } }
+        ), titleVisibility: .visible) {
+            Button("Slet lokalt", role: .destructive) {
+                if let pendingLocalDeletion { viewModel.deleteTreatment(pendingLocalDeletion) }
+                pendingLocalDeletion = nil
+            }
+        } message: {
+            Text("Posten slettes i xDrip. En kopi kan stadig findes i Apple Sundhed og skal i så fald kontrolleres dér.")
+        }
+        .alert("Lagring usikker", isPresented: Binding(
+            get: { viewModel.deletionFailureMessage != nil },
+            set: { if !$0 { viewModel.deletionFailureMessage = nil } }
+        )) {
+            Button("OK", role: .cancel) { viewModel.deletionFailureMessage = nil }
+        } message: {
+            Text(viewModel.deletionFailureMessage ?? "Kontrollér behandlingshistorikken.")
+        }
     }
 
     @ViewBuilder private func treatmentRow(for treatment: TreatmentSnapshot) -> some View {

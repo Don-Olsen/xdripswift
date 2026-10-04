@@ -96,7 +96,7 @@
 	<key>NSHealthShareUsageDescription</key>
 	<string>xDrip læser blodsukkerhistorik fra Sundhed til lokal træning af prognosen samt bolusinsulin og kulhydrater fra dine valgte kilder til IOB og COB. Oplysningerne sendes ikke ud af telefonen af prognosefunktionen.</string>
 	<key>NSHealthUpdateUsageDescription</key>
-	<string>Store bloodglucose readings</string>
+	<string>xDrip gemmer dine blodsukkermålinger og dine bekræftede insulin- og kulhydratregistreringer i Sundhed, når du har givet tilladelse.</string>
 	<key>NSSupportsLiveActivities</key>
 	<true/>
 	<key>UIBackgroundModes</key>

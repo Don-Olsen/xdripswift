@@ -29,6 +29,7 @@ final class BatteryHistoryTests: XCTestCase {
                     "careLinkPatientAliases", "pendingHealthKitReplacements", "healthKitSyncVersion",
                     "healthTherapyImport.v1.insulin.enabled", "healthTherapyImport.v1.carbs.anchor",
                     "healthTherapyImport.v1.insulin.selectedSource",
+                    TreatmentSourceCutover.defaultsKey, "therapyRestoreRequiresSourceSetup",
                     "dexcomG7PairingCode-ABC", "dexcomG7BluetoothSlot-ABC", "m5StackWiFiPassword1",
                     "m5StackWiFiPassword2", "m5StackWiFiPassword3", "careLinkPassword"] {
             XCTAssertFalse(BackupService.isPortableSetting(key), key)
@@ -84,7 +85,9 @@ final class BatteryHistoryTests: XCTestCase {
 
         let encoded = try JSONEncoder().encode(try XCTUnwrap(inspection.payload.treatments.first))
         var legacyObject = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
-        for key in ["healthKitSampleUUID", "healthKitSourceBundleIdentifier", "healthKitExternalUUID", "healthKitSyncIdentifier"] {
+        for key in ["healthKitSampleUUID", "healthKitSourceBundleIdentifier", "healthKitExternalUUID", "healthKitSyncIdentifier",
+                    "localTreatmentUUID", "createdAt", "modifiedAt", "mealKindRaw", "carbohydrateDurationMinutes",
+                    "plannedMealStateRaw", "healthKitSyncVersion", "healthKitSyncStateRaw"] {
             legacyObject.removeValue(forKey: key)
         }
         let legacy = try JSONDecoder().decode(BackupTreatment.self,
@@ -93,6 +96,97 @@ final class BatteryHistoryTests: XCTestCase {
         XCTAssertNil(legacy.healthKitSourceBundleIdentifier)
         XCTAssertNil(legacy.healthKitExternalUUID)
         XCTAssertNil(legacy.healthKitSyncIdentifier)
+        XCTAssertNil(legacy.localTreatmentUUID)
+        XCTAssertNil(legacy.plannedMealStateRaw)
+        XCTAssertNil(legacy.healthKitSyncVersion)
+    }
+
+    @MainActor
+    func testTreatmentBackupPreservesPlannedMealStatesAndPostCutoverLocalIdentity() async throws {
+        let source = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let states: [TreatmentMealState] = [.planned, .cancelled, .confirmed]
+        let originalUUIDs = states.map { _ in UUID().uuidString }
+        for (index, state) in states.enumerated() {
+            let treatment = TreatmentEntry(
+                date: now, value: 30, treatmentType: .Carbs, nightscoutEventType: nil,
+                enteredBy: "xDrip4iOS", nsManagedObjectContext: source.mainManagedObjectContext)
+            treatment.localTreatmentUUID = originalUUIDs[index]
+            treatment.createdAt = now.addingTimeInterval(-600)
+            treatment.modifiedAt = now.addingTimeInterval(-300)
+            treatment.mealKindRaw = TreatmentMealKind.fast.rawValue
+            treatment.carbohydrateDurationMinutes = NSNumber(value: 120)
+            treatment.plannedMealStateRaw = state.rawValue
+            if state == .confirmed {
+                treatment.healthKitSyncVersion = NSNumber(value: 2)
+                treatment.healthKitSyncStateRaw = "pending"
+            }
+        }
+        XCTAssertTrue(source.saveChangesSynchronously())
+
+        let exporter = BackupService(coreDataManager: source)
+        let archive = try await exporter.createBackup(options: BackupOptions(
+            includesSettings: false, includesAccounts: false, includesBgReadings: false, includesTreatments: true))
+        defer { try? FileManager.default.removeItem(at: archive.url) }
+        let inspection = try exporter.inspectBackup(at: archive.url)
+        XCTAssertEqual(inspection.payload.treatments.count, 3,
+                       "Distinct local UUIDs must survive even at the same time and amount")
+
+        let destination = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let importer = BackupService(coreDataManager: destination)
+        _ = try await importer.restore(inspection: inspection, mode: .keepCurrent,
+                                       restoresSettings: false, restoredAccountCategories: [])
+        _ = try await importer.restore(inspection: inspection, mode: .keepCurrent,
+                                       restoresSettings: false, restoredAccountCategories: [])
+        let restored = try destination.mainManagedObjectContext.fetch(TreatmentEntry.fetchRequest())
+        XCTAssertEqual(restored.count, 3)
+        XCTAssertEqual(Set(restored.compactMap(\.localTreatmentUUID)), Set(originalUUIDs))
+        for (index, state) in states.enumerated() {
+            let row = try XCTUnwrap(restored.first { $0.localTreatmentUUID == originalUUIDs[index] })
+            XCTAssertEqual(row.plannedMealStateRaw, state.rawValue)
+            XCTAssertEqual(row.mealKindRaw, TreatmentMealKind.fast.rawValue)
+            XCTAssertEqual(row.carbohydrateDurationMinutes?.doubleValue, 120)
+            XCTAssertEqual(row.createdAt, now.addingTimeInterval(-600))
+            XCTAssertEqual(row.modifiedAt, now.addingTimeInterval(-300))
+            XCTAssertEqual(row.isConfirmedMeal, state == .confirmed)
+            if state == .confirmed {
+                XCTAssertEqual(row.healthKitSyncVersion?.intValue, 2)
+                XCTAssertEqual(row.healthKitSyncStateRaw, "pending")
+            }
+        }
+        let cutover = TreatmentSourceCutover(cutoff: now.addingTimeInterval(-3600),
+            insulinSourceBundleID: "com.mysugr.insulin", carbohydrateSourceBundleID: "com.mysugr.carbs")
+        let consumed = TherapyMetricsManager.eligibleTreatments(restored,
+            policy: UserDefaults.standard.dataFlowPolicy, insulinSource: nil, carbsSource: nil,
+            insulinEnabled: false, carbsEnabled: false, cutover: cutover)
+        XCTAssertEqual(consumed.compactMap(\.localTreatmentUUID), [originalUUIDs[2]])
+
+        // A treatment archive may carry the old boundary as provenance, but restoring onto
+        // a fresh installation must not silently install it or report missing doses as zero.
+        let defaults = UserDefaults.standard
+        let oldCutover = defaults.object(forKey: TreatmentSourceCutover.defaultsKey)
+        let oldSetupFlag = defaults.object(forKey: "therapyRestoreRequiresSourceSetup")
+        defer {
+            if let oldCutover { defaults.set(oldCutover, forKey: TreatmentSourceCutover.defaultsKey) }
+            else { defaults.removeObject(forKey: TreatmentSourceCutover.defaultsKey) }
+            if let oldSetupFlag { defaults.set(oldSetupFlag, forKey: "therapyRestoreRequiresSourceSetup") }
+            else { defaults.removeObject(forKey: "therapyRestoreRequiresSourceSetup") }
+        }
+        defaults.removeObject(forKey: TreatmentSourceCutover.defaultsKey)
+        defaults.removeObject(forKey: "therapyRestoreRequiresSourceSetup")
+        var boundaryPayload = inspection.payload
+        boundaryPayload.treatmentSourceCutover = cutover
+        _ = try await importer.restore(inspection: BackupInspection(payload: boundaryPayload),
+                                       mode: .keepCurrent, restoresSettings: false,
+                                       restoredAccountCategories: [])
+        XCTAssertNil(TreatmentSourceCutover.current())
+        XCTAssertTrue(defaults.bool(forKey: "therapyRestoreRequiresSourceSetup"))
+        defaults.removeObject(forKey: "therapyRestoreRequiresSourceSetup")
+        XCTAssertTrue(TreatmentSourceCutover.persist(cutover))
+        _ = try await importer.restore(inspection: BackupInspection(payload: boundaryPayload),
+                                       mode: .keepCurrent, restoresSettings: false,
+                                       restoredAccountCategories: [])
+        XCTAssertEqual(TreatmentSourceCutover.current(), cutover)
+        XCTAssertFalse(defaults.bool(forKey: "therapyRestoreRequiresSourceSetup"))
     }
 
     @MainActor
@@ -146,7 +240,8 @@ final class BatteryHistoryTests: XCTestCase {
         ))
         defer { try? FileManager.default.removeItem(at: archive.url) }
         let manifest = try service.inspectBackup(at: archive.url).payload.manifest
-        let keys = ["healthKitSyncVersion", "m5StackWiFiPassword1", "dexcomG7PairingCode-TEST"]
+        let keys = ["healthKitSyncVersion", TreatmentSourceCutover.defaultsKey,
+                    "therapyRestoreRequiresSourceSetup", "m5StackWiFiPassword1", "dexcomG7PairingCode-TEST"]
         let defaults = UserDefaults.standard
         let previous = keys.map { defaults.object(forKey: $0) }
         defer {

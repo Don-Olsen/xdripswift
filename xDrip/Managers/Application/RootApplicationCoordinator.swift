@@ -222,6 +222,18 @@ struct InitialCalibrationRequestGate {
     /// initiate a Timer object that we will use keep the follower connection status updated every 30 seconds or so
     private var followerConnectionTimer: Timer?
     private var therapyMetricsObserver: NSObjectProtocol?
+    private var lowSoonImportObserver: NSObjectProtocol?
+    private var lowSoonForecastAdapter: GlucoseForecastDataAdapter?
+    private struct LowSoonReadingReference: Equatable {
+        let id: String
+        let measuredAt: Date
+        let sensorID: String?
+        let finalValueMgdl: Double
+    }
+    private var lowSoonPendingReference: LowSoonReadingReference?
+    private var lowSoonInFlightID: String?
+    private var lowSoonRetryAfterFlight = false
+    private var lowSoonCompletedID: String?
     private var lastTherapyPublication: TherapyMetricsSnapshot?
     private var lastTherapyPublicationAt = Date.distantPast
     private var pendingTherapyPublication: Task<Void, Never>?
@@ -721,7 +733,15 @@ struct InitialCalibrationRequestGate {
                 Task { @MainActor [weak self] in
                     if UIApplication.shared.applicationState == .active { self?.publishRootHomeState() }
                     self?.publishTherapyMetricsIfNeeded()
+                    self?.requestLowSoonRetry()
                 }
+            }
+        }
+        if lowSoonImportObserver == nil {
+            lowSoonImportObserver = NotificationCenter.default.addObserver(
+                forName: HealthKitTherapyImportManager.statusDidChange, object: nil, queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor [weak self] in self?.requestLowSoonRetry() }
             }
         }
         activeSensor = SensorsAccessor.init(coreDataManager: coreDataManager).fetchActiveSensor()
@@ -1421,6 +1441,7 @@ struct InitialCalibrationRequestGate {
                 if !initialCalibrationIsRequired {
                     // check alerts, create notification, set app badge
                     checkAlertsCreateNotificationAndSetAppBadge()
+                    queueLowSoonForLatestReading()
                     rootHomeStateModel.invalidateCharts()
                     
                     // update all text in  first screen
@@ -2323,6 +2344,104 @@ struct InitialCalibrationRequestGate {
             } else {
                 // update notification and app badge
                 createBgReadingNotificationAndSetAppBadge(overrideShowReadingInNotification: false)
+            }
+        }
+    }
+
+    /// The prospective warning waits for the final post-processed CGM value and a durable parent
+    /// store save. The existing measured-value alarms above remain synchronous and unchanged.
+    private func queueLowSoonForLatestReading() {
+        guard let reading = currentLowSoonReference() else { return }
+        if lowSoonPendingReference != reading {
+            lowSoonPendingReference = reading
+            lowSoonCompletedID = nil
+        }
+        requestLowSoonRetry()
+    }
+
+    private func currentLowSoonReference() -> LowSoonReadingReference? {
+        guard let accessor = bgReadingsAccessor,
+              let latest = accessor.getLatestBgReadings(limit: 1, howOld: nil,
+                                                        forSensor: nil, ignoreRawData: true,
+                                                        ignoreCalculatedValue: false).first,
+              latest.isValidForDownstream,
+              latest.finalValue.isFinite, latest.finalValue > 0,
+              Date().timeIntervalSince(latest.timeStamp) >= 0,
+              Date().timeIntervalSince(latest.timeStamp) <= 330 else { return nil }
+        return LowSoonReadingReference(id: latest.id, measuredAt: latest.timeStamp,
+                                       sensorID: latest.sensor?.id,
+                                       finalValueMgdl: latest.finalValue)
+    }
+
+    /// Import and treatment commits are event-driven. If they were incomplete at the first
+    /// attempt, this retries the same fresh reading when they finish, without a polling timer.
+    private func requestLowSoonRetry() {
+        if lowSoonInFlightID != nil {
+            lowSoonRetryAfterFlight = true
+        } else {
+            retryLowSoonIfPending()
+        }
+    }
+
+    private func retryLowSoonIfPending() {
+        guard lowSoonPendingReference != nil,
+              let current = currentLowSoonReference(),
+              let coreDataManager else { return }
+        if lowSoonPendingReference != current {
+            lowSoonPendingReference = current
+            lowSoonCompletedID = nil
+        }
+        guard let pending = lowSoonPendingReference,
+              pending.id != lowSoonCompletedID,
+              lowSoonInFlightID == nil else { return }
+        lowSoonInFlightID = pending.id
+        coreDataManager.saveChanges { [weak self] saved in
+            guard let self else { return }
+            guard saved else {
+                self.lowSoonInFlightID = nil
+                let retry = self.lowSoonRetryAfterFlight
+                self.lowSoonRetryAfterFlight = false
+                if retry { self.retryLowSoonIfPending() }
+                return
+            }
+            let adapter: GlucoseForecastDataAdapter
+            if let existing = self.lowSoonForecastAdapter {
+                adapter = existing
+            } else {
+                adapter = GlucoseForecastDataAdapter(coreDataManager: coreDataManager)
+                self.lowSoonForecastAdapter = adapter
+            }
+            Task { @MainActor [weak self] in
+                let outcome = await adapter.engineOnlyForecast(horizonMinutes: 60, at: .now)
+                guard let self else { return }
+                self.lowSoonInFlightID = nil
+                let retry = self.lowSoonRetryAfterFlight
+                self.lowSoonRetryAfterFlight = false
+                guard let stillPending = self.lowSoonPendingReference,
+                      stillPending == pending,
+                      let latest = self.currentLowSoonReference(), latest == pending
+                else {
+                    // A same-ID reading may have been reprocessed or recalibrated while the
+                    // worker ran. Never use its older forecast; evaluate the new finalValue.
+                    if self.currentLowSoonReference() != nil || retry {
+                        self.retryLowSoonIfPending()
+                    }
+                    return
+                }
+                self.alertManager?.checkLowSoon(outcome,
+                    expectedReferenceDate: pending.measuredAt, expectedSensorID: pending.sensorID,
+                    expectedGlucoseMgdl: pending.finalValueMgdl)
+                let matchesRequestedReading = outcome.result.referenceDate == pending.measuredAt &&
+                    outcome.result.referenceSensorID == pending.sensorID
+                if outcome.result.reason != .dataUnavailable &&
+                    (outcome.result.reason != nil || matchesRequestedReading) {
+                    self.lowSoonCompletedID = pending.id
+                    self.lowSoonPendingReference = nil
+                } else if retry {
+                    // An import or local treatment commit may have finished while the older
+                    // snapshot was being calculated. Re-evaluate once against the newer state.
+                    self.retryLowSoonIfPending()
+                }
             }
         }
     }
@@ -3363,6 +3482,10 @@ extension RootApplicationCoordinator: @preconcurrency UNUserNotificationCenterDe
             // banner avoids showing the same title and message twice. A terminal failure remains
             // a real alarm, so it may still make its one-off sound and remain in Notification Center.
             completionHandler(isTerminal ? [.sound, .list] : [])
+        } else if notification.request.identifier.hasPrefix(PlannedMealReminder.identifierPrefix) {
+            completionHandler([.banner, .list, .sound])
+        } else if notification.request.identifier.hasPrefix(PizzaSplitReminder.identifierPrefix) {
+            completionHandler([.banner, .list, .sound])
             // this will verify if it concerns an alert notification, if not pickerviewData will be nil
         } else if let pickerViewData = alertManager?.userNotificationCenter(center, willPresent: notification, withCompletionHandler: completionHandler) {
             presentPicker(pickerViewData)
@@ -3411,6 +3534,13 @@ extension RootApplicationCoordinator: @preconcurrency UNUserNotificationCenterDe
             // active banner behind and make the notification and banner behave like separate
             // alerts. The in-app banner remains the single route to the relevant detail view.
             rootTabStateModel?.showHomeForSensorHealthNotification()
+        } else if let uuid = PlannedMealReminder.tappedUUID(from: response.notification.request) {
+            // Tapping the reminder opens the planned entry for an explicit confirmation.
+            // Delivery or a tap must never mark carbohydrates as eaten.
+            DispatchQueue.main.async { PlannedMealReminder.recordTap(uuid: uuid) }
+        } else if let uuid = PizzaSplitReminder.tappedUUID(from: response.notification.request) {
+            // A reminder opens a new calculation using current data; no saved residual dose is used.
+            DispatchQueue.main.async { PizzaSplitReminder.recordTap(uuid: uuid) }
         } else {
             // it's not an initial calibration request notification that the user clicked, by calling alertManager?.userNotificationCenter, we check if it was an alert notification that was clicked and if yes pickerViewData will have the list of alert snooze values
             if let pickerViewData = alertManager?.userNotificationCenter(center, didReceive: response) {
@@ -3617,6 +3747,7 @@ extension RootApplicationCoordinator: @preconcurrency FollowerDelegate {
                 
                 // check alerts, create notification, set app badge
                 checkAlertsCreateNotificationAndSetAppBadge()
+                queueLowSoonForLatestReading()
                 
                 healthKitManager?.storeBgReadings()
                 

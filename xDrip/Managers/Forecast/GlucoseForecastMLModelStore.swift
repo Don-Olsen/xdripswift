@@ -113,6 +113,7 @@ final class GlucoseForecastMLModelStore {
         let modelSchemaVersion: Int
         let engineVersion: String
         let featureVersion: String
+        let modelID: String?
         let report: GlucoseForecastMLSelfCheck
 
         var matchesCurrentGeneration: Bool {
@@ -200,19 +201,63 @@ final class GlucoseForecastMLModelStore {
         }
     }
 
-    func saveReview(_ metadata: GlucoseForecastMLModelMetadata) throws {
+    func saveReview(_ metadata: GlucoseForecastMLModelMetadata,
+                    rows: [GlucoseForecastMLReviewRow] = []) throws {
         guard GlucoseForecastMLModelCompatibility.matchesGeneration(metadata) else {
             throw GlucoseForecastMLTrainingFailure.packageInvalid
         }
         try prepareDirectory()
+        let csvURL = reviewCSVURL(modelID: metadata.modelID)
+        let stagedReview = directory.appendingPathComponent(
+            "latest-review-\(UUID().uuidString.lowercased()).tmp")
+        var createdCSV = false
         let review = SavedReview(
             modelSchemaVersion: metadata.schemaVersion,
             engineVersion: metadata.context.engineVersion,
             featureVersion: metadata.context.featureVersion,
+            modelID: rows.isEmpty ? nil : metadata.modelID,
             report: metadata.selfCheck)
-        let data = try JSONEncoder().encode(review)
-        try data.write(to: reviewURL, options: .atomic)
-        try protect(reviewURL)
+        do {
+            if !rows.isEmpty {
+                guard GlucoseForecastMLStoragePolicy.isGeneratedUUID(metadata.modelID),
+                      let csv = GlucoseForecastMLReviewCSV.data(rows,
+                                                                context: metadata.context) else {
+                    throw GlucoseForecastMLTrainingFailure.packageInvalid
+                }
+                if fileManager.fileExists(atPath: csvURL.path) {
+                    // Never overwrite evidence for a previously saved review ID.
+                    guard try Data(contentsOf: csvURL) == csv else {
+                        throw GlucoseForecastMLTrainingFailure.packageInvalid
+                    }
+                } else {
+                    try csv.write(to: csvURL, options: .atomic)
+                    createdCSV = true
+                    try protect(csvURL)
+                }
+            }
+            try JSONEncoder().encode(review).write(to: stagedReview, options: .atomic)
+            try protect(stagedReview)
+            if fileManager.fileExists(atPath: reviewURL.path) {
+                let targetType = try fileManager.attributesOfItem(
+                    atPath: reviewURL.path)[.type] as? FileAttributeType
+                guard targetType == .typeRegular,
+                      let values = try? reviewURL.resourceValues(forKeys: [.isSymbolicLinkKey]),
+                      values.isSymbolicLink != true else {
+                    throw GlucoseForecastMLTrainingFailure.packageInvalid
+                }
+                _ = try fileManager.replaceItemAt(reviewURL, withItemAt: stagedReview,
+                    backupItemName: nil, options: [.usingNewMetadataOnly])
+            } else {
+                try fileManager.moveItem(at: stagedReview, to: reviewURL)
+            }
+        } catch {
+            // Any failed protection or review commit leaves the previous review
+            // intact and removes the new sensitive CSV rather than orphaning it.
+            if createdCSV { try? fileManager.removeItem(at: csvURL) }
+            try? fileManager.removeItem(at: stagedReview)
+            throw error
+        }
+        if !rows.isEmpty { pruneOlderReviewCSVs(keeping: metadata.modelID) }
     }
 
     func loadReview() -> GlucoseForecastMLSelfCheck? {
@@ -220,6 +265,39 @@ final class GlucoseForecastMLModelStore {
         guard let saved = try? JSONDecoder().decode(SavedReview.self, from: data),
               saved.matchesCurrentGeneration else { return nil }
         return saved.report
+    }
+
+    /// A review export is available only for the matching current-generation
+    /// self-check. A previous build's bare review cannot expose a stale CSV.
+    func reviewCSVURL() -> URL? {
+        guard let data = try? Data(contentsOf: reviewURL),
+              let saved = try? JSONDecoder().decode(SavedReview.self, from: data),
+              saved.matchesCurrentGeneration,
+              let modelID = saved.modelID,
+              GlucoseForecastMLStoragePolicy.isGeneratedUUID(modelID) else { return nil }
+        let url = reviewCSVURL(modelID: modelID)
+        guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]),
+              values.isRegularFile == true, values.isSymbolicLink != true else { return nil }
+        return url
+    }
+
+    private func reviewCSVURL(modelID: String) -> URL {
+        directory.appendingPathComponent("self-check-\(modelID).csv")
+    }
+
+    private func pruneOlderReviewCSVs(keeping modelID: String) {
+        guard let children = try? fileManager.contentsOfDirectory(at: directory,
+            includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey]) else { return }
+        for child in children {
+            let name = child.lastPathComponent
+            guard name.hasPrefix("self-check-"), name.hasSuffix(".csv"),
+                  name != "self-check-\(modelID).csv" else { continue }
+            let candidateID = String(name.dropFirst("self-check-".count).dropLast(".csv".count))
+            guard GlucoseForecastMLStoragePolicy.isGeneratedUUID(candidateID),
+                  let values = try? child.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]),
+                  values.isRegularFile == true, values.isSymbolicLink != true else { continue }
+            try? fileManager.removeItem(at: child)
+        }
     }
 
     #if canImport(CreateML)
@@ -436,6 +514,7 @@ final class GlucoseForecastMLManager: @unchecked Sendable {
     private var lastOutcome: String?
     private var lastIssue: GlucoseForecastMLTrainingIssue?
     private var lastSelfCheck: GlucoseForecastMLSelfCheck?
+    private var lastReviewCSVURL: URL?
     private var lifecycleObservers: [NSObjectProtocol] = []
     private var appHasResignedActive = false
 
@@ -458,9 +537,11 @@ final class GlucoseForecastMLManager: @unchecked Sendable {
             guard let self else { return }
             let bundle = await self.store.loadActive()
             let review = self.store.loadReview()
+            let reviewCSVURL = self.store.reviewCSVURL()
             self.lock.withLock {
                 self.loaded = bundle
                 self.lastSelfCheck = review
+                self.lastReviewCSVURL = reviewCSVURL
                 self.loading = false
             }
             self.notifyStatus()
@@ -481,6 +562,8 @@ final class GlucoseForecastMLManager: @unchecked Sendable {
             trainedAt: loaded?.metadata.trainedAt, lastAttempt: lastAttempt,
             lastOutcome: lastOutcome, lastIssue: lastIssue, lastSelfCheck: lastSelfCheck)
     }
+
+    var selfCheckCSVURL: URL? { lock.withLock { lastReviewCSVURL } }
 
     func shouldTrain(context: GlucoseForecastMLContext, now: Date = .now) -> Bool {
         lock.lock(); defer { lock.unlock() }
@@ -549,12 +632,20 @@ final class GlucoseForecastMLManager: @unchecked Sendable {
                     self.recordProgress(.installing, attemptID: attemptID)
                     let bundle = try await self.store.install(candidate)
                     self.lock.withLock { self.loaded = bundle }
-                    try? self.store.saveReview(candidate.metadata)
+                    let reviewSaved = (try? self.store.saveReview(
+                        candidate.metadata, rows: candidate.reviewRows)) != nil
+                    self.lock.withLock {
+                        self.lastReviewCSVURL = reviewSaved ? self.store.reviewCSVURL() : nil
+                    }
                     self.notifyModel()
                     self.finish(outcome: "activated", report: candidate.metadata.selfCheck,
                                 attemptID: attemptID)
                 } else {
-                    try? self.store.saveReview(candidate.metadata)
+                    let reviewSaved = (try? self.store.saveReview(
+                        candidate.metadata, rows: candidate.reviewRows)) != nil
+                    self.lock.withLock {
+                        self.lastReviewCSVURL = reviewSaved ? self.store.reviewCSVURL() : nil
+                    }
                     self.finish(outcome: "rejected", report: candidate.metadata.selfCheck,
                                 attemptID: attemptID)
                 }

@@ -34,6 +34,30 @@ struct RootHomeForecastContext: Equatable {
 struct RootHomeCompletedForecast {
     let result: GlucoseForecastResult
     let context: RootHomeForecastContext
+    /// Separate what-if presentation; never used as a measured or live forecast input.
+    let conditionalPlannedPoints: [GlucoseForecastPoint]?
+
+    init(result: GlucoseForecastResult, context: RootHomeForecastContext,
+         conditionalPlannedPoints: [GlucoseForecastPoint]? = nil) {
+        self.result = result
+        self.context = context
+        self.conditionalPlannedPoints = conditionalPlannedPoints
+    }
+}
+
+enum RootHomePlannedMealPresentation {
+    /// Planned state is tied to the exact treatment revision. Unlike a valid base forecast,
+    /// it must disappear immediately after an edit, confirmation or cancellation.
+    static func mayDisplay(completed: RootHomeCompletedForecast?,
+                           currentContext: RootHomeForecastContext,
+                           currentResult: GlucoseForecastResult?,
+                           hasPendingTreatmentCommit: Bool) -> Bool {
+        guard let completed, let currentResult, currentResult.reason == nil,
+              !hasPendingTreatmentCommit,
+              completed.context == currentContext,
+              completed.result.referenceDate == currentResult.referenceDate else { return false }
+        return completed.conditionalPlannedPoints?.isEmpty == false
+    }
 }
 
 /// Retains only a dated, previously valid drawing. The importer and pending-commit gates own
@@ -43,7 +67,8 @@ struct RootHomeForecastPresentationState {
 
     mutating func accept(_ outcome: GlucoseForecastPresentationOutcome,
                          context: RootHomeForecastContext, requestedAt: Date) {
-        completed = RootHomeCompletedForecast(result: outcome.result, context: context)
+        completed = RootHomeCompletedForecast(result: outcome.result, context: context,
+            conditionalPlannedPoints: outcome.conditionalPlannedPoints)
     }
 
     func displayableResult(context: RootHomeForecastContext, chartState: GlucoseChartState,
@@ -981,6 +1006,7 @@ struct RootHomeView: View {
             allowsTherapyCharts: !state.isScreenLocked,
             chartState: chartState,
             forecastResult: scrollCoordinator.isShowingCurrentTimeRange && !state.usesScreenLockNightLayout ? displayableForecastResult : nil,
+            conditionalPlannedForecastPoints: scrollCoordinator.isShowingCurrentTimeRange && !state.usesScreenLockNightLayout ? displayableConditionalPlannedPoints : nil,
             forecastHorizonMinutes: scrollCoordinator.isShowingCurrentTimeRange && !state.usesScreenLockNightLayout ? effectiveForecastHorizonMinutes : 0,
             forecastIsUpdating: TherapyMetricsManager.shared.pendingHomeTreatmentCommitState() != nil
                 || (HealthKitTherapyImportManager.shared.routineRefreshState().map {
@@ -1170,6 +1196,17 @@ struct RootHomeView: View {
                 == TherapyMetricsManager.shared.nonHealthTreatmentChangeRevision,
             at: max(Date(), forecastFreshnessCheckTime)
         )
+    }
+
+    private var displayableConditionalPlannedPoints: [GlucoseForecastPoint]? {
+        let completed = forecastPresentation.completed
+        let pending = TherapyMetricsManager.shared.hasUncommittedForecastInputChanges
+            || TherapyMetricsManager.shared.pendingHomeTreatmentCommitState() != nil
+        guard RootHomePlannedMealPresentation.mayDisplay(
+            completed: completed, currentContext: forecastContext,
+            currentResult: displayableForecastResult, hasPendingTreatmentCommit: pending
+        ) else { return nil }
+        return completed?.conditionalPlannedPoints
     }
 
     private var glucoseDisplayState: RootHomeGlucoseState {

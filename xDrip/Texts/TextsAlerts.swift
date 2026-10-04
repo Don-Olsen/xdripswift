@@ -21,6 +21,11 @@ class Texts_Alerts {
         return NSLocalizedString("alerts_verylowalerttitle", tableName: filename, bundle: Bundle.main, value: "Very Low Alarm", comment: "When very low alert rises, this is the start of the text shown in the title of the alert notification, also in alert settings list, for the name of the alert")
     }()
 
+    static let lowSoonAlertTitle: String = {
+        NSLocalizedString("alerts_lowsoon", tableName: filename, bundle: Bundle.main,
+                          value: "Lavt om lidt", comment: "30-minute engine forecast low warning")
+    }()
+
     // Concise titles used only by the large snooze presentation.
     static let highSnoozeTitle: String = {
         return NSLocalizedString("alerts_snooze_high_title", tableName: filename, bundle: Bundle.main, value: "High", comment: "Concise high alarm title shown in the large snooze screen")

@@ -24,6 +24,10 @@ final class BackupService: @unchecked Sendable {
         UserDefaults.Key.careLinkPatientAliases.rawValue,
         "pendingHealthKitReplacements",
         "healthKitSyncVersion",
+        // A cutover is a source-history boundary, not a portable display preference.
+        // Restoring settings alone must never claim complete local therapy coverage.
+        TreatmentSourceCutover.defaultsKey,
+        "therapyRestoreRequiresSourceSetup",
         "is15DayDexcomG7",
         // Keep removed credentials out of settings backups from upgraded installations.
         "m5StackWiFiName1", "m5StackWiFiName2", "m5StackWiFiName3",
@@ -220,7 +224,7 @@ final class BackupService: @unchecked Sendable {
             includesAccounts: accounts?.isEmpty == false,
             isPasswordProtected: options.passphrase?.isEmpty == false
         )
-        let payload = BackupPayload(
+        var payload = BackupPayload(
             manifest: manifest,
             settings: settings,
             accounts: accounts,
@@ -233,6 +237,9 @@ final class BackupService: @unchecked Sendable {
             careLinkPatientAliases: options.includesTreatments
                 ? UserDefaults.standard.dictionary(forKey: UserDefaults.Key.careLinkPatientAliases.rawValue) as? [String: String] : nil
         )
+        // A settings-only backup must not carry a treatment source boundary. Full treatment
+        // archives retain it as provenance, never as an automatically restored preference.
+        payload.treatmentSourceCutover = options.includesTreatments ? TreatmentSourceCutover.current() : nil
         let json = try encoder.encode(payload)
         let compressed = try (json as NSData).compressed(using: .lzfse) as Data
         var archive = Self.magic
@@ -395,6 +402,18 @@ final class BackupService: @unchecked Sendable {
         guard coreDataManager.saveChangesSynchronously() else {
             throw NSError(domain: NSCocoaErrorDomain, code: NSPersistentStoreSaveError)
         }
+        // A fresh installation cannot prove that restored pre-cutover mySugr history and the
+        // destination's Health library cover the same period. Prevent a false zero until the
+        // user explicitly reconfigures the source and completes a new durable cutover.
+        if mode != .ignore, payload.treatmentSourceCutover != nil,
+           TreatmentSourceCutover.current() == nil {
+            await MainActor.run {
+                UserDefaults.standard.set(true, forKey: "therapyRestoreRequiresSourceSetup")
+                NotificationCenter.default.post(name: UserDefaults.didChangeNotification,
+                                                object: UserDefaults.standard)
+                TherapyMetricsManager.shared.invalidate()
+            }
+        }
 
         let restoredValueCounts = try await MainActor.run {
             let settings = (payload.settings ?? [:]).filter { Self.isPortableSetting($0.key) }
@@ -541,7 +560,15 @@ final class BackupService: @unchecked Sendable {
                 healthKitSourceBundleIdentifier: $0.healthKitSourceBundleIdentifier,
                 healthKitExternalUUID: $0.healthKitExternalUUID,
                 healthKitSyncIdentifier: $0.healthKitSyncIdentifier,
-                watchSourceUUID: $0.watchSourceUUID
+                watchSourceUUID: $0.watchSourceUUID,
+                localTreatmentUUID: $0.localTreatmentUUID,
+                createdAt: $0.createdAt,
+                modifiedAt: $0.modifiedAt,
+                mealKindRaw: $0.mealKindRaw,
+                carbohydrateDurationMinutes: $0.carbohydrateDurationMinutes?.doubleValue,
+                plannedMealStateRaw: $0.plannedMealStateRaw,
+                healthKitSyncVersion: $0.healthKitSyncVersion?.intValue,
+                healthKitSyncStateRaw: $0.healthKitSyncStateRaw
             )
         }
     }
@@ -805,6 +832,14 @@ final class BackupService: @unchecked Sendable {
             treatment.healthKitExternalUUID = record.healthKitExternalUUID
             treatment.healthKitSyncIdentifier = record.healthKitSyncIdentifier
             treatment.watchSourceUUID = record.watchSourceUUID
+            treatment.localTreatmentUUID = record.localTreatmentUUID
+            treatment.createdAt = record.createdAt
+            treatment.modifiedAt = record.modifiedAt
+            treatment.mealKindRaw = record.mealKindRaw
+            treatment.carbohydrateDurationMinutes = record.carbohydrateDurationMinutes.map(NSNumber.init(value:))
+            treatment.plannedMealStateRaw = record.plannedMealStateRaw
+            treatment.healthKitSyncVersion = record.healthKitSyncVersion.map(NSNumber.init(value:))
+            treatment.healthKitSyncStateRaw = record.healthKitSyncStateRaw
             if !record.id.isEmpty {
                 ids.insert(record.id)
             }
@@ -1059,7 +1094,15 @@ final class BackupService: @unchecked Sendable {
             healthKitSourceBundleIdentifier: treatment.healthKitSourceBundleIdentifier,
             healthKitExternalUUID: treatment.healthKitExternalUUID,
             healthKitSyncIdentifier: treatment.healthKitSyncIdentifier,
-            watchSourceUUID: treatment.watchSourceUUID
+            watchSourceUUID: treatment.watchSourceUUID,
+            localTreatmentUUID: treatment.localTreatmentUUID,
+            createdAt: treatment.createdAt,
+            modifiedAt: treatment.modifiedAt,
+            mealKindRaw: treatment.mealKindRaw,
+            carbohydrateDurationMinutes: treatment.carbohydrateDurationMinutes?.doubleValue,
+            plannedMealStateRaw: treatment.plannedMealStateRaw,
+            healthKitSyncVersion: treatment.healthKitSyncVersion?.intValue,
+            healthKitSyncStateRaw: treatment.healthKitSyncStateRaw
         ))
     }
 
@@ -1071,6 +1114,9 @@ final class BackupService: @unchecked Sendable {
         // doses and prevent an imported treatment from merging with a manual entry.
         if let uuid = treatment.healthKitSampleUUID, !uuid.isEmpty {
             return "healthkit|\(uuid)"
+        }
+        if let uuid = treatment.localTreatmentUUID, !uuid.isEmpty {
+            return "local|\(uuid)"
         }
         let timestampBucket = Int64(treatment.date.timeIntervalSince1970 / 30)
         let notes = treatment.notes?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""

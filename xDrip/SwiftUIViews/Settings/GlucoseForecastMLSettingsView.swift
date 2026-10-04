@@ -84,6 +84,7 @@ struct GlucoseForecastMLSettingsView: View {
     @State private var coverageText = GlucoseForecastMLTrainingCoordinator.shared.coverageText
     @State private var isPreparing = GlucoseForecastMLTrainingCoordinator.shared.isPreparing
     @State private var currentContext: GlucoseForecastMLContext?
+    @State private var selfCheckCSVURL: URL?
 
     private func t(_ key: String, _ fallback: String) -> String {
         GlucoseForecastTexts.text(key, fallback: fallback)
@@ -150,16 +151,34 @@ struct GlucoseForecastMLSettingsView: View {
 
             if let selfCheck = status.lastSelfCheck ?? metadata?.selfCheck {
                 Section(t("forecast.mlSelfCheck", "Last historical self-check")) {
+                    Text("Referenceperiode: \(selfCheck.startedAt.formatted(date: .abbreviated, time: .omitted))–\((selfCheck.referenceEndAt ?? selfCheck.endedAt).formatted(date: .abbreviated, time: .omitted))")
+                        .font(.footnote)
                     ForEach([30, 60, 120], id: \.self) { horizon in
                         if let metric = selfCheck.horizons[horizon] {
                             VStack(alignment: .leading, spacing: 4) {
-                                Text("+\(horizon) min · \(metric.count) \(t("forecast.mlPairs", "pairs"))")
+                                Text("+\(horizon) min · \(metric.count) fælles eksempler")
                                     .fontWeight(.semibold)
-                                Text("\(t("forecast.mlMAE", "MAE")): \(format(GlucoseForecastMLStatusPresentation.maeMmolPerL(metric.candidateMAE))) / \(format(GlucoseForecastMLStatusPresentation.maeMmolPerL(metric.engineMAE))) mmol/L (ML / \(t("forecast.engineEstimate", "engine")))")
+                                Text("MAE mmol/L · motor \(format(GlucoseForecastMLStatusPresentation.maeMmolPerL(metric.engineMAE))) · ML \(format(GlucoseForecastMLStatusPresentation.maeMmolPerL(metric.candidateMAE)))" +
+                                     (metric.unchangedMAE.map { " · uændret \(format(GlucoseForecastMLStatusPresentation.maeMmolPerL($0)))" } ?? ""))
+                                if let engineBias = metric.engineBias,
+                                   let unchangedBias = metric.unchangedBias {
+                                    Text("Signeret fejl mmol/L (prognose − faktisk) · motor \(format(GlucoseForecastMLStatusPresentation.maeMmolPerL(engineBias))) · ML \(format(GlucoseForecastMLStatusPresentation.maeMmolPerL(metric.candidateBias))) · uændret \(format(GlucoseForecastMLStatusPresentation.maeMmolPerL(unchangedBias)))")
+                                }
+                                if let unchangedMAE = metric.unchangedMAE {
+                                    Text("ML-forbedring mod uændret: \(format(GlucoseForecastMLStatusPresentation.maeMmolPerL(unchangedMAE - metric.candidateMAE))) mmol/L")
+                                }
                                 Text("\(t("forecast.mlCoverage", "Observed band coverage")): \(format(metric.candidateCoverage * 100)) %")
                             }
                             .font(.footnote)
                         }
+                    }
+                    if let selfCheckCSVURL {
+                        ShareLink(item: selfCheckCSVURL) {
+                            Label("Del selvtjekkets eksempler (CSV)", systemImage: "square.and.arrow.up")
+                        }
+                        Text("Filen indeholder helbredsdata og deles kun, når du vælger en modtager.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
                     }
                 }
             }
@@ -187,6 +206,7 @@ struct GlucoseForecastMLSettingsView: View {
     private func refresh() {
         status = GlucoseForecastMLManager.shared.statusSummary
         metadata = GlucoseForecastMLManager.shared.activeModelMetadata
+        selfCheckCSVURL = GlucoseForecastMLManager.shared.selfCheckCSVURL
         preparationStatus = GlucoseForecastMLTrainingCoordinator.shared.statusText
         coverageText = GlucoseForecastMLTrainingCoordinator.shared.coverageText
         isPreparing = GlucoseForecastMLTrainingCoordinator.shared.isPreparing

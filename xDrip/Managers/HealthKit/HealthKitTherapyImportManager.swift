@@ -3,8 +3,8 @@ import Foundation
 import HealthKit
 import UIKit
 
-/// Health therapy import is deliberately separate from the existing glucose export manager.
-/// Neither enabling a read type nor receiving a HealthKit callback writes therapy to Health.
+/// Health therapy import is deliberately separate from glucose export and local therapy writing.
+/// Import callbacks never write therapy back to Health.
 enum HealthTherapyImportKind: String, CaseIterable {
     case insulin
     case carbohydrates
@@ -25,12 +25,84 @@ enum HealthTherapyImportKind: String, CaseIterable {
 struct HealthTherapyImportSource: Equatable {
     let bundleIdentifier: String
     let name: String
+
+    var isMySugr: Bool {
+        name.localizedCaseInsensitiveContains("mysugr") ||
+            bundleIdentifier.localizedCaseInsensitiveContains("mysugr")
+    }
+}
+
+/// A stable namespace keeps our writes out of imported therapy, including after reinstall.
+enum HealthLocalTherapyIdentity {
+    static let syncPrefix = "xdrip.therapy."
+
+    static func isOwn(sourceBundleID: String, syncIdentifier: String?,
+                      appBundleID: String? = Bundle.main.bundleIdentifier) -> Bool {
+        (appBundleID != nil && sourceBundleID == appBundleID) ||
+            (syncIdentifier?.hasPrefix(syncPrefix) == true)
+    }
 }
 
 struct HealthTherapyImportStatus {
     let lastSync: Date?
     let message: String
     let isIncomplete: Bool
+}
+
+/// One durable source boundary shared by the live therapy calculation and historical replay.
+/// The event time, not the time a backdated entry was saved, selects its source. A single
+/// encoded value prevents a crash from persisting a cutoff without its source identities.
+struct TreatmentSourceCutover: Codable, Equatable, Sendable {
+    static let defaultsKey = "localTreatmentSourceCutover.v1"
+    static let restoreRequiresSourceSetupKey = "therapyRestoreRequiresSourceSetup"
+    let cutoff: Date
+    let insulinSourceBundleID: String
+    let carbohydrateSourceBundleID: String
+
+    static func current(defaults: UserDefaults = .standard) -> Self? {
+        guard let data = defaults.data(forKey: defaultsKey),
+              let value = try? JSONDecoder().decode(Self.self, from: data),
+              value.cutoff.isFiniteDate,
+              !value.insulinSourceBundleID.isEmpty,
+              !value.carbohydrateSourceBundleID.isEmpty else { return nil }
+        return value
+    }
+
+    /// A damaged stored boundary must never be interpreted as "no cutover".
+    static func hasInvalidStoredValue(defaults: UserDefaults = .standard) -> Bool {
+        defaults.object(forKey: defaultsKey) != nil && current(defaults: defaults) == nil
+    }
+
+    static func hasStoredValue(defaults: UserDefaults = .standard) -> Bool {
+        defaults.object(forKey: defaultsKey) != nil
+    }
+
+    @discardableResult
+    static func persist(_ value: Self, defaults: UserDefaults = .standard) -> Bool {
+        guard value.cutoff.isFiniteDate,
+              !value.insulinSourceBundleID.isEmpty,
+              !value.carbohydrateSourceBundleID.isEmpty,
+              defaults.object(forKey: defaultsKey) == nil,
+              let encoded = try? JSONEncoder().encode(value) else { return false }
+        defaults.set(encoded, forKey: defaultsKey)
+        return current(defaults: defaults) == value
+    }
+
+    func permitsImported(eventDate: Date, kind: HealthTherapyImportKind,
+                         sourceBundleID: String?) -> Bool {
+        guard eventDate.isFiniteDate, eventDate < cutoff else { return false }
+        return sourceBundleID == (kind == .insulin ? insulinSourceBundleID : carbohydrateSourceBundleID)
+    }
+
+    func permitsLocal(eventDate: Date, localTreatmentUUID: String?,
+                      watchSourceUUID: String?) -> Bool {
+        eventDate.isFiniteDate && eventDate >= cutoff &&
+            ((localTreatmentUUID?.isEmpty == false) || (watchSourceUUID?.isEmpty == false))
+    }
+}
+
+private extension Date {
+    var isFiniteDate: Bool { timeIntervalSinceReferenceDate.isFinite }
 }
 
 /// Presentation-only proof for a routine anchored reread. Calculations must continue to use
@@ -224,6 +296,8 @@ enum HealthTherapyImportError: Error {
     case invalidAnchor
     case storeFailure
     case notConfigured
+    case finalSyncIncomplete
+    case switchAlreadyRunning
 }
 
 /// Serializes each type's anchored pages and advances its checkpoint only after Core Data has
@@ -252,6 +326,9 @@ final class HealthKitTherapyImportManager {
     private var nextRoutineRefreshGeneration = 0
     private var observerInstalled = Set<HealthTherapyImportKind>()
     private var observerCompletions: [HealthTherapyImportKind: [() -> Void]] = [:]
+    private var cutoverCompletion: ((Error?) -> Void)?
+    private var cutoverWaitingFor = Set<HealthTherapyImportKind>()
+    private var cutoverSources: [HealthTherapyImportKind: String] = [:]
     /// Injected only by isolated tests to fail one parent-store save at a precise boundary.
     var saveImportedPage: ((CoreDataManager, @escaping (Bool) -> Void) -> Void)?
 
@@ -261,6 +338,9 @@ final class HealthKitTherapyImportManager {
     }
 
     func configure(coreDataManager: CoreDataManager) {
+        if self === Self.shared {
+            HealthKitLocalTherapyWriter.shared.configure(coreDataManager: coreDataManager)
+        }
         queue.async {
             self.coreDataManager = coreDataManager
             for kind in HealthTherapyImportKind.allCases where self.isEnabled(kind) {
@@ -275,7 +355,56 @@ final class HealthKitTherapyImportManager {
     }
 
     func isEnabled(_ kind: HealthTherapyImportKind) -> Bool {
-        defaults.bool(forKey: key(kind, "enabled"))
+        !TreatmentSourceCutover.hasStoredValue(defaults: defaults) &&
+            defaults.bool(forKey: key(kind, "enabled"))
+    }
+
+    /// Finish both selected-source reads and their durable Core Data commits before moving the
+    /// event-time boundary. If either type fails, keep both imports active and report failure.
+    func switchToLocalLogging(completion: @escaping (Error?) -> Void) {
+        queue.async {
+            guard !TreatmentSourceCutover.hasInvalidStoredValue(defaults: self.defaults) else {
+                DispatchQueue.main.async { completion(HealthTherapyImportError.storeFailure) }
+                return
+            }
+            guard TreatmentSourceCutover.current(defaults: self.defaults) == nil else {
+                DispatchQueue.main.async { completion(nil) }
+                return
+            }
+            guard self.cutoverCompletion == nil else {
+                DispatchQueue.main.async { completion(HealthTherapyImportError.switchAlreadyRunning) }
+                return
+            }
+            guard self.coreDataManager != nil,
+                  self.isEnabled(.insulin), self.isEnabled(.carbohydrates),
+                  let insulinSource = self.selectedSource(.insulin), insulinSource.isMySugr,
+                  let carbohydrateSource = self.selectedSource(.carbohydrates),
+                  carbohydrateSource.isMySugr else {
+                DispatchQueue.main.async { completion(HealthTherapyImportError.notConfigured) }
+                return
+            }
+            let insulin = insulinSource.bundleIdentifier
+            let carbohydrates = carbohydrateSource.bundleIdentifier
+            self.cutoverCompletion = completion
+            self.cutoverWaitingFor = Set(HealthTherapyImportKind.allCases)
+            self.cutoverSources = [.insulin: insulin, .carbohydrates: carbohydrates]
+            self.queue.asyncAfter(deadline: .now() + 60) {
+                if self.cutoverCompletion != nil {
+                    self.finishCutover(error: HealthTherapyImportError.finalSyncIncomplete)
+                }
+            }
+            // An already running query is queued for another pass. This is essential when the
+            // user presses the switch during a partially saved anchored import.
+            for kind in HealthTherapyImportKind.allCases { self.startSync(kind) }
+        }
+    }
+
+    private func finishCutover(error: Error?) {
+        let completion = cutoverCompletion
+        cutoverCompletion = nil
+        cutoverWaitingFor.removeAll()
+        cutoverSources.removeAll()
+        DispatchQueue.main.async { completion?(error) }
     }
 
     func selectedSource(_ kind: HealthTherapyImportKind) -> HealthTherapyImportSource? {
@@ -296,6 +425,10 @@ final class HealthKitTherapyImportManager {
 
     func setEnabled(_ enabled: Bool, kind: HealthTherapyImportKind,
                     completion: @escaping (Error?) -> Void) {
+        if enabled && TreatmentSourceCutover.hasStoredValue(defaults: defaults) {
+            completion(HealthTherapyImportError.notConfigured)
+            return
+        }
         guard enabled else {
             defaults.set(false, forKey: key(kind, "enabled"))
             defaults.removeObject(forKey: key(kind, "syncInProgress"))
@@ -332,6 +465,7 @@ final class HealthKitTherapyImportManager {
     }
 
     func selectSource(_ source: HealthTherapyImportSource, kind: HealthTherapyImportKind) {
+        guard !TreatmentSourceCutover.hasStoredValue(defaults: defaults) else { return }
         guard !source.bundleIdentifier.isEmpty else { return }
         presentationLock.lock()
         routineRefresh = nil
@@ -584,8 +718,60 @@ final class HealthKitTherapyImportManager {
         presentationLock.unlock()
         active.remove(kind)
         finishObserverCallbacks(kind)
-        if pending.remove(kind) != nil { startSync(kind) }
-        else { notifyStatusChanged() }
+        if cutoverCompletion != nil && !succeeded {
+            finishCutover(error: HealthTherapyImportError.finalSyncIncomplete)
+        }
+        if pending.remove(kind) != nil {
+            startSync(kind)
+            return
+        }
+        if cutoverCompletion != nil {
+            guard selectedSource(kind)?.bundleIdentifier == cutoverSources[kind] else {
+                finishCutover(error: HealthTherapyImportError.finalSyncIncomplete)
+                notifyStatusChanged()
+                return
+            }
+            cutoverWaitingFor.remove(kind)
+            if cutoverWaitingFor.isEmpty {
+                guard HealthTherapyImportKind.allCases.allSatisfy({ selectedSource($0)?.bundleIdentifier == cutoverSources[$0] }) else {
+                    finishCutover(error: HealthTherapyImportError.finalSyncIncomplete)
+                    notifyStatusChanged()
+                    return
+                }
+                guard HealthTherapyImportKind.allCases.allSatisfy({ !status($0).isIncomplete }) else {
+                    finishCutover(error: HealthTherapyImportError.finalSyncIncomplete)
+                    notifyStatusChanged()
+                    return
+                }
+                let candidate = TreatmentSourceCutover(
+                    cutoff: Date(),
+                    insulinSourceBundleID: cutoverSources[.insulin] ?? "",
+                    carbohydrateSourceBundleID: cutoverSources[.carbohydrates] ?? "")
+                // Local logging must never coexist with an effective external IOB/COB owner.
+                // Set local therapy ownership first: a crash here still leaves the selected
+                // mySugr imports active, whereas the inverse order could hide local metrics.
+                let priorTherapySource = defaults.therapyDataSourceType
+                defaults.therapyDataSourceType = .none
+                guard TreatmentSourceCutover.persist(candidate, defaults: defaults) else {
+                    defaults.therapyDataSourceType = priorTherapySource
+                    finishCutover(error: HealthTherapyImportError.storeFailure)
+                    notifyStatusChanged()
+                    return
+                }
+                // The single cutover blob already disables effective importing, even if the
+                // process stops before both legacy enabled preferences are cleared.
+                for stoppedKind in HealthTherapyImportKind.allCases {
+                    defaults.set(false, forKey: key(stoppedKind, "enabled"))
+                    defaults.removeObject(forKey: key(stoppedKind, "syncInProgress"))
+                    if observerInstalled.remove(stoppedKind) != nil { query.stopObserving(stoppedKind) }
+                }
+                defaults.removeObject(forKey: TreatmentSourceCutover.restoreRequiresSourceSetupKey)
+                TherapyMetricsManager.shared.invalidate()
+                finishCutover(error: nil)
+                HealthKitLocalTherapyWriter.shared.retryPending()
+            }
+        }
+        notifyStatusChanged()
     }
 
     private func finishObserverCallbacks(_ kind: HealthTherapyImportKind) {
@@ -616,7 +802,9 @@ final class HealthKitTherapyImportManager {
                     ledger[id]?.wasDeletedInHealthKit = true
                     if let entry = treatments[id] { entry.treatmentdeleted = true }
                 }
-                for sample in page.samples where sample.kind == kind {
+                for sample in page.samples where sample.kind == kind && !HealthLocalTherapyIdentity.isOwn(
+                    sourceBundleID: sample.source.bundleIdentifier,
+                    syncIdentifier: sample.syncIdentifier) {
                     let id = sample.uuid.uuidString
                     guard !deletionIDs.contains(id) else { continue }
                     let record: HealthKitTherapySample
@@ -704,6 +892,9 @@ final class HealthKitTherapyImportManager {
                 existingRequest.predicate = NSPredicate(format: "healthKitSampleUUID IN %@", ids)
                 let existingIDs = Set(try context.fetch(existingRequest).compactMap(\.healthKitSampleUUID))
                 for record in records where !existingIDs.contains(record.uuid) {
+                    guard !HealthLocalTherapyIdentity.isOwn(
+                        sourceBundleID: record.sourceBundleIdentifier,
+                        syncIdentifier: record.syncIdentifier) else { continue }
                     guard record.classification == "bolus" || record.classification == "carbohydrates" else { continue }
                     let entry = TreatmentEntry(date: record.startDate, value: record.quantity,
                         treatmentType: kind.treatmentType, nightscoutEventType: nil,
@@ -763,5 +954,231 @@ final class HealthKitTherapyImportManager {
             Date().addingTimeInterval(-TherapyModelSettings.visibilityInterval) as NSDate)
         request.fetchLimit = 1
         return try context.count(for: request) > 0
+    }
+}
+
+/// An immutable value copied from the durable local treatment row before any HealthKit work.
+/// Reusing this identity and version on retry makes an interrupted save idempotent.
+struct HealthLocalTherapyWriteRequest: Equatable {
+    let localUUID: String
+    let kind: HealthTherapyImportKind
+    let eventDate: Date
+    let amount: Double
+    let version: Int
+
+    var syncIdentifier: String { HealthLocalTherapyIdentity.syncPrefix + localUUID }
+
+    var isValid: Bool {
+        !localUUID.isEmpty && eventDate.timeIntervalSinceReferenceDate.isFinite &&
+            amount.isFinite && amount > 0 && version > 0
+    }
+}
+
+/// The token changes on every edit, even when a child/main Core Data context still
+/// has the old `pending` value after the writer acknowledged in its parent context.
+enum HealthLocalTherapySyncState {
+    static func pending(version: Int) -> String {
+        version == 1 ? "pending" : "pending.\(version)"
+    }
+
+    static func isPending(_ raw: String?, version: Int) -> Bool {
+        raw == "pending" || raw == pending(version: version)
+    }
+}
+
+protocol HealthLocalTherapyWriting: AnyObject {
+    func save(_ request: HealthLocalTherapyWriteRequest,
+              completion: @escaping (Bool, Error?) -> Void)
+}
+
+private final class LiveHealthLocalTherapyStore: HealthLocalTherapyWriting {
+    private let healthStore = HKHealthStore()
+
+    func save(_ request: HealthLocalTherapyWriteRequest,
+              completion: @escaping (Bool, Error?) -> Void) {
+        guard request.isValid, HKHealthStore.isHealthDataAvailable(),
+              let type = HKObjectType.quantityType(forIdentifier: request.kind.quantityIdentifier) else {
+            completion(false, HealthTherapyImportError.unavailable)
+            return
+        }
+        let writeSample = {
+            var metadata: [String: Any] = [
+                HKMetadataKeySyncIdentifier: request.syncIdentifier,
+                HKMetadataKeySyncVersion: NSNumber(value: request.version)
+            ]
+            if request.kind == .insulin {
+                metadata[HKMetadataKeyInsulinDeliveryReason] = NSNumber(value: HKInsulinDeliveryReason.bolus.rawValue)
+            }
+            let sample = HKQuantitySample(type: type,
+                quantity: HKQuantity(unit: request.kind.unit, doubleValue: request.amount),
+                start: request.eventDate, end: request.eventDate, metadata: metadata)
+            self.healthStore.save(sample) { success, error in completion(success, error) }
+        }
+        if healthStore.authorizationStatus(for: type) == .sharingAuthorized {
+            writeSample()
+        } else {
+            healthStore.requestAuthorization(toShare: [type], read: []) { _, error in
+                if let error { completion(false, error); return }
+                guard self.healthStore.authorizationStatus(for: type) == .sharingAuthorized else {
+                    completion(false, HealthTherapyImportError.unavailable)
+                    return
+                }
+                writeSample()
+            }
+        }
+    }
+}
+
+/// One-at-a-time Health writes. The local Core Data row is authoritative: Health failure only
+/// leaves its durable `pending` marker for the next foreground/save retry. No treatment data is
+/// put in diagnostics, and nothing is written before the mySugr source cutover is complete.
+final class HealthKitLocalTherapyWriter {
+    static let shared = HealthKitLocalTherapyWriter(store: LiveHealthLocalTherapyStore())
+
+    private let store: HealthLocalTherapyWriting
+    private let defaults: UserDefaults
+    private let acknowledgementSaver: (NSManagedObjectContext) throws -> Void
+    private let queue = DispatchQueue(label: "health.therapy.local.write", qos: .utility)
+    private var coreDataManager: CoreDataManager?
+    private var saveObserver: NSObjectProtocol?
+    private var foregroundObserver: NSObjectProtocol?
+    private var inFlight = false
+    private var failedOnce = false
+    private var retryScheduled = false
+
+    init(store: HealthLocalTherapyWriting, defaults: UserDefaults = .standard,
+         acknowledgementSaver: @escaping (NSManagedObjectContext) throws -> Void = { try $0.save() }) {
+        self.store = store
+        self.defaults = defaults
+        self.acknowledgementSaver = acknowledgementSaver
+    }
+
+    deinit {
+        if let saveObserver { NotificationCenter.default.removeObserver(saveObserver) }
+        if let foregroundObserver { NotificationCenter.default.removeObserver(foregroundObserver) }
+    }
+
+    func configure(coreDataManager: CoreDataManager) {
+        queue.async {
+            self.coreDataManager = coreDataManager
+            if let saveObserver = self.saveObserver { NotificationCenter.default.removeObserver(saveObserver) }
+            self.saveObserver = NotificationCenter.default.addObserver(
+                forName: .NSManagedObjectContextDidSave,
+                object: coreDataManager.privateManagedObjectContext,
+                queue: nil) { [weak self] _ in self?.retryPending() }
+            if self.foregroundObserver == nil {
+                self.foregroundObserver = NotificationCenter.default.addObserver(
+                    forName: UIApplication.didBecomeActiveNotification,
+                    object: nil, queue: nil) { [weak self] _ in
+                        self?.queue.async {
+                            self?.failedOnce = false
+                            self?.attemptNext()
+                        }
+                    }
+            }
+            self.attemptNext()
+        }
+    }
+
+    func retryPending() { queue.async { self.attemptNext() } }
+
+    private func attemptNext() {
+        guard !inFlight, let coreDataManager,
+              let cutover = TreatmentSourceCutover.current(defaults: defaults) else { return }
+        inFlight = true // Reserve the worker before the asynchronous Core Data fetch.
+        let context = coreDataManager.privateManagedObjectContext
+        context.perform {
+            let next: HealthLocalTherapyWriteRequest?
+            do {
+                let request: NSFetchRequest<TreatmentEntry> = TreatmentEntry.fetchRequest()
+                request.predicate = NSPredicate(
+                    format: "localTreatmentUUID != nil AND (healthKitSyncStateRaw == %@ OR healthKitSyncStateRaw BEGINSWITH %@) AND (treatmentdeleted == NO OR treatmentdeleted == nil)",
+                    "pending", "pending.")
+                request.sortDescriptors = [NSSortDescriptor(key: "date", ascending: true)]
+                next = try context.fetch(request).compactMap { entry in
+                    guard !entry.isHealthKitImported, !entry.isWatchLocalOnly,
+                          let uuid = entry.localTreatmentUUID,
+                          cutover.permitsLocal(eventDate: entry.date,
+                            localTreatmentUUID: uuid, watchSourceUUID: nil),
+                          entry.treatmentType == .Insulin || entry.isConfirmedMeal else { return nil }
+                    let kind: HealthTherapyImportKind = entry.treatmentType == .Insulin
+                        ? .insulin : .carbohydrates
+                    let value = HealthLocalTherapyWriteRequest(localUUID: uuid, kind: kind,
+                        eventDate: entry.date, amount: entry.value,
+                        version: entry.healthKitSyncVersion?.intValue ?? 0)
+                    return value.isValid && HealthLocalTherapySyncState.isPending(
+                        entry.healthKitSyncStateRaw, version: value.version) ? value : nil
+                }.first
+            } catch { next = nil }
+            self.queue.async {
+                guard let next else { self.inFlight = false; return }
+                self.store.save(next) { success, error in
+                    self.queue.async {
+                        if success && error == nil {
+                            self.markSynced(next, in: coreDataManager)
+                        } else {
+                            self.stopAfterFailure()
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func stopAfterFailure() {
+        inFlight = false
+        // A bounded delayed retry covers a transient Health or local acknowledgement
+        // failure. Persistent failures wait for foreground or another durable save.
+        guard !failedOnce, !retryScheduled else { return }
+        failedOnce = true
+        retryScheduled = true
+        queue.asyncAfter(deadline: .now() + 60) {
+            self.retryScheduled = false
+            self.attemptNext()
+        }
+    }
+
+    private func markSynced(_ sent: HealthLocalTherapyWriteRequest, in core: CoreDataManager) {
+        let context = core.privateManagedObjectContext
+        context.perform {
+            var acknowledged = false
+            var superseded = false
+            do {
+                let request: NSFetchRequest<TreatmentEntry> = TreatmentEntry.fetchRequest()
+                request.predicate = NSPredicate(format: "localTreatmentUUID == %@", sent.localUUID)
+                if let entry = try context.fetch(request).first {
+                    let storedVersion = entry.healthKitSyncVersion?.intValue ?? 0
+                    if storedVersion > sent.version,
+                       HealthLocalTherapySyncState.isPending(entry.healthKitSyncStateRaw,
+                                                             version: storedVersion) {
+                        superseded = true
+                    } else if storedVersion == sent.version,
+                              HealthLocalTherapySyncState.isPending(entry.healthKitSyncStateRaw,
+                                                                    version: sent.version),
+                              !entry.treatmentdeleted {
+                        entry.healthKitSyncStateRaw = "synced"
+                        do {
+                            try self.acknowledgementSaver(context)
+                            acknowledged = true
+                        } catch {
+                            context.refresh(entry, mergeChanges: false)
+                        }
+                    }
+                }
+            } catch {
+                // A failed local acknowledgement leaves the same sync ID/version pending.
+            }
+            let didAcknowledge = acknowledged
+            let newerEditIsPending = superseded
+            self.queue.async {
+                if didAcknowledge || newerEditIsPending {
+                    self.inFlight = false
+                    self.failedOnce = false
+                    self.attemptNext()
+                } else {
+                    self.stopAfterFailure()
+                }
+            }
+        }
     }
 }

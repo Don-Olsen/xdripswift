@@ -76,6 +76,10 @@ enum WatchManualTreatmentStore {
                     treatmentType: type, nightscoutEventType: nil, enteredBy: "xDrip4iOS Watch",
                     nsManagedObjectContext: context)
                 entry.watchSourceUUID = treatment.id.uuidString
+                // Receipt on the phone is the first durable proof that this Watch
+                // treatment was available to historical local forecasts.
+                entry.createdAt = now
+                entry.modifiedAt = now
             }
 
             // saveChanges() only saves the child context before returning. Its completion

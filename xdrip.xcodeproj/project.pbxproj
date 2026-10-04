@@ -466,6 +466,11 @@
 		F821CF56229BF43A005C1E43 /* AlertKind.swift in Sources */ = {isa = PBXBuildFile; fileRef = F821CF49229BF43A005C1E43 /* AlertKind.swift */; };
 		F821CF57229BF43A005C1E43 /* SnoozeParameters.swift in Sources */ = {isa = PBXBuildFile; fileRef = F821CF4A229BF43A005C1E43 /* SnoozeParameters.swift */; };
 		F821CF58229BF43A005C1E43 /* AlertManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = F821CF4B229BF43A005C1E43 /* AlertManager.swift */; };
+		C30000013017000100000001 /* LowSoonAlert.swift in Sources */ = {isa = PBXBuildFile; fileRef = C30000023017000100000001 /* LowSoonAlert.swift */; };
+		C30000013017000100000002 /* LowSoonAlertTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C30000023017000100000002 /* LowSoonAlertTests.swift */; };
+		C30000013017000100000003 /* PenBolusCalculator.swift in Sources */ = {isa = PBXBuildFile; fileRef = C30000023017000100000003 /* PenBolusCalculator.swift */; };
+		C30000013017000100000004 /* LowSoonStatistics.swift in Sources */ = {isa = PBXBuildFile; fileRef = C30000023017000100000004 /* LowSoonStatistics.swift */; };
+		C30000013017000100000005 /* LowSoonStatisticsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C30000023017000100000005 /* LowSoonStatisticsTests.swift */; };
 		F821CF5A229BF43A005C1E43 /* CoreDataManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = F821CF4E229BF43A005C1E43 /* CoreDataManager.swift */; };
 		F821CF5D229BF43A005C1E43 /* NightscoutDateFormatter.swift in Sources */ = {isa = PBXBuildFile; fileRef = F821CF52229BF43A005C1E43 /* NightscoutDateFormatter.swift */; };
 		F821CF5E229BF43A005C1E43 /* BgReading+Nightscout.swift in Sources */ = {isa = PBXBuildFile; fileRef = F821CF53229BF43A005C1E43 /* BgReading+Nightscout.swift */; };
@@ -1405,6 +1410,7 @@
 		A7BC01020000000000000002 /* HealthKitTherapySample+CoreDataProperties.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "HealthKitTherapySample+CoreDataProperties.swift"; sourceTree = "<group>"; };
 		A7BC01030000000000000001 /* xdrip v33.xcdatamodel */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcdatamodel; path = "xdrip v33.xcdatamodel"; sourceTree = "<group>"; };
 		A7BC01040000000000000001 /* xdrip v34.xcdatamodel */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcdatamodel; path = "xdrip v34.xcdatamodel"; sourceTree = "<group>"; };
+		A7BC01050000000000000001 /* xdrip v35.xcdatamodel */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcdatamodel; path = "xdrip v35.xcdatamodel"; sourceTree = "<group>"; };
 		D40C3DA52775438F00111B73 /* TreatmentEntry+CoreDataProperties.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "TreatmentEntry+CoreDataProperties.swift"; sourceTree = "<group>"; };
 		D41F32912827240E00861B3D /* SettingsViewHousekeeperSettingsViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsViewHousekeeperSettingsViewModel.swift; sourceTree = "<group>"; };
 		D48E8F77278E49B300CCEE08 /* TreatmentNSResponse.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TreatmentNSResponse.swift; sourceTree = "<group>"; };
@@ -1614,6 +1620,11 @@
 		F821CF49229BF43A005C1E43 /* AlertKind.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = AlertKind.swift; sourceTree = "<group>"; };
 		F821CF4A229BF43A005C1E43 /* SnoozeParameters.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = SnoozeParameters.swift; sourceTree = "<group>"; };
 		F821CF4B229BF43A005C1E43 /* AlertManager.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = AlertManager.swift; sourceTree = "<group>"; };
+		C30000023017000100000001 /* LowSoonAlert.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LowSoonAlert.swift; sourceTree = "<group>"; };
+		C30000023017000100000002 /* LowSoonAlertTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "xDrip Tests/LowSoonAlertTests.swift"; sourceTree = SOURCE_ROOT; };
+		C30000023017000100000003 /* PenBolusCalculator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "xDrip/Managers/Therapy/PenBolusCalculator.swift"; sourceTree = SOURCE_ROOT; };
+		C30000023017000100000004 /* LowSoonStatistics.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LowSoonStatistics.swift; sourceTree = "<group>"; };
+		C30000023017000100000005 /* LowSoonStatisticsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "xDrip Tests/LowSoonStatisticsTests.swift"; sourceTree = SOURCE_ROOT; };
 		F821CF4E229BF43A005C1E43 /* CoreDataManager.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = CoreDataManager.swift; sourceTree = "<group>"; };
 		F821CF52229BF43A005C1E43 /* NightscoutDateFormatter.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = NightscoutDateFormatter.swift; sourceTree = "<group>"; };
 		F821CF53229BF43A005C1E43 /* BgReading+Nightscout.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = "BgReading+Nightscout.swift"; sourceTree = "<group>"; };
@@ -2785,6 +2796,8 @@
 				FC0303000000000000000007 /* GlucoseForecastEngineTests.swift */,
 				FC0303000000000000000008 /* GlucoseForecastDataAdapterTests.swift */,
 				FA0310000000000000000012 /* GlucoseForecastLogTests.swift */,
+				C30000023017000100000002 /* LowSoonAlertTests.swift */,
+				C30000023017000100000005 /* LowSoonStatisticsTests.swift */,
 				A33C0F02000000000000000A /* GlucoseForecastMLReplayTests.swift */,
 				A33C0F02000000000000000B /* GlucoseForecastMLTrainerTests.swift */,
 				A9C7F0043003000100000001 /* HealthKitTherapyImportTests.swift */,
@@ -2997,6 +3010,8 @@
 			children = (
 				F821CF49229BF43A005C1E43 /* AlertKind.swift */,
 				F821CF4B229BF43A005C1E43 /* AlertManager.swift */,
+				C30000023017000100000001 /* LowSoonAlert.swift */,
+				C30000023017000100000004 /* LowSoonStatistics.swift */,
 				47976E352BF536BA005E86EC /* AlertSnoozeStatus.swift */,
 				47CD642B2BEBEB0E002BDA68 /* AlertUrgencyType.swift */,
 				4734FF542BEFE3F200C7115A /* AlertNotificationDictionary.swift */,
@@ -3173,6 +3188,7 @@
 				4D20C0012FF1000100000001 /* RootHomeState.swift */,
 				05272484BD024BDAAA341C1C /* xDrip/SwiftUIViews/Settings/TherapyMetricsSettingsView.swift */,
 				5F219EC5BAAF4D5E924415FA /* xDrip/Managers/Therapy/TherapyMetricsManager.swift */,
+				C30000023017000100000003 /* PenBolusCalculator.swift */,
 				4D20C0032FF1000100000001 /* RootHomeView.swift */,
 				4D20C0092FF1000100000001 /* RootTabView.swift */,
 				475F2A862D0DA80E00DE6019 /* ShowHideItemsView.swift */,
@@ -4618,6 +4634,8 @@
 				FC0303000000000000000003 /* GlucoseForecastEngineTests.swift in Sources */,
 				FC0303000000000000000004 /* GlucoseForecastDataAdapterTests.swift in Sources */,
 				FA0310000000000000000002 /* GlucoseForecastLogTests.swift in Sources */,
+				C30000013017000100000002 /* LowSoonAlertTests.swift in Sources */,
+				C30000013017000100000005 /* LowSoonStatisticsTests.swift in Sources */,
 				A33C0F01000000000000000A /* GlucoseForecastMLReplayTests.swift in Sources */,
 				A33C0F01000000000000000B /* GlucoseForecastMLTrainerTests.swift in Sources */,
 				A9C7F0033003000100000001 /* HealthKitTherapyImportTests.swift in Sources */,
@@ -5016,6 +5034,9 @@
 				F8E51D63244B3386001C9E5A /* MiaoMiaoResponseType.swift in Sources */,
 				F821CF6B229FC22D005C1E43 /* Endpoint.swift in Sources */,
 				F821CF58229BF43A005C1E43 /* AlertManager.swift in Sources */,
+				C30000013017000100000001 /* LowSoonAlert.swift in Sources */,
+				C30000013017000100000004 /* LowSoonStatistics.swift in Sources */,
+				C30000013017000100000003 /* PenBolusCalculator.swift in Sources */,
 				F80D916B24F82913006840B5 /* CGMLibre2Transmitter.swift in Sources */,
 				4D800002301F000100000001 /* Libre2FrameAssembler.swift in Sources */,
 				F8297F59238EE14E00D74D66 /* TextsBluetoothPeripheralsView.swift in Sources */,
@@ -6315,6 +6336,7 @@
 		F85FF3C2252D0C32004E6FF1 /* xdrip.xcdatamodeld */ = {
 			isa = XCVersionGroup;
 			children = (
+				A7BC01050000000000000001 /* xdrip v35.xcdatamodel */,
 				A7BC01040000000000000001 /* xdrip v34.xcdatamodel */,
 				A7BC01030000000000000001 /* xdrip v33.xcdatamodel */,
 				4F3200313008000100000001 /* xdrip v32.xcdatamodel */,
@@ -6339,7 +6361,7 @@
 				F85FF3CB252F9C9A004E6FF1 /* xdrip v13.xcdatamodel */,
 				F85FF3C3252D0C32004E6FF1 /* xdrip v12.xcdatamodel */,
 			);
-			currentVersion = A7BC01040000000000000001 /* xdrip v34.xcdatamodel */;
+			currentVersion = A7BC01050000000000000001 /* xdrip v35.xcdatamodel */;
 			path = xdrip.xcdatamodeld;
 			sourceTree = "<group>";
 			versionGroupType = wrapper.xcdatamodel;

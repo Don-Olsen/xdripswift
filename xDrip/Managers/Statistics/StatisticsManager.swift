@@ -180,6 +180,40 @@ public final class StatisticsManager: @unchecked Sendable {
         }
     }
 
+    /// Thirty local calendar days, including today. A day is eligible for a
+    /// per-day false-warning rate only when both measured glucose and alert
+    /// evaluation have continuous coverage. Notification requests are described
+    /// as planned; watchOS/iOS delivery is not observable from this journal.
+    func lowSoonStatistics(now: Date = .now,
+                           journal: LowSoonEvaluationJournal = .shared) async -> LowSoonStatisticsSummary {
+        let localCalendar = Calendar.current
+        let today = localCalendar.startOfDay(for: now)
+        let start = localCalendar.date(byAdding: .day, value: -29, to: today) ??
+            now.addingTimeInterval(-29 * 24 * 60 * 60)
+        let lookback = start.addingTimeInterval(-LowSoonStatisticsCalculator.warningWindow)
+        let records = await journal.records(from: lookback, to: now)
+        return await withCheckedContinuation { continuation in
+            operationQueue.addOperation { [weak self] in
+                guard let self else {
+                    continuation.resume(returning: LowSoonStatisticsCalculator.calculate(
+                        glucose: [], evaluations: [], confirmedCarbDates: [],
+                        period: DateInterval(start: start, end: now), calendar: localCalendar))
+                    return
+                }
+                let glucose = self.cachedSamples(fromDate: lookback, toDate: now).map {
+                    LowSoonStatisticsGlucose(date: $0.date, mgdl: $0.valueMgDl,
+                                             sensorID: $0.sensorID)
+                }
+                let carbs = self.treatmentSamples(fromDate: start, toDate: now)
+                    .filter { $0.type == .Carbs }.map(\.date)
+                let evaluations = records.map(LowSoonStatisticsEvaluation.fromJournal)
+                continuation.resume(returning: LowSoonStatisticsCalculator.calculate(
+                    glucose: glucose, evaluations: evaluations, confirmedCarbDates: carbs,
+                    period: DateInterval(start: start, end: now), calendar: localCalendar))
+            }
+        }
+    }
+
     /// Returns available report periods based on CGM coverage.
     ///
     /// The 70% coverage threshold follows the same consensus target used by the report:
@@ -767,7 +801,7 @@ public final class StatisticsManager: @unchecked Sendable {
             request.includesPropertyValues = true
 
             guard let treatments = try? context.fetch(request) else { return }
-            totalCarbs = treatments.reduce(0) { $0 + $1.value }
+            totalCarbs = treatments.filter(Self.isConsumedTreatment).reduce(0) { $0 + $1.value }
         }
 
         return totalCarbs > 0 ? totalCarbs / intervalDays : nil
@@ -1061,7 +1095,7 @@ public final class StatisticsManager: @unchecked Sendable {
             request.includesPropertyValues = true
 
             guard let treatments = try? context.fetch(request) else { return }
-            markers = treatments.map { treatment in
+            markers = treatments.filter(Self.isConsumedTreatment).map { treatment in
                 let components = calendar.dateComponents([.hour, .minute], from: treatment.date)
                 return GlucoseReportLoopalyzerTreatmentMarker(
                     minuteOfDay: ((components.hour ?? 0) * 60) + (components.minute ?? 0),
@@ -1502,7 +1536,7 @@ public final class StatisticsManager: @unchecked Sendable {
             request.includesPropertyValues = true
 
             guard let treatments = try? context.fetch(request) else { return }
-            samples = treatments.map {
+            samples = treatments.filter(Self.isConsumedTreatment).map {
                 TreatmentSample(
                     date: $0.date,
                     value: $0.value,
@@ -1513,6 +1547,12 @@ public final class StatisticsManager: @unchecked Sendable {
         }
 
         return samples
+    }
+
+    /// A scheduled or cancelled meal is a planning record, never consumed food.
+    /// Legacy carbohydrate rows remain confirmed with the normal duration.
+    static func isConsumedTreatment(_ entry: TreatmentEntry) -> Bool {
+        entry.treatmentType != .Carbs || entry.isConfirmedMeal
     }
 
     private func averagePerDay(

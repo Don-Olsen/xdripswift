@@ -8,9 +8,193 @@
 
 import XCTest
 import SwiftUI
+import CoreData
 @testable import xdrip
 
 final class TherapyMetricsTests: XCTestCase {
+    func testV34TreatmentStoreMigratesToV35WithLegacyMealDefaults() throws {
+        let bundle = Bundle(for: TreatmentEntry.self)
+        let modelDirectory = try XCTUnwrap(bundle.url(
+            forResource: ConstantsCoreData.modelName, withExtension: "momd"))
+        let oldModel = try XCTUnwrap(NSManagedObjectModel(contentsOf:
+            modelDirectory.appendingPathComponent("xdrip v34.mom")))
+        let newModel = try XCTUnwrap(NSManagedObjectModel(contentsOf:
+            modelDirectory.appendingPathComponent("xdrip v35.mom")))
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("xdrip-v35-migration-\(UUID().uuidString).sqlite")
+        defer {
+            for suffix in ["", "-wal", "-shm"] {
+                try? FileManager.default.removeItem(atPath: url.path + suffix)
+            }
+        }
+        let oldCoordinator = NSPersistentStoreCoordinator(managedObjectModel: oldModel)
+        let oldStore = try oldCoordinator.addPersistentStore(ofType: NSSQLiteStoreType,
+            configurationName: nil, at: url, options: nil)
+        let oldContext = NSManagedObjectContext(concurrencyType: .mainQueueConcurrencyType)
+        oldContext.persistentStoreCoordinator = oldCoordinator
+        let row = NSEntityDescription.insertNewObject(forEntityName: "TreatmentEntry",
+            into: oldContext)
+        row.setValue(Date(timeIntervalSince1970: 1_800_000_000), forKey: "date")
+        row.setValue(20.0, forKey: "value")
+        row.setValue(TreatmentType.Carbs.rawValue, forKey: "treatmentType")
+        row.setValue(TreatmentEntry.EmptyId, forKey: "id")
+        row.setValue(false, forKey: "uploaded")
+        try oldContext.save()
+        oldContext.reset()
+        try oldCoordinator.remove(oldStore)
+
+        let newCoordinator = NSPersistentStoreCoordinator(managedObjectModel: newModel)
+        _ = try newCoordinator.addPersistentStore(ofType: NSSQLiteStoreType,
+            configurationName: nil, at: url, options: [
+                NSMigratePersistentStoresAutomaticallyOption: true,
+                NSInferMappingModelAutomaticallyOption: true
+            ])
+        let newContext = NSManagedObjectContext(concurrencyType: .mainQueueConcurrencyType)
+        newContext.persistentStoreCoordinator = newCoordinator
+        let migrated = try XCTUnwrap(newContext.fetch(TreatmentEntry.fetchRequest()).first)
+        XCTAssertEqual(migrated.value, 20)
+        XCTAssertNil(migrated.mealKindRaw)
+        XCTAssertNil(migrated.carbohydrateDurationMinutes)
+        XCTAssertEqual(migrated.effectiveCarbohydrateDurationMinutes, 240)
+        XCTAssertTrue(migrated.isConfirmedMeal)
+    }
+    func testLegacyMealDefaultsToConfirmedNormalAndPlannedMealNeverCounts() throws {
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let context = core.mainManagedObjectContext
+        let at = Date(timeIntervalSince1970: 1_800_000_000)
+        let legacy = TreatmentEntry(date: at.addingTimeInterval(-60), value: 20,
+            treatmentType: .Carbs, nightscoutEventType: nil, enteredBy: nil,
+            nsManagedObjectContext: context)
+        XCTAssertEqual(legacy.mealKind, .normal)
+        XCTAssertEqual(legacy.effectiveCarbohydrateDurationMinutes, 240)
+        XCTAssertTrue(legacy.isConfirmedMeal)
+        let planned = TreatmentEntry(date: at.addingTimeInterval(30 * 60), value: 25,
+            treatmentType: .Carbs, nightscoutEventType: nil, enteredBy: nil,
+            nsManagedObjectContext: context)
+        planned.localTreatmentUUID = UUID().uuidString
+        planned.plannedMealStateRaw = TreatmentMealState.planned.rawValue
+        planned.mealKindRaw = TreatmentMealKind.slow.rawValue
+        planned.carbohydrateDurationMinutes = NSNumber(value: 300)
+        let eligible = TherapyMetricsManager.eligibleTreatments([legacy, planned],
+            policy: policy(), insulinSource: nil, carbsSource: nil,
+            insulinEnabled: false, carbsEnabled: false)
+        XCTAssertEqual(eligible.count, 1)
+        XCTAssertTrue(eligible[0] === legacy)
+        XCTAssertFalse(planned.isConfirmedMeal)
+        XCTAssertTrue(core.saveChangesSynchronously())
+        XCTAssertFalse(TreatmentEntryAccessor(coreDataManager: core)
+            .getLatestTreatmentsForNightscout(limit: 20).contains(planned))
+    }
+
+    func testStatisticsCountOnlyConsumedCarbohydrates() {
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let context = core.mainManagedObjectContext
+        let at = Date(timeIntervalSince1970: 1_800_000_000)
+        func carbs(_ state: TreatmentMealState?) -> TreatmentEntry {
+            let row = TreatmentEntry(date: at, value: 20, treatmentType: .Carbs,
+                nightscoutEventType: nil, enteredBy: nil, nsManagedObjectContext: context)
+            row.plannedMealStateRaw = state?.rawValue
+            return row
+        }
+        XCTAssertTrue(StatisticsManager.isConsumedTreatment(carbs(nil)))
+        XCTAssertTrue(StatisticsManager.isConsumedTreatment(carbs(.confirmed)))
+        XCTAssertFalse(StatisticsManager.isConsumedTreatment(carbs(.planned)))
+        XCTAssertFalse(StatisticsManager.isConsumedTreatment(carbs(.cancelled)))
+        let insulin = TreatmentEntry(date: at, value: 2, treatmentType: .Insulin,
+            nightscoutEventType: nil, enteredBy: nil, nsManagedObjectContext: context)
+        XCTAssertTrue(StatisticsManager.isConsumedTreatment(insulin))
+    }
+
+    func testCutoverUsesImportedBeforeAndAppOriginAfterBoundary() {
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let context = core.mainManagedObjectContext
+        let boundary = Date(timeIntervalSince1970: 1_800_000_000)
+        let cutover = TreatmentSourceCutover(cutoff: boundary,
+            insulinSourceBundleID: "com.mysugr", carbohydrateSourceBundleID: "com.mysugr")
+        func imported(_ date: Date) -> TreatmentEntry {
+            let entry = TreatmentEntry(date: date, value: 2, treatmentType: .Insulin,
+                nightscoutEventType: nil, enteredBy: nil, nsManagedObjectContext: context)
+            entry.healthKitSampleUUID = UUID().uuidString
+            entry.healthKitSourceBundleIdentifier = "com.mysugr"
+            return entry
+        }
+        func local(_ date: Date) -> TreatmentEntry {
+            let entry = TreatmentEntry(date: date, value: 3, treatmentType: .Insulin,
+                nightscoutEventType: nil, enteredBy: nil, nsManagedObjectContext: context)
+            entry.localTreatmentUUID = UUID().uuidString
+            entry.createdAt = boundary
+            return entry
+        }
+        let oldImported = imported(boundary.addingTimeInterval(-60))
+        let lateImported = imported(boundary)
+        let oldLocal = local(boundary.addingTimeInterval(-60))
+        let newLocal = local(boundary)
+        let watch = TreatmentEntry(date: boundary, value: 3, treatmentType: .Insulin,
+            nightscoutEventType: nil, enteredBy: "xDrip4iOS Watch", nsManagedObjectContext: context)
+        watch.watchSourceUUID = UUID().uuidString
+        let secondWatch = TreatmentEntry(date: boundary, value: 3, treatmentType: .Insulin,
+            nightscoutEventType: nil, enteredBy: "xDrip4iOS Watch", nsManagedObjectContext: context)
+        secondWatch.watchSourceUUID = UUID().uuidString
+        let watchBasal = TreatmentEntry(date: boundary, value: 12, treatmentType: .BasalInjection,
+            nightscoutEventType: nil, enteredBy: "xDrip4iOS Watch", nsManagedObjectContext: context)
+        watchBasal.watchSourceUUID = UUID().uuidString
+        let selected = TherapyMetricsManager.eligibleTreatments(
+            [oldImported, lateImported, oldLocal, newLocal, watch, secondWatch, watchBasal], policy: policy(),
+            insulinSource: nil, carbsSource: nil,
+            insulinEnabled: false, carbsEnabled: false, cutover: cutover)
+        XCTAssertEqual(selected.count, 4)
+        XCTAssertTrue(selected.contains { $0 === oldImported })
+        XCTAssertTrue(selected.contains { $0 === newLocal })
+        XCTAssertTrue(selected.contains { $0 === watch })
+        XCTAssertTrue(selected.contains { $0 === secondWatch }, "distinct Watch UUIDs must not deduplicate")
+        XCTAssertFalse(selected.contains { $0 === watchBasal })
+    }
+
+    func testCutoverRejectsExternalTherapyPolicyInsteadOfMixingLocalAndRemoteMetrics() {
+        let cutover = TreatmentSourceCutover(cutoff: Date(timeIntervalSince1970: 1_800_000_000),
+            insulinSourceBundleID: "com.mysugr", carbohydrateSourceBundleID: "com.mysugr")
+        XCTAssertTrue(TherapyMetricsManager.cutoverPolicyIsConsistent(policy(), cutover: cutover))
+        XCTAssertFalse(TherapyMetricsManager.cutoverPolicyIsConsistent(
+            policy(therapy: .nightscout), cutover: cutover))
+        XCTAssertFalse(TherapyMetricsManager.cutoverPolicyIsConsistent(
+            policy(therapy: .careLink), cutover: cutover))
+        XCTAssertTrue(TherapyMetricsManager.cutoverPolicyIsConsistent(
+            policy(therapy: .nightscout), cutover: nil))
+        let suite = "TherapyRestoreGate.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set(true, forKey: TreatmentSourceCutover.restoreRequiresSourceSetupKey)
+        XCTAssertFalse(TherapyMetricsManager.cutoverPolicyIsConsistent(
+            policy(), cutover: nil, defaults: defaults))
+        XCTAssertFalse(GlucoseForecastDataAdapter.sourceAllowsForecast(
+            policy(), defaults: defaults))
+        defaults.removeObject(forKey: TreatmentSourceCutover.restoreRequiresSourceSetupKey)
+        XCTAssertTrue(GlucoseForecastDataAdapter.sourceAllowsForecast(
+            policy(), defaults: defaults))
+        defaults.set(Data("{invalid json".utf8), forKey: TreatmentSourceCutover.defaultsKey)
+        XCTAssertFalse(TherapyMetricsManager.cutoverPolicyIsConsistent(
+            policy(), cutover: TreatmentSourceCutover.current(defaults: defaults), defaults: defaults))
+        XCTAssertFalse(GlucoseForecastDataAdapter.sourceAllowsForecast(
+            policy(), defaults: defaults))
+        defaults.removeObject(forKey: TreatmentSourceCutover.defaultsKey)
+        XCTAssertTrue(TherapyMetricsManager.cutoverPolicyIsConsistent(
+            policy(), cutover: nil, defaults: defaults))
+    }
+
+    func testPerMealDurationChangesCOBWithoutChangingBolus() {
+        let at = Date(timeIntervalSince1970: 1_800_000_000)
+        let start = at.addingTimeInterval(-60 * 60)
+        let fast = TherapyTreatment(date: start, amount: 30, isIOB: false,
+            carbohydrateDurationMinutes: 30)
+        let slow = TherapyTreatment(date: start, amount: 30, isIOB: false,
+            carbohydrateDurationMinutes: 300)
+        let quick = TherapyMetricsManager.localMetric(entries: [fast], isIOB: false,
+            date: at, settings: TherapyModelSettings()).value(at: at)
+        let prolonged = TherapyMetricsManager.localMetric(entries: [slow], isIOB: false,
+            date: at, settings: TherapyModelSettings()).value(at: at)
+        XCTAssertEqual(quick, 0)
+        XCTAssertGreaterThan(prolonged ?? 0, 0)
+    }
     func testHomeRoutineRefreshAgesLastCompleteTreatmentsWithoutPartialInputs() throws {
         let at = Date(timeIntervalSince1970: 1_800_000_000)
         let inputs = [TherapyTreatment(date: at.addingTimeInterval(-3600), amount: 100, isIOB: true),
@@ -83,9 +267,12 @@ final class TherapyMetricsTests: XCTestCase {
             let summary = try XCTUnwrap(layout.settingsRows(sectionID: 0).first { $0.id == "homeScreen.showTherapySummary" })
             XCTAssertTrue(summary.isVisible)
             XCTAssertEqual(summary.isEnabled, enabled)
-            let children = treatments.settingsRows(sectionID: 1).filter { $0.id != "homeScreen.showTreatments" }
-            XCTAssertEqual(children.count, 2)
-            XCTAssertTrue(children.allSatisfy { $0.isVisible == enabled })
+            let rows = treatments.settingsRows(sectionID: 1)
+            let chartChildren = rows.filter { ["homeScreen.showIOBCOB", "homeScreen.renderBasalDownwards"].contains($0.id) }
+            XCTAssertEqual(chartChildren.count, 2)
+            XCTAssertTrue(chartChildren.allSatisfy { $0.isVisible == enabled })
+            XCTAssertTrue(rows.contains { $0.id == "homeScreen.quickCarbohydrateGrams" && $0.isVisible },
+                          "Local quick-carbohydrate setup is independent of chart visibility")
             XCTAssertTrue(defaults.showTherapySummary)
             XCTAssertTrue(defaults.showIOBCOB)
         }
@@ -1009,4 +1196,262 @@ final class TherapyMetricsTests: XCTestCase {
         XCTAssertEqual(Set(points.map(\.id)).count, points.count)
     }
 
+}
+
+final class PenBolusCalculatorTests: XCTestCase {
+    private var now: Date {
+        Calendar.current.date(from: DateComponents(year: 2026, month: 10, day: 4,
+            hour: 12, minute: 0))!
+    }
+
+    private func profile() -> PenDoseProfile {
+        var profile = PenDoseProfile.prefilledUnconfirmed
+        XCTAssertTrue(profile.confirm(at: now))
+        return profile
+    }
+
+    private func glucose(_ value: Double = 126, increase: Double = 18)
+        -> [GlucoseForecastSample] {
+        stride(from: -30, through: 0, by: 5).map { minute in
+            GlucoseForecastSample(date: now.addingTimeInterval(Double(minute) * 60),
+                glucoseMgdl: value + increase * Double(minute + 20) / 20,
+                sensorID: "sensor-a")
+        }
+    }
+
+    private func snapshot(glucose: [GlucoseForecastSample]? = nil,
+                          treatments: [TherapyTreatment] = []) throws -> PenDoseInputSnapshot {
+        try PenDoseInputSnapshot.make(capturedAt: now,
+            glucose: glucose ?? self.glucose(), treatments: treatments,
+            therapySettings: TherapyModelSettings(), treatmentRevision: 4).get()
+    }
+
+    func testPrefilledProfileIsUnconfirmedAndEditingInvalidatesConfirmation() throws {
+        var profile = PenDoseProfile.prefilledUnconfirmed
+        XCTAssertFalse(profile.isConfirmed)
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: UUID().uuidString))
+        XCTAssertTrue(profile.persist(defaults: defaults))
+        XCTAssertFalse(PenDoseProfile.load(defaults: defaults).isConfirmed)
+        XCTAssertTrue(profile.confirm(at: now))
+        XCTAssertTrue(profile.isConfirmed)
+        XCTAssertTrue(profile.persist(defaults: defaults))
+        XCTAssertTrue(PenDoseProfile.load(defaults: defaults).isConfirmed)
+        profile.settings.correctionMmolPerUnit = 2
+        XCTAssertFalse(profile.isConfirmed)
+        defaults.set(Data("bad".utf8), forKey: PenDoseProfile.storageKey)
+        XCTAssertFalse(PenDoseProfile.load(defaults: defaults).isConfirmed)
+    }
+
+    func testLocalScheduleBoundariesAndDSTUseWallClock() {
+        let profile = profile()
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: "Europe/Copenhagen")!
+        func time(_ year: Int, _ month: Int, _ day: Int, _ hour: Int, _ minute: Int) -> Date {
+            calendar.date(from: DateComponents(year: year, month: month, day: day,
+                hour: hour, minute: minute))!
+        }
+        XCTAssertEqual(profile.values(at: time(2026, 10, 4, 4, 29), calendar: calendar)?.carbohydrateRatio, 7.5)
+        XCTAssertEqual(profile.values(at: time(2026, 10, 4, 4, 30), calendar: calendar)?.carbohydrateRatio, 5)
+        XCTAssertEqual(profile.values(at: time(2026, 10, 4, 9, 30), calendar: calendar)?.carbohydrateRatio, 6)
+        XCTAssertEqual(profile.values(at: time(2026, 10, 4, 21, 30), calendar: calendar)?.targetMmol, 7.75)
+        // Both occurrences of an autumn DST hour resolve to the same wall-clock entry.
+        let first = time(2026, 10, 25, 2, 30)
+        XCTAssertEqual(profile.values(at: first, calendar: calendar)?.carbohydrateRatio,
+            profile.values(at: first.addingTimeInterval(3600), calendar: calendar)?.carbohydrateRatio)
+    }
+
+    func testKnownZeroSnapshotAndHandCalculatedFormulaWithTwentyMinuteTrend() throws {
+        let snapshot = try snapshot(treatments: [])
+        XCTAssertEqual(snapshot.iobUnits, 0)
+        XCTAssertEqual(snapshot.cobGrams, 0)
+        let calculation = PenBolusCalculator.calculate(snapshot: snapshot,
+            profile: profile(), glucose: .currentCGM,
+            newCarbs: .unrecorded(grams: 30), safetyForecast: nil, at: now)
+        let lines = try XCTUnwrap(calculation.lines)
+        XCTAssertEqual(lines.carbohydratesUnits, 5, accuracy: 0.00001)
+        let current = try XCTUnwrap(snapshot.glucose.last?.glucoseMgdl)
+        let expectedCorrection = (current / PenBolusCalculator.mgdlPerMmol - 6.85) / 1.2
+        XCTAssertEqual(lines.correctionUnits, expectedCorrection, accuracy: 0.00001)
+        let expectedTrendUnits = (18 / PenBolusCalculator.mgdlPerMmol) / 1.2
+        XCTAssertEqual(lines.trendUnits, expectedTrendUnits, accuracy: 0.00001)
+        let raw = 5 + expectedCorrection + expectedTrendUnits
+        XCTAssertEqual(lines.rawUnits, raw, accuracy: 0.00001)
+        XCTAssertEqual(calculation.suggestedUnits, floor(raw / 0.5) * 0.5)
+        if case .forecastUnchecked = calculation.safety {} else { XCTFail("needs unchecked warning") }
+    }
+
+    func testNoShortSpanExtrapolationAndSensorGapCannotBecomeZeroTrend() throws {
+        let short = glucose().filter { $0.date >= now.addingTimeInterval(-5 * 60) }
+        XCTAssertNil(PenBolusCalculator.twentyMinuteChange(short, at: now))
+        let calculation = PenBolusCalculator.calculate(snapshot: try snapshot(glucose: short),
+            profile: profile(), glucose: .currentCGM,
+            newCarbs: .alreadyRecorded, safetyForecast: nil, at: now)
+        XCTAssertEqual(calculation.unavailableReason, .missingTwentyMinuteTrend)
+        XCTAssertNil(calculation.suggestedUnits)
+        let crossSensor = glucose().map { sample in
+            GlucoseForecastSample(date: sample.date, glucoseMgdl: sample.glucoseMgdl,
+                sensorID: sample.date < now.addingTimeInterval(-10 * 60) ? "old" : "new")
+        }
+        XCTAssertNil(PenBolusCalculator.twentyMinuteChange(crossSensor, at: now))
+    }
+
+    func testManualOrConfirmedOldReadingUsesExplicitZeroTrendAndUncheckedForecast() throws {
+        let snapshot = try snapshot(glucose: [])
+        let manual = PenBolusCalculator.calculate(snapshot: snapshot, profile: profile(),
+            glucose: .manual(valueMgdl: 110, measuredAt: now),
+            newCarbs: .alreadyRecorded, safetyForecast: nil, at: now)
+        XCTAssertTrue(manual.trendWasIntentionallyZero)
+        XCTAssertEqual(manual.lines?.trendUnits, 0)
+        XCTAssertNotNil(manual.suggestedUnits)
+        if case .forecastUnchecked = manual.safety {} else { XCTFail("manual requires warning") }
+        let old = PenBolusCalculator.calculate(snapshot: snapshot, profile: profile(),
+            glucose: .confirmedStale(valueMgdl: 100, measuredAt: now.addingTimeInterval(-3600)),
+            newCarbs: .alreadyRecorded, safetyForecast: nil, at: now)
+        XCTAssertTrue(old.trendWasIntentionallyZero)
+        XCTAssertNotNil(old.suggestedUnits)
+        let current = PenBolusCalculator.calculate(snapshot: snapshot, profile: profile(),
+            glucose: .currentCGM, newCarbs: .alreadyRecorded,
+            safetyForecast: nil, at: now)
+        XCTAssertEqual(current.unavailableReason, .missingGlucose)
+    }
+
+    func testExistingMealIsNotAddedAgainAndDoseFloorsAtCap() throws {
+        let carbs = TherapyTreatment(date: now.addingTimeInterval(-5 * 60),
+            amount: 60, isIOB: false, carbohydrateDurationMinutes: 240)
+        let input = try snapshot(treatments: [carbs])
+        let already = PenBolusCalculator.calculate(snapshot: input, profile: profile(),
+            glucose: .currentCGM, newCarbs: .alreadyRecorded,
+            safetyForecast: nil, at: now)
+        let extra = PenBolusCalculator.calculate(snapshot: input, profile: profile(),
+            glucose: .currentCGM, newCarbs: .unrecorded(grams: 60),
+            safetyForecast: nil, at: now)
+        XCTAssertEqual((extra.lines?.carbohydratesUnits ?? 0) - (already.lines?.carbohydratesUnits ?? 0),
+            10, accuracy: 0.00001)
+        let capped = PenBolusCalculator.calculate(snapshot: input, profile: profile(),
+            glucose: .currentCGM, newCarbs: .unrecorded(grams: 500),
+            safetyForecast: nil, at: now)
+        XCTAssertEqual(capped.suggestedUnits, 25)
+    }
+
+    func testBolusAndConsumedCarbohydrateContributeOnlyThroughIOBAndCOB() throws {
+        let bolus = TherapyTreatment(date: now.addingTimeInterval(-30 * 60),
+            amount: 2, isIOB: true)
+        let meal = TherapyTreatment(date: now.addingTimeInterval(-20 * 60),
+            amount: 30, isIOB: false, carbohydrateDurationMinutes: 240)
+        let input = try snapshot(treatments: [bolus, meal])
+        XCTAssertGreaterThan(input.iobUnits, 0)
+        XCTAssertGreaterThan(input.cobGrams, 0)
+        let calculated = PenBolusCalculator.calculate(snapshot: input, profile: profile(),
+            glucose: .currentCGM, newCarbs: .alreadyRecorded,
+            safetyForecast: nil, at: now)
+        let lines = try XCTUnwrap(calculated.lines)
+        XCTAssertEqual(lines.carbohydratesUnits, input.cobGrams / 6, accuracy: 0.00001)
+        XCTAssertEqual(lines.insulinOnBoardUnits, input.iobUnits, accuracy: 0.00001)
+        XCTAssertEqual(lines.rawUnits, lines.carbohydratesUnits + lines.correctionUnits +
+            lines.trendUnits - input.iobUnits, accuracy: 0.00001)
+    }
+
+    func testCurrentOrPredictedSevereLowBlocksButMissingForecastDoesNotMasqueradeAsChecked() throws {
+        let input = try snapshot()
+        let low = PenBolusCalculator.calculate(snapshot: input, profile: profile(),
+            glucose: .manual(valueMgdl: 53, measuredAt: now),
+            newCarbs: .unrecorded(grams: 30), safetyForecast: nil, at: now)
+        XCTAssertNil(low.suggestedUnits)
+        if case .blockedCurrentLow = low.safety {} else { XCTFail("current severe low") }
+        let points = stride(from: 0, through: 120, by: 5).map { minute in
+            GlucoseForecastPoint(date: now.addingTimeInterval(Double(minute) * 60),
+                glucoseMgdl: minute == 60 ? 52 : minute == 0 ? 144 : 110)
+        }
+        let forecast = GlucoseForecastResult(points: points, referenceDate: now,
+            reason: nil, referenceSensorID: "sensor-a")
+        let predicted = PenBolusCalculator.calculate(snapshot: input, profile: profile(),
+            glucose: .currentCGM, newCarbs: .unrecorded(grams: 30),
+            safetyForecast: forecast, at: now)
+        XCTAssertNil(predicted.suggestedUnits)
+        if case .blockedForecastLow = predicted.safety {} else { XCTFail("predicted severe low") }
+        let unchecked = PenBolusCalculator.calculate(snapshot: input, profile: profile(),
+            glucose: .currentCGM, newCarbs: .unrecorded(grams: 30),
+            safetyForecast: GlucoseForecastResult(points: [], referenceDate: now,
+                reason: .insufficientHistory), at: now)
+        XCTAssertNotNil(unchecked.suggestedUnits)
+        if case .forecastUnchecked(.insufficientHistory) = unchecked.safety {} else {
+            XCTFail("must identify unchecked forecast")
+        }
+    }
+
+    func testMLCapNeverChangesEngineAndRetainsBandWidth() throws {
+        let points = [GlucoseForecastPoint(date: now, glucoseMgdl: 80),
+                      GlucoseForecastPoint(date: now.addingTimeInterval(300), glucoseMgdl: 75)]
+        let engine = GlucoseForecastResult(points: points, referenceDate: now, reason: nil)
+        let ml = GlucoseForecastMLForecast(points: [
+            .init(date: now, glucoseMgdl: 80),
+            .init(date: now.addingTimeInterval(300), glucoseMgdl: 90)], band: [
+                .init(date: now, lowerMgdl: 75, upperMgdl: 85),
+                .init(date: now.addingTimeInterval(300), lowerMgdl: 80, upperMgdl: 100)],
+            modelID: "test")
+        let capped = try XCTUnwrap(GlucoseForecastMLPresentation.cappedBelowEngine(ml,
+            engine: engine, currentGlucoseMgdl: 80, slope15MgdlPerMinute: -1,
+            lowSoonActive: false))
+        XCTAssertEqual(capped.points[1].glucoseMgdl, 75)
+        XCTAssertEqual(capped.band[1].upperMgdl - capped.band[1].lowerMgdl, 20)
+        XCTAssertEqual(engine.points[1].glucoseMgdl, 75)
+        let unchanged = try XCTUnwrap(GlucoseForecastMLPresentation.cappedBelowEngine(ml,
+            engine: engine, currentGlucoseMgdl: 110, slope15MgdlPerMinute: -1,
+            lowSoonActive: false))
+        XCTAssertEqual(unchanged.points[1].glucoseMgdl, 90)
+    }
+
+    func testDoseSnapshotSourceSignatureChangesWhenCutoverOrSourceChanges() throws {
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: UUID().uuidString))
+        defaults.therapyDataSourceType = .none
+        XCTAssertFalse(TherapyMetricsManager.doseSourceIsReady(defaults.dataFlowPolicy,
+            cutover: nil, defaults: defaults),
+            "without a completed source switch an empty window is not proven zero")
+        let initial = GlucoseForecastDataAdapter.presentationInputSignature(
+            horizonMinutes: 120, defaults: defaults)
+        XCTAssertTrue(TreatmentSourceCutover.persist(.init(cutoff: now,
+            insulinSourceBundleID: "mysugr.insulin",
+            carbohydrateSourceBundleID: "mysugr.carbs"), defaults: defaults))
+        XCTAssertTrue(TherapyMetricsManager.doseSourceIsReady(defaults.dataFlowPolicy,
+            cutover: TreatmentSourceCutover.current(defaults: defaults), defaults: defaults))
+        let afterCutover = GlucoseForecastDataAdapter.presentationInputSignature(
+            horizonMinutes: 120, defaults: defaults)
+        XCTAssertNotEqual(initial, afterCutover,
+            "a boundary appearing during the dose read must invalidate its snapshot")
+        defaults.therapyDataSourceType = .nightscout
+        defaults.nightscoutEnabled = true
+        let external = GlucoseForecastDataAdapter.presentationInputSignature(
+            horizonMinutes: 120, defaults: defaults)
+        XCTAssertNotEqual(afterCutover, external,
+            "an external source becoming effective during the read must invalidate it")
+        XCTAssertFalse(TherapyMetricsManager.doseSourceIsReady(defaults.dataFlowPolicy,
+            cutover: TreatmentSourceCutover.current(defaults: defaults), defaults: defaults))
+    }
+
+    func testEngineOnlySafetyIgnoresHomeVisibilityAndUnconfirmedPlannedMeal() throws {
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: UUID().uuidString))
+        defaults.glucoseForecastHorizonMinutes = 0
+        defaults.glucoseForecastManualSensitivityMgdlPerUnit = 40
+        defaults.glucoseForecastManualCarbRatioGramsPerUnit = 10
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let planned = TreatmentEntry(date: now.addingTimeInterval(15 * 60),
+            value: 40, treatmentType: .Carbs, nightscoutEventType: nil,
+            enteredBy: nil, nsManagedObjectContext: core.mainManagedObjectContext)
+        planned.localTreatmentUUID = UUID().uuidString
+        planned.plannedMealStateRaw = TreatmentMealState.planned.rawValue
+        let eligible = TherapyMetricsManager.eligibleTreatments([planned],
+            policy: defaults.dataFlowPolicy, insulinSource: nil, carbsSource: nil,
+            insulinEnabled: false, carbsEnabled: false)
+        XCTAssertTrue(eligible.isEmpty)
+        let input = try snapshot(treatments: eligible.map {
+            TherapyTreatment(date: $0.date, amount: $0.value, isIOB: false)
+        })
+        let result = PenBolusCalculator.safetyForecast(snapshot: input, at: now,
+            defaults: defaults, horizonMinutes: 120)
+        XCTAssertNil(result.reason)
+        XCTAssertNotNil(result.value(atMinutes: 30))
+        XCTAssertNotNil(result.value(atMinutes: 120))
+        XCTAssertEqual(defaults.glucoseForecastHorizonMinutes, 0,
+            "Home chart setting must not govern the safety engine")
+    }
 }

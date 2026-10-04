@@ -109,10 +109,15 @@ final class GlucoseForecastMLHistoryLoader {
         // Exactly days local calendar dates, including the possibly partial current date.
         guard let firstDay = calendar.date(byAdding: .day, value: 1 - days,
                                            to: calendar.startOfDay(for: endDate)) else { return nil }
-        let insulinEnabled = healthImporter.isEnabled(.insulin)
-        let carbsEnabled = healthImporter.isEnabled(.carbohydrates)
-        let insulinBundle = healthImporter.selectedSource(.insulin)?.bundleIdentifier
-        let carbsBundle = healthImporter.selectedSource(.carbohydrates)?.bundleIdentifier
+        let cutover = TreatmentSourceCutover.current()
+        // After the final mySugr import the periodic importer is off, but direct
+        // historical Health reads still supply its pre-cutover training history.
+        let insulinEnabled = healthImporter.isEnabled(.insulin) || cutover != nil
+        let carbsEnabled = healthImporter.isEnabled(.carbohydrates) || cutover != nil
+        let insulinBundle = cutover?.insulinSourceBundleID ??
+            healthImporter.selectedSource(.insulin)?.bundleIdentifier
+        let carbsBundle = cutover?.carbohydrateSourceBundleID ??
+            healthImporter.selectedSource(.carbohydrates)?.bundleIdentifier
         let insulinHistoryStart = healthImporter.historyStart(.insulin)
         let carbsHistoryStart = healthImporter.historyStart(.carbohydrates)
 
@@ -189,7 +194,9 @@ final class GlucoseForecastMLHistoryLoader {
                                        sourceBundleIdentifier: insulinBundle, completion: completion)
                }) {
                 for sample in values where sample.sourceBundleIdentifier == insulinBundle &&
-                    sample.startDate >= dayStart && sample.startDate < dayEnd {
+                    sample.startDate >= dayStart && sample.startDate < dayEnd &&
+                    (cutover?.permitsImported(eventDate: sample.startDate, kind: .insulin,
+                        sourceBundleID: sample.sourceBundleIdentifier) ?? true) {
                     if !sample.isUnambiguous(kind: .insulin) {
                         ambiguousInsulinDates.append(sample.startDate)
                     }
@@ -205,7 +212,9 @@ final class GlucoseForecastMLHistoryLoader {
                                        sourceBundleIdentifier: carbsBundle, completion: completion)
                }) {
                 for sample in values where sample.sourceBundleIdentifier == carbsBundle &&
-                    sample.startDate >= dayStart && sample.startDate < dayEnd {
+                    sample.startDate >= dayStart && sample.startDate < dayEnd &&
+                    (cutover?.permitsImported(eventDate: sample.startDate, kind: .carbohydrates,
+                        sourceBundleID: sample.sourceBundleIdentifier) ?? true) {
                     if !sample.isUnambiguous(kind: .carbohydrates) {
                         ambiguousCarbsDates.append(sample.startDate)
                     }
@@ -246,6 +255,16 @@ final class GlucoseForecastMLHistoryLoader {
                 carbsEnabled ? localCarbsDates : allLocalCarbsDates, calendar: calendar),
             ambiguousDays: GlucoseForecastMLHistoryCoverageRules.daySet(ambiguousCarbsDates, calendar: calendar),
             historyStart: carbsHistoryStart, requiresSelectedSource: carbsEnabled)
+        let cutoverInsulin = GlucoseForecastMLTherapyEvidence(
+            sourceDays: GlucoseForecastMLHistoryCoverageRules.daySet(
+                healthInsulinDates + allLocalInsulinDates, calendar: calendar),
+            ambiguousDays: GlucoseForecastMLHistoryCoverageRules.daySet(ambiguousInsulinDates, calendar: calendar),
+            historyStart: nil, requiresSelectedSource: false)
+        let cutoverCarbs = GlucoseForecastMLTherapyEvidence(
+            sourceDays: GlucoseForecastMLHistoryCoverageRules.daySet(
+                healthCarbsDates + allLocalCarbsDates, calendar: calendar),
+            ambiguousDays: GlucoseForecastMLHistoryCoverageRules.daySet(ambiguousCarbsDates, calendar: calendar),
+            historyStart: nil, requiresSelectedSource: false)
 
         var healthTagged = [GlucoseForecastMLHistoryTaggedObservation]()
         var localTagged = [GlucoseForecastMLHistoryTaggedObservation]()
@@ -268,15 +287,19 @@ final class GlucoseForecastMLHistoryLoader {
             })
             let healthPresent = day.healthByBundle.values.contains { !$0.isEmpty }
             let localPresent = !day.localGlucose.isEmpty
-            let healthInsulinEvidence = insulinEnabled ? healthInsulin : localInsulin
-            let healthCarbEvidence = carbsEnabled ? healthCarbs : localCarbs
+            let healthInsulinEvidence = cutover != nil ? cutoverInsulin :
+                (insulinEnabled ? healthInsulin : localInsulin)
+            let healthCarbEvidence = cutover != nil ? cutoverCarbs :
+                (carbsEnabled ? healthCarbs : localCarbs)
+            let localInsulinEvidence = cutover != nil ? cutoverInsulin : localInsulin
+            let localCarbEvidence = cutover != nil ? cutoverCarbs : localCarbs
             let insulinCovered = (healthPresent && healthInsulinEvidence.covers(
                 from: day.start, to: day.start, calendar: calendar, usingLocalImport: false)) ||
-                (localPresent && localInsulin.covers(
+                (localPresent && localInsulinEvidence.covers(
                     from: day.start, to: day.start, calendar: calendar, usingLocalImport: true))
             let carbsCovered = (healthPresent && healthCarbEvidence.covers(
                 from: day.start, to: day.start, calendar: calendar, usingLocalImport: false)) ||
-                (localPresent && localCarbs.covers(
+                (localPresent && localCarbEvidence.covers(
                     from: day.start, to: day.start, calendar: calendar, usingLocalImport: true))
             if !insulinCovered { unknownInsulinDays += 1 }
             if !carbsCovered { unknownCarbsDays += 1 }
@@ -297,12 +320,18 @@ final class GlucoseForecastMLHistoryLoader {
         for (segment, readings) in separated {
             guard !cancellation.isCancelled else { return nil }
             let usingLocal = segment.source == .local
-            let insulinEvidence = usingLocal || !insulinEnabled ? localInsulin : healthInsulin
-            let carbEvidence = usingLocal || !carbsEnabled ? localCarbs : healthCarbs
-            let insulinEvents = insulinEnabled && !usingLocal
-                ? directHealthInsulin : localTreatments.filter(\.isIOB)
-            let carbEvents = carbsEnabled && !usingLocal
-                ? directHealthCarbs : localTreatments.filter { !$0.isIOB }
+            let insulinEvidence = cutover != nil ? cutoverInsulin :
+                (usingLocal || !insulinEnabled ? localInsulin : healthInsulin)
+            let carbEvidence = cutover != nil ? cutoverCarbs :
+                (usingLocal || !carbsEnabled ? localCarbs : healthCarbs)
+            let insulinEvents = cutover != nil
+                ? directHealthInsulin + localTreatments.filter(\.isIOB)
+                : (insulinEnabled && !usingLocal ? directHealthInsulin :
+                    localTreatments.filter(\.isIOB))
+            let carbEvents = cutover != nil
+                ? directHealthCarbs + localTreatments.filter { !$0.isIOB }
+                : (carbsEnabled && !usingLocal ? directHealthCarbs :
+                    localTreatments.filter { !$0.isIOB })
             var lastAnchorDate: Date?
             var anchorDay = calendar.startOfDay(for: segment.startDate)
             while anchorDay <= segment.endDate {
@@ -339,7 +368,7 @@ final class GlucoseForecastMLHistoryLoader {
                                 -settings.insulinDuration * 60), to: anchor,
                                 calendar: calendar, usingLocalImport: usingLocal),
                               carbEvidence.covers(from: anchor.addingTimeInterval(
-                                -settings.carbDuration * 60), to: anchor,
+                                -max(settings.carbDuration, 480) * 60), to: anchor,
                                 calendar: calendar, usingLocalImport: usingLocal) else { continue }
                         let accepted = rows.sorted { $0.row.horizonMinutes < $1.row.horizonMinutes }
                         if usingLocal {
@@ -444,7 +473,7 @@ final class GlucoseForecastMLHistoryLoader {
             glucoseRequest.relationshipKeyPathsForPrefetching = ["sensor"]
             let treatmentRequest: NSFetchRequest<TreatmentEntry> = TreatmentEntry.fetchRequest()
             treatmentRequest.predicate = NSPredicate(format:
-                "date >= %@ AND date < %@ AND (treatmentdeleted == NO OR treatmentdeleted == nil) AND treatmentType IN %@",
+                "date >= %@ AND date < %@ AND treatmentType IN %@",
                 start as NSDate, end as NSDate,
                 [TreatmentType.Insulin.rawValue, TreatmentType.Carbs.rawValue])
             do {
@@ -455,27 +484,52 @@ final class GlucoseForecastMLHistoryLoader {
                         isSuppressedByFiveMinuteCadence: reading.isSuppressedByFiveMinuteCadence)
                 }
                 let fetched = try context.fetch(treatmentRequest)
-                let insulinBundle = healthImporter.selectedSource(.insulin)?.bundleIdentifier
-                let carbsBundle = healthImporter.selectedSource(.carbohydrates)?.bundleIdentifier
+                let cutover = TreatmentSourceCutover.current()
+                let insulinBundle = cutover?.insulinSourceBundleID ??
+                    healthImporter.selectedSource(.insulin)?.bundleIdentifier
+                let carbsBundle = cutover?.carbohydrateSourceBundleID ??
+                    healthImporter.selectedSource(.carbohydrates)?.bundleIdentifier
                 let eligible = TherapyMetricsManager.eligibleTreatments(fetched, policy: policy,
                     insulinSource: insulinBundle, carbsSource: carbsBundle,
                     insulinEnabled: healthImporter.isEnabled(.insulin),
-                    carbsEnabled: healthImporter.isEnabled(.carbohydrates))
-                let treatments = eligible.map {
+                    carbsEnabled: healthImporter.isEnabled(.carbohydrates),
+                    cutover: cutover)
+                // Direct Health history owns the pre-cutover portion in replay. Local
+                // rows supply only app-origin records after the boundary, preventing
+                // imported Core Data copies from being counted twice.
+                let replayEligible = cutover == nil ? eligible :
+                    eligible.filter { !$0.isHealthKitImported }
+                let deletedLocal = fetched.filter { entry in
+                    guard entry.treatmentdeleted, entry.isAppLocalTreatment,
+                          (entry.treatmentType == .Insulin || entry.treatmentType == .Carbs) else {
+                        return false
+                    }
+                    return cutover?.permitsLocal(eventDate: entry.date,
+                        localTreatmentUUID: entry.localTreatmentUUID,
+                        watchSourceUUID: entry.watchSourceUUID) ?? true
+                }
+                let treatments = (replayEligible + deletedLocal).map {
                     TherapyTreatment(date: $0.date, amount: $0.value,
-                                     isIOB: $0.treatmentType == .Insulin)
+                        isIOB: $0.treatmentType == .Insulin,
+                        carbohydrateDurationMinutes: $0.treatmentType == .Carbs
+                            ? $0.effectiveCarbohydrateDurationMinutes : nil,
+                        knownAt: $0.isAppLocalTreatment ? $0.knownAtForCurrentRevision : nil,
+                        createdAt: $0.isAppLocalTreatment ? $0.createdAt : nil,
+                        modifiedAt: $0.isAppLocalTreatment ? $0.modifiedAt : nil,
+                        isAppLocal: $0.isAppLocalTreatment,
+                        isDeletedCurrentRevision: $0.treatmentdeleted)
                 }
                 result = LocalDay(glucose: glucose, treatments: treatments,
                     importedInsulinDates: fetched.filter {
-                        $0.isHealthKitImported && $0.treatmentType == .Insulin &&
+                        !$0.treatmentdeleted && $0.isHealthKitImported && $0.treatmentType == .Insulin &&
                             $0.healthKitSourceBundleIdentifier == insulinBundle
                     }.map(\.date),
                     importedCarbohydrateDates: fetched.filter {
-                        $0.isHealthKitImported && $0.treatmentType == .Carbs &&
+                        !$0.treatmentdeleted && $0.isHealthKitImported && $0.treatmentType == .Carbs &&
                             $0.healthKitSourceBundleIdentifier == carbsBundle
                     }.map(\.date),
-                    insulinDates: eligible.filter { $0.treatmentType == .Insulin }.map(\.date),
-                    carbohydrateDates: eligible.filter { $0.treatmentType == .Carbs }.map(\.date))
+                    insulinDates: replayEligible.filter { $0.treatmentType == .Insulin }.map(\.date),
+                    carbohydrateDates: replayEligible.filter { $0.treatmentType == .Carbs }.map(\.date))
             } catch { result = nil }
             context.reset()
         }
@@ -525,8 +579,11 @@ final class GlucoseForecastMLHistoryLoader {
     }
 
     private func sourceSignature() -> String {
-        HealthTherapyImportKind.allCases.map { kind in
+        let sources = HealthTherapyImportKind.allCases.map { kind in
             "\(healthImporter.isEnabled(kind)):\(healthImporter.selectedSource(kind)?.bundleIdentifier ?? "")"
         }.joined(separator: "|")
+        let cutover = TreatmentSourceCutover.current()
+        return "\(sources)|\(cutover?.cutoff.timeIntervalSince1970 ?? 0):" +
+            "\(cutover?.insulinSourceBundleID ?? ""):\(cutover?.carbohydrateSourceBundleID ?? "")"
     }
 }

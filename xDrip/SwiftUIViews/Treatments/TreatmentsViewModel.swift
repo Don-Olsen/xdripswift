@@ -31,11 +31,14 @@ import OSLog
     @Published private(set) var showBasalInjectionTreatments = UserDefaults.standard.showBasalInjectionTreatmentsInList
     @Published private(set) var showNoteTreatments = UserDefaults.standard.showNoteTreatmentsInList
     @Published private(set) var selectedDate = Date().toMidnight()
+    @Published var deletionFailureMessage: String?
 
     // MARK: - private properties
 
     let coreDataManager: CoreDataManager
     private let treatmentEntryAccessor: TreatmentEntryAccessor
+    private let localSaveJournal: PenDoseLogJournal
+    private let localSaveOverride: (() -> Bool)?
     private let log = OSLog(subsystem: ConstantsLog.subSystem, category: ConstantsLog.categoryApplicationDataTreatments)
 
     private var allTreatments: [TreatmentSnapshot] = []
@@ -43,9 +46,12 @@ import OSLog
 
     // MARK: - initialization
 
-    init(coreDataManager: CoreDataManager) {
+    init(coreDataManager: CoreDataManager, localSaveJournal: PenDoseLogJournal? = nil,
+         localSaveOverride: (() -> Bool)? = nil) {
         self.coreDataManager = coreDataManager
         self.treatmentEntryAccessor = TreatmentEntryAccessor(coreDataManager: coreDataManager)
+        self.localSaveJournal = localSaveJournal ?? .shared
+        self.localSaveOverride = localSaveOverride
 
         updateDayName()
     }
@@ -67,17 +73,38 @@ import OSLog
     func reloadTreatments() {
         syncFilterSettingsFromUserDefaults()
 
-        let treatments = treatmentEntryAccessor
-            .getLatestTreatments(howOld: nil)
-            .filter { entry in
-                guard !entry.treatmentdeleted else { return false }
-                guard entry.isHealthKitImported else { return true }
-                let kind: HealthTherapyImportKind = entry.treatmentType == .Insulin ? .insulin : .carbohydrates
-                let importer = HealthKitTherapyImportManager.shared
-                return importer.isEnabled(kind) &&
-                    entry.healthKitSourceBundleIdentifier == importer.selectedSource(kind)?.bundleIdentifier
+        let fetched = treatmentEntryAccessor.getLatestTreatments(howOld: nil)
+        let importer = HealthKitTherapyImportManager.shared
+        let cutover = TreatmentSourceCutover.current()
+        // Match the source, cutover and origin-dedup rules used by live IOB/COB. Turning the
+        // Health importer off at cutover must not hide the already imported mySugr history.
+        let eligibleActualIDs = Set(TherapyMetricsManager.eligibleTreatments(
+            fetched.filter { !$0.treatmentdeleted && ($0.treatmentType == .Insulin || $0.treatmentType == .Carbs) },
+            policy: UserDefaults.standard.dataFlowPolicy,
+            insulinSource: importer.selectedSource(.insulin)?.bundleIdentifier,
+            carbsSource: importer.selectedSource(.carbohydrates)?.bundleIdentifier,
+            insulinEnabled: importer.isEnabled(.insulin),
+            carbsEnabled: importer.isEnabled(.carbohydrates),
+            cutover: cutover
+        ).map(\.objectID))
+        let treatments = fetched.filter { entry in
+            guard !entry.treatmentdeleted else { return false }
+            if entry.treatmentType == .Insulin || entry.treatmentType == .Carbs {
+                if entry.isPlannedMeal || entry.isCancelledMeal {
+                    // A plan stays visible for editing/history, but is never counted as eaten.
+                    guard entry.isAppLocalTreatment else { return false }
+                    guard let cutover else { return true }
+                    return cutover.permitsLocal(eventDate: entry.date,
+                        localTreatmentUUID: entry.localTreatmentUUID,
+                        watchSourceUUID: entry.watchSourceUUID)
+                }
+                return eligibleActualIDs.contains(entry.objectID)
             }
-            .sorted(by: { $0.date > $1.date })
+            guard entry.isHealthKitImported else { return true }
+            let kind: HealthTherapyImportKind = entry.treatmentType == .Insulin ? .insulin : .carbohydrates
+            return importer.isEnabled(kind) &&
+                entry.healthKitSourceBundleIdentifier == importer.selectedSource(kind)?.bundleIdentifier
+        }.sorted(by: { $0.date > $1.date })
 
         // Rows and edit routes retain object IDs rather than managed objects. Make those IDs
         // permanent before publication, even when the asynchronous parent save is still pending.
@@ -94,6 +121,10 @@ import OSLog
         allTreatments = treatments.map { TreatmentSnapshot(treatmentEntry: $0) }
 
         applyFilters()
+    }
+
+    func plannedMealSnapshot(uuid: String) -> TreatmentSnapshot? {
+        allTreatments.first { $0.localTreatmentUUID == uuid && $0.isPlannedMeal }
     }
 
     func handleUserDefaultsDidChange() {
@@ -153,18 +184,37 @@ import OSLog
         applyFilters()
     }
 
-    func deleteTreatment(_ treatment: TreatmentSnapshot) {
+    @discardableResult
+    func deleteTreatment(_ treatment: TreatmentSnapshot) -> Bool {
         guard let treatmentEntry = treatmentEntryAccessor.getTreatment(objectID: treatment.objectID) else {
-            return
+            deletionFailureMessage = "Behandlingen kunne ikke findes. Genåbn historikken før ny registrering."
+            return false
+        }
+        let durableMutation = treatmentEntry.treatmentType == .Insulin ||
+            treatmentEntry.treatmentType == .Carbs
+        if durableMutation && !localSaveJournal.beginMutation(treatmentEntry) {
+            let state = localSaveJournal.recoveryState(coreDataManager: coreDataManager)
+            deletionFailureMessage = state.message.isEmpty ?
+                "En tidligere ændring kan ikke afstemmes sikkert. Kontrollér behandlingshistorikken." :
+                state.message
+            return false
         }
 
         treatmentEntry.treatmentdeleted = true
         treatmentEntry.uploaded = false
+        treatmentEntry.modifiedAt = Date()
 
-        guard coreDataManager.saveChanges() else {
+        let saved = durableMutation ? (localSaveOverride?() ?? coreDataManager.saveChangesSynchronously()) :
+            coreDataManager.saveChanges()
+        guard saved, !durableMutation ||
+            localSaveJournal.completeMutationVerified(coreDataManager: coreDataManager,
+                entry: treatmentEntry) else {
+            deletionFailureMessage = "Sletningen kunne ikke bekræftes. Kontrollér behandlingshistorikken og eventuelt Sundhed før ny registrering."
             trace("failed to save a deleted treatment", log: log, category: ConstantsLog.categoryApplicationDataTreatments, type: .error)
-            return
+            return false
         }
+        deletionFailureMessage = nil
+        if let uuid = treatmentEntry.localTreatmentUUID { PlannedMealReminder.cancel(uuid: uuid) }
 
         // Swipe deletion and editor deletion use the same typed fact. Emit it only after the local
         // save succeeds, and keep all treatment values, notes and identifiers in private app data.
@@ -182,6 +232,7 @@ import OSLog
         )
         setNightscoutSyncRequiredToTrue()
         reloadTreatments()
+        return true
     }
 
     // MARK: - private functions
@@ -201,7 +252,8 @@ import OSLog
         let selectedMidnight = selectedDate.toMidnight()
 
         filteredTreatments = allTreatments.filter { treatment in
-            Calendar.current.compare(treatment.date, to: selectedMidnight, toGranularity: .day) == .orderedSame
+            Calendar.current.compare(treatment.date, to: selectedMidnight, toGranularity: .day) == .orderedSame ||
+                (treatment.isPlannedMeal && Calendar.current.isDateInToday(selectedDate))
         }
 
         if !showBolusTreatments {
@@ -255,12 +307,15 @@ import OSLog
 
 enum TreatmentEditorState: Identifiable {
     case add
+    case quickCarbs(Double)
     case edit(TreatmentSnapshot)
 
     var id: String {
         switch self {
         case .add:
             return "add"
+        case .quickCarbs:
+            return "quickCarbs"
         case .edit(let treatment):
             return treatment.objectID.uriRepresentation().absoluteString
         }
@@ -277,6 +332,11 @@ struct TreatmentSnapshot: Hashable {
     let enteredBy: String?
     let notes: String?
     let isHealthKitImported: Bool
+    let localTreatmentUUID: String?
+    let isPlannedMeal: Bool
+    let isCancelledMeal: Bool
+    let mealKind: TreatmentMealKind
+    let deletionMayLeaveHealthCopy: Bool
 
     init(treatmentEntry: TreatmentEntry) {
         objectID = treatmentEntry.objectID
@@ -287,6 +347,13 @@ struct TreatmentSnapshot: Hashable {
         enteredBy = treatmentEntry.enteredBy
         notes = treatmentEntry.notes
         isHealthKitImported = treatmentEntry.isHealthKitImported
+        localTreatmentUUID = treatmentEntry.localTreatmentUUID
+        isPlannedMeal = treatmentEntry.isPlannedMeal
+        isCancelledMeal = treatmentEntry.isCancelledMeal
+        mealKind = treatmentEntry.mealKind
+        deletionMayLeaveHealthCopy = treatmentEntry.localTreatmentUUID != nil &&
+            treatmentEntry.healthKitSyncVersion != nil &&
+            (treatmentEntry.treatmentType == .Insulin || treatmentEntry.isConfirmedMeal)
     }
 
     var isEditable: Bool {
@@ -322,7 +389,18 @@ struct TreatmentSnapshot: Hashable {
     }
 
     var typeText: String {
-        treatmentType.asString()
+        if treatmentType == .Carbs {
+            let mealSymbol: String
+            switch mealKind {
+            case .fast: mealSymbol = "🍭"
+            case .normal: mealSymbol = "🌮"
+            case .slow: mealSymbol = "🍕"
+            }
+            if isPlannedMeal { return "\(mealSymbol) Planlagt" }
+            if isCancelledMeal { return "\(mealSymbol) Annulleret" }
+            return "\(mealSymbol) \(treatmentType.asString())"
+        }
+        return treatmentType.asString()
     }
 
     var timeString: String {

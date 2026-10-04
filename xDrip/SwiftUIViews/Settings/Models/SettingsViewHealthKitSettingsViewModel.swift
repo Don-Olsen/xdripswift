@@ -66,6 +66,11 @@ class SettingsViewHealthKitSettingsViewModel:SettingsViewModelProtocol {
                 control: .custom(content: {
                     AnyView(HealthTherapyImportStatusRow(kind: .carbohydrates, title: Texts_SettingsView.healthKitCarbohydrateStatus))
                 })
+            ),
+            SettingsRow(
+                id: "healthKit.localTreatmentCutover",
+                title: "Log behandlinger i xDrip",
+                control: .custom(content: { AnyView(HealthTherapyLocalCutoverRow()) })
             )
         ]
     }
@@ -85,7 +90,11 @@ class SettingsViewHealthKitSettingsViewModel:SettingsViewModelProtocol {
     
     func isEnabled(index: Int) -> Bool {
         // if healthkit not available (iPad) then don't enable
-        return HKHealthStore.isHealthDataAvailable()
+        guard HKHealthStore.isHealthDataAvailable() else { return false }
+        if let setting = Setting(rawValue: index),
+           setting != .enabledHealthKit,
+           TreatmentSourceCutover.current() != nil { return false }
+        return true
     }
     
     func onRowSelect(index: Int) -> SettingsSelectedRowAction {
@@ -218,6 +227,60 @@ class SettingsViewHealthKitSettingsViewModel:SettingsViewModelProtocol {
 
         // set UserDefaults.standard.storeReadingsInHealthkit to isOn
         UserDefaults.standard.storeReadingsInHealthkit = isOn
+    }
+}
+
+private struct HealthTherapyLocalCutoverRow: View {
+    @State private var switching = false
+    @State private var message: String?
+    @State private var cutover = TreatmentSourceCutover.current()
+    @AppStorage("therapyRestoreRequiresSourceSetup") private var restoreRequiresSourceSetup = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if restoreRequiresSourceSetup {
+                Text("Gendannede behandlinger mangler kildeopsætning. Vælg og aktivér mySugr som både insulin- og kulhydratkilde i Sundhed, og gennemfør derefter skiftet til lokal registrering igen. Behandlingsberegninger er utilgængelige indtil da.")
+                    .font(.footnote)
+                    .foregroundStyle(.orange)
+            }
+            if let cutover {
+                Text("Aktiv siden \(cutover.cutoff.formatted(date: .abbreviated, time: .shortened)). Tidligere importerede behandlinger fra før skiftet bevares.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            } else {
+                let insulinSource = HealthKitTherapyImportManager.shared.selectedSource(.insulin)
+                let carbohydrateSource = HealthKitTherapyImportManager.shared.selectedSource(.carbohydrates)
+                Text("Insulin: \(insulinSource?.name ?? "Ingen kilde") (\(insulinSource?.bundleIdentifier ?? "–"))")
+                    .font(.footnote).foregroundStyle(.secondary)
+                Text("Kulhydrater: \(carbohydrateSource?.name ?? "Ingen kilde") (\(carbohydrateSource?.bundleIdentifier ?? "–"))")
+                    .font(.footnote).foregroundStyle(.secondary)
+                Button(switching ? "Afslutter import…" : "Skift til lokal registrering") {
+                    switching = true
+                    message = nil
+                    HealthKitTherapyImportManager.shared.switchToLocalLogging { error in
+                        switching = false
+                        cutover = TreatmentSourceCutover.current()
+                        if error != nil {
+                            message = "Skiftet blev ikke gennemført. Vælg og aktivér mySugr som både insulin- og kulhydratkilde, og prøv igen. Intet er ændret."
+                        }
+                    }
+                }
+                .disabled(switching || !HKHealthStore.isHealthDataAvailable() ||
+                    insulinSource?.isMySugr != true || carbohydrateSource?.isMySugr != true)
+                Text("Vælg mySugr for begge typer. Når begge sidste Sundhed-læsninger er gemt, bliver xDrip primær behandlingskilde, og den eksterne IOB/COB-kilde slås fra. Glukose og Nightscout-upload ændres ikke.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                Text("Sletter du senere en behandling i xDrip, kan en allerede skrevet kopi blive i Sundhed. xDrip læser ikke sin egen kopi tilbage.")
+                    .font(.footnote)
+                    .foregroundStyle(.orange)
+            }
+            if let message {
+                Text(message).font(.footnote).foregroundStyle(.orange)
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: HealthKitTherapyImportManager.statusDidChange)) { _ in
+            cutover = TreatmentSourceCutover.current()
+        }
     }
 }
 

@@ -3,6 +3,32 @@ import XCTest
 @testable import xdrip
 
 final class GlucoseForecastMLReplayTests: XCTestCase {
+    func testEditedLocalRevisionInvalidatesPastAnchorInsteadOfPretendingZero() {
+        let treatmentDate = reference.addingTimeInterval(-10 * 60)
+        let created = reference.addingTimeInterval(-20 * 60)
+        let changed = reference.addingTimeInterval(5 * 60)
+        let edited = TherapyTreatment(date: treatmentDate, amount: 4, isIOB: true,
+            knownAt: changed, createdAt: created, modifiedAt: changed, isAppLocal: true)
+        XCTAssertTrue(batch(readings(), treatments: [edited]).examples.isEmpty)
+        let unknownCreation = TherapyTreatment(date: treatmentDate, amount: 4,
+            isIOB: true, isAppLocal: true)
+        XCTAssertTrue(batch(readings(), treatments: [unknownCreation]).examples.isEmpty)
+        let laterBackdated = TherapyTreatment(date: treatmentDate, amount: 4,
+            isIOB: true, knownAt: changed, createdAt: changed, isAppLocal: true)
+        let replay = batch(readings(), treatments: [laterBackdated]).examples
+        XCTAssertEqual(replay.count, 3)
+        XCTAssertTrue(replay.allSatisfy { $0.bolusUnitsInWindow == 0 },
+            "a post first recorded later is excluded, without rewriting an older forecast")
+    }
+    func testDeletedLocalRevisionInvalidatesPastAnchorInsteadOfPretendingNoMeal() {
+        let deleted = TherapyTreatment(date: reference.addingTimeInterval(-10 * 60),
+            amount: 40, isIOB: false, carbohydrateDurationMinutes: 240,
+            knownAt: reference.addingTimeInterval(5 * 60),
+            createdAt: reference.addingTimeInterval(-20 * 60),
+            modifiedAt: reference.addingTimeInterval(5 * 60),
+            isAppLocal: true, isDeletedCurrentRevision: true)
+        XCTAssertTrue(batch(readings(), treatments: [deleted]).examples.isEmpty)
+    }
     private let reference = Date(timeIntervalSince1970: 1_800_000_000)
     private let settings = TherapyModelSettings()
 
@@ -122,6 +148,101 @@ final class GlucoseForecastMLReplayTests: XCTestCase {
             XCTAssertEqual(original.row.engineValue, changed.row.engineValue)
             XCTAssertEqual(changed.treatmentAvailability, .retrospectiveUnknown)
             XCTAssertEqual(changed.settingsAvailability, .retrospectiveUnknown)
+        }
+    }
+
+    func testReplayAndLiveAdapterHandTheSameEventTimeTreatmentsToEngine() throws {
+        let glucose = readings()
+        let treatmentStart = reference.addingTimeInterval(
+            -max(settings.insulinDuration, settings.carbDuration) * 60)
+        let insulin = TherapyTreatment(date: reference.addingTimeInterval(-20 * 60),
+                                       amount: 2, isIOB: true)
+        let carbohydrates = TherapyTreatment(date: reference.addingTimeInterval(-15 * 60),
+                                             amount: 18, isIOB: false)
+        let boundary = TherapyTreatment(date: treatmentStart, amount: 1, isIOB: true)
+        let tooOld = TherapyTreatment(date: treatmentStart.addingTimeInterval(-1),
+                                      amount: 99, isIOB: true)
+        let future = TherapyTreatment(date: reference.addingTimeInterval(60),
+                                      amount: 99, isIOB: false)
+        let fetched = [tooOld, insulin, future, carbohydrates, boundary]
+        let liveTreatments = GlucoseForecastDataAdapter.treatmentsKnownAtReference(
+            fetched, from: treatmentStart, referenceDate: reference)
+        XCTAssertEqual(liveTreatments.count, 3)
+        let selectedGlucose = GlucoseForecastGlucoseSelection.select(
+            glucose.filter { $0.date <= reference }, at: reference)
+        let liveInput = GlucoseForecastInput(glucose: selectedGlucose,
+            treatments: liveTreatments, settings: settings,
+            sensitivityMgdlPerUnit: 40, carbohydrateRatioGramsPerUnit: 10,
+            horizonMinutes: 120, now: reference)
+        let live = GlucoseForecastEngine.predict(liveInput)
+        XCTAssertNil(live.reason)
+        let replay = batch(glucose, treatments: fetched).examples
+        XCTAssertEqual(replay.count, 3)
+        for example in replay {
+            XCTAssertEqual(example.engineTargetGlucoseMgdl,
+                           live.value(atMinutes: example.row.horizonMinutes)!, accuracy: 1e-9)
+            let liveRow = try XCTUnwrap(GlucoseForecastMLFeatures.row(input: liveInput,
+                result: live, horizonMinutes: example.row.horizonMinutes,
+                calendar: utcCalendar))
+            XCTAssertEqual(example.row.values, liveRow.values)
+            XCTAssertEqual(example.bolusUnitsInWindow, 3, accuracy: 1e-9)
+            XCTAssertEqual(example.carbohydrateGramsInWindow, 18, accuracy: 1e-9)
+        }
+    }
+
+    func testSelectedSourceAndOriginDedupFeedSameCanonicalUnitsToReplayAndLive() throws {
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let context = core.mainManagedObjectContext
+        let doseDate = reference.addingTimeInterval(-20 * 60)
+        let mealDate = reference.addingTimeInterval(-10 * 60)
+        let localDose = TreatmentEntry(id: "same-origin", date: doseDate, value: 2,
+            treatmentType: .Insulin, nightscoutEventType: nil, enteredBy: "Manual",
+            nsManagedObjectContext: context)
+        let duplicateHealth = TreatmentEntry(date: doseDate, value: 2,
+            treatmentType: .Insulin, nightscoutEventType: nil, enteredBy: "Apple Health",
+            nsManagedObjectContext: context)
+        duplicateHealth.healthKitSampleUUID = UUID().uuidString
+        duplicateHealth.healthKitSourceBundleIdentifier = "com.selected"
+        duplicateHealth.healthKitExternalUUID = "same-origin"
+        let wrongSource = TreatmentEntry(date: doseDate, value: 50,
+            treatmentType: .Insulin, nightscoutEventType: nil, enteredBy: "Apple Health",
+            nsManagedObjectContext: context)
+        wrongSource.healthKitSampleUUID = UUID().uuidString
+        wrongSource.healthKitSourceBundleIdentifier = "com.other"
+        let meal = TreatmentEntry(date: mealDate, value: 18,
+            treatmentType: .Carbs, nightscoutEventType: nil, enteredBy: "Apple Health",
+            nsManagedObjectContext: context)
+        meal.healthKitSampleUUID = UUID().uuidString
+        meal.healthKitSourceBundleIdentifier = "com.selected"
+        let policy = DataFlowPolicy(isMaster: true, followerDataSource: .nightscout,
+            therapyDataSourceSelection: .none, nightscoutEnabled: false,
+            masterUploadsGlucoseToNightscout: false, followerUploadsGlucoseToNightscout: false,
+            nightscoutFollowType: .none)
+        let eligible = TherapyMetricsManager.eligibleTreatments(
+            [localDose, duplicateHealth, wrongSource, meal], policy: policy,
+            insulinSource: "com.selected", carbsSource: "com.selected",
+            insulinEnabled: true, carbsEnabled: true)
+        XCTAssertEqual(eligible.count, 2)
+        XCTAssertTrue(eligible.contains(localDose))
+        XCTAssertTrue(eligible.contains(meal))
+        let canonical = eligible.map {
+            TherapyTreatment(date: $0.date, amount: $0.value,
+                             isIOB: $0.treatmentType == .Insulin)
+        }
+        let selectedGlucose = GlucoseForecastGlucoseSelection.select(
+            readings(through: 0).filter { $0.date <= reference }, at: reference)
+        let liveInput = GlucoseForecastInput(glucose: selectedGlucose,
+            treatments: canonical, settings: settings, sensitivityMgdlPerUnit: 40,
+            carbohydrateRatioGramsPerUnit: 10, horizonMinutes: 120, now: reference)
+        let live = GlucoseForecastEngine.predict(liveInput)
+        XCTAssertNil(live.reason)
+        let replay = batch(readings(), treatments: canonical).examples
+        XCTAssertEqual(replay.count, 3)
+        for example in replay {
+            XCTAssertEqual(example.engineTargetGlucoseMgdl,
+                           live.value(atMinutes: example.row.horizonMinutes)!, accuracy: 1e-9)
+            XCTAssertEqual(example.bolusUnitsInWindow, 2, accuracy: 1e-9)
+            XCTAssertEqual(example.carbohydrateGramsInWindow, 18, accuracy: 1e-9)
         }
     }
 

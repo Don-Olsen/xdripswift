@@ -325,6 +325,11 @@ class TreatmentEntryAccessor {
         if excludingExternalLocalOnly {
             predicates.append(NSPredicate(format: "healthKitSampleUUID == nil"))
             predicates.append(NSPredicate(format: "watchSourceUUID == nil"))
+            // A proposed or cancelled meal is not a treatment and must not leave the device.
+            // Confirmed and legacy carbohydrate entries retain the existing export path.
+            predicates.append(NSPredicate(
+                format: "treatmentType != %d OR plannedMealStateRaw == nil OR plannedMealStateRaw == %@",
+                TreatmentType.Carbs.rawValue, TreatmentMealState.confirmed.rawValue))
         }
         if !predicates.isEmpty {
             fetchRequest.predicate = NSCompoundPredicate(andPredicateWithSubpredicates: predicates)

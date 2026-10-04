@@ -389,6 +389,9 @@ struct RootTabView: View {
         .onAppear {
             if stateModel.incomingBackupRequest != nil {
                 selectedTab = .settings
+            } else if PlannedMealReminder.pendingOpenUUID != nil ||
+                        PizzaSplitReminder.pendingOpenUUID != nil {
+                selectedTab = .treatments
             }
             updateSupportedOrientations(for: selectedTab)
         }
@@ -411,6 +414,12 @@ struct RootTabView: View {
         }
         .onChange(of: stateModel.sensorHealthHomeRequest) { _ in
             selectedTab = .home
+        }
+        .onReceive(NotificationCenter.default.publisher(for: PlannedMealReminder.openRequested)) { _ in
+            selectedTab = .treatments
+        }
+        .onReceive(NotificationCenter.default.publisher(for: PizzaSplitReminder.openRequested)) { _ in
+            selectedTab = .treatments
         }
         .alert(
             item: Binding(

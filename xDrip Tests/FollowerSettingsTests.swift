@@ -433,6 +433,48 @@ final class FollowerSettingsTests: XCTestCase {
         }
     }
 
+    func testLocalTreatmentCutoverLocksExternalTherapySourceMenuAndStaleAction() throws {
+        let standard = UserDefaults.standard
+        let cutoverKey = TreatmentSourceCutover.defaultsKey
+        let previousCutover = standard.object(forKey: cutoverKey)
+        let previousSource = standard.therapyDataSourceType
+        let previousNightscout = standard.nightscoutEnabled
+        defer {
+            if let previousCutover { standard.set(previousCutover, forKey: cutoverKey) }
+            else { standard.removeObject(forKey: cutoverKey) }
+            standard.therapyDataSourceType = previousSource
+            standard.nightscoutEnabled = previousNightscout
+        }
+        standard.removeObject(forKey: cutoverKey)
+        standard.nightscoutEnabled = true
+        standard.therapyDataSourceType = .none
+
+        let model = SettingsViewDataSourceSettingsViewModel(coreDataManager: nil)
+        let before = try XCTUnwrap(model.settingsSections(sectionIDBase: 0)[0].rows.first {
+            $0.id == "dataSource.therapyDataSource"
+        })
+        guard case let .menuWithSelectionTitle(_, _, selectStaleOption)? = before.control else {
+            return XCTFail("Expected treatment-source menu before cutover")
+        }
+
+        XCTAssertTrue(TreatmentSourceCutover.persist(.init(
+            cutoff: Date(), insulinSourceBundleID: "test.mysugr.insulin",
+            carbohydrateSourceBundleID: "test.mysugr.carbs")))
+        selectStaleOption(1) // Nightscout was available when the menu was created.
+        XCTAssertEqual(standard.therapyDataSourceType, .none)
+        XCTAssertFalse(model.isEnabled(index: 13))
+
+        let after = try XCTUnwrap(model.settingsSections(sectionIDBase: 0)[0].rows.first {
+            $0.id == "dataSource.therapyDataSource"
+        })
+        XCTAssertFalse(after.isEnabled)
+        guard case let .menuWithSelectionTitle(options, selectedTitle, _)? = after.control else {
+            return XCTFail("Expected locked treatment-source menu after cutover")
+        }
+        XCTAssertEqual(options().map(\.title), [TherapyDataSourceType.none.description])
+        XCTAssertEqual(selectedTitle(), TherapyDataSourceType.none.description)
+    }
+
     func testKeepAlivePickerPairsEachDescriptionWithItsSymbol() {
         let standard = UserDefaults.standard
         let previousMaster = standard.isMaster

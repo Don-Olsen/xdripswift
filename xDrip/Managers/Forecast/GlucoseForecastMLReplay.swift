@@ -17,6 +17,28 @@ struct GlucoseForecastMLReplayExample: Sendable {
     let sourceIdentity: String
     let treatmentAvailability: GlucoseForecastMLAvailabilityProvenance
     let settingsAvailability: GlucoseForecastMLAvailabilityProvenance
+    /// The exact event-time treatment window handed to the forecast engine.
+    /// These totals are diagnostic; they do not establish import availability.
+    let bolusUnitsInWindow: Double
+    let carbohydrateGramsInWindow: Double
+
+    init(row: GlucoseForecastMLFeatureRow, targetDate: Date,
+         targetGlucoseMgdl: Double, engineTargetGlucoseMgdl: Double,
+         engineTrajectoryMgdl: [Double], sourceIdentity: String,
+         treatmentAvailability: GlucoseForecastMLAvailabilityProvenance,
+         settingsAvailability: GlucoseForecastMLAvailabilityProvenance,
+         bolusUnitsInWindow: Double = 0, carbohydrateGramsInWindow: Double = 0) {
+        self.row = row
+        self.targetDate = targetDate
+        self.targetGlucoseMgdl = targetGlucoseMgdl
+        self.engineTargetGlucoseMgdl = engineTargetGlucoseMgdl
+        self.engineTrajectoryMgdl = engineTrajectoryMgdl
+        self.sourceIdentity = sourceIdentity
+        self.treatmentAvailability = treatmentAvailability
+        self.settingsAvailability = settingsAvailability
+        self.bolusUnitsInWindow = bolusUnitsInWindow
+        self.carbohydrateGramsInWindow = carbohydrateGramsInWindow
+    }
 }
 
 struct GlucoseForecastMLReplayBatch: Sendable {
@@ -71,9 +93,22 @@ enum GlucoseForecastMLReplay {
             else { continue }
             let treatmentStart = anchorDate.addingTimeInterval(
                 -max(settings.insulinDuration, settings.carbDuration) * 60)
-            let knownByEventTime = treatments.filter {
-                $0.date >= treatmentStart && $0.date <= anchorDate
+            // A local row edited after this anchor no longer contains its earlier value.
+            // Skipping just that row would falsely claim zero treatment at the anchor;
+            // discard the entire example instead. Legacy/Watch local rows without
+            // created-at provenance are likewise not proof of a complete past input.
+            let localWindow = treatments.filter {
+                $0.isAppLocal && $0.date >= treatmentStart && $0.date <= anchorDate
             }
+            guard !localWindow.contains(where: {
+                guard let createdAt = $0.createdAt else { return true }
+                if $0.isDeletedCurrentRevision { return createdAt <= anchorDate }
+                return createdAt <= anchorDate && ($0.modifiedAt.map { $0 > anchorDate } ?? false)
+            }) else { continue }
+            // Imported Health history lacks reliable registration time. It remains
+            // event-time based and is marked retrospective/unknown in the report.
+            let knownByEventTime = GlucoseForecastDataAdapter.treatmentsKnownAtReference(
+                treatments, from: treatmentStart, referenceDate: anchorDate)
             let input = GlucoseForecastInput(glucose: glucose, treatments: knownByEventTime,
                 settings: settings, sensitivityMgdlPerUnit: sensitivityMgdlPerUnit,
                 carbohydrateRatioGramsPerUnit: carbohydrateRatioGramsPerUnit,
@@ -95,7 +130,11 @@ enum GlucoseForecastMLReplay {
                     engineTrajectoryMgdl: trajectory,
                     sourceIdentity: "sensor:" + sensorID,
                     treatmentAvailability: .retrospectiveUnknown,
-                    settingsAvailability: .retrospectiveUnknown))
+                    settingsAvailability: .retrospectiveUnknown,
+                    bolusUnitsInWindow: knownByEventTime.filter(\.isIOB)
+                        .reduce(0) { $0 + $1.amount },
+                    carbohydrateGramsInWindow: knownByEventTime.filter { !$0.isIOB }
+                        .reduce(0) { $0 + $1.amount }))
             }
             if triple.count == 3 { examples.append(contentsOf: triple) }
         }

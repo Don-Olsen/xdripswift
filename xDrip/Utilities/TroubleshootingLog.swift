@@ -2599,6 +2599,7 @@ struct TroubleshootingLogReportBuilder {
         case .phonebatterylow: return "Phone battery"
         case .notlooping: return "Not looping"
         case .sensorTransmitterFailure: return "Sensor/Transmitter Failure"
+        case .lowSoon: return "Low soon"
         }
     }
 

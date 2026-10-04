@@ -33,7 +33,13 @@ struct GlucoseForecastLogSnapshot: Codable, Sendable {
     enum RecordType: String, Codable, Sendable { case forecast, unavailable }
     struct Point: Codable, Sendable { let offsetMinutes: Int; let glucoseMgdl: Double }
     struct Sample: Codable, Sendable { let date: Date; let glucoseMgdl: Double; let sensorIdentity: String? }
-    struct Treatment: Codable, Sendable { let date: Date; let amount: Double; let kind: String; let unit: String }
+    struct Treatment: Codable, Sendable {
+        let date: Date
+        let amount: Double
+        let kind: String
+        let unit: String
+        let carbohydrateDurationMinutes: Double?
+    }
     struct Inputs: Codable, Sendable {
         let calculationDate: Date
         let glucose: [Sample]
@@ -122,7 +128,10 @@ struct GlucoseForecastLogSnapshot: Codable, Sendable {
             let treatments = value.treatments.filter {
                 $0.amount.isFinite && $0.amount > 0 && reference != nil && $0.date <= reference!
             }.map { Treatment(date: $0.date, amount: $0.amount,
-                              kind: $0.isIOB ? "bolus" : "carbohydrate", unit: $0.isIOB ? "U" : "g") }
+                              kind: $0.isIOB ? "bolus" : "carbohydrate",
+                              unit: $0.isIOB ? "U" : "g",
+                              carbohydrateDurationMinutes: $0.isIOB ? nil :
+                                  $0.carbohydrateDuration(or: value.settings.carbDuration)) }
                 .sorted { a, b in
                     if a.date != b.date { return a.date < b.date }
                     if a.kind != b.kind { return a.kind < b.kind }
@@ -141,7 +150,7 @@ struct GlucoseForecastLogSnapshot: Codable, Sendable {
         }
         let fingerprint = try inputs.map { try digest(Fingerprint(source: context.sourceIdentity,
             sensor: sensorIdentity, horizon: context.horizonMinutes, inputs: $0, parameters: parameters, constants: config)) }
-        return Self(schemaVersion: 1, engineVersion: GlucoseForecastEngine.engineVersion,
+        return Self(schemaVersion: 2, engineVersion: GlucoseForecastEngine.engineVersion,
             recordType: valid ? .forecast : .unavailable,
             appVersion: context.appVersion, appBuild: context.appBuild,
             sourceIdentity: context.sourceIdentity, sensorIdentity: sensorIdentity,

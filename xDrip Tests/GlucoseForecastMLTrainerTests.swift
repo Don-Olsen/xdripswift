@@ -244,6 +244,106 @@ final class GlucoseForecastMLTrainerTests: XCTestCase {
             "Rejected in self-check: ML was not better than the engine at +60 minutes.")
     }
 
+    func testFairAccuracyUsesIdenticalPairsAndSignedPredictionMinusActual() throws {
+        let actual = [100.0, 130.0]
+        let engine = try XCTUnwrap(GlucoseForecastMLFairAccuracy.measure(
+            predictions: [110, 140], actuals: actual))
+        let ml = try XCTUnwrap(GlucoseForecastMLFairAccuracy.measure(
+            predictions: [120, 120], actuals: actual))
+        let unchanged = try XCTUnwrap(GlucoseForecastMLFairAccuracy.measure(
+            predictions: [100, 100], actuals: actual))
+        XCTAssertEqual(engine.count, 2)
+        XCTAssertEqual(engine.maeMgdl, 10)
+        XCTAssertEqual(engine.signedErrorMgdl, 10)
+        XCTAssertEqual(ml.maeMgdl, 15)
+        XCTAssertEqual(ml.signedErrorMgdl, 5)
+        XCTAssertEqual(unchanged.maeMgdl, 15)
+        XCTAssertEqual(unchanged.signedErrorMgdl, -15)
+        XCTAssertNil(GlucoseForecastMLFairAccuracy.measure(predictions: [100], actuals: actual))
+    }
+
+    func testSelfCheckCSVHasOneRowPerAnchorAndKeepsSettingsAndTreatmentTotals() throws {
+        let metadata = reviewMetadata()
+        let reference = Date(timeIntervalSince1970: 1_700_000_000)
+        let row = GlucoseForecastMLReviewRow(referenceDate: reference,
+            sourceIdentity: "sensor:A,\"B", glucoseMgdl: 121,
+            engineMgdl: [30: 122, 60: 123, 120: 124],
+            mlMgdl: [30: 121.5, 60: 122.5, 120: 123.5],
+            actualMgdl: [30: 120, 60: 125, 120: 126],
+            actualDate: [30: reference.addingTimeInterval(1800),
+                         60: reference.addingTimeInterval(3600),
+                         120: reference.addingTimeInterval(7200)],
+            iobUnits: 1.25, cobGrams: 12,
+            bolusUnitsInWindow: 3, carbohydrateGramsInWindow: 20)
+        let data = try XCTUnwrap(GlucoseForecastMLReviewCSV.data([row],
+                                                                  context: metadata.context))
+        let csv = try XCTUnwrap(String(data: data, encoding: .utf8))
+        XCTAssertEqual(csv.components(separatedBy: "\r\n").filter { !$0.isEmpty }.count, 2)
+        XCTAssertTrue(csv.contains("\"sensor:A,\"\"B\""))
+        XCTAssertTrue(csv.contains("121.0,122.0,123.0,124.0,121.5,122.5,123.5"))
+        XCTAssertTrue(csv.contains(",1.25,12.0,3.0,20.0\r\n"))
+        XCTAssertTrue(csv.contains(metadata.context.engineVersion))
+        XCTAssertTrue(csv.contains(metadata.context.featureVersion))
+
+        let files = FileManager.default
+        let root = files.temporaryDirectory.appendingPathComponent(UUID().uuidString,
+                                                                     isDirectory: true)
+        defer { try? files.removeItem(at: root) }
+        let store = GlucoseForecastMLModelStore(directory: root)
+        try store.saveReview(metadata, rows: [row])
+        let first = try XCTUnwrap(store.reviewCSVURL())
+        XCTAssertEqual(try Data(contentsOf: first), data)
+        let next = reviewMetadata()
+        try store.saveReview(next, rows: [row])
+        XCTAssertFalse(files.fileExists(atPath: first.path))
+        XCTAssertNotNil(store.reviewCSVURL())
+    }
+
+    func testFailedReviewCommitRemovesNewSensitiveCSVAndDoesNotPruneOldEvidence() throws {
+        let files = FileManager.default
+        let root = files.temporaryDirectory.appendingPathComponent(UUID().uuidString,
+                                                                     isDirectory: true)
+        defer { try? files.removeItem(at: root) }
+        let store = GlucoseForecastMLModelStore(directory: root)
+        let old = reviewMetadata()
+        let date = Date(timeIntervalSince1970: 1_700_000_000)
+        func row(_ glucose: Double) -> GlucoseForecastMLReviewRow {
+            GlucoseForecastMLReviewRow(referenceDate: date,
+                sourceIdentity: "sensor:A", glucoseMgdl: glucose,
+                engineMgdl: [30: 120, 60: 120, 120: 120],
+                mlMgdl: [30: 120, 60: 120, 120: 120],
+                actualMgdl: [30: 120, 60: 120, 120: 120],
+                actualDate: [30: date, 60: date, 120: date],
+                iobUnits: 0, cobGrams: 0, bolusUnitsInWindow: 0,
+                carbohydrateGramsInWindow: 0)
+        }
+        try store.saveReview(old, rows: [row(120)])
+        let oldCSV = try XCTUnwrap(store.reviewCSVURL())
+        let oldData = try Data(contentsOf: oldCSV)
+        XCTAssertThrowsError(try store.saveReview(old, rows: [row(121)]))
+        XCTAssertEqual(try Data(contentsOf: oldCSV), oldData)
+        XCTAssertNotNil(store.loadReview())
+
+        // A directory at the review destination blocks the commit *after*
+        // writing the new protected CSV. The catch must remove that CSV.
+        let reviewURL = root.appendingPathComponent("latest-review.json")
+        try files.removeItem(at: reviewURL)
+        try files.createDirectory(at: reviewURL, withIntermediateDirectories: false)
+        XCTAssertEqual(try files.attributesOfItem(atPath: reviewURL.path)[.type]
+            as? FileAttributeType, .typeDirectory)
+        let candidate = reviewMetadata()
+        XCTAssertThrowsError(try store.saveReview(candidate, rows: [row(130)]))
+        XCTAssertFalse(files.fileExists(atPath: root.appendingPathComponent(
+            "self-check-\(candidate.modelID).csv").path))
+        XCTAssertEqual(try files.attributesOfItem(atPath: reviewURL.path)[.type]
+            as? FileAttributeType, .typeDirectory)
+        XCTAssertTrue(files.fileExists(atPath: oldCSV.path),
+                      "Unrelated previous evidence is not pruned after a failed commit")
+        let temporary = try files.contentsOfDirectory(atPath: root.path)
+            .filter { $0.hasPrefix("latest-review-") && $0.hasSuffix(".tmp") }
+        XCTAssertTrue(temporary.isEmpty)
+    }
+
     private func reviewMetadata(schemaVersion: Int = GlucoseForecastMLModelMetadata.schemaVersion,
                                 context: GlucoseForecastMLContext? = nil)
         -> GlucoseForecastMLModelMetadata {

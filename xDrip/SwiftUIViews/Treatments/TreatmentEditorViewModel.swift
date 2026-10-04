@@ -9,12 +9,13 @@
 import Foundation
 import CoreData
 import OSLog
+import UserNotifications
 
 @MainActor final class TreatmentEditorViewModel: ObservableObject {
     // MARK: - public static properties
 
     /// Permit a small amount of advance entry without allowing accidental future-day treatments.
-    static let maximumFutureTreatmentInterval: TimeInterval = 60 * 60
+    nonisolated static let maximumFutureTreatmentInterval: TimeInterval = 60 * 60
 
     static let supportedTreatmentTypes: [TreatmentType] = [.Insulin, .Carbs, .BgCheck, .Exercise, .BasalInjection, .Note]
 
@@ -26,7 +27,10 @@ import OSLog
     @Published var enteredByValue: String
     @Published var enteredNotesValue: String
     @Published var enteredInsulinDescription: String
+    @Published var selectedMealKind: TreatmentMealKind
+    @Published var isPlanningNewMeal: Bool
     @Published var alertMessage: TreatmentEditorAlertMessage?
+    @Published private(set) var localSaveGateState: PenDoseLogJournal.RecoveryState
 
     /// Only show the copied-values footer when both fields were prefilled for a new injection.
     let didPrefillBasalInjection: Bool
@@ -38,15 +42,25 @@ import OSLog
     // from temporary to permanent while the parent context saves a newly added treatment.
     private let originalTreatment: TreatmentEntry?
     private let initialTreatmentState: TreatmentEditorInitialState?
+    private let localSaveJournal: PenDoseLogJournal
+    private let localSaveOperation = PenDoseLogOperation()
+    private let localSaveOverride: (() -> Bool)?
+    private var requestedExistingMealState: TreatmentMealState?
     private let log = OSLog(subsystem: ConstantsLog.subSystem, category: ConstantsLog.categoryApplicationDataTreatments)
 
     // MARK: - initialization
 
-    init(coreDataManager: CoreDataManager?, treatmentToEdit: TreatmentEntry?, initialType: TreatmentType = .Carbs) {
+    init(coreDataManager: CoreDataManager?, treatmentToEdit: TreatmentEntry?, initialType: TreatmentType = .Carbs,
+         quickCarbohydrateGrams: Double? = nil, localSaveJournal: PenDoseLogJournal? = nil,
+         localSaveOverride: (() -> Bool)? = nil) {
+        let localSaveJournal = localSaveJournal ?? .shared
         self.didPrefillBasalInjection = treatmentToEdit == nil && initialType == .BasalInjection
             && UserDefaults.standard.lastBasalInjectionUnits > 0
             && !UserDefaults.standard.lastBasalInjectionInsulinDescription.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         self.coreDataManager = coreDataManager
+        self.localSaveJournal = localSaveJournal
+        self.localSaveOverride = localSaveOverride
+        self.localSaveGateState = coreDataManager.map { localSaveJournal.recoveryState(coreDataManager: $0) } ?? .ready
         self.originalTreatment = treatmentToEdit
         self.initialTreatmentState = treatmentToEdit.map {
             TreatmentEditorInitialState(
@@ -54,13 +68,18 @@ import OSLog
                 selectedDate: $0.date,
                 storedValue: $0.value,
                 enteredBy: $0.enteredBy,
-                notes: $0.notes
+                notes: $0.notes,
+                mealKind: $0.treatmentType == .Carbs ? $0.mealKind : nil,
+                mealState: $0.treatmentType == .Carbs ? ($0.plannedMealStateRaw.flatMap(TreatmentMealState.init(rawValue:)) ?? .confirmed) : nil
             )
         }
         self.selectedType = treatmentToEdit?.treatmentType ?? initialType
         self.selectedDate = treatmentToEdit?.date ?? Date()
         self.enteredByValue = treatmentToEdit?.enteredBy ?? ConstantsHomeView.applicationName
         self.enteredNotesValue = treatmentToEdit?.notes ?? ""
+        self.selectedMealKind = treatmentToEdit?.treatmentType == .Carbs ? (treatmentToEdit?.mealKind ?? .normal)
+            : (quickCarbohydrateGrams == nil ? .normal : .fast)
+        self.isPlanningNewMeal = treatmentToEdit?.isPlannedMeal ?? false
         // Editing always uses the saved treatment. Defaults only prefill a new injection draft.
         self.enteredInsulinDescription = treatmentToEdit?.notes ?? (initialType == .BasalInjection ? UserDefaults.standard.lastBasalInjectionInsulinDescription : "")
 
@@ -76,6 +95,9 @@ import OSLog
             }
         } else if initialType == .BasalInjection, UserDefaults.standard.lastBasalInjectionUnits > 0 {
             self.enteredValue = String(UserDefaults.standard.lastBasalInjectionUnits)
+        } else if initialType == .Carbs, let quickCarbohydrateGrams,
+                  quickCarbohydrateGrams.isFinite, quickCarbohydrateGrams > 0 {
+            self.enteredValue = quickCarbohydrateGrams.stringWithoutTrailingZeroes
         } else {
             self.enteredValue = ""
         }
@@ -87,9 +109,22 @@ import OSLog
         originalTreatment == nil
     }
 
-    /// BG checks are measurements and retain their existing no-future rule.
+    /// Insulin is recorded as already taken. Only explicitly planned carbs can be future-dated.
     var latestSelectableDate: Date {
-        Date().addingTimeInterval(selectedType == .BgCheck ? 0 : Self.maximumFutureTreatmentInterval)
+        let allowsFuture = selectedType == .Carbs
+            ? (isPlanningNewMeal || originalTreatment?.isPlannedMeal == true)
+            : ![TreatmentType.BgCheck, .Insulin, .BasalInjection].contains(selectedType)
+        return Date().addingTimeInterval(allowsFuture ? Self.maximumFutureTreatmentInterval : 0)
+    }
+
+    var isExistingPlannedMeal: Bool { originalTreatment?.isPlannedMeal == true }
+    var isExistingCancelledMeal: Bool { originalTreatment?.isCancelledMeal == true }
+    var selectedCarbohydrateDurationMinutes: Double { selectedMealKind.durationMinutes }
+    var deletionMayLeaveHealthCopy: Bool {
+        guard let originalTreatment else { return false }
+        return originalTreatment.localTreatmentUUID != nil &&
+            originalTreatment.healthKitSyncVersion != nil &&
+            (originalTreatment.treatmentType == .Insulin || originalTreatment.isConfirmedMeal)
     }
 
     var navigationTitle: String {
@@ -133,6 +168,10 @@ import OSLog
     }
 
     var canSaveTreatment: Bool {
+        if isExistingCancelledMeal || wouldChangeHealthSyncedTreatmentType { return false }
+        if (requiresDurableLocalInsert || requiresDurableLocalMutation),
+           let coreDataManager,
+           localSaveJournal.recoveryState(coreDataManager: coreDataManager) != .ready { return false }
         guard currentInputIsValid else {
             return false
         }
@@ -162,6 +201,7 @@ import OSLog
 
     func saveTreatment() -> Bool {
         validateSelectedDateIfNeeded()
+        guard currentInputIsValid else { return false }
 
         guard let coreDataManager = coreDataManager else {
             return false
@@ -200,6 +240,41 @@ import OSLog
         let treatmentToEdit = treatmentToEdit(in: coreDataManager)
         // An edit whose target was deleted or detached must never fall through to insertion.
         guard isAddMode || treatmentToEdit != nil else { return false }
+        if requiresDurableLocalInsert {
+            localSaveGateState = localSaveJournal.recoveryState(coreDataManager: coreDataManager)
+            guard localSaveGateState == .ready,
+                  localSaveJournal.begin(localSaveOperation,
+                    expectsBolus: selectedType == .Insulin, expectsMeal: selectedType == .Carbs) else {
+                localSaveGateState = localSaveJournal.recoveryState(coreDataManager: coreDataManager)
+                alertMessage = TreatmentEditorAlertMessage(title: Texts_Common.warning,
+                    message: localSaveGateState.message.isEmpty ?
+                        "Kan ikke bekræfte lokal lagring. Kontrollér behandlingshistorikken før ny registrering." :
+                        localSaveGateState.message)
+                return false
+            }
+        }
+        if wouldChangeHealthSyncedTreatmentType {
+            alertMessage = TreatmentEditorAlertMessage(
+                title: Texts_Common.warning,
+                message: "En behandling, der er sendt til Sundhed, kan ikke ændres til en anden type. Opret i stedet en ny registrering."
+            )
+            return false
+        }
+        if treatmentToEdit != nil && !treatmentHasChanges { return true }
+        if requiresDurableLocalMutation {
+            guard let treatmentToEdit,
+                  localSaveJournal.beginMutation(treatmentToEdit) else {
+                localSaveGateState = localSaveJournal.recoveryState(coreDataManager: coreDataManager)
+                alertMessage = TreatmentEditorAlertMessage(title: Texts_Common.warning,
+                    message: localSaveGateState.message.isEmpty ?
+                        "En tidligere ændring kan ikke afstemmes sikkert. Kontrollér behandlingshistorikken." :
+                        localSaveGateState.message)
+                return false
+            }
+        }
+        let now = Date()
+        let mealState = selectedType == .Carbs ? selectedMealStateForSave : nil
+        var savedTreatment: TreatmentEntry?
 
         if let treatmentToEdit {
             var treatmentChanged = false
@@ -235,12 +310,45 @@ import OSLog
                 treatmentChanged = true
             }
 
+            let mealKindRaw = selectedType == .Carbs ? selectedMealKind.rawValue : nil
+            let mealDuration = selectedType == .Carbs ? NSNumber(value: selectedCarbohydrateDurationMinutes) : nil
+            let mealStateRaw = mealState?.rawValue
+            if treatmentToEdit.mealKindRaw != mealKindRaw ||
+                treatmentToEdit.carbohydrateDurationMinutes != mealDuration ||
+                treatmentToEdit.plannedMealStateRaw != mealStateRaw {
+                treatmentToEdit.mealKindRaw = mealKindRaw
+                treatmentToEdit.carbohydrateDurationMinutes = mealDuration
+                treatmentToEdit.plannedMealStateRaw = mealStateRaw
+                treatmentChanged = true
+            }
+
             if treatmentChanged {
+                // A legacy local record gets an identity on its first edit. Imported and Watch
+                // records retain their original source identity.
+                if treatmentToEdit.localTreatmentUUID == nil,
+                   treatmentToEdit.id == TreatmentEntry.EmptyId,
+                   !treatmentToEdit.isHealthKitImported, !treatmentToEdit.isWatchLocalOnly {
+                    treatmentToEdit.localTreatmentUUID = UUID().uuidString
+                }
+                if treatmentToEdit.createdAt == nil { treatmentToEdit.createdAt = now }
+                treatmentToEdit.modifiedAt = now
+                markHealthWritePendingIfNeeded(treatmentToEdit)
                 treatmentToEdit.uploaded = false
-                guard coreDataManager.saveChanges() else {
+                let saved = requiresDurableLocalMutation
+                    ? (localSaveOverride?() ?? coreDataManager.saveChangesSynchronously())
+                    : coreDataManager.saveChanges()
+                guard saved, !requiresDurableLocalMutation ||
+                    localSaveJournal.completeMutationVerified(coreDataManager: coreDataManager,
+                        entry: treatmentToEdit) else {
+                    if requiresDurableLocalMutation {
+                        localSaveGateState = localSaveJournal.recoveryState(coreDataManager: coreDataManager)
+                        alertMessage = TreatmentEditorAlertMessage(title: Texts_Common.warning,
+                            message: "Lagringsstatus er usikker. Kontrollér behandlingshistorikken og eventuelt Sundhed. Log ikke samme dosis igen.")
+                    }
                     trace("failed to save an edited treatment", log: log, category: ConstantsLog.categoryApplicationDataTreatments, type: .error)
                     return false
                 }
+                if requiresDurableLocalMutation { localSaveGateState = .ready }
 
                 // A treatment edit is an explicit user-provoked data change. Keep the developer
                 // trace useful while attaching only the controlled type and treatment date to the
@@ -257,10 +365,13 @@ import OSLog
                     selectedType.asString(),
                     selectedDate.description
                 )
-                setNightscoutSyncRequiredToTrue()
+                if mealState != .planned && mealState != .cancelled {
+                    setNightscoutSyncRequiredToTrue()
+                }
             }
+            savedTreatment = treatmentToEdit
         } else {
-            _ = TreatmentEntry(
+            let entry = TreatmentEntry(
                 date: selectedDate,
                 value: storedValue,
                 treatmentType: selectedType,
@@ -269,11 +380,34 @@ import OSLog
                 notes: storedNotesValue,
                 nsManagedObjectContext: coreDataManager.mainManagedObjectContext
             )
+            entry.localTreatmentUUID = requiresDurableLocalInsert
+                ? (selectedType == .Insulin ? localSaveOperation.bolusUUID : localSaveOperation.mealUUID)
+                : UUID().uuidString
+            entry.createdAt = now
+            entry.modifiedAt = now
+            if selectedType == .Carbs {
+                entry.mealKindRaw = selectedMealKind.rawValue
+                entry.carbohydrateDurationMinutes = NSNumber(value: selectedCarbohydrateDurationMinutes)
+                entry.plannedMealStateRaw = mealState?.rawValue
+            }
+            markHealthWritePendingIfNeeded(entry)
 
-            guard coreDataManager.saveChanges() else {
+            let saved = requiresDurableLocalInsert
+                ? (localSaveOverride?() ?? coreDataManager.saveChangesSynchronously())
+                : coreDataManager.saveChanges()
+            guard saved, !requiresDurableLocalInsert || localSaveJournal.completeVerified(
+                coreDataManager: coreDataManager, operation: localSaveOperation,
+                insulinUnits: selectedType == .Insulin ? storedValue : 0,
+                carbohydrateGrams: selectedType == .Carbs ? storedValue : 0) else {
+                if requiresDurableLocalInsert {
+                    localSaveGateState = localSaveJournal.recoveryState(coreDataManager: coreDataManager)
+                    alertMessage = TreatmentEditorAlertMessage(title: Texts_Common.warning,
+                        message: localSaveGateState.message)
+                }
                 trace("failed to save a new treatment", log: log, category: ConstantsLog.categoryApplicationDataTreatments, type: .error)
                 return false
             }
+            if requiresDurableLocalInsert { localSaveGateState = .ready }
 
             trace(
                 "added %{public}@ treatment at %{public}@",
@@ -287,8 +421,20 @@ import OSLog
                 selectedType.asString(),
                 selectedDate.description
             )
-            setNightscoutSyncRequiredToTrue()
+            if mealState != .planned && mealState != .cancelled {
+                setNightscoutSyncRequiredToTrue()
+            }
+            savedTreatment = entry
         }
+
+        if let savedTreatment, let uuid = savedTreatment.localTreatmentUUID {
+            if savedTreatment.isPlannedMeal {
+                PlannedMealReminder.schedule(uuid: uuid, at: savedTreatment.date)
+            } else {
+                PlannedMealReminder.cancel(uuid: uuid)
+            }
+        }
+        requestedExistingMealState = nil
 
         // Only a successful explicit save updates the next draft. Cancel and failed saves must
         // leave these preferences alone, and editing a bolus must never replace the basal defaults.
@@ -300,18 +446,68 @@ import OSLog
         return true
     }
 
+    /// Confirmation is a separate user action. Opening an overdue plan or reaching its time
+    /// never changes it into a meal that was actually eaten.
+    func confirmPlannedMeal() -> Bool {
+        guard isExistingPlannedMeal else { return false }
+        guard selectedDate <= Date() else {
+            alertMessage = TreatmentEditorAlertMessage(
+                title: Texts_Common.warning,
+                message: "Måltidet ligger stadig i fremtiden. Ret tidspunktet til det tidspunkt, hvor du spiste, før du bekræfter."
+            )
+            return false
+        }
+        requestedExistingMealState = .confirmed
+        let saved = saveTreatment()
+        if !saved { requestedExistingMealState = nil }
+        return saved
+    }
+
+    func cancelPlannedMeal() -> Bool {
+        guard isExistingPlannedMeal else { return false }
+        requestedExistingMealState = .cancelled
+        let saved = saveTreatment()
+        if !saved { requestedExistingMealState = nil }
+        return saved
+    }
+
     func deleteTreatment() -> Bool {
         guard let coreDataManager = coreDataManager, let treatmentToEdit = treatmentToEdit(in: coreDataManager) else {
             return false
         }
+        let durableMutation = treatmentToEdit.treatmentType == .Insulin ||
+            treatmentToEdit.treatmentType == .Carbs
+        if durableMutation {
+            guard localSaveJournal.beginMutation(treatmentToEdit) else {
+                localSaveGateState = localSaveJournal.recoveryState(coreDataManager: coreDataManager)
+                alertMessage = TreatmentEditorAlertMessage(title: Texts_Common.warning,
+                    message: localSaveGateState.message.isEmpty ?
+                        "En tidligere ændring kan ikke afstemmes sikkert." : localSaveGateState.message)
+                return false
+            }
+        }
 
         treatmentToEdit.treatmentdeleted = true
         treatmentToEdit.uploaded = false
+        treatmentToEdit.modifiedAt = Date()
 
-        guard coreDataManager.saveChanges() else {
+        let saved = durableMutation
+            ? (localSaveOverride?() ?? coreDataManager.saveChangesSynchronously())
+            : coreDataManager.saveChanges()
+        guard saved, !durableMutation ||
+            localSaveJournal.completeMutationVerified(coreDataManager: coreDataManager,
+                entry: treatmentToEdit) else {
+            if durableMutation {
+                localSaveGateState = localSaveJournal.recoveryState(coreDataManager: coreDataManager)
+                alertMessage = TreatmentEditorAlertMessage(title: Texts_Common.warning,
+                    message: "Sletningen kunne ikke bekræftes. Kontrollér behandlingshistorikken og eventuelt Sundhed før ny registrering.")
+            }
             trace("failed to save a deleted treatment", log: log, category: ConstantsLog.categoryApplicationDataTreatments, type: .error)
             return false
         }
+        if durableMutation { localSaveGateState = .ready }
+
+        if let uuid = treatmentToEdit.localTreatmentUUID { PlannedMealReminder.cancel(uuid: uuid) }
 
         trace(
             "deleted %{public}@ treatment at %{public}@",
@@ -331,6 +527,35 @@ import OSLog
     }
 
     // MARK: - private functions
+
+    /// New bolus and carbohydrate entries receive a durable operation marker before insertion.
+    /// An uncertain parent save must not be retried with another UUID, even after reopening.
+    private var requiresDurableLocalInsert: Bool {
+        isAddMode && (selectedType == .Insulin || selectedType == .Carbs)
+    }
+
+    private var requiresDurableLocalMutation: Bool {
+        !isAddMode && (selectedType == .Insulin || selectedType == .Carbs ||
+                       originalTreatment?.treatmentType == .Insulin ||
+                       originalTreatment?.treatmentType == .Carbs)
+    }
+
+    func acknowledgePreviouslyFoundTreatment() {
+        guard localSaveGateState == .foundPriorEntry ||
+                localSaveGateState == .noLocalEntryHealthUncertain ||
+                localSaveGateState == .uncertainMutationAfterRestart else { return }
+        localSaveGateState = localSaveJournal.complete() ? .ready : .partialOrUnreadable
+    }
+
+    private var wouldChangeHealthSyncedTreatmentType: Bool {
+        guard let originalTreatment, originalTreatment.localTreatmentUUID != nil,
+              originalTreatment.healthKitSyncVersion != nil || originalTreatment.healthKitSyncStateRaw != nil,
+              originalTreatment.treatmentType == .Insulin || originalTreatment.treatmentType == .Carbs else {
+            return false
+        }
+        // A stable Health sync ID cannot safely change between insulin and carbohydrate samples.
+        return selectedType != originalTreatment.treatmentType
+    }
 
     private func normalizedValue() -> Double? {
         guard let value = enteredValue.toDouble(), value.isFinite else { return nil }
@@ -364,6 +589,7 @@ import OSLog
 
     private var currentInputIsValid: Bool {
         guard selectedDate <= latestSelectableDate else { return false }
+        if selectedType == .Carbs, isAddMode, isPlanningNewMeal, selectedDate <= Date() { return false }
 
         if selectedType == .BasalInjection, normalizedInsulinDescription() == nil {
             return false
@@ -407,8 +633,25 @@ import OSLog
             selectedDate: selectedDate,
             storedValue: storedValue,
             enteredBy: normalizedEnteredByValue(),
-            notes: storedNotesValue
+            notes: storedNotesValue,
+            mealKind: selectedType == .Carbs ? selectedMealKind : nil,
+            mealState: selectedType == .Carbs ? selectedMealStateForSave : nil
         )
+    }
+
+    private var selectedMealStateForSave: TreatmentMealState {
+        if let requestedExistingMealState { return requestedExistingMealState }
+        if originalTreatment?.isCancelledMeal == true { return .cancelled }
+        if originalTreatment?.isPlannedMeal == true { return .planned }
+        return isPlanningNewMeal ? .planned : .confirmed
+    }
+
+    private func markHealthWritePendingIfNeeded(_ entry: TreatmentEntry) {
+        guard entry.localTreatmentUUID != nil,
+              entry.treatmentType == .Insulin || entry.isConfirmedMeal else { return }
+        let nextVersion = max(1, (entry.healthKitSyncVersion?.intValue ?? 0) + 1)
+        entry.healthKitSyncVersion = NSNumber(value: nextVersion)
+        entry.healthKitSyncStateRaw = HealthLocalTherapySyncState.pending(version: nextVersion)
     }
 
     private func treatmentToEdit(in coreDataManager: CoreDataManager) -> TreatmentEntry? {
@@ -439,10 +682,855 @@ private struct TreatmentEditorInitialState: Equatable {
     let storedValue: Double
     let enteredBy: String?
     let notes: String?
+    let mealKind: TreatmentMealKind?
+    let mealState: TreatmentMealState?
 }
 
 struct TreatmentEditorAlertMessage: Identifiable {
     let id = UUID()
     let title: String
     let message: String
+}
+
+/// The notification is a prompt to confirm, never evidence that a planned meal was eaten.
+/// Identifiers remain separate from glucose alerts so alarm refreshes cannot cancel them.
+enum PlannedMealReminder {
+    static let identifierPrefix = "xdrip.plannedMeal."
+    static let openRequested = Notification.Name("xdrip.plannedMeal.openRequested")
+    static let uuidUserInfoKey = "plannedMealUUID"
+    private static let pendingOpenKey = "plannedMealPendingOpenUUID"
+
+    static func identifier(for uuid: String) -> String { identifierPrefix + uuid }
+
+    static func request(uuid: String, at date: Date, now: Date = Date()) -> UNNotificationRequest? {
+        let interval = date.timeIntervalSince(now)
+        guard !uuid.isEmpty, interval > 0, interval <= TreatmentEditorViewModel.maximumFutureTreatmentInterval else {
+            return nil
+        }
+        let content = UNMutableNotificationContent()
+        content.title = "Planlagt måltid"
+        content.body = "Har du spist? Åbn xDrip og bekræft, ret eller annullér kulhydraterne."
+        content.sound = .default
+        content.userInfo = [uuidUserInfoKey: uuid]
+        return UNNotificationRequest(
+            identifier: identifier(for: uuid), content: content,
+            trigger: UNTimeIntervalNotificationTrigger(timeInterval: interval, repeats: false)
+        )
+    }
+
+    static func schedule(uuid: String, at date: Date) {
+        guard let reminder = request(uuid: uuid, at: date) else {
+            cancel(uuid: uuid)
+            return
+        }
+        // The stable identifier replaces an earlier pending reminder after a plan edit.
+        UNUserNotificationCenter.current().add(reminder) { _ in
+            // A notification error never changes the persisted planned/confirmed state.
+        }
+    }
+
+    static func cancel(uuid: String) {
+        let identifier = identifier(for: uuid)
+        UNUserNotificationCenter.current().removePendingNotificationRequests(withIdentifiers: [identifier])
+        UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [identifier])
+    }
+
+    static func tappedUUID(from request: UNNotificationRequest) -> String? {
+        guard request.identifier.hasPrefix(identifierPrefix),
+              let uuid = request.content.userInfo[uuidUserInfoKey] as? String,
+              request.identifier == identifier(for: uuid) else { return nil }
+        return uuid
+    }
+
+    static func recordTap(uuid: String) {
+        UserDefaults.standard.set(uuid, forKey: pendingOpenKey)
+        NotificationCenter.default.post(name: openRequested, object: nil)
+    }
+
+    static var pendingOpenUUID: String? { UserDefaults.standard.string(forKey: pendingOpenKey) }
+
+    static func clearPendingOpenUUID(_ uuid: String) {
+        guard pendingOpenUUID == uuid else { return }
+        UserDefaults.standard.removeObject(forKey: pendingOpenKey)
+    }
+}
+
+/// A pizza notification opens a new calculation. It never carries a promised remaining dose.
+enum PizzaSplitReminder {
+    static let identifierPrefix = "xdrip.pizzaSplit."
+    static let uuidUserInfoKey = "pizzaMealUUID"
+    static let openRequested = Notification.Name("xdrip.pizzaSplit.openRequested")
+    private static let pendingOpenKey = "pizzaSplitPendingOpenUUID"
+
+    static func identifier(for uuid: String) -> String { identifierPrefix + uuid }
+
+    static func request(uuid: String, after minutes: Int, now: Date = Date()) -> UNNotificationRequest? {
+        guard !uuid.isEmpty, (15...240).contains(minutes) else { return nil }
+        let content = UNMutableNotificationContent()
+        content.title = "Tid til ny vurdering"
+        content.body = "Åbn xDrip og beregn igen med aktuelle målinger. Tidligere forslag gælder ikke."
+        content.sound = .default
+        content.userInfo = [uuidUserInfoKey: uuid]
+        return UNNotificationRequest(
+            identifier: identifier(for: uuid),
+            content: content,
+            trigger: UNTimeIntervalNotificationTrigger(timeInterval: TimeInterval(minutes * 60), repeats: false)
+        )
+    }
+
+    static func schedule(uuid: String, after minutes: Int) {
+        guard let reminder = request(uuid: uuid, after: minutes) else { return }
+        UNUserNotificationCenter.current().add(reminder) { _ in
+            // The treatment is already durable; a notification failure must not alter it.
+        }
+    }
+
+    static func cancel(uuid: String) {
+        let id = identifier(for: uuid)
+        UNUserNotificationCenter.current().removePendingNotificationRequests(withIdentifiers: [id])
+        UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [id])
+    }
+
+    static func tappedUUID(from request: UNNotificationRequest) -> String? {
+        guard request.identifier.hasPrefix(identifierPrefix),
+              let uuid = request.content.userInfo[uuidUserInfoKey] as? String,
+              request.identifier == identifier(for: uuid) else { return nil }
+        return uuid
+    }
+
+    static func recordTap(uuid: String) {
+        UserDefaults.standard.set(uuid, forKey: pendingOpenKey)
+        NotificationCenter.default.post(name: openRequested, object: nil)
+    }
+
+    static var pendingOpenUUID: String? { UserDefaults.standard.string(forKey: pendingOpenKey) }
+
+    static func clearPendingOpenUUID(_ uuid: String) {
+        guard pendingOpenUUID == uuid else { return }
+        UserDefaults.standard.removeObject(forKey: pendingOpenKey)
+    }
+}
+
+/// This is a calculator input only; it is never a CGM reading, treatment or alarm input.
+struct ManualDoseGlucoseRecord: Codable, Equatable {
+    let valueMgdl: Double
+    let measuredAt: Date
+    let recordedAt: Date
+    let source: String
+
+    init?(valueMgdl: Double, measuredAt: Date, recordedAt: Date = Date()) {
+        guard valueMgdl.isFinite, (20...600).contains(valueMgdl),
+              measuredAt <= recordedAt, recordedAt.timeIntervalSince(measuredAt) <= 24 * 60 * 60 else {
+            return nil
+        }
+        self.valueMgdl = valueMgdl
+        self.measuredAt = measuredAt
+        self.recordedAt = recordedAt
+        self.source = "manual"
+    }
+}
+
+/// Serializes the one explicitly entered value in protected, normally backed-up Application Support.
+/// Loading it never selects it for a later calculator session.
+actor ManualDoseGlucoseStore {
+    static let shared = ManualDoseGlucoseStore()
+    private let fileManager: FileManager
+    private let fileURL: URL
+
+    init(directory: URL? = nil, fileManager: FileManager = .default) {
+        self.fileManager = fileManager
+        let root = directory ?? fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        self.fileURL = root.appendingPathComponent("PenDose", isDirectory: true)
+            .appendingPathComponent("manual-glucose.json")
+    }
+
+    func load() -> ManualDoseGlucoseRecord? {
+        guard let data = try? Data(contentsOf: fileURL),
+              let record = try? JSONDecoder().decode(ManualDoseGlucoseRecord.self, from: data),
+              record.source == "manual",
+              record.valueMgdl.isFinite, (20...600).contains(record.valueMgdl) else { return nil }
+        return record
+    }
+
+    @discardableResult
+    func save(valueMgdl: Double, measuredAt: Date, now: Date = Date()) throws -> ManualDoseGlucoseRecord {
+        guard let record = ManualDoseGlucoseRecord(valueMgdl: valueMgdl, measuredAt: measuredAt, recordedAt: now) else {
+            throw ManualDoseGlucoseStoreError.invalidValue
+        }
+        let folder = fileURL.deletingLastPathComponent()
+        try fileManager.createDirectory(at: folder, withIntermediateDirectories: true)
+        try fileManager.setAttributes([.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
+                                      ofItemAtPath: folder.path)
+        let data = try JSONEncoder().encode(record)
+        try data.write(to: fileURL, options: .atomic)
+        try fileManager.setAttributes([.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
+                                      ofItemAtPath: fileURL.path)
+        return record
+    }
+}
+
+enum ManualDoseGlucoseStoreError: Error {
+    case invalidValue
+}
+
+enum PenDoseGlucoseChoice: String, CaseIterable {
+    case currentCGM
+    case confirmStaleCGM
+    case manual
+}
+
+/// UI state for a read-only pen suggestion. A draft edit invalidates the displayed suggestion.
+@MainActor final class PenDoseCalculatorViewModel: ObservableObject {
+    @Published var carbohydratesText = "0"
+    @Published var mealKind: TreatmentMealKind = .normal
+    @Published var isPlannedMeal = false
+    @Published var plannedDate = Date().addingTimeInterval(15 * 60)
+    @Published var glucoseChoice: PenDoseGlucoseChoice = .currentCGM
+    @Published var manualGlucoseText = ""
+    @Published var manualGlucoseDate = Date()
+    @Published var insulinToLogText = ""
+    @Published private(set) var calculation: PenDoseCalculation?
+    @Published private(set) var latestGlucoseDate: Date?
+    @Published private(set) var isWorking = false
+    @Published private(set) var storageGateState: PenDoseLogJournal.RecoveryState = .ready
+    @Published var statusMessage: String?
+
+    let reminderMealUUID: String?
+    private let coreDataManager: CoreDataManager
+    private let glucoseStore: ManualDoseGlucoseStore
+    private let logJournal: PenDoseLogJournal
+    private var calculatedDraftSignature: String?
+    private var snapshotAtCalculation: PenDoseInputSnapshot?
+    private var calculatedAt: Date?
+    private var logOperation: PenDoseLogOperation?
+    private var selectedManualRecord: ManualDoseGlucoseRecord?
+
+    init(coreDataManager: CoreDataManager, reminderMealUUID: String? = nil,
+         glucoseStore: ManualDoseGlucoseStore = .shared,
+         logJournal: PenDoseLogJournal? = nil) {
+        let logJournal = logJournal ?? .shared
+        self.coreDataManager = coreDataManager
+        self.reminderMealUUID = reminderMealUUID
+        self.glucoseStore = glucoseStore
+        self.logJournal = logJournal
+        self.storageGateState = logJournal.recoveryState(coreDataManager: coreDataManager)
+        if storageGateState != .ready { statusMessage = storageGateState.message }
+    }
+
+    var profile: PenDoseProfile { PenDoseProfile.load() }
+    var glucoseUnitIsMgdl: Bool { UserDefaults.standard.bloodGlucoseUnitIsMgDl }
+    var isReviewCurrent: Bool {
+        calculation?.unavailableReason == nil && calculation != nil &&
+            calculatedDraftSignature == draftSignature
+    }
+    var suggestedUnits: Double? {
+        guard isReviewCurrent, let calculation, let suggestion = calculation.suggestedUnits else { return nil }
+        let pizza = PizzaSplitSettings.load()
+        guard pizza.isEnabled, mealKind == .slow, !isPlannedMeal,
+              reminderMealUUID == nil, (parsedCarbs ?? 0) > 0 else { return suggestion }
+        let step = profile.settings.penStepUnits
+        return floor((suggestion * Double(pizza.percentageNow) / 100) / step + 1e-10) * step
+    }
+    var canLog: Bool {
+        guard storageGateState == .ready,
+              logJournal.recoveryState(coreDataManager: coreDataManager) == .ready,
+              isReviewCurrent, let calculation,
+              calculation.unavailableReason == nil,
+              let units = parsedUnits, units >= 0, units <= profile.settings.maximumSuggestionUnits,
+              unitsAreOnPenStep(units) else { return false }
+        switch calculation.safety {
+        case .blockedCurrentLow, .blockedForecastLow: if units > 0 { return false }
+        default: break
+        }
+        guard let carbs = parsedCarbs else { return false }
+        if isPlannedMeal {
+            guard carbs > 0, reminderMealUUID == nil,
+                  plannedDate > Date(), plannedDate <= Date().addingTimeInterval(60 * 60) else { return false }
+        }
+        return units > 0 || (carbs > 0 && reminderMealUUID == nil)
+    }
+
+    func calculate() async {
+        guard !isWorking else { return }
+        storageGateState = logJournal.recoveryState(coreDataManager: coreDataManager)
+        guard storageGateState == .ready else {
+            clearCalculation(storageGateState.message)
+            return
+        }
+        isWorking = true
+        defer { isWorking = false }
+        statusMessage = nil
+        let signature = draftSignature
+        let now = Date()
+        guard profile.isConfirmed else {
+            clearCalculation("Bekræft først doseringsprofilen i indstillingerne.")
+            return
+        }
+        guard let newCarbs = newCarbsInput() else {
+            clearCalculation("Indtast en gyldig mængde kulhydrat.")
+            return
+        }
+        let inputResult = await TherapyMetricsManager.shared.penDoseSnapshot(at: now)
+        guard signature == draftSignature else { return }
+        guard case .success(let snapshot) = inputResult else {
+            if case .failure(let reason) = inputResult {
+                clearCalculation(Self.unavailableText(reason))
+            }
+            return
+        }
+        latestGlucoseDate = snapshot.glucose.last?.date
+        guard let glucose = await glucoseInput(snapshot: snapshot, now: now) else {
+            clearCalculation("Indtast og vælg en gyldig blodsukkerværdi.")
+            return
+        }
+        guard signature == draftSignature else { return }
+        let safety = glucoseChoice == .currentCGM
+            ? PenBolusCalculator.safetyForecast(snapshot: snapshot, at: now) : nil
+        let result = PenBolusCalculator.calculate(snapshot: snapshot, profile: profile,
+            glucose: glucose, newCarbs: newCarbs, safetyForecast: safety, at: now)
+        calculation = result
+        snapshotAtCalculation = snapshot
+        calculatedAt = now
+        calculatedDraftSignature = signature
+        if let reason = result.unavailableReason {
+            statusMessage = Self.unavailableText(reason)
+            insulinToLogText = ""
+        } else if result.suggestedUnits == nil {
+            statusMessage = "Sikkerhedstjekket blokerer insulin. Du kan stadig registrere kulhydrater uden insulin."
+            insulinToLogText = "0"
+        } else {
+            insulinToLogText = (suggestedUnits ?? 0).stringWithoutTrailingZeroes
+        }
+    }
+
+    /// Re-read every input before a user-confirmed log. If the calculation changed, require
+    /// another review instead of persisting the previously displayed amount.
+    func logReviewedTreatment() async -> Bool {
+        guard canLog, !isWorking, let previous = calculation,
+              let original = snapshotAtCalculation, let calculatedAt,
+              let units = parsedUnits, let carbs = parsedCarbs,
+              let newCarbs = newCarbsInput() else { return false }
+        isWorking = true
+        defer { isWorking = false }
+        let now = Date()
+        let input = await TherapyMetricsManager.shared.penDoseSnapshot(at: now)
+        guard case .success(let fresh) = input,
+              let glucose = await glucoseInput(snapshot: fresh, now: now) else {
+            clearCalculation("Grundlaget er ændret eller ufuldstændigt. Beregn igen.")
+            return false
+        }
+        let safety = glucoseChoice == .currentCGM
+            ? PenBolusCalculator.safetyForecast(snapshot: fresh, at: now) : nil
+        let current = PenBolusCalculator.calculate(snapshot: fresh, profile: profile,
+            glucose: glucose, newCarbs: newCarbs, safetyForecast: safety, at: now)
+        guard Self.reviewInputsMatch(original, fresh),
+              previous.suggestedUnits == current.suggestedUnits,
+              Self.safetyIdentity(previous.safety) == Self.safetyIdentity(current.safety),
+              now.timeIntervalSince(calculatedAt) <= 120,
+              calculatedDraftSignature == draftSignature else {
+            calculation = current
+            snapshotAtCalculation = fresh
+            self.calculatedAt = now
+            calculatedDraftSignature = draftSignature
+            insulinToLogText = current.suggestedUnits.map { $0.stringWithoutTrailingZeroes } ?? "0"
+            statusMessage = "Nye data er kommet til. Gennemgå beregningen og tryk Log igen."
+            return false
+        }
+        let operation = logOperation ?? PenDoseLogOperation()
+        logOperation = operation
+        let result = PenDoseTreatmentLogger.log(coreDataManager: coreDataManager,
+            insulinUnits: units, carbohydrateGrams: reminderMealUUID == nil ? carbs : 0,
+            mealKind: mealKind, plannedDate: isPlannedMeal ? plannedDate : nil,
+            operation: operation, now: now, journal: logJournal)
+        switch result {
+        case .success(let receipt):
+            if let mealUUID = receipt.confirmedMealUUID, mealKind == .slow,
+               PizzaSplitSettings.load().isEnabled, reminderMealUUID == nil {
+                PizzaSplitReminder.schedule(uuid: mealUUID, after: PizzaSplitSettings.load().reminderMinutes)
+            }
+            calculation = nil
+            calculatedDraftSignature = nil
+            statusMessage = "Behandlingen er registreret."
+            return true
+        case .failure:
+            storageGateState = .awaitingRestart
+            clearCalculation("Lagring kunne ikke bekræftes. Kontrollér behandlingshistorikken. Denne beregner kan ikke logge igen, før du åbner den på ny.")
+            return false
+        }
+    }
+
+    func acknowledgePreviouslyFoundTreatment() {
+        guard storageGateState == .foundPriorEntry ||
+                storageGateState == .noLocalEntryHealthUncertain ||
+                storageGateState == .uncertainMutationAfterRestart else { return }
+        guard logJournal.complete() else { return }
+        storageGateState = .ready
+        statusMessage = "Den tidligere registrering blev fundet. Kontrollér historikken før en ny behandling."
+    }
+
+    private var parsedCarbs: Double? {
+        guard reminderMealUUID == nil else { return 0 }
+        let text = carbohydratesText.trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: ",", with: ".")
+        guard let value = Double(text), value.isFinite, (0...500).contains(value) else { return nil }
+        return value
+    }
+    private var parsedUnits: Double? {
+        let text = insulinToLogText.trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: ",", with: ".")
+        guard let value = Double(text), value.isFinite else { return nil }
+        return value
+    }
+    private func unitsAreOnPenStep(_ units: Double) -> Bool {
+        let step = profile.settings.penStepUnits
+        return step > 0 && abs(units / step - (units / step).rounded()) < 0.0001
+    }
+    private func newCarbsInput() -> PenDoseNewCarbs? {
+        guard let grams = parsedCarbs else { return nil }
+        return reminderMealUUID == nil
+            ? .unrecorded(grams: isPlannedMeal ? 0 : grams) : .alreadyRecorded
+    }
+    private var draftSignature: String {
+        let profile = PenDoseProfile.load()
+        let pizza = PizzaSplitSettings.load()
+        let forecastInputSignature = GlucoseForecastDataAdapter.presentationInputSignature(
+            horizonMinutes: 120)
+        return [carbohydratesText, mealKind.rawValue, String(isPlannedMeal),
+         String(plannedDate.timeIntervalSince1970), glucoseChoice.rawValue,
+         manualGlucoseText, String(manualGlucoseDate.timeIntervalSince1970),
+         reminderMealUUID ?? "", String(describing: profile.settings),
+         String(profile.isConfirmed), String(pizza.isEnabled),
+         String(pizza.percentageNow), String(pizza.reminderMinutes),
+         String(describing: UserDefaults.standard.dataFlowPolicy),
+         forecastInputSignature].joined(separator: "|")
+    }
+    private func glucoseInput(snapshot: PenDoseInputSnapshot, now: Date) async -> PenDoseGlucoseInput? {
+        switch glucoseChoice {
+        case .currentCGM: return .currentCGM
+        case .confirmStaleCGM:
+            guard let latest = snapshot.glucose.last else { return nil }
+            return .confirmedStale(valueMgdl: latest.glucoseMgdl, measuredAt: latest.date)
+        case .manual:
+            let text = manualGlucoseText.trimmingCharacters(in: .whitespacesAndNewlines)
+                .replacingOccurrences(of: ",", with: ".")
+            guard let input = Double(text), input.isFinite else { return nil }
+            let mgdl = glucoseUnitIsMgdl ? input : input * PenBolusCalculator.mgdlPerMmol
+            if let existing = selectedManualRecord,
+               existing.valueMgdl == mgdl, existing.measuredAt == manualGlucoseDate {
+                return .manual(valueMgdl: existing.valueMgdl, measuredAt: existing.measuredAt)
+            }
+            guard let record = try? await glucoseStore.save(valueMgdl: mgdl,
+                measuredAt: manualGlucoseDate, now: now) else { return nil }
+            selectedManualRecord = record
+            return .manual(valueMgdl: record.valueMgdl, measuredAt: record.measuredAt)
+        }
+    }
+    private func clearCalculation(_ message: String) {
+        calculation = nil
+        snapshotAtCalculation = nil
+        calculatedDraftSignature = nil
+        latestGlucoseDate = nil
+        insulinToLogText = ""
+        statusMessage = message
+    }
+    private static func safetyIdentity(_ state: PenDoseSafetyState?) -> String {
+        switch state {
+        case .checked: return "checked"
+        case .eatFirst: return "eatFirst"
+        case .blockedCurrentLow: return "blockedCurrentLow"
+        case .blockedForecastLow: return "blockedForecastLow"
+        case .forecastUnchecked: return "forecastUnchecked"
+        case .eatFirstForecastUnchecked: return "eatFirstForecastUnchecked"
+        case nil: return "missing"
+        }
+    }
+    static func reviewInputsMatch(_ old: PenDoseInputSnapshot,
+                                  _ fresh: PenDoseInputSnapshot) -> Bool {
+        guard old.treatmentRevision == fresh.treatmentRevision,
+              old.glucose == fresh.glucose,
+              old.therapySettings == fresh.therapySettings,
+              old.iobUnits == fresh.iobUnits,
+              old.cobGrams == fresh.cobGrams,
+              old.treatments.count == fresh.treatments.count else { return false }
+        return zip(old.treatments, fresh.treatments).allSatisfy { left, right in
+            left.date == right.date && left.amount == right.amount &&
+                left.isIOB == right.isIOB &&
+                left.carbohydrateDurationMinutes == right.carbohydrateDurationMinutes &&
+                left.knownAt == right.knownAt &&
+                left.createdAt == right.createdAt &&
+                left.modifiedAt == right.modifiedAt &&
+                left.isAppLocal == right.isAppLocal &&
+                left.isDeletedCurrentRevision == right.isDeletedCurrentRevision
+        }
+    }
+    static func unavailableText(_ reason: PenDoseUnavailableReason) -> String {
+        switch reason {
+        case .unconfirmedProfile: return "Bekræft først doseringsprofilen."
+        case .invalidProfile: return "Doseringsprofilen indeholder ugyldige tal."
+        case .incompleteTherapySources:
+            return "Kan ikke beregne: gennemfør først skiftet til lokal behandlingslogning, så både insulin og kulhydrater har én sikker kilde."
+        case .uncommittedTreatments, .treatmentReadFailed,
+             .treatmentChangedDuringRead, .invalidTreatment:
+            return "Kan ikke beregne: insulin- eller kulhydratgrundlaget er ufuldstændigt."
+        case .invalidGlucose, .missingGlucose: return "Kan ikke beregne: ingen gyldig blodsukkerværdi."
+        case .glucoseNeedsConfirmation: return "Målingen er over 15 minutter gammel. Bekræft den eller indtast en manuel værdi."
+        case .missingTwentyMinuteTrend: return "Kan ikke beregne: der mangler sammenhængende 20-minutters glukosehistorik."
+        case .invalidCarbohydrates: return "Indtast en gyldig kulhydratmængde."
+        case .invalidCalculation: return "Kan ikke beregne med de aktuelle oplysninger."
+        }
+    }
+}
+
+struct PenDoseLogReceipt {
+    let confirmedMealUUID: String?
+}
+
+enum PenDoseLogError: Error { case invalidInput, storageFailed }
+
+/// Stable IDs for one reviewed Log action, retained across an uncertain save result.
+struct PenDoseLogOperation: Codable, Equatable {
+    let bolusUUID: String
+    let mealUUID: String
+    init(bolusUUID: String = UUID().uuidString, mealUUID: String = UUID().uuidString) {
+        self.bolusUUID = bolusUUID
+        self.mealUUID = mealUUID
+    }
+}
+
+/// A protected write-ahead gate. A failed parent save may leave child objects in memory;
+/// reopening the calculator in the same process must never create a second dose.
+@MainActor final class PenDoseLogJournal {
+    private struct PersistedTreatment {
+        let localTreatmentUUID: String?
+        let treatmentType: TreatmentType
+        let treatmentdeleted: Bool
+        let value: Double
+    }
+    enum RecoveryState: Equatable {
+        case ready
+        case awaitingRestart
+        case foundPriorEntry
+        case noLocalEntryHealthUncertain
+        case partialOrUnreadable
+        case uncertainMutationAfterRestart
+
+        var message: String {
+            switch self {
+            case .ready: return ""
+            case .awaitingRestart:
+                return "En tidligere lagring er usikker. Luk og genåbn appen, og kontrollér behandlingshistorikken før ny logning."
+            case .foundPriorEntry:
+                return "En tidligere registrering blev fundet. Kontrollér den i behandlingshistorikken før ny logning."
+            case .noLocalEntryHealthUncertain:
+                return "Ingen lokal registrering blev fundet, men Sundhed kan have modtaget en kopi. Kontrollér både xDrip og Sundhed før ny logning."
+            case .partialOrUnreadable:
+                return "Tidligere lagring kan ikke afstemmes sikkert. Log ikke samme dosis igen; kontrollér behandlingshistorikken."
+            case .uncertainMutationAfterRestart:
+                return "En ændring af insulin eller kulhydrater kunne ikke bekræftes. Kontrollér behandlingshistorikken og eventuelt Sundhed før ny registrering."
+            }
+        }
+    }
+    private struct Pending: Codable {
+        let operation: PenDoseLogOperation
+        let expectsBolus: Bool
+        let expectsMeal: Bool
+        let processToken: String
+    }
+    private struct PendingMutation: Codable {
+        let objectURI: String
+        let processToken: String
+    }
+    private struct MutationSnapshot: Equatable {
+        let date: Date
+        let value: Double
+        let type: TreatmentType
+        let deleted: Bool
+        let localUUID: String?
+        let createdAt: Date?
+        let modifiedAt: Date?
+        let mealKind: String?
+        let mealDuration: Double?
+        let mealState: String?
+        let healthSyncVersion: Int?
+        let note: String?
+        let enteredBy: String?
+        let nightscoutEventType: String?
+
+        init(_ entry: TreatmentEntry) {
+            date = entry.date
+            value = entry.value
+            type = entry.treatmentType
+            deleted = entry.treatmentdeleted
+            localUUID = entry.localTreatmentUUID
+            createdAt = entry.createdAt
+            modifiedAt = entry.modifiedAt
+            mealKind = entry.mealKindRaw
+            mealDuration = entry.carbohydrateDurationMinutes?.doubleValue
+            mealState = entry.plannedMealStateRaw
+            healthSyncVersion = entry.healthKitSyncVersion?.intValue
+            note = entry.notes
+            enteredBy = entry.enteredBy
+            nightscoutEventType = entry.nightscoutEventType
+        }
+    }
+    static let shared = PenDoseLogJournal()
+    private static let currentProcessToken = UUID().uuidString
+    private let fileManager: FileManager
+    private let fileURL: URL
+    private let mutationFileURL: URL
+    private let processToken: String
+
+    init(directory: URL? = nil, fileManager: FileManager = .default,
+         processToken: String? = nil) {
+        self.fileManager = fileManager
+        self.processToken = processToken ?? Self.currentProcessToken
+        let root = directory ?? fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        self.fileURL = root.appendingPathComponent("PenDose", isDirectory: true)
+            .appendingPathComponent("pending-log.json")
+        self.mutationFileURL = root.appendingPathComponent("PenDose", isDirectory: true)
+            .appendingPathComponent("pending-mutation.json")
+    }
+
+    func begin(_ operation: PenDoseLogOperation, expectsBolus: Bool, expectsMeal: Bool) -> Bool {
+        guard !fileManager.fileExists(atPath: mutationFileURL.path) else { return false }
+        if fileManager.fileExists(atPath: fileURL.path) {
+            guard let pending = try? readPending() else { return false }
+            return pending.operation == operation && pending.expectsBolus == expectsBolus &&
+                pending.expectsMeal == expectsMeal &&
+                pending.processToken == processToken
+        }
+        let pending = Pending(operation: operation, expectsBolus: expectsBolus,
+                              expectsMeal: expectsMeal, processToken: processToken)
+        do {
+            let folder = fileURL.deletingLastPathComponent()
+            try fileManager.createDirectory(at: folder, withIntermediateDirectories: true)
+            try fileManager.setAttributes(
+                [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
+                ofItemAtPath: folder.path)
+            try JSONEncoder().encode(pending).write(to: fileURL, options: .atomic)
+            try fileManager.setAttributes(
+                [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
+                ofItemAtPath: fileURL.path)
+            let handle = try FileHandle(forWritingTo: fileURL)
+            handle.synchronizeFile()
+            try handle.close()
+            return true
+        } catch {
+            try? fileManager.removeItem(at: fileURL)
+            return false
+        }
+    }
+
+    /// Write before changing an existing dose. A failed parent save can otherwise be committed
+    /// by an unrelated later save after the editor has reported failure.
+    func beginMutation(_ entry: TreatmentEntry) -> Bool {
+        if entry.objectID.isTemporaryID {
+            guard let context = entry.managedObjectContext else { return false }
+            do { try context.obtainPermanentIDs(for: [entry]) }
+            catch { return false }
+        }
+        guard !entry.objectID.isTemporaryID,
+              !fileManager.fileExists(atPath: fileURL.path),
+              !fileManager.fileExists(atPath: mutationFileURL.path) else { return false }
+        let pending = PendingMutation(objectURI: entry.objectID.uriRepresentation().absoluteString,
+                                      processToken: processToken)
+        do {
+            let folder = mutationFileURL.deletingLastPathComponent()
+            try fileManager.createDirectory(at: folder, withIntermediateDirectories: true)
+            try fileManager.setAttributes(
+                [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
+                ofItemAtPath: folder.path)
+            try JSONEncoder().encode(pending).write(to: mutationFileURL, options: .atomic)
+            try fileManager.setAttributes(
+                [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
+                ofItemAtPath: mutationFileURL.path)
+            let handle = try FileHandle(forWritingTo: mutationFileURL)
+            handle.synchronizeFile()
+            try handle.close()
+            return true
+        } catch {
+            try? fileManager.removeItem(at: mutationFileURL)
+            return false
+        }
+    }
+
+    /// Check the persistent store in a fresh context; a child-context save alone is not proof.
+    func completeMutationVerified(coreDataManager: CoreDataManager,
+                                  entry: TreatmentEntry) -> Bool {
+        guard let pending = try? JSONDecoder().decode(PendingMutation.self,
+                from: Data(contentsOf: mutationFileURL)),
+              pending.processToken == processToken,
+              pending.objectURI == entry.objectID.uriRepresentation().absoluteString,
+              let coordinator = coreDataManager.privateManagedObjectContext.persistentStoreCoordinator,
+              let url = URL(string: pending.objectURI),
+              let objectID = coordinator.managedObjectID(forURIRepresentation: url) else { return false }
+        let context = NSManagedObjectContext(concurrencyType: .privateQueueConcurrencyType)
+        context.persistentStoreCoordinator = coordinator
+        var persisted: MutationSnapshot?
+        context.performAndWait {
+            if let stored = try? context.existingObject(with: objectID) as? TreatmentEntry {
+                persisted = MutationSnapshot(stored)
+            }
+        }
+        guard persisted == MutationSnapshot(entry) else { return false }
+        do { try fileManager.removeItem(at: mutationFileURL); return true }
+        catch { return false }
+    }
+
+    @discardableResult
+    func complete() -> Bool {
+        for url in [fileURL, mutationFileURL] where fileManager.fileExists(atPath: url.path) {
+            do { try fileManager.removeItem(at: url) }
+            catch { return false }
+        }
+        return true
+    }
+
+    func recoveryState(coreDataManager: CoreDataManager) -> RecoveryState {
+        if fileManager.fileExists(atPath: mutationFileURL.path) {
+            guard let pending = try? JSONDecoder().decode(PendingMutation.self,
+                    from: Data(contentsOf: mutationFileURL)) else { return .partialOrUnreadable }
+            return pending.processToken == processToken ? .awaitingRestart : .uncertainMutationAfterRestart
+        }
+        guard fileManager.fileExists(atPath: fileURL.path) else { return .ready }
+        guard let pending = try? readPending() else { return .partialOrUnreadable }
+        if pending.processToken == processToken { return .awaitingRestart }
+        let found = persistedEntries(coreDataManager: coreDataManager, operation: pending.operation)
+        guard let found else { return .partialOrUnreadable }
+        let bolusCount = found.filter {
+            $0.localTreatmentUUID == pending.operation.bolusUUID &&
+                $0.treatmentType == .Insulin && !$0.treatmentdeleted
+        }.count
+        let mealCount = found.filter {
+            $0.localTreatmentUUID == pending.operation.mealUUID &&
+                $0.treatmentType == .Carbs && !$0.treatmentdeleted
+        }.count
+        let count = bolusCount + mealCount
+        let expected = (pending.expectsBolus ? 1 : 0) + (pending.expectsMeal ? 1 : 0)
+        if count == 0 {
+            // A Health write may have seen a child-context save before the parent failed.
+            // A missing local row is not proof that no Health sample was delivered.
+            return .noLocalEntryHealthUncertain
+        }
+        return found.count == expected && count == expected &&
+            bolusCount == (pending.expectsBolus ? 1 : 0) &&
+            mealCount == (pending.expectsMeal ? 1 : 0) ? .foundPriorEntry : .partialOrUnreadable
+    }
+
+    /// A successful context save is not enough: inspect the persistent store in a fresh
+    /// context before removing the write-ahead marker or reporting a completed treatment.
+    func completeVerified(coreDataManager: CoreDataManager, operation: PenDoseLogOperation,
+                          insulinUnits: Double, carbohydrateGrams: Double) -> Bool {
+        guard let found = persistedEntries(coreDataManager: coreDataManager, operation: operation) else {
+            return false
+        }
+        let bolus = found.filter { $0.localTreatmentUUID == operation.bolusUUID }
+        let meal = found.filter { $0.localTreatmentUUID == operation.mealUUID }
+        guard bolus.count == (insulinUnits > 0 ? 1 : 0),
+              meal.count == (carbohydrateGrams > 0 ? 1 : 0),
+              found.count == bolus.count + meal.count,
+              bolus.allSatisfy({ $0.treatmentType == .Insulin && !$0.treatmentdeleted && $0.value == insulinUnits }),
+              meal.allSatisfy({ $0.treatmentType == .Carbs && !$0.treatmentdeleted && $0.value == carbohydrateGrams }) else {
+            return false
+        }
+        return complete()
+    }
+
+    private func persistedEntries(coreDataManager: CoreDataManager,
+                                  operation: PenDoseLogOperation) -> [PersistedTreatment]? {
+        guard let coordinator = coreDataManager.privateManagedObjectContext.persistentStoreCoordinator else {
+            return nil
+        }
+        let context = NSManagedObjectContext(concurrencyType: .privateQueueConcurrencyType)
+        context.persistentStoreCoordinator = coordinator
+        var found: [PersistedTreatment]?
+        context.performAndWait {
+            let request: NSFetchRequest<TreatmentEntry> = TreatmentEntry.fetchRequest()
+            request.predicate = NSPredicate(format: "localTreatmentUUID IN %@",
+                [operation.bolusUUID, operation.mealUUID])
+            found = try? context.fetch(request).map {
+                PersistedTreatment(localTreatmentUUID: $0.localTreatmentUUID,
+                    treatmentType: $0.treatmentType, treatmentdeleted: $0.treatmentdeleted,
+                    value: $0.value)
+            }
+        }
+        return found
+    }
+
+    private func readPending() throws -> Pending {
+        try JSONDecoder().decode(Pending.self, from: Data(contentsOf: fileURL))
+    }
+}
+
+/// Writes only the locally reviewed entries. The existing treatment pipeline observes the
+/// durable Core Data save; this code does not initiate any upload or direct HealthKit call.
+@MainActor enum PenDoseTreatmentLogger {
+    static func log(coreDataManager: CoreDataManager, insulinUnits: Double,
+                    carbohydrateGrams: Double, mealKind: TreatmentMealKind,
+                    plannedDate: Date?, operation: PenDoseLogOperation = .init(),
+                    now: Date = .now, journal: PenDoseLogJournal? = nil,
+                    saveOverride: (() -> Bool)? = nil)
+        -> Result<PenDoseLogReceipt, PenDoseLogError> {
+        let journal = journal ?? .shared
+        guard insulinUnits.isFinite, carbohydrateGrams.isFinite,
+              (0...25).contains(insulinUnits), (0...500).contains(carbohydrateGrams),
+              insulinUnits > 0 || carbohydrateGrams > 0 else { return .failure(.invalidInput) }
+        if let plannedDate {
+            guard carbohydrateGrams > 0, plannedDate > now,
+                  plannedDate <= now.addingTimeInterval(60 * 60) else { return .failure(.invalidInput) }
+        }
+        guard journal.begin(operation, expectsBolus: insulinUnits > 0,
+                            expectsMeal: carbohydrateGrams > 0) else {
+            return .failure(.storageFailed)
+        }
+        let context = coreDataManager.mainManagedObjectContext
+        let existing = TreatmentEntryAccessor(coreDataManager: coreDataManager)
+            .getLatestTreatments(howOld: nil)
+        let priorBolus = existing.first { $0.localTreatmentUUID == operation.bolusUUID }
+        let priorMeal = existing.first { $0.localTreatmentUUID == operation.mealUUID }
+        guard priorBolus == nil || (insulinUnits > 0 && priorBolus?.treatmentType == .Insulin &&
+                  priorBolus?.value == insulinUnits && priorBolus?.treatmentdeleted == false),
+              priorMeal == nil || (carbohydrateGrams > 0 && priorMeal?.treatmentType == .Carbs &&
+                  priorMeal?.value == carbohydrateGrams && priorMeal?.treatmentdeleted == false) else {
+            return .failure(.invalidInput)
+        }
+        if insulinUnits > 0 && priorBolus == nil {
+            let bolus = TreatmentEntry(date: now, value: insulinUnits,
+                treatmentType: .Insulin, nightscoutEventType: nil,
+                enteredBy: ConstantsHomeView.applicationName,
+                nsManagedObjectContext: context)
+            bolus.localTreatmentUUID = operation.bolusUUID
+            bolus.createdAt = now
+            bolus.modifiedAt = now
+            bolus.healthKitSyncVersion = NSNumber(value: 1)
+            bolus.healthKitSyncStateRaw = HealthLocalTherapySyncState.pending(version: 1)
+        }
+        if carbohydrateGrams > 0 && priorMeal == nil {
+            let meal = TreatmentEntry(date: plannedDate ?? now, value: carbohydrateGrams,
+                treatmentType: .Carbs, nightscoutEventType: nil,
+                enteredBy: ConstantsHomeView.applicationName,
+                nsManagedObjectContext: context)
+            meal.localTreatmentUUID = operation.mealUUID
+            meal.createdAt = now
+            meal.modifiedAt = now
+            meal.mealKindRaw = mealKind.rawValue
+            meal.carbohydrateDurationMinutes = NSNumber(value: mealKind.durationMinutes)
+            meal.plannedMealStateRaw = plannedDate == nil
+                ? TreatmentMealState.confirmed.rawValue : TreatmentMealState.planned.rawValue
+            if plannedDate == nil {
+                meal.healthKitSyncVersion = NSNumber(value: 1)
+                meal.healthKitSyncStateRaw = HealthLocalTherapySyncState.pending(version: 1)
+            }
+        }
+        guard saveOverride?() ?? coreDataManager.saveChangesSynchronously(),
+              journal.completeVerified(coreDataManager: coreDataManager, operation: operation,
+                insulinUnits: insulinUnits, carbohydrateGrams: carbohydrateGrams) else {
+            return .failure(.storageFailed)
+        }
+        if carbohydrateGrams > 0, let plannedDate {
+            PlannedMealReminder.schedule(uuid: operation.mealUUID, at: plannedDate)
+        }
+        return .success(PenDoseLogReceipt(confirmedMealUUID:
+            plannedDate == nil && carbohydrateGrams > 0 ? operation.mealUUID : nil))
+    }
 }

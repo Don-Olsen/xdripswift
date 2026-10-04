@@ -75,6 +75,8 @@ public enum AlertKind: Int, CaseIterable {
     case dexcomG5BatteryLow = 12
     /// G7, ONE+ and Stelo use the disposable-sensor Voltage B alarm.
     case dexcomG7BatteryLow = 13
+    /// Engine-only 30-minute low prediction; evaluated separately after each saved reading.
+    case lowSoon = 14
 
     /// Returns the single battery configuration that belongs to a configured CGM type.
     ///
@@ -124,6 +126,7 @@ public enum AlertKind: Int, CaseIterable {
         var kinds: [AlertKind] = [
             .verylow,
             .low,
+            .lowSoon,
             .fastdrop,
             .high,
             .veryhigh,
@@ -156,13 +159,13 @@ public enum AlertKind: Int, CaseIterable {
     ///
     /// probably only useful in UI - named AlertKind and not AlertType because there's already an AlertType which has a different goal
     func needsAlertValue() -> Bool {
-        return self != .sensorTransmitterFailure
+        return self != .sensorTransmitterFailure && self != .lowSoon
     }
 
     /// A terminal failure is event-driven and has one all-day configuration.
     /// It cannot be divided into schedules because there is no value or time window to evaluate.
     func supportsAlertSchedules() -> Bool {
-        return self != .sensorTransmitterFailure
+        return self != .sensorTransmitterFailure && self != .lowSoon
     }
 
     /// A terminal failure is reported once by the active BLE peripheral and is never snoozable.
@@ -239,6 +242,8 @@ public enum AlertKind: Int, CaseIterable {
             return ConstantsDefaultAlertLevels.notLooping
         case .sensorTransmitterFailure:
             return 0
+        case .lowSoon:
+            return 0
         }
     }
 
@@ -295,6 +300,8 @@ public enum AlertKind: Int, CaseIterable {
             return "notlooping"
         case .sensorTransmitterFailure:
             return "sensorTransmitterFailure"
+        case .lowSoon:
+            return "lowSoon"
         }
     }
     
@@ -538,6 +545,9 @@ public enum AlertKind: Int, CaseIterable {
             // normal value and schedule checks. AlertManager reads this kind's enabled state and
             // assigned Alert Type only when SensorHealthIssueManager passes the event across.
             return (false, nil, nil, nil)
+        case .lowSoon:
+            // Uses an independently validated engine result, never the generic BG threshold path.
+            return (false, nil, nil, nil)
         }
     }
 
@@ -593,6 +603,8 @@ public enum AlertKind: Int, CaseIterable {
             return ConstantsNotifications.NotificationIdentifiersForAlerts.notLoopingAlert
         case .sensorTransmitterFailure:
             return ConstantsNotifications.NotificationIdentifiersForAlerts.sensorTransmitterFailure
+        case .lowSoon:
+            return ConstantsNotifications.NotificationIdentifiersForAlerts.lowSoon
         }
     }
     
@@ -625,6 +637,8 @@ public enum AlertKind: Int, CaseIterable {
             return Texts_Alerts.notLoopingAlertTitle
         case .sensorTransmitterFailure:
             return Texts_Alerts.sensorTransmitterFailureAlertTitle
+        case .lowSoon:
+            return Texts_Alerts.lowSoonAlertTitle
         }
     }
 
@@ -692,7 +706,7 @@ public enum AlertKind: Int, CaseIterable {
             return "mV"
         case .phonebatterylow:
             return "%"
-        case .sensorTransmitterFailure:
+        case .sensorTransmitterFailure, .lowSoon:
             return ""
         }
     }
@@ -743,7 +757,7 @@ public enum AlertKind: Int, CaseIterable {
         switch self {
         case .verylow, .veryhigh, .fastdrop:
             return .urgent
-        case .low, .high, .fastrise, .notlooping:
+        case .low, .lowSoon, .high, .fastrise, .notlooping:
             return .warning
         default:
             return .normal
@@ -768,7 +782,7 @@ private func createAlertTitleForBgReadingAlerts(alertKind: AlertKind) -> String 
     case .fastrise:
         return Texts_Alerts.fastRiseTitle
     case .missedreading, .calibration, .batterylow, .dexcomG5BatteryLow, .dexcomG7BatteryLow,
-         .phonebatterylow, .notlooping, .sensorTransmitterFailure:
+         .phonebatterylow, .notlooping, .sensorTransmitterFailure, .lowSoon:
         return ""
     }
 }

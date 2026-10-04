@@ -2,6 +2,30 @@ import XCTest
 @testable import xdrip
 
 final class GlucoseForecastEngineTests: XCTestCase {
+    func testMealDurationsAndConditionalPlanDoNotMutateBaseForecast() throws {
+        let start = now.addingTimeInterval(-30 * 60)
+        let fast = TherapyTreatment(date: start, amount: 15, isIOB: false,
+            carbohydrateDurationMinutes: 30)
+        let slow = TherapyTreatment(date: start, amount: 15, isIOB: false,
+            carbohydrateDurationMinutes: 300)
+        let fastResult = GlucoseForecastEngine.predict(input(treatments: [fast]))
+        let slowResult = GlucoseForecastEngine.predict(input(treatments: [slow]))
+        XCTAssertNil(fastResult.reason)
+        XCTAssertNil(slowResult.reason)
+        XCTAssertNotEqual(fastResult.value(atMinutes: 30), slowResult.value(atMinutes: 30))
+
+        let base = GlucoseForecastEngine.predict(input())
+        let planned = TherapyTreatment(date: now.addingTimeInterval(15 * 60),
+            amount: 20, isIOB: false, carbohydrateDurationMinutes: 300)
+        let points = try XCTUnwrap(GlucoseForecastEngine.conditionalPlannedCarbohydratePoints(
+            base: base, planned: [planned], sensitivityMgdlPerUnit: 40,
+            carbohydrateRatioGramsPerUnit: 10, settings: TherapyModelSettings()))
+        XCTAssertEqual(points.first?.glucoseMgdl, base.points.first?.glucoseMgdl)
+        XCTAssertEqual(points[2].glucoseMgdl, base.points[2].glucoseMgdl)
+        XCTAssertGreaterThan(points[9].glucoseMgdl, base.points[9].glucoseMgdl)
+        XCTAssertEqual(base.value(atMinutes: 45), 120,
+            "the authoritative engine result is not changed by a planned meal")
+    }
     private let now = Date(timeIntervalSince1970: 1_800_000_000)
 
     private func glucose(_ value: Double = 120, spacingMinutes: Int = 1,

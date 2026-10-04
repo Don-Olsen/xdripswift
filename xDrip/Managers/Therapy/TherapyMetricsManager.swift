@@ -20,6 +20,34 @@ struct TherapyTreatment: Sendable {
     let date: Date
     let amount: Double
     let isIOB: Bool
+    /// A nil value is retained for older test callers; persisted carbohydrate rows supply 240.
+    let carbohydrateDurationMinutes: Double?
+    /// A local revision is usable in historical replay only after this instant.
+    let knownAt: Date?
+    let createdAt: Date?
+    let modifiedAt: Date?
+    let isAppLocal: Bool
+    /// Replay-only tombstone: an earlier value cannot be reconstructed after deletion.
+    let isDeletedCurrentRevision: Bool
+
+    init(date: Date, amount: Double, isIOB: Bool,
+         carbohydrateDurationMinutes: Double? = nil, knownAt: Date? = nil,
+         createdAt: Date? = nil, modifiedAt: Date? = nil,
+         isAppLocal: Bool = false, isDeletedCurrentRevision: Bool = false) {
+        self.date = date
+        self.amount = amount
+        self.isIOB = isIOB
+        self.carbohydrateDurationMinutes = carbohydrateDurationMinutes
+        self.knownAt = knownAt
+        self.createdAt = createdAt
+        self.modifiedAt = modifiedAt
+        self.isAppLocal = isAppLocal
+        self.isDeletedCurrentRevision = isDeletedCurrentRevision
+    }
+
+    func carbohydrateDuration(or fallback: Double) -> Double {
+        carbohydrateDurationMinutes ?? fallback
+    }
 }
 
 struct TherapyChartLoad {
@@ -284,6 +312,88 @@ final class TherapyMetricsManager {
         return forecastInputRevision
     }
 
+    /// A fresh, immutable dosing input. This never borrows the Home display cache: a loaded
+    /// empty treatment window is known zero, while an incomplete import or save is unknown.
+    func penDoseSnapshot(at date: Date = .now) async
+        -> Result<PenDoseInputSnapshot, PenDoseUnavailableReason> {
+        await withCheckedContinuation { continuation in
+            inputQueue.async { [self] in
+                continuation.resume(returning: makePenDoseSnapshot(at: date))
+            }
+        }
+    }
+
+    private func makePenDoseSnapshot(at date: Date)
+        -> Result<PenDoseInputSnapshot, PenDoseUnavailableReason> {
+        guard let coreDataManager else { return .failure(.treatmentReadFailed) }
+        let defaults = UserDefaults.standard
+        let policy = defaults.dataFlowPolicy
+        guard Self.doseSourceIsReady(policy,
+              cutover: TreatmentSourceCutover.current(defaults: defaults), defaults: defaults) else {
+            return .failure(.incompleteTherapySources)
+        }
+        let importer = HealthKitTherapyImportManager.shared
+        guard !importer.localInputIsIncomplete(.insulin),
+              !importer.localInputIsIncomplete(.carbohydrates),
+              Self.sourceInputsUnambiguousForDose(policy: policy, importer: importer) else {
+            return .failure(.incompleteTherapySources)
+        }
+        guard !hasUncommittedForecastInputChanges else {
+            return .failure(.uncommittedTreatments)
+        }
+        let settings = TherapyModelSettings(defaults: defaults)
+        guard settings.validInsulin, settings.validCarbs else {
+            return .failure(.invalidTreatment)
+        }
+        let sourceSignature = GlucoseForecastDataAdapter.presentationInputSignature(
+            horizonMinutes: 120, defaults: defaults, importer: importer)
+        let revision = treatmentChangeRevision
+        // Glucose and treatments are read at one logical date on the same serial worker.
+        // Check both the treatment revision and newest glucose again before publishing, so
+        // a save or arriving minute cannot make a mixed, apparently fresh dosing snapshot.
+        let glucoseReader = GlucoseForecastDataAdapter(coreDataManager: coreDataManager,
+            therapyManager: self, defaults: defaults, healthImporter: importer)
+        guard let firstGlucose = glucoseReader.recentGlucose(at: date) else {
+            return .failure(.missingGlucose)
+        }
+        let windowMinutes = max(settings.insulinDuration, 480)
+        guard let treatments = treatments(from: date.addingTimeInterval(-windowMinutes * 60),
+                                           to: date, policy: policy, settings: settings) else {
+            return .failure(.treatmentReadFailed)
+        }
+        guard let finalGlucose = glucoseReader.recentGlucose(at: date),
+              firstGlucose == finalGlucose,
+              abs(Date().timeIntervalSince(date)) <= 30,
+              revision == treatmentChangeRevision,
+              !hasUncommittedForecastInputChanges,
+              !importer.localInputIsIncomplete(.insulin),
+              !importer.localInputIsIncomplete(.carbohydrates),
+              Self.doseSourceIsReady(defaults.dataFlowPolicy,
+                  cutover: TreatmentSourceCutover.current(defaults: defaults), defaults: defaults),
+              sourceSignature == GlucoseForecastDataAdapter.presentationInputSignature(
+                  horizonMinutes: 120, defaults: defaults, importer: importer) else {
+            return .failure(.treatmentChangedDuringRead)
+        }
+        return PenDoseInputSnapshot.make(capturedAt: date, glucose: finalGlucose,
+            treatments: treatments.filter { $0.date <= date }, therapySettings: settings,
+            treatmentRevision: revision)
+    }
+
+    private static func sourceInputsUnambiguousForDose(policy: DataFlowPolicy,
+        importer: HealthKitTherapyImportManager) -> Bool {
+        !policy.importsTreatmentsFromNightscout ||
+            (!importer.isEnabled(.insulin) && !importer.isEnabled(.carbohydrates))
+    }
+
+    static func doseSourceIsReady(_ policy: DataFlowPolicy,
+        cutover: TreatmentSourceCutover?, defaults: UserDefaults = .standard) -> Bool {
+        // A successful Phase B source switch persists this boundary only after the final
+        // Health import. Without it an empty local window cannot prove zero IOB or COB.
+        cutover != nil && policy.therapyDataSource == .none &&
+            !policy.importsTreatmentsFromNightscout &&
+            cutoverPolicyIsConsistent(policy, cutover: cutover, defaults: defaults)
+    }
+
     /// Detached values from the last complete local read. Home may age these during a brief
     /// Health reread; this never changes the strict current snapshot used by calculations.
     func completeLocalTreatmentsForHome(at date: Date = .now) -> [TherapyTreatment]? {
@@ -291,6 +401,8 @@ final class TherapyMetricsManager {
               !HealthKitTherapyImportManager.shared.localInputIsIncomplete(.insulin),
               !HealthKitTherapyImportManager.shared.localInputIsIncomplete(.carbohydrates) else { return nil }
         let policy = UserDefaults.standard.dataFlowPolicy
+        guard Self.cutoverPolicyIsConsistent(policy,
+            cutover: TreatmentSourceCutover.current()) else { return nil }
         let settings = TherapyModelSettings(defaults: .standard)
         return treatments(from: date.addingTimeInterval(-TherapyModelSettings.visibilityInterval),
             to: min(Date(), date.addingTimeInterval(TherapyModelSettings.visibilityInterval)),
@@ -302,8 +414,22 @@ final class TherapyMetricsManager {
         return "\(version)-\(UserDefaults.standard.nightscoutTreatmentsUpdateCounter)-\(policy.therapyDataSource.rawValue)-\(policy.nightscoutFollowType.rawValue)-\(settings)"
     }
 
+    static func cutoverPolicyIsConsistent(_ policy: DataFlowPolicy,
+                                         cutover: TreatmentSourceCutover?,
+                                         defaults: UserDefaults = .standard) -> Bool {
+        !defaults.bool(forKey: TreatmentSourceCutover.restoreRequiresSourceSetupKey) &&
+            !TreatmentSourceCutover.hasInvalidStoredValue(defaults: defaults) &&
+            (cutover == nil || policy.therapyDataSource == .none)
+    }
+
     func snapshot(at date: Date = .now, external: AIDStatus? = nil, historical: Bool = false) -> TherapyMetricsSnapshot {
         let policy = UserDefaults.standard.dataFlowPolicy
+        guard Self.cutoverPolicyIsConsistent(policy,
+            cutover: TreatmentSourceCutover.current()) else {
+            let unavailable = TherapyMetricState(amount: nil, source: .local,
+                referenceDate: date, reason: .readFailed)
+            return TherapyMetricsSnapshot(iob: unavailable, cob: unavailable)
+        }
         let settings = TherapyModelSettings(defaults: .standard)
         let status = historical ? external : externalStatus?() ?? external
         let needsInputs = policy.externalIOBSource == nil || policy.externalCOBSource == nil
@@ -376,7 +502,8 @@ final class TherapyMetricsManager {
             let minutes = date.timeIntervalSince(entry.date) / 60
             amount += isIOB
                 ? TherapyCalculations.insulinRemaining(units: entry.amount, minutes: minutes, duration: settings.insulinDuration, peak: settings.insulinPeak)
-                : TherapyCalculations.carbsRemaining(grams: entry.amount, minutes: minutes, duration: settings.carbDuration)
+                : TherapyCalculations.carbsRemaining(grams: entry.amount, minutes: minutes,
+                    duration: entry.carbohydrateDuration(or: settings.carbDuration))
         }
         for entry in recentEntries ?? [] where entry.amount.isFinite && entry.amount > 0 && entry.date <= currentDate {
             includeVisibility(entry, nearby: false)
@@ -392,14 +519,18 @@ final class TherapyMetricsManager {
 
     func treatments(from start: Date, to end: Date, policy: DataFlowPolicy, settings: TherapyModelSettings) -> [TherapyTreatment]? {
         guard let coreDataManager else { return nil }
+        guard Self.cutoverPolicyIsConsistent(policy,
+            cutover: TreatmentSourceCutover.current()) else { return nil }
         // Hour buckets let 15-second refreshes reuse the same input snapshot, including future entries.
         let from = Date(timeIntervalSince1970: floor(start.timeIntervalSince1970 / 3600) * 3600)
         let to = Date(timeIntervalSince1970: (floor(end.timeIntervalSince1970 / 3600) + 1) * 3600)
         let importer = HealthKitTherapyImportManager.shared
         // A source choice can change eligibility without any Core Data save. Include it in the
         // cache identity so a previously selected source never leaks into a new forecast.
+        let cutover = TreatmentSourceCutover.current()
         let sourceSignature = "\(importer.isEnabled(.insulin))-\(importer.selectedSource(.insulin)?.bundleIdentifier ?? "")-" +
-            "\(importer.isEnabled(.carbohydrates))-\(importer.selectedSource(.carbohydrates)?.bundleIdentifier ?? "")"
+            "\(importer.isEnabled(.carbohydrates))-\(importer.selectedSource(.carbohydrates)?.bundleIdentifier ?? "")-" +
+            "\(cutover?.cutoff.timeIntervalSince1970 ?? 0)-\(cutover?.insulinSourceBundleID ?? "")-\(cutover?.carbohydrateSourceBundleID ?? "")"
         lock.lock()
         let generation = treatmentRevision
         let cacheKey = "\(generation)-\(policy.therapyDataSource.rawValue)-\(policy.nightscoutFollowType.rawValue)-\(sourceSignature)-\(from)-\(to)"
@@ -447,8 +578,18 @@ final class TherapyMetricsManager {
                 let healthCarbsOn = HealthKitTherapyImportManager.shared.isEnabled(.carbohydrates)
                 result = Self.eligibleTreatments(fetched, policy: policy,
                     insulinSource: selectedInsulin, carbsSource: selectedCarbs,
-                    insulinEnabled: healthInsulinOn, carbsEnabled: healthCarbsOn)
-                    .map { TherapyTreatment(date: $0.date, amount: $0.value, isIOB: $0.treatmentType == .Insulin) }
+                    insulinEnabled: healthInsulinOn, carbsEnabled: healthCarbsOn,
+                    cutover: cutover)
+                    .map {
+                        TherapyTreatment(date: $0.date, amount: $0.value,
+                            isIOB: $0.treatmentType == .Insulin,
+                            carbohydrateDurationMinutes: $0.treatmentType == .Carbs
+                                ? $0.effectiveCarbohydrateDurationMinutes : nil,
+                            knownAt: $0.isAppLocalTreatment ? $0.knownAtForCurrentRevision : nil,
+                            createdAt: $0.isAppLocalTreatment ? $0.createdAt : nil,
+                            modifiedAt: $0.isAppLocalTreatment ? $0.modifiedAt : nil,
+                            isAppLocal: $0.isAppLocalTreatment)
+                    }
             } catch { result = nil }
         }
         lock.lock()
@@ -465,10 +606,27 @@ final class TherapyMetricsManager {
     /// assert that only shared origin identifiers deduplicate. Time and dose are never identity.
     static func eligibleTreatments(_ fetched: [TreatmentEntry], policy: DataFlowPolicy,
                                    insulinSource: String?, carbsSource: String?,
-                                   insulinEnabled: Bool, carbsEnabled: Bool) -> [TreatmentEntry] {
+                                   insulinEnabled: Bool, carbsEnabled: Bool,
+                                   cutover: TreatmentSourceCutover? = nil) -> [TreatmentEntry] {
         let sourceEligible = fetched.filter { entry in
+            guard entry.treatmentType == .Insulin || entry.treatmentType == .Carbs else {
+                return false
+            }
+            guard !entry.treatmentdeleted else { return false }
+            if entry.treatmentType == .Carbs && !entry.isConfirmedMeal { return false }
             let careLink = entry.careLinkSourceIdentifier != nil ||
                 (entry.nightscoutEventType != nil && entry.enteredBy == "CareLink")
+            if let cutover {
+                if entry.isHealthKitImported {
+                    let kind: HealthTherapyImportKind =
+                        entry.treatmentType == .Insulin ? .insulin : .carbohydrates
+                    return cutover.permitsImported(eventDate: entry.date, kind: kind,
+                        sourceBundleID: entry.healthKitSourceBundleIdentifier)
+                }
+                return cutover.permitsLocal(eventDate: entry.date,
+                    localTreatmentUUID: entry.localTreatmentUUID,
+                    watchSourceUUID: entry.watchSourceUUID)
+            }
             if careLink { return policy.importsTherapyFromCareLink }
             if entry.isHealthKitImported {
                 let selected = entry.treatmentType == .Insulin ? insulinSource : carbsSource
@@ -525,6 +683,8 @@ final class TherapyMetricsManager {
         let end = min(end, Date())
         guard start < end else { return unavailable }
         let policy = UserDefaults.standard.dataFlowPolicy
+        guard Self.cutoverPolicyIsConsistent(policy,
+            cutover: TreatmentSourceCutover.current()) else { return unavailable }
         let settings = TherapyModelSettings(defaults: .standard)
         let cacheKey = "\(key(policy: policy, settings: settings))-\(start.timeIntervalSince1970)-\(floor(end.timeIntervalSince1970 / 300))-\(floor(Date().timeIntervalSince1970 / 60))"
         lock.lock(); let cached = chartCache[cacheKey]; let generation = revision; lock.unlock()
@@ -577,7 +737,10 @@ final class TherapyMetricsManager {
             while t < end.timeIntervalSince1970 { dates.insert(Date(timeIntervalSince1970: t)); t += 300 }
             for entry in entries {
                 guard !isCancelled() else { return [] }
-                for offset in [-TherapyModelSettings.visibilityInterval, 0.0, entry.isIOB ? settings.insulinDuration * 60 : (settings.carbDuration + TherapyModelSettings.carbDelay) * 60, TherapyModelSettings.visibilityInterval] {
+                for offset in [-TherapyModelSettings.visibilityInterval, 0.0,
+                    entry.isIOB ? settings.insulinDuration * 60 :
+                        (entry.carbohydrateDuration(or: settings.carbDuration) + TherapyModelSettings.carbDelay) * 60,
+                    TherapyModelSettings.visibilityInterval] {
                     let boundary = entry.date.addingTimeInterval(offset)
                     for date in [boundary.addingTimeInterval(-0.001), boundary, boundary.addingTimeInterval(0.001)] where date >= start && date <= end { dates.insert(date) }
                 }

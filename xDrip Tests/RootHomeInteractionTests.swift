@@ -442,6 +442,38 @@ final class RootHomeInteractionTests: XCTestCase {
                      chartState: chart, at: now))
     }
 
+    func testPlannedMealWhatIfDisappearsAtTreatmentStateChange() {
+        let reference = Date(timeIntervalSince1970: 1_800_000_000)
+        let context = forecastContext()
+        let result = GlucoseForecastResult(
+            points: [GlucoseForecastPoint(date: reference, glucoseMgdl: 120)],
+            referenceDate: reference, reason: nil, parameterSource: .manual
+        )
+        let conditional = [GlucoseForecastPoint(date: reference.addingTimeInterval(30 * 60), glucoseMgdl: 145)]
+        let completed = RootHomeCompletedForecast(result: result, context: context,
+                                                  conditionalPlannedPoints: conditional)
+        XCTAssertTrue(RootHomePlannedMealPresentation.mayDisplay(
+            completed: completed, currentContext: context,
+            currentResult: result, hasPendingTreatmentCommit: false))
+        XCTAssertFalse(RootHomePlannedMealPresentation.mayDisplay(
+            completed: completed, currentContext: context,
+            currentResult: result, hasPendingTreatmentCommit: true),
+            "Confirmation/edit/cancellation must hide the old hypothetical curve during commit")
+        var changed = context
+        changed.therapyRevision += 1
+        XCTAssertFalse(RootHomePlannedMealPresentation.mayDisplay(
+            completed: completed, currentContext: changed,
+            currentResult: result, hasPendingTreatmentCommit: false),
+            "The old planned UUID/state is no longer valid after a treatment revision")
+        let newerReading = GlucoseForecastResult(
+            points: [GlucoseForecastPoint(date: reference.addingTimeInterval(60), glucoseMgdl: 121)],
+            referenceDate: reference.addingTimeInterval(60), reason: nil, parameterSource: .manual
+        )
+        XCTAssertFalse(RootHomePlannedMealPresentation.mayDisplay(
+            completed: completed, currentContext: context,
+            currentResult: newerReading, hasPendingTreatmentCommit: false))
+    }
+
     @MainActor func testSuppressedNewSensorInvalidatesVisibleForecastProvenance() async {
         let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
         let now = Date()

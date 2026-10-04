@@ -11,6 +11,23 @@ import Foundation
 
 struct GlucoseForecastPresentationOutcome: Sendable {
     let result: GlucoseForecastResult
+    /// Separate, hypothetical curve for unconfirmed scheduled food; never an input to ML/alarms.
+    let conditionalPlannedPoints: [GlucoseForecastPoint]?
+
+    init(result: GlucoseForecastResult,
+         conditionalPlannedPoints: [GlucoseForecastPoint]? = nil) {
+        self.result = result
+        self.conditionalPlannedPoints = conditionalPlannedPoints
+    }
+}
+
+/// A single validated, read-only engine calculation for safety decisions. All auxiliary
+/// values derive from the same detached treatment and glucose snapshot as `result`.
+struct GlucoseForecastSafetyOutcome: Sendable {
+    let result: GlucoseForecastResult
+    let referenceGlucoseMgdl: Double?
+    let activeInsulinUnits: Double?
+    let slope15MgdlPerMinute: Double?
 }
 
 /// Core Data reads run on a serial worker. Home can cancel or supersede its awaiting Task
@@ -43,13 +60,57 @@ final class GlucoseForecastDataAdapter {
         await forecastForPresentation(horizonMinutes: horizonMinutes, at: now).result
     }
 
+    /// Unlike Home presentation, this performs no ML inference, logging, planned-food
+    /// overlay, cache reuse or training. An incomplete source stays unavailable.
+    func engineOnlyForecast(horizonMinutes: Int = 60, at now: Date = .now)
+        async -> GlucoseForecastSafetyOutcome {
+        let snapshot = await therapyManager.penDoseSnapshot(at: now)
+        switch snapshot {
+        case .failure:
+            return GlucoseForecastSafetyOutcome(
+                result: GlucoseForecastResult(points: [], referenceDate: nil,
+                    reason: .dataUnavailable), referenceGlucoseMgdl: nil,
+                activeInsulinUnits: nil, slope15MgdlPerMinute: nil)
+        case .success(let input):
+            let result = PenBolusCalculator.safetyForecast(snapshot: input, at: now,
+                defaults: defaults, horizonMinutes: horizonMinutes)
+            return GlucoseForecastSafetyOutcome(result: result,
+                referenceGlucoseMgdl: input.glucose.last?.glucoseMgdl,
+                activeInsulinUnits: result.reason == nil ? input.iobUnits : nil,
+                slope15MgdlPerMinute: Self.rawSlope15(input.glucose))
+        }
+    }
+
+    static func rawSlope15(_ glucose: [GlucoseForecastSample]) -> Double? {
+        guard let latest = glucose.last, let sensorID = latest.sensorID,
+              !sensorID.isEmpty else { return nil }
+        let values = glucose.filter {
+            $0.sensorID == sensorID && $0.date >= latest.date.addingTimeInterval(-15 * 60)
+        }
+        guard values.count >= 4,
+              let first = values.first,
+              latest.date.timeIntervalSince(first.date) >= 10 * 60 else { return nil }
+        let x = values.map { $0.date.timeIntervalSince(first.date) / 60 }
+        let y = values.map(\.glucoseMgdl)
+        let xMean = x.reduce(0, +) / Double(x.count)
+        let yMean = y.reduce(0, +) / Double(y.count)
+        let denominator = zip(x, x).reduce(0.0) { $0 + ($1.0 - xMean) * ($1.1 - xMean) }
+        guard denominator > 0 else { return nil }
+        let numerator = zip(x, y).reduce(0.0) { $0 + ($1.0 - xMean) * ($1.1 - yMean) }
+        let slope = numerator / denominator
+        return slope.isFinite ? slope : nil
+    }
+
     static func presentationInputSignature(horizonMinutes: Int, defaults: UserDefaults = .standard,
                                           importer: HealthKitTherapyImportManager = .shared) -> String {
-        "\(defaults.dataFlowPolicy)|\(TherapyModelSettings(defaults: defaults))|\(horizonMinutes)|"
+        let cutover = TreatmentSourceCutover.current(defaults: defaults)
+        return "\(defaults.dataFlowPolicy)|\(TherapyModelSettings(defaults: defaults))|\(horizonMinutes)|"
             + "\(defaults.glucoseForecastManualSensitivityMgdlPerUnit ?? 0)|\(defaults.glucoseForecastManualCarbRatioGramsPerUnit ?? 0)|"
             + HealthTherapyImportKind.allCases.map {
                 "\(importer.isEnabled($0)):\(importer.selectedSource($0)?.bundleIdentifier ?? "")"
             }.joined(separator: "|")
+            + "|cutover:\(cutover?.cutoff.timeIntervalSince1970 ?? 0):" +
+                "\(cutover?.insulinSourceBundleID ?? ""):\(cutover?.carbohydrateSourceBundleID ?? "")"
     }
 
     func forecastForPresentation(horizonMinutes: Int, at now: Date = .now) async -> GlucoseForecastPresentationOutcome {
@@ -66,9 +127,12 @@ final class GlucoseForecastDataAdapter {
             return unavailable(.invalidHorizon)
         }
         let policy = defaults.dataFlowPolicy
+        guard !defaults.bool(forKey: TreatmentSourceCutover.restoreRequiresSourceSetupKey) else {
+            return unavailable(.ambiguousTreatmentSources)
+        }
         // External AID/pump amounts own Home therapy. The local treatment cache is not a
         // substitute when an external status is missing or late.
-        guard Self.sourceAllowsForecast(policy) else {
+        guard Self.sourceAllowsForecast(policy, defaults: defaults) else {
             return unavailable(.externalOwner)
         }
         let importer = healthImporter
@@ -160,11 +224,26 @@ final class GlucoseForecastDataAdapter {
             horizonMinutes: horizonMinutes,
             now: now
         )
+        let plannedMeals = futurePlannedMeals(from: referenceDate,
+            through: referenceDate.addingTimeInterval(60 * 60))
+        func presentation(_ result: GlucoseForecastResult) -> GlucoseForecastPresentationOutcome {
+            let conditional = plannedMeals.flatMap { meals -> [GlucoseForecastPoint]? in
+                guard !meals.isEmpty else { return nil }
+                return GlucoseForecastEngine.conditionalPlannedCarbohydratePoints(
+                    base: result, planned: meals, sensitivityMgdlPerUnit: sensitivity,
+                    carbohydrateRatioGramsPerUnit: ratio, settings: settings)
+            }
+            return .init(result: addMLIfUsable(to: result, input: input,
+                sourceSignature: mlSourceSignature),
+                conditionalPlannedPoints: conditional)
+        }
         let key = CacheKey(glucose: input.glucose.map { Stamp(date: $0.date, value: $0.glucoseMgdl,
                                                             sensorID: $0.sensorID) },
                            treatments: input.treatments.map { TreatmentStamp(date: $0.date,
                                                                                amount: $0.amount,
-                                                                               isIOB: $0.isIOB) },
+                                                                               isIOB: $0.isIOB,
+                                                                               carbohydrateDurationMinutes: $0.carbohydrateDurationMinutes,
+                                                                               knownAt: $0.knownAt) },
                            horizonMinutes: horizonMinutes,
                            nowMinute: Int(now.timeIntervalSince1970 / 60),
                            insulinDuration: settings.insulinDuration,
@@ -183,7 +262,7 @@ final class GlucoseForecastDataAdapter {
                     sensitivity: sensitivity, ratio: ratio,
                     sourceSignature: mlSourceSignature)
             }
-            return .init(result: addMLIfUsable(to: cached, input: input, sourceSignature: mlSourceSignature))
+            return presentation(cached)
         }
         guard !Task.isCancelled else { return unavailable(.dataUnavailable) }
         let calculated = GlucoseForecastEngine.predict(input)
@@ -211,7 +290,33 @@ final class GlucoseForecastDataAdapter {
         let recordedEngineResult = record(engineResult, horizonMinutes: horizonMinutes,
             input: input, knownReference: knownReference, settings: settings,
             treatmentWindowStart: start, treatmentWindowEnd: referenceDate)
-        return .init(result: addMLIfUsable(to: recordedEngineResult, input: input, sourceSignature: mlSourceSignature))
+        return presentation(recordedEngineResult)
+    }
+
+    private func futurePlannedMeals(from start: Date, through end: Date) -> [TherapyTreatment]? {
+        let context = NSManagedObjectContext(concurrencyType: .privateQueueConcurrencyType)
+        context.persistentStoreCoordinator =
+            coreDataManager.privateManagedObjectContext.persistentStoreCoordinator
+        var result: [TherapyTreatment]?
+        context.performAndWait {
+            let request: NSFetchRequest<TreatmentEntry> = TreatmentEntry.fetchRequest()
+            request.predicate = NSPredicate(format:
+                "date >= %@ AND date <= %@ AND treatmentType == %d AND plannedMealStateRaw == %@ AND (treatmentdeleted == NO OR treatmentdeleted == nil)",
+                start as NSDate, end as NSDate, TreatmentType.Carbs.rawValue,
+                TreatmentMealState.planned.rawValue)
+            do {
+                result = try context.fetch(request).compactMap { entry in
+                    guard entry.localTreatmentUUID?.isEmpty == false,
+                          entry.hasValidMealMetadata, entry.value.isFinite,
+                          entry.value > 0 else { return nil }
+                    return TherapyTreatment(date: entry.date, amount: entry.value,
+                        isIOB: false,
+                        carbohydrateDurationMinutes: entry.effectiveCarbohydrateDurationMinutes)
+                }
+            } catch { result = nil }
+            context.reset()
+        }
+        return result
     }
 
     private func addMLIfUsable(to engineResult: GlucoseForecastResult,
@@ -226,12 +331,18 @@ final class GlucoseForecastDataAdapter {
                   result: engineResult, sourceSignature: sourceSignature) else {
             return engineResult
         }
+        let selectedML = GlucoseForecastMLPresentation.cappedBelowEngine(mlForecast,
+            engine: engineResult,
+            currentGlucoseMgdl: input.glucose.last?.glucoseMgdl,
+            slope15MgdlPerMinute: Self.rawSlope15(input.glucose),
+            lowSoonActive: LowSoonAlertState.isActive(at: input.now, defaults: defaults))
+        guard let selectedML else { return engineResult }
         return GlucoseForecastResult(points: engineResult.points,
                                      referenceDate: engineResult.referenceDate,
                                      reason: engineResult.reason,
                                      parameterSource: engineResult.parameterSource,
                                      referenceSensorID: engineResult.referenceSensorID,
-                                     mlForecast: mlForecast)
+                                     mlForecast: selectedML)
     }
 
     private func record(_ result: GlucoseForecastResult, horizonMinutes: Int,
@@ -257,8 +368,11 @@ final class GlucoseForecastDataAdapter {
         return result
     }
 
-    static func sourceAllowsForecast(_ policy: DataFlowPolicy) -> Bool {
-        policy.externalIOBSource == nil && policy.externalCOBSource == nil
+    static func sourceAllowsForecast(_ policy: DataFlowPolicy,
+                                     defaults: UserDefaults = .standard) -> Bool {
+        !defaults.bool(forKey: TreatmentSourceCutover.restoreRequiresSourceSetupKey) &&
+            !TreatmentSourceCutover.hasInvalidStoredValue(defaults: defaults) &&
+            policy.externalIOBSource == nil && policy.externalCOBSource == nil
     }
 
     /// Nightscout IDs and HealthKit UUIDs can refer to the same dose without matching.
@@ -271,13 +385,19 @@ final class GlucoseForecastDataAdapter {
 
     static func hasTreatmentAfterReading(_ treatments: [TherapyTreatment], referenceDate: Date,
                                          calculationDate: Date) -> Bool {
-        treatments.contains { $0.date > referenceDate && $0.date <= calculationDate &&
-            $0.amount.isFinite && $0.amount > 0 }
+        treatments.contains {
+            (($0.date > referenceDate && $0.date <= calculationDate) ||
+                ($0.knownAt.map { $0 > referenceDate && $0 <= calculationDate } ?? false)) &&
+                $0.amount.isFinite && $0.amount > 0
+        }
     }
 
     static func treatmentsKnownAtReference(_ treatments: [TherapyTreatment], from start: Date,
                                            referenceDate: Date) -> [TherapyTreatment] {
-        treatments.filter { $0.date >= start && $0.date <= referenceDate }
+        treatments.filter {
+            $0.date >= start && $0.date <= referenceDate &&
+                ($0.knownAt.map { $0 <= referenceDate } ?? true)
+        }
     }
 
     /// Read the same downstream-valid final glucose value used by the Home graph. A fresh
@@ -326,7 +446,13 @@ final class GlucoseForecastDataAdapter {
     }
 
     private struct Stamp: Hashable { let date: Date; let value: Double; let sensorID: String? }
-    private struct TreatmentStamp: Hashable { let date: Date; let amount: Double; let isIOB: Bool }
+    private struct TreatmentStamp: Hashable {
+        let date: Date
+        let amount: Double
+        let isIOB: Bool
+        let carbohydrateDurationMinutes: Double?
+        let knownAt: Date?
+    }
     private struct CacheKey: Equatable {
         let glucose: [Stamp]
         let treatments: [TreatmentStamp]

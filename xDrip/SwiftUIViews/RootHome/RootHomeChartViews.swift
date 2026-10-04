@@ -26,6 +26,8 @@ struct RootHomeMainChartView: View {
     var allowsTherapyCharts = true
     let chartState: GlucoseChartState
     let forecastResult: GlucoseForecastResult?
+    /// Display-only hypothetical meal curve, independent of the real/ML forecast.
+    let conditionalPlannedForecastPoints: [GlucoseForecastPoint]?
     let forecastHorizonMinutes: Int
     var forecastIsUpdating = false
     let routineTherapyRefresh: HealthTherapyRoutineRefreshState?
@@ -145,6 +147,11 @@ struct RootHomeMainChartView: View {
                     isML: isMLForecast,
                     from: forecastResult?.reason == nil ? forecastResult?.referenceDate : nil,
                     horizonMinutes: forecastHorizonMinutes
+                )
+                .conditionalPlannedMealPlot(
+                    conditionalPlannedForecastPoints?.map {
+                        GlucoseChartForecastPoint(date: $0.date, glucoseMgdl: $0.glucoseMgdl)
+                    } ?? []
                 )
                 .transaction { transaction in
                     transaction.animation = nil
@@ -343,6 +350,10 @@ struct RootHomeMainChartView: View {
                     Text(GlucoseForecastTexts.text("forecast.pointwise80Target",
                                                    fallback: "80% target at +30/+60/+120 min; intermediate widths are interpolated"))
                         .foregroundStyle(ConstantsAppColors.secondaryText)
+                }
+                if conditionalPlannedForecastPoints?.isEmpty == false {
+                    Text("🍽 Hvis spist · betinget motorprognose")
+                        .foregroundStyle(.orange)
                 }
             } else {
                 Text(GlucoseForecastTexts.estimate)

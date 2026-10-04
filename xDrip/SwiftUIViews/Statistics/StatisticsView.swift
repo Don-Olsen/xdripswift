@@ -124,6 +124,9 @@ struct StatisticsView: View {
                     }
 
                     StatisticsSummaryView(analytics: analytics, columnCount: width >= 980 ? 4 : 2)
+                    if let lowSoon = viewModel.lowSoonStatistics {
+                        StatisticsLowSoonCard(summary: lowSoon)
+                    }
                 } else {
                     StatisticsAGPCard(analytics: analytics)
 
@@ -147,6 +150,9 @@ struct StatisticsView: View {
         switch page {
         case .cgmData:
             StatisticsCGMDataPage(analytics: analytics)
+            if let lowSoon = viewModel.lowSoonStatistics {
+                StatisticsLowSoonCard(summary: lowSoon)
+            }
         case .cgmStatistics:
             StatisticsCGMStatisticsPage(analytics: analytics, period: viewModel.selectedPeriod)
         }
@@ -187,6 +193,54 @@ struct StatisticsView: View {
         .background(Color(.systemGroupedBackground))
     }
 
+}
+
+/// Requests in the local journal are shown as planned warnings, never as
+/// proof that an iPhone or Apple Watch delivered a notification.
+private struct StatisticsLowSoonCard: View {
+    let summary: LowSoonStatisticsSummary
+
+    private func formatted(_ value: Double?) -> String {
+        guard let value, value.isFinite else { return "–" }
+        return String(format: "%.1f", value)
+    }
+
+    var body: some View {
+        StatisticsSection(title: "Lavt om lidt · seneste 30 dage", detail: "Lokal evaluering") {
+            VStack(alignment: .leading, spacing: 8) {
+                row("Lave episoder (mindst 15 min)", "\(summary.lowEpisodes)")
+                row("Planlagt varsel før lav",
+                    "\(summary.episodesWithPlannedWarning)/\(summary.evaluableEpisodes) vurderbare")
+                row("Gennemsnitligt varsel", summary.meanPlannedLeadMinutes.map {
+                    "\(formatted($0)) min"
+                } ?? "–")
+                row("Planlagte varsler uden målt lav pr. vurderbar dag",
+                    formatted(summary.plannedWarningsWithoutLowPerEvaluableDay))
+                row("Vurderbare dage", "\(summary.evaluableDays)")
+                row("Heraf fulgt af registrerede kulhydrater",
+                    "\(summary.thoseWithRecordedCarbs)")
+                row("Heraf under 4,4 mmol/L", "\(summary.thoseReachingBelow4Point4)")
+                if summary.unevaluableWarnings > 0 {
+                    row("Varsler uden nok efterfølgende målinger",
+                        "\(summary.unevaluableWarnings)")
+                }
+                Text("En planlagt notifikation er ikke dokumentation for, at den blev vist, hørt eller mærket. Huller i målinger eller evaluering tæller ikke som normale dage.")
+                    .font(.caption)
+                    .foregroundStyle(Color(.colorSecondary))
+            }
+        }
+    }
+
+    private func row(_ title: String, _ value: String) -> some View {
+        HStack(alignment: .firstTextBaseline) {
+            Text(title)
+                .foregroundStyle(Color(.colorSecondary))
+            Spacer(minLength: 8)
+            Text(value)
+                .monospacedDigit()
+        }
+        .font(.subheadline)
+    }
 }
 
 private enum StatisticsPage: String, CaseIterable, Identifiable {

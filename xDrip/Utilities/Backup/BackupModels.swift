@@ -158,6 +158,9 @@ struct BackupPayload: Codable, Sendable {
     // Older backups have no battery history or CareLink identity map.
     var batteryHistory: [BackupBatteryHistorySample]? = nil
     var careLinkPatientAliases: [String: String]? = nil
+    /// Source-boundary provenance is included only with a treatment archive. It is never
+    /// installed as a portable preference during restore without source reconfiguration.
+    var treatmentSourceCutover: TreatmentSourceCutover? = nil
 }
 
 // MARK: - Settings and Alerts
@@ -241,6 +244,16 @@ struct BackupTreatment: Codable, Sendable {
     let healthKitSyncIdentifier: String?
     /// Preserves manual Watch entry identity so restoring a backup cannot erase retry deduplication.
     let watchSourceUUID: String?
+    /// Optional v35 fields retain local source identity and explicit meal state. Older archives
+    /// decode with nil, which continues to mean a legacy confirmed carbohydrate entry.
+    let localTreatmentUUID: String?
+    let createdAt: Date?
+    let modifiedAt: Date?
+    let mealKindRaw: String?
+    let carbohydrateDurationMinutes: Double?
+    let plannedMealStateRaw: String?
+    let healthKitSyncVersion: Int?
+    let healthKitSyncStateRaw: String?
     let id: String
     let nightscoutEventType: String?
     let notes: String?
@@ -266,7 +279,15 @@ struct BackupTreatment: Codable, Sendable {
         healthKitSourceBundleIdentifier: String? = nil,
         healthKitExternalUUID: String? = nil,
         healthKitSyncIdentifier: String? = nil,
-        watchSourceUUID: String? = nil
+        watchSourceUUID: String? = nil,
+        localTreatmentUUID: String? = nil,
+        createdAt: Date? = nil,
+        modifiedAt: Date? = nil,
+        mealKindRaw: String? = nil,
+        carbohydrateDurationMinutes: Double? = nil,
+        plannedMealStateRaw: String? = nil,
+        healthKitSyncVersion: Int? = nil,
+        healthKitSyncStateRaw: String? = nil
     ) {
         self.careLinkSourceIdentifier = careLinkSourceIdentifier
         self.date = date
@@ -276,6 +297,14 @@ struct BackupTreatment: Codable, Sendable {
         self.healthKitExternalUUID = healthKitExternalUUID
         self.healthKitSyncIdentifier = healthKitSyncIdentifier
         self.watchSourceUUID = watchSourceUUID
+        self.localTreatmentUUID = localTreatmentUUID
+        self.createdAt = createdAt
+        self.modifiedAt = modifiedAt
+        self.mealKindRaw = mealKindRaw
+        self.carbohydrateDurationMinutes = carbohydrateDurationMinutes
+        self.plannedMealStateRaw = plannedMealStateRaw
+        self.healthKitSyncVersion = healthKitSyncVersion
+        self.healthKitSyncStateRaw = healthKitSyncStateRaw
         self.id = id
         self.nightscoutEventType = nightscoutEventType
         self.notes = notes

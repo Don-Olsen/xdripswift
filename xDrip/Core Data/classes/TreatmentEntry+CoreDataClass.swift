@@ -242,6 +242,26 @@ public class TreatmentEntry: NSManagedObject, Comparable {
 
 }
 
+enum TreatmentMealKind: String, CaseIterable, Codable, Sendable {
+    case fast
+    case normal
+    case slow
+
+    var durationMinutes: Double {
+        switch self {
+        case .fast: return 30
+        case .normal: return 240
+        case .slow: return 300
+        }
+    }
+}
+
+enum TreatmentMealState: String, Codable, Sendable {
+    case planned
+    case confirmed
+    case cancelled
+}
+
 /// Shared conversion used only at presentation and compatibility boundaries.
 /// Automatic basal treatments remain stored as delivered insulin amounts in units.
 enum AutomaticBasalTreatmentMath {

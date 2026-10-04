@@ -1,8 +1,8 @@
 # Local glucose forecast
 
-The iPhone Home chart can show a separate, dotted estimate for the next 60 minutes, or 120 minutes when selected. Set **Settings → Home Screen → Glucose forecast** to Off to hide it. The values at +30 and +60 minutes (+120 when selected) are estimates, never sensor readings. The 120-minute horizon is more uncertain. The calculation assumes no new, unrecorded food or insulin after its starting reading. It does not provide a dose recommendation.
+The iPhone Home chart can show a separate, dotted estimate for the next 60 minutes, or 120 minutes when selected. Set **Settings → Home Screen → Glucose forecast** to Off to hide it. The values at +30 and +60 minutes (+120 when selected) are estimates, never sensor readings. The 120-minute horizon is more uncertain. The calculation assumes no new, unrecorded food or insulin after its starting reading. The chart itself does not calculate a dose; the separate, confirmation-gated pen calculator described below does.
 
-The forecast is display-only. Its points are never saved as BG readings, used for statistics or alerts, sent to Nightscout or Apple Health, or sent to Watch. Watch sensor ownership, Bluetooth recovery, workout runtime and alarm rules are unchanged. It uses existing event-driven Home updates and adds no polling or keepalive timer.
+Forecast points are never saved as BG readings or sent to Nightscout, Apple Health or Watch. From the post-4294 local-treatment change, the existing engine can also supply a separate bolus safety check and the new optional “Low soon” warning. Neither use writes forecast points as measurements, and ML never supplies the safety check or warning. Watch sensor ownership, Bluetooth recovery and workout runtime are unchanged. These checks use new glucose events, without polling or a keepalive timer.
 
 ## Home presentation during reloads
 
@@ -91,7 +91,7 @@ Enter your own insulin sensitivity (ISF) and carbohydrate ratio in Home Screen s
 
 The local calculation is a small Swift adaptation of the *principles* in [LoopKit's prediction code at commit 1b09bddd22bd91fb81e4b074f7638bc9e987246e](https://github.com/LoopKit/LoopKit/tree/1b09bddd22bd91fb81e4b074f7638bc9e987246e), especially date-aligned treatment effects and short glucose momentum. The previous retrospective discrepancy contribution is explicitly disabled in this candidate. It is not a verbatim port of the full LoopKit algorithm and does not include its pump basal, zero-temp or dynamic carbohydrate absorption model. The [LoopKit MIT license](https://github.com/LoopKit/LoopKit/blob/1b09bddd22bd91fb81e4b074f7638bc9e987246e/LICENSE) and the existing xDrip therapy-model source notices apply to reused model formulas.
 
-For each five-minute point, bolus and carbohydrate effects are the difference between the existing selected treatment curves at that point and at the latest CGM reading. Thus current IOB/COB is not multiplied by a constant. The recent measured glucose trajectory is adjusted for already modeled treatment effects before its residual trend is estimated from actual sample times. The 15-minute regression window (at least four readings spanning ten minutes, with the existing 30-second cadence tolerance) is independent from the new ten-minute momentum decay. Five-minute midpoint integration uses weights 0.75 and 0.25; after +10 minutes the accumulated residual contribution stays constant while treatment effects continue. A residual slope of +2 mg/dL/min therefore contributes +10 mg/dL by +10 minutes; the equivalent fall contributes −10 mg/dL. `correctionRate` is still calculated, but the shared compile-time configuration explicitly sets `correctionContributionEnabled = false` and `correctionWeight = 0`. There is no active 60-minute residual correction and no division by a zero correction duration. The overall history still needs six samples over at least 25 minutes within its 30-minute window; the existing freshness and maximum-gap limits remain 330 seconds. Values outside 20–600 mg/dL cause rejection, not clipping. The 60/120-minute horizon is unchanged. `GlucoseForecastEngine.configuration` is the single source of the constants used by both the engine and evidence log; the engine version is `local-residual-momentum10-v2`. The selected Fiasp/other insulin peak, ten-hour duration of insulin action and selected carbohydrate absorption duration remain unchanged.
+For each five-minute point, bolus and carbohydrate effects are the difference between the existing selected treatment curves at that point and at the latest CGM reading. Thus current IOB/COB is not multiplied by a constant. The recent measured glucose trajectory is adjusted for already modeled treatment effects before its residual trend is estimated from actual sample times. The 15-minute regression window (at least four readings spanning ten minutes, with the existing 30-second cadence tolerance) is independent from the new ten-minute momentum decay. Five-minute midpoint integration uses weights 0.75 and 0.25; after +10 minutes the accumulated residual contribution stays constant while treatment effects continue. A residual slope of +2 mg/dL/min therefore contributes +10 mg/dL by +10 minutes; the equivalent fall contributes −10 mg/dL. `correctionRate` is still calculated, but the shared compile-time configuration explicitly sets `correctionContributionEnabled = false` and `correctionWeight = 0`. There is no active 60-minute residual correction and no division by a zero correction duration. The overall history still needs six samples over at least 25 minutes within its 30-minute window; the existing freshness and maximum-gap limits remain 330 seconds. Values outside 20–600 mg/dL cause rejection, not clipping. The 60/120-minute horizon is unchanged. `GlucoseForecastEngine.configuration` is the single source of the constants used by both the engine and evidence log; the post-4294 engine version is `local-residual-momentum10-mealduration-v3`. The selected Fiasp/other insulin peak and insulin-action duration remain unchanged. Each confirmed carbohydrate entry can now supply its selected absorption duration; legacy entries use the normal four-hour duration.
 
 The model assumes stable unmodeled background glucose/long-acting basal action. Missed or changed Tresiba, exercise, illness, stress, sensor lag and new food or insulin can invalidate that assumption. The forecast is exploratory until prospective device data establishes its error and coverage. No claim of Trio-equivalent accuracy is made.
 
@@ -250,6 +250,131 @@ repeated **1,255/1,255 XCTest tests** and both simulator builds on the exact
 4294 source checkpoint; Apple confirmed **Internal / Testing** in the existing
 Ole Internal group.
 
+## After 4294: fair local ML self-check (step A)
+
+The historical self-check now scores the engine, the finished ML line (with
+the same whole-line fallback as live inference), and an unchanged-glucose
+baseline against **the same complete C-period reference/actual pairs** at
+each horizon. It shows the count, reference period, MAE and signed error
+(prediction minus actual) for all three, and ML's MAE difference from the
+unchanged baseline. A negative improvement means ML was worse. The activation
+gate remains the existing comparison against the engine and a fairly
+comparable prior model; this addition does not silently change model selection.
+
+An explicit share action on the personal-model settings screen exposes a
+device-local UTF-8 CSV with one row per C-period reference. It includes UTC
+reference and matched-target times, source identity, effective engine/feature
+version and treatment/ISF/ratio settings, reference glucose, engine and ML
+values at +30/+60/+120, actual values, IOB/COB and bolus/carbohydrate sums
+from the treatment window passed to the engine. The file is written for a
+completed self-check even when the candidate is rejected, protected in
+Application Support, and shared only on user action. An older or failed review
+write cannot expose a mismatched CSV. This is sensitive health data; it is
+not sent to Git, HealthKit, Nightscout, Watch or the network by the app.
+
+Live Home and replay use the same event-time treatment-window filter and
+unchanged forecast engine. Synthetic tests also exercise selected-source
+filtering and exact-origin duplicate precedence before handing canonical
+insulin units and carbohydrate grams to both paths. This proves parity *after
+the chosen records and glucose samples are supplied*; it does not prove that
+historical HealthKit and live Core Data contain identical observations,
+source selections or settings. In particular, the historical loader
+deliberately chooses direct HealthKit bolus/carbohydrate samples when their
+selected sources are enabled, while live metrics use eligible imported Core
+Data entries with local/remote origin-ID precedence. This source-level
+difference is not covered by the synthetic motor-input parity test and is
+not proof of a bug or of matching real iPhone inputs. Historical import availability is often
+unknown, so replay continues to mark it as retrospective. The user's external
+20 September–3 October replay rows are unavailable locally; the reported MAE
+difference remains unexplained until matching per-reference inputs and targets
+can be compared. Neither aggregate MAE nor daily treatment totals identify a
+cause.
+
+After a source-cutover backup is restored without its active source setup,
+`therapyRestoreRequiresSourceSetup` keeps local therapy metrics, the forecast
+and ML training unavailable until the selected source history and cutoff are
+re-established. This is a fail-safe for an unknown treatment window, not a
+zero-insulin or zero-carbohydrate result. Historical replay also rejects an
+anchor whose treatment window contains a local entry created at an unknown time,
+edited after the anchor, or now deleted when an earlier revision may have
+existed. The earlier value cannot be reconstructed from the current row; these
+anchors are omitted rather than evaluated with a falsely empty treatment set.
+
+## After 4294: local treatment data (step B)
+
+Treatment logging can use local xDrip entries as the primary source after an
+explicit, persisted cutoff. A final selected Health import completes before the
+source switches. Earlier selected mySugr entries remain eligible by event time;
+local entries are eligible from the cutoff, including after a restart or a
+later backdated entry. A restored cutoff without its source setup fails closed.
+Confirmed local bolus and carbohydrate entries are offered to HealthKit by the
+existing local writer using a stable sync identifier and version. The local
+entry remains authoritative if the Health write fails, and xDrip does not
+reimport its own Health samples. See `HEALTHKIT-THERAPY-IMPORT.md` for the
+source, retry and backup rules.
+
+Carbohydrate entries carry a meal kind and a selected duration: quick 30,
+normal 240, or slow 300 minutes. Older entries read as normal/240 minutes.
+The selected duration flows through local COB, the existing engine treatment
+curve and historical ML input. A planned meal is a separate, unconfirmed
+entry; its time passing is not confirmation. It is excluded from actual COB,
+the unconditional engine forecast, ML and safety decisions until the user
+confirms it as eaten. Any separate dotted planned-food scenario is conditional
+on that future meal, and must not be confused with the unconditional forecast.
+New local entries retain event and creation/modification times so historical
+replay can reject information unavailable at the anchor. Imported historical
+Health entries still use event time where knowledge time is unprovable.
+The changed treatment formation invalidates incompatible stored ML models and
+checkpoints; the engine remains available while ML retrains.
+
+## After 4294: pen calculator and “Low soon” (step C)
+
+The separate pen calculator uses `(COB + new unrecorded carbohydrates) / CR +
+(glucose − target) / correction factor + 20-minute glucose change / correction
+factor − IOB`. It shares the carbohydrate, glucose-correction, trend and active
+insulin terms described by [Trio's bolus calculator](https://triodocs.org/usage/features/bolus-calculator/),
+but uses the user's specified 20-minute change and a pen-specific workflow.
+It has no loop control, superbolus, automatic dosing, or dependence on the ML
+estimate. The profile is prefilled with the user's stated time-of-day CR,
+correction, target, 0.5-unit pen step and 25-unit maximum, but it cannot be
+used before explicit confirmation. The forecast's ISF/CR are separate and
+never substitute for dose settings. A coherent, fresh local treatment snapshot
+and verified source cutoff are required; unknown therapy data never become
+zero IOB/COB. A stale or manual glucose value is identified with its time and
+has no trend term. Already-recorded or backdated carbohydrate is included in
+COB and not added again as a new meal.
+
+The proposed amount is bounded at zero and the confirmed maximum and rounded
+down to the pen step. The engine's unplanned-food 120-minute path is a read-only
+safety check: a current or predicted glucose below 3.0 mmol/L blocks an
+insulin proposal, and current glucose below 3.9 mmol/L displays “eat first”.
+When that engine check is unavailable, the arithmetic proposal can still be
+shown with an explicit unverified warning, as requested; this is a material
+limitation. A user may separately record the amount actually taken. The app
+never administers insulin. For a slow meal, the optional default 70% now and
+90-minute reminder starts a *new* calculation; it is not a guaranteed second
+dose. These rules are software behavior, not demonstrated clinical accuracy.
+
+“Low soon” is a new, separately switchable iPhone alert, initially enabled.
+At each newly saved CGM reading, it requests a warning when the valid engine
+projection at +30 minutes is below 4.4 mmol/L while current glucose is at
+least 3.9 mmol/L; repeated requests are limited to one per 30 minutes. Its
+calculation does not depend on Home visibility, chart horizon or ML and does
+not include unconfirmed meals. It requires the completed local-treatment
+source cutover and a complete current therapy snapshot; being enabled in
+Settings alone does not prove it is ready to warn. Health-import completion
+can trigger a coalesced retry for the same reading, without a new timer. The Apple Watch
+receives only the ordinary forwarded iPhone notification; it does not compute
+this alert. An accepted notification request proves scheduling, not that the
+person saw or heard it. The descriptive 30-day statistics distinguish planned
+warning requests, sustained recorded lows and periods that cannot be judged
+because readings or evaluations are missing. Low episodes require at least
+15 minutes below 3.9 mmol/L, with no inter-reading gap over 5.5 minutes;
+a normal reading or a longer gap ends an episode. The ML display is capped
+at the engine curve when glucose is below 5.0 mmol/L and falling, or the
+new warning is active. This presentation cap does not change the engine or
+the recorded ML model.
+
 ## Validation boundary
 
 Unit tests cover model curves, timing, units, stale and gapped data, treatment selection, source ownership and missing settings. Real-world accuracy must be assessed at +30, +60 and +120 minutes separately against measured glucose, an unchanged-value baseline and a simple short trend. Inputs must be frozen at prediction time; later meals, insulin, corrections and changed settings must be reported separately. Historical xDrip treatment rows do not consistently retain a “known to the app at this time” timestamp, so a retrospective replay cannot prove that it avoided future information. Prospective snapshots or an external dataset with that provenance are needed before reporting comparative accuracy.
@@ -259,7 +384,7 @@ Future extensions may evaluate proven profile provenance, activity, heart rate, 
 
 ## Prospective evidence log and export
 
-A completed calculation supplies an immutable value snapshot to a separate serial IO worker. It never sends Core Data objects between queues or rereads settings while writing. Rendering does not wait for disk IO. No new forecast timer or background calculation is introduced. Off means no forecast attempt is logged; cache hits do not create records.
+A completed Home calculation supplies an immutable value snapshot to a separate serial IO worker. It never sends Core Data objects between queues or rereads settings while writing. Rendering does not wait for disk IO. The Home evidence log adds no timer or continuous background calculation; the separate “Low soon” event-driven calculation is described above. Off means no Home forecast attempt is logged; cache hits do not create records.
 
 Daily JSON Lines files live in **Application Support/GlucoseForecastLog**. The first valid result for each source/reference identity, configured horizon and engine version is retained unchanged, including across restarts and later setting changes. The UI still recomputes normally when its inputs change. Unavailable results have a separate record type and reason; they cannot block a later valid result. Identical failures are throttled to one per reference/reason/horizon/engine in a ten-minute UTC bucket. Unknown reference dates stay null, and unknown parameters/treatment counts are not zero.
 

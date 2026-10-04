@@ -706,6 +706,357 @@ final class HealthKitTherapyImportTests: XCTestCase {
         XCTAssertTrue(uploadRows.first === local)
     }
 
+    func testSourceCutoverIsDurableAndUsesEventTimeForBackdatedEntries() throws {
+        let suite = "TreatmentSourceCutover.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let boundary = Date(timeIntervalSince1970: 1_800_000_000)
+        let policy = TreatmentSourceCutover(cutoff: boundary,
+            insulinSourceBundleID: "com.mysugr.insulin",
+            carbohydrateSourceBundleID: "com.mysugr.carbs")
+        XCTAssertTrue(TreatmentSourceCutover.persist(policy, defaults: defaults))
+        XCTAssertEqual(TreatmentSourceCutover.current(defaults: defaults), policy)
+        XCTAssertFalse(TreatmentSourceCutover.persist(policy, defaults: defaults),
+            "a second switch must not silently move the persisted source boundary")
+        XCTAssertTrue(policy.permitsImported(eventDate: boundary.addingTimeInterval(-1),
+            kind: .insulin, sourceBundleID: "com.mysugr.insulin"))
+        XCTAssertFalse(policy.permitsImported(eventDate: boundary,
+            kind: .insulin, sourceBundleID: "com.mysugr.insulin"))
+        XCTAssertFalse(policy.permitsImported(eventDate: boundary.addingTimeInterval(-1),
+            kind: .insulin, sourceBundleID: "com.other"))
+        XCTAssertTrue(policy.permitsLocal(eventDate: boundary,
+            localTreatmentUUID: UUID().uuidString, watchSourceUUID: nil))
+        XCTAssertTrue(policy.permitsLocal(eventDate: boundary,
+            localTreatmentUUID: nil, watchSourceUUID: UUID().uuidString))
+        XCTAssertFalse(policy.permitsLocal(eventDate: boundary.addingTimeInterval(-1),
+            localTreatmentUUID: UUID().uuidString, watchSourceUUID: nil))
+        XCTAssertFalse(policy.permitsLocal(eventDate: boundary,
+            localTreatmentUUID: nil, watchSourceUUID: nil))
+        let restarted = try XCTUnwrap(TreatmentSourceCutover.current(defaults: defaults))
+        XCTAssertEqual(restarted.cutoff, boundary)
+    }
+
+    func testDamagedCutoverNeverReenablesOldImportOrReportsSuccessfulSwitch() {
+        let fixture = ImportFixture()
+        defer { fixture.close() }
+        fixture.defaults.set(true, forKey: "healthTherapyImport.v1.insulin.enabled")
+        for damagedValue in ["not data" as Any, Data("{invalid json".utf8) as Any] {
+            fixture.defaults.set(damagedValue, forKey: TreatmentSourceCutover.defaultsKey)
+            XCTAssertNil(TreatmentSourceCutover.current(defaults: fixture.defaults))
+            XCTAssertTrue(TreatmentSourceCutover.hasInvalidStoredValue(defaults: fixture.defaults))
+            XCTAssertFalse(fixture.manager.isEnabled(.insulin))
+
+            let enable = expectation(description: "damaged cutoff rejects import enablement")
+            fixture.manager.setEnabled(true, kind: .insulin) { error in
+                XCTAssertNotNil(error)
+                enable.fulfill()
+            }
+            wait(for: [enable], timeout: 5)
+
+            let switchAttempt = expectation(description: "damaged cutoff rejects new switch")
+            fixture.manager.switchToLocalLogging { error in
+                XCTAssertNotNil(error)
+                switchAttempt.fulfill()
+            }
+            wait(for: [switchAttempt], timeout: 5)
+        }
+        fixture.defaults.removeObject(forKey: TreatmentSourceCutover.defaultsKey)
+        XCTAssertFalse(TreatmentSourceCutover.hasInvalidStoredValue(defaults: fixture.defaults))
+        XCTAssertTrue(fixture.manager.isEnabled(.insulin))
+    }
+
+    func testCutoverWaitsForBothDurableSelectedMySugrReads() {
+        let fixture = ImportFixture()
+        defer { fixture.close() }
+        let mySugr = HealthTherapyImportSource(bundleIdentifier: "com.mysugr.therapy", name: "mySugr")
+        fixture.query.setPage(page([sample(.insulin, source: mySugr)], next: "i0"),
+                              for: .insulin, after: nil)
+        fixture.query.setPage(page([sample(.carbohydrates, source: mySugr)], next: "c0"),
+                              for: .carbohydrates, after: nil)
+        enable(.insulin, source: mySugr, fixture: fixture)
+        enable(.carbohydrates, source: mySugr, fixture: fixture)
+        waitUntil("both selected mySugr imports complete") {
+            !fixture.manager.status(.insulin).isIncomplete &&
+                !fixture.manager.status(.carbohydrates).isIncomplete
+        }
+        fixture.query.holdPage(for: .carbohydrates, after: anchor("c0"))
+        let completed = expectation(description: "final mySugr import committed")
+        fixture.manager.switchToLocalLogging { error in
+            XCTAssertNil(error)
+            completed.fulfill()
+        }
+        waitUntil("final carbohydrate read held") {
+            fixture.query.anchors(for: .carbohydrates).contains { $0 == self.anchor("c0") }
+        }
+        XCTAssertNil(TreatmentSourceCutover.current(defaults: fixture.defaults))
+        XCTAssertTrue(fixture.manager.isEnabled(.insulin))
+        fixture.query.releaseHeldPage(for: .carbohydrates, after: anchor("c0"))
+        wait(for: [completed], timeout: 5)
+        XCTAssertNotNil(TreatmentSourceCutover.current(defaults: fixture.defaults))
+        XCTAssertFalse(fixture.manager.isEnabled(.insulin))
+        XCTAssertFalse(fixture.manager.isEnabled(.carbohydrates))
+        XCTAssertEqual(treatments(in: fixture.core).count, 2)
+    }
+
+    func testFailedFinalImportDoesNotChangeSourceBoundary() {
+        let fixture = ImportFixture()
+        defer { fixture.close() }
+        let mySugr = HealthTherapyImportSource(bundleIdentifier: "com.mysugr.therapy", name: "mySugr")
+        fixture.query.setPage(page([sample(.insulin, source: mySugr)], next: "i0"),
+                              for: .insulin, after: nil)
+        fixture.query.setPage(page([sample(.carbohydrates, source: mySugr)], next: "c0"),
+                              for: .carbohydrates, after: nil)
+        enable(.insulin, source: mySugr, fixture: fixture)
+        enable(.carbohydrates, source: mySugr, fixture: fixture)
+        waitUntil("initial mySugr import complete") {
+            !fixture.manager.status(.insulin).isIncomplete &&
+                !fixture.manager.status(.carbohydrates).isIncomplete
+        }
+        fixture.query.setError(ReadFailure.locked, for: .insulin)
+        let failed = expectation(description: "final read failed")
+        fixture.manager.switchToLocalLogging { error in
+            XCTAssertNotNil(error)
+            failed.fulfill()
+        }
+        wait(for: [failed], timeout: 5)
+        XCTAssertNil(TreatmentSourceCutover.current(defaults: fixture.defaults))
+        XCTAssertTrue(fixture.manager.isEnabled(.insulin))
+        XCTAssertTrue(fixture.manager.isEnabled(.carbohydrates))
+    }
+
+    func testChangingEitherSelectedSourceDuringFinalImportPreventsCutover() {
+        let fixture = ImportFixture()
+        defer { fixture.close() }
+        let mySugr = HealthTherapyImportSource(bundleIdentifier: "com.mysugr.therapy", name: "mySugr")
+        let other = HealthTherapyImportSource(bundleIdentifier: "com.other.therapy", name: "Other")
+        fixture.query.setPage(page([sample(.insulin, source: mySugr)], next: "i0"),
+                              for: .insulin, after: nil)
+        fixture.query.setPage(page([sample(.carbohydrates, source: mySugr)], next: "c0"),
+                              for: .carbohydrates, after: nil)
+        enable(.insulin, source: mySugr, fixture: fixture)
+        enable(.carbohydrates, source: mySugr, fixture: fixture)
+        waitUntil("both sources initially complete") {
+            !fixture.manager.status(.insulin).isIncomplete &&
+                !fixture.manager.status(.carbohydrates).isIncomplete
+        }
+        fixture.query.holdPage(for: .carbohydrates, after: anchor("c0"))
+        let failed = expectation(description: "source changed during final import")
+        fixture.manager.switchToLocalLogging { error in
+            XCTAssertNotNil(error)
+            failed.fulfill()
+        }
+        waitUntil("final carbohydrate read held") {
+            fixture.query.anchors(for: .carbohydrates).contains { $0 == self.anchor("c0") }
+        }
+        fixture.manager.selectSource(other, kind: .insulin)
+        fixture.query.releaseHeldPage(for: .carbohydrates, after: anchor("c0"))
+        wait(for: [failed], timeout: 5)
+        XCTAssertNil(TreatmentSourceCutover.current(defaults: fixture.defaults))
+        XCTAssertTrue(fixture.manager.isEnabled(.insulin))
+    }
+
+    func testOwnHealthWritesAreNeverImportedEvenWhenSelected() {
+        let fixture = ImportFixture()
+        defer { fixture.close() }
+        let own = sample(.insulin, source: sourceA,
+            syncIdentifier: HealthLocalTherapyIdentity.syncPrefix + UUID().uuidString)
+        fixture.query.setPage(page([own], next: "own"), for: .insulin, after: nil)
+        enable(.insulin, source: sourceA, fixture: fixture)
+        waitUntil("own sample skipped and anchor advanced") {
+            fixture.anchor(for: .insulin) == self.anchor("own")
+        }
+        XCTAssertTrue(treatments(in: fixture.core).isEmpty)
+        XCTAssertTrue(ledger(in: fixture.core).isEmpty)
+        XCTAssertTrue(HealthLocalTherapyIdentity.isOwn(sourceBundleID: sourceA.bundleIdentifier,
+            syncIdentifier: own.syncIdentifier))
+    }
+
+    func testLocalHealthWriteRetryKeepsLocalPostAndStableIdentity() throws {
+        let suite = "HealthLocalTherapyWriter.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let policy = TreatmentSourceCutover(cutoff: Date().addingTimeInterval(-3600),
+            insulinSourceBundleID: "com.mysugr.insulin",
+            carbohydrateSourceBundleID: "com.mysugr.carbs")
+        XCTAssertTrue(TreatmentSourceCutover.persist(policy, defaults: defaults))
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let uuid = UUID().uuidString
+        let dose = TreatmentEntry(date: Date().addingTimeInterval(-30), value: 2,
+            treatmentType: .Insulin, nightscoutEventType: nil, enteredBy: "xDrip",
+            nsManagedObjectContext: core.mainManagedObjectContext)
+        dose.localTreatmentUUID = uuid
+        dose.healthKitSyncVersion = NSNumber(value: 1)
+        dose.healthKitSyncStateRaw = "pending"
+        XCTAssertNil(dose.primitiveValue(forKey: "treatmentdeleted"),
+            "new local rows must be writable even when this optional legacy field is nil")
+        XCTAssertTrue(core.saveChangesSynchronously())
+        let store = FakeWriteStore()
+        store.failNext = true
+        let writer = HealthKitLocalTherapyWriter(store: store, defaults: defaults)
+        writer.configure(coreDataManager: core)
+        waitUntil("first Health write attempted") { store.requests.count == 1 }
+        XCTAssertEqual(store.requests.first?.syncIdentifier,
+            HealthLocalTherapyIdentity.syncPrefix + uuid)
+        XCTAssertEqual(store.requests.first?.version, 1)
+        var persistedCount = 0
+        var persistedSyncState: String?
+        core.privateManagedObjectContext.performAndWait {
+            let persisted = (try? core.privateManagedObjectContext.fetch(TreatmentEntry.fetchRequest())) ?? []
+            persistedCount = persisted.count
+            persistedSyncState = persisted.first?.healthKitSyncStateRaw
+        }
+        XCTAssertEqual(persistedCount, 1)
+        XCTAssertEqual(persistedSyncState, "pending",
+            "a Health failure must not roll back a local dose")
+        writer.retryPending()
+        waitUntil("same version retried") { store.requests.count >= 2 }
+        XCTAssertEqual(Array(store.requests.prefix(2)), [store.requests[0], store.requests[0]])
+        waitUntil("successful write acknowledged") {
+            var state: String?
+            core.privateManagedObjectContext.performAndWait {
+                state = (try? core.privateManagedObjectContext.fetch(TreatmentEntry.fetchRequest()))?.first?.healthKitSyncStateRaw
+            }
+            return state == "synced"
+        }
+        dose.value = 3
+        dose.healthKitSyncVersion = NSNumber(value: 2)
+        dose.healthKitSyncStateRaw = HealthLocalTherapySyncState.pending(version: 2)
+        XCTAssertTrue(core.saveChangesSynchronously())
+        core.privateManagedObjectContext.performAndWait {
+            let stored = (try? core.privateManagedObjectContext.fetch(TreatmentEntry.fetchRequest()))?.first
+            XCTAssertEqual(stored?.value, 3)
+            XCTAssertEqual(stored?.healthKitSyncVersion?.intValue, 2)
+            XCTAssertEqual(stored?.healthKitSyncStateRaw, "pending.2",
+                "the edited pending token must survive a stale main-context v1 acknowledgement")
+        }
+        writer.retryPending()
+        waitUntil("edited dose written as higher version") { store.requests.count >= 3 }
+        XCTAssertEqual(store.requests[2].syncIdentifier, store.requests[0].syncIdentifier)
+        XCTAssertEqual(store.requests[2].version, 2)
+        XCTAssertEqual(store.requests[2].amount, 3)
+    }
+
+    func testLocalHealthWriteFalseWithoutErrorAndAckFailureRemainPendingWithoutTightRetry() throws {
+        let suite = "HealthLocalTherapyWriter.Failures.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        XCTAssertTrue(TreatmentSourceCutover.persist(.init(
+            cutoff: Date().addingTimeInterval(-3600),
+            insulinSourceBundleID: "com.mysugr.insulin",
+            carbohydrateSourceBundleID: "com.mysugr.carbs"), defaults: defaults))
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let dose = TreatmentEntry(date: Date().addingTimeInterval(-30), value: 2,
+            treatmentType: .Insulin, nightscoutEventType: nil, enteredBy: "xDrip",
+            nsManagedObjectContext: core.mainManagedObjectContext)
+        dose.localTreatmentUUID = UUID().uuidString
+        dose.healthKitSyncVersion = NSNumber(value: 1)
+        dose.healthKitSyncStateRaw = "pending"
+        XCTAssertTrue(core.saveChangesSynchronously())
+        let store = FakeWriteStore()
+        store.failWithoutErrorNext = true
+        let writer = HealthKitLocalTherapyWriter(store: store, defaults: defaults,
+            acknowledgementSaver: { _ in throw ReadFailure.locked })
+        writer.configure(coreDataManager: core)
+        waitUntil("unsuccessful Health callback without NSError") { store.requests.count == 1 }
+        let firstPause = expectation(description: "no immediate retry after unsuccessful Health callback")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { firstPause.fulfill() }
+        wait(for: [firstPause], timeout: 2)
+        XCTAssertEqual(store.requests.count, 1)
+        writer.retryPending()
+        waitUntil("Health succeeds but local acknowledgement fails") { store.requests.count == 2 }
+        let secondPause = expectation(description: "no tight retry after local acknowledgement failure")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { secondPause.fulfill() }
+        wait(for: [secondPause], timeout: 2)
+        XCTAssertEqual(store.requests.count, 2)
+        var state: String?
+        core.privateManagedObjectContext.performAndWait {
+            state = (try? core.privateManagedObjectContext.fetch(TreatmentEntry.fetchRequest()))?
+                .first?.healthKitSyncStateRaw
+        }
+        XCTAssertEqual(state, "pending")
+    }
+
+    func testEditedDoseDuringInFlightHealthWriteKeepsNewerPendingVersion() throws {
+        let suite = "HealthLocalTherapyWriter.InFlight.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        XCTAssertTrue(TreatmentSourceCutover.persist(.init(
+            cutoff: Date().addingTimeInterval(-3600),
+            insulinSourceBundleID: "com.mysugr.insulin",
+            carbohydrateSourceBundleID: "com.mysugr.carbs"), defaults: defaults))
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let dose = TreatmentEntry(date: Date().addingTimeInterval(-30), value: 2,
+            treatmentType: .Insulin, nightscoutEventType: nil, enteredBy: "xDrip",
+            nsManagedObjectContext: core.mainManagedObjectContext)
+        dose.localTreatmentUUID = UUID().uuidString
+        dose.healthKitSyncVersion = NSNumber(value: 1)
+        dose.healthKitSyncStateRaw = "pending"
+        XCTAssertTrue(core.saveChangesSynchronously())
+        let store = FakeWriteStore()
+        store.holdNext = true
+        let writer = HealthKitLocalTherapyWriter(store: store, defaults: defaults)
+        writer.configure(coreDataManager: core)
+        waitUntil("first Health write held") { store.requests.count == 1 }
+
+        dose.value = 3
+        dose.healthKitSyncVersion = NSNumber(value: 2)
+        dose.healthKitSyncStateRaw = HealthLocalTherapySyncState.pending(version: 2)
+        XCTAssertTrue(core.saveChangesSynchronously())
+        store.completeHeld()
+        waitUntil("newer edit written after old acknowledgement") { store.requests.count == 2 }
+        XCTAssertEqual(store.requests.map(\.version), [1, 2])
+        XCTAssertEqual(store.requests[1].amount, 3)
+        XCTAssertEqual(store.requests[1].syncIdentifier, store.requests[0].syncIdentifier)
+        waitUntil("newer version acknowledged") {
+            var version: Int?
+            var state: String?
+            core.privateManagedObjectContext.performAndWait {
+                let row = (try? core.privateManagedObjectContext.fetch(TreatmentEntry.fetchRequest()))?.first
+                version = row?.healthKitSyncVersion?.intValue
+                state = row?.healthKitSyncStateRaw
+            }
+            return version == 2 && state == "synced"
+        }
+    }
+
+    private final class FakeWriteStore: HealthLocalTherapyWriting {
+        private let lock = NSLock()
+        private var values: [HealthLocalTherapyWriteRequest] = []
+        private var heldCompletion: ((Bool, Error?) -> Void)?
+        var failNext = false
+        var failWithoutErrorNext = false
+        var holdNext = false
+        var requests: [HealthLocalTherapyWriteRequest] {
+            lock.lock(); defer { lock.unlock() }
+            return values
+        }
+        func completeHeld() {
+            lock.lock()
+            let completion = heldCompletion
+            heldCompletion = nil
+            lock.unlock()
+            completion?(true, nil)
+        }
+        func save(_ request: HealthLocalTherapyWriteRequest,
+                  completion: @escaping (Bool, Error?) -> Void) {
+            lock.lock()
+            values.append(request)
+            if holdNext {
+                holdNext = false
+                heldCompletion = completion
+                lock.unlock()
+                return
+            }
+            let shouldFail = failNext
+            failNext = false
+            let failWithoutError = failWithoutErrorNext
+            failWithoutErrorNext = false
+            lock.unlock()
+            completion(!shouldFail && !failWithoutError,
+                shouldFail ? ReadFailure.locked : nil)
+        }
+    }
+
     private enum ReadFailure: Error { case locked }
 
     private final class ImportFixture {
@@ -897,6 +1248,10 @@ final class WatchManualTreatmentTests: XCTestCase {
             XCTAssertEqual(rows.count, 2)
             XCTAssertEqual(Set(rows.compactMap(\.watchSourceUUID)), Set([first.id.uuidString, sameValueDifferentID.id.uuidString]))
             XCTAssertTrue(rows.allSatisfy { $0.treatmentType == .Insulin && $0.value == 2.5 && $0.isWatchLocalOnly })
+            XCTAssertEqual(rows.first { $0.watchSourceUUID == first.id.uuidString }?.createdAt,
+                at.addingTimeInterval(1), "retry must preserve the first iPhone receipt time")
+            XCTAssertEqual(rows.first { $0.watchSourceUUID == first.id.uuidString }?.modifiedAt,
+                at.addingTimeInterval(1))
         }
         try restartedPhone.disconnectPersistentStoresForTesting()
     }

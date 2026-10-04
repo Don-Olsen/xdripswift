@@ -142,16 +142,108 @@ struct GlucoseForecastMLHorizonMetrics: Codable, Sendable {
     let medianBandWidthMgdl: Double
     let candidateFallbackCount: Int
     let activeFallbackCount: Int?
+    // Optional so a 4294 package remains readable. New reviews always fill them.
+    let engineBias: Double?
+    let unchangedMAE: Double?
+    let unchangedBias: Double?
+}
+
+/// MAE and signed error always use the identical reference/actual pairs.
+struct GlucoseForecastMLFairAccuracy: Equatable {
+    let count: Int
+    let maeMgdl: Double
+    let signedErrorMgdl: Double
+
+    static func measure(predictions: [Double], actuals: [Double]) -> Self? {
+        guard !predictions.isEmpty, predictions.count == actuals.count,
+              predictions.allSatisfy(\.isFinite), actuals.allSatisfy(\.isFinite) else { return nil }
+        let errors = zip(predictions, actuals).map(-)
+        let denominator = Double(errors.count)
+        return Self(count: errors.count,
+                    maeMgdl: errors.reduce(0) { $0 + abs($1) } / denominator,
+                    signedErrorMgdl: errors.reduce(0, +) / denominator)
+    }
 }
 
 struct GlucoseForecastMLSelfCheck: Codable, Sendable {
     let startedAt: Date
     let endedAt: Date
+    /// Last reference anchor, distinct from the last matched target in endedAt.
+    let referenceEndAt: Date?
     let horizons: [Int: GlucoseForecastMLHorizonMetrics]
     let activeComparisonWasFair: Bool
     let promoted: Bool
     let rejectionReasons: [String]
     let retrospectiveUnknownCount: Int
+
+    init(startedAt: Date, endedAt: Date, referenceEndAt: Date? = nil,
+         horizons: [Int: GlucoseForecastMLHorizonMetrics],
+         activeComparisonWasFair: Bool, promoted: Bool,
+         rejectionReasons: [String], retrospectiveUnknownCount: Int) {
+        self.startedAt = startedAt
+        self.endedAt = endedAt
+        self.referenceEndAt = referenceEndAt
+        self.horizons = horizons
+        self.activeComparisonWasFair = activeComparisonWasFair
+        self.promoted = promoted
+        self.rejectionReasons = rejectionReasons
+        self.retrospectiveUnknownCount = retrospectiveUnknownCount
+    }
+}
+
+/// One immutable C-period anchor. This is only exported on explicit share;
+/// it is never sent to HealthKit, Nightscout, Watch or Git.
+struct GlucoseForecastMLReviewRow: Sendable {
+    let referenceDate: Date
+    let sourceIdentity: String
+    let glucoseMgdl: Double
+    let engineMgdl: [Int: Double]
+    let mlMgdl: [Int: Double]
+    let actualMgdl: [Int: Double]
+    let actualDate: [Int: Date]
+    let iobUnits: Double
+    let cobGrams: Double
+    let bolusUnitsInWindow: Double
+    let carbohydrateGramsInWindow: Double
+}
+
+enum GlucoseForecastMLReviewCSV {
+    static let header = "reference_utc,source_identity,engine_version,feature_version,source_signature,isf_mgdl_per_unit,carb_ratio_grams_per_unit,insulin_model,insulin_peak_minutes,insulin_duration_minutes,carb_duration_minutes,reference_glucose_mgdl,engine_30_mgdl,engine_60_mgdl,engine_120_mgdl,ml_30_mgdl,ml_60_mgdl,ml_120_mgdl,actual_30_mgdl,actual_60_mgdl,actual_120_mgdl,actual_30_utc,actual_60_utc,actual_120_utc,iob_units,cob_grams,bolus_units_in_window,carbohydrate_grams_in_window\r\n"
+
+    static func data(_ rows: [GlucoseForecastMLReviewRow],
+                     context: GlucoseForecastMLContext) -> Data? {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        func number(_ value: Double?) -> String {
+            guard let value, value.isFinite else { return "" }
+            return String(value)
+        }
+        func cell(_ value: String) -> String {
+            if value.contains(",") || value.contains("\"") || value.contains("\n") || value.contains("\r") {
+                return "\"" + value.replacingOccurrences(of: "\"", with: "\"\"") + "\""
+            }
+            return value
+        }
+        var csv = header
+        for row in rows {
+            let fields = [formatter.string(from: row.referenceDate), row.sourceIdentity,
+                context.engineVersion, context.featureVersion, context.sourceSignature,
+                number(context.sensitivityMgdlPerUnit),
+                number(context.carbohydrateRatioGramsPerUnit),
+                TherapyInsulinPreset.nearest(to: context.insulinPeakMinutes).rawValue,
+                number(context.insulinPeakMinutes), number(context.insulinDurationMinutes),
+                number(context.carbohydrateDurationMinutes), number(row.glucoseMgdl)]
+                + [30, 60, 120].map { number(row.engineMgdl[$0]) }
+                + [30, 60, 120].map { number(row.mlMgdl[$0]) }
+                + [30, 60, 120].map { number(row.actualMgdl[$0]) }
+                + [30, 60, 120].map { row.actualDate[$0].map(formatter.string(from:)) ?? "" }
+                + [number(row.iobUnits), number(row.cobGrams),
+                   number(row.bolusUnitsInWindow), number(row.carbohydrateGramsInWindow)]
+            csv += fields.map(cell).joined(separator: ",") + "\r\n"
+        }
+        return csv.data(using: .utf8)
+    }
 }
 
 struct GlucoseForecastMLModelMetadata: Codable, Sendable {
@@ -433,6 +525,14 @@ enum GlucoseForecastMLChronology {
 struct GlucoseForecastMLTrainedCandidate {
     let models: [String: MLBoostedTreeRegressor]
     let metadata: GlucoseForecastMLModelMetadata
+    let reviewRows: [GlucoseForecastMLReviewRow]
+
+    init(models: [String: MLBoostedTreeRegressor], metadata: GlucoseForecastMLModelMetadata,
+         reviewRows: [GlucoseForecastMLReviewRow] = []) {
+        self.models = models
+        self.metadata = metadata
+        self.reviewRows = reviewRows
+    }
 }
 
 enum GlucoseForecastMLTrainer {
@@ -694,11 +794,14 @@ enum GlucoseForecastMLTrainer {
         var metrics = [Int: GlucoseForecastMLHorizonMetrics]()
         var selfCheckCounts = [Int: Int]()
         var rejections = [String]()
+        var reviewMLValues = [Date: [Int: Double]]()
         for horizon in GlucoseForecastMLChronology.horizons {
             try Task.checkCancellation()
             let lineMinutes = horizon == 120 ? 120 : 60
-            var candidateAbsolute = [Double]()
-            var engineAbsolute = [Double]()
+            var actuals = [Double]()
+            var candidatePredictions = [Double]()
+            var enginePredictions = [Double]()
+            var unchangedPredictions = [Double]()
             var activeAbsolute = [Double]()
             var candidateBiases = [Double]()
             var widths = [Double]()
@@ -709,7 +812,9 @@ enum GlucoseForecastMLTrainer {
                 let example = anchor.example(at: horizon)
                 let actual = example.targetGlucoseMgdl
                 let baseline = example.engineTargetGlucoseMgdl
-                engineAbsolute.append(abs(actual - baseline))
+                actuals.append(actual)
+                enginePredictions.append(baseline)
+                unchangedPredictions.append(example.row.glucose)
                 let candidateLine = replayLine(anchor: anchor, horizonMinutes: lineMinutes,
                     multiplier: { calibrations[$0]?.multiplier }, prediction: candidatePrediction)
                 let candidateCentral: Double
@@ -722,8 +827,8 @@ enum GlucoseForecastMLTrainer {
                     candidateCentral = baseline
                     candidateFallbacks += 1
                 }
-                candidateAbsolute.append(abs(actual - candidateCentral))
-                candidateBiases.append(candidateCentral - actual)
+                candidatePredictions.append(candidateCentral)
+                reviewMLValues[anchor.referenceDate, default: [:]][horizon] = candidateCentral
                 if let active, fairActive {
                     let activeLine = replayLine(anchor: anchor, horizonMinutes: lineMinutes,
                         multiplier: { selected in
@@ -742,22 +847,33 @@ enum GlucoseForecastMLTrainer {
                     }
                 }
             }
+            guard let engineAccuracy = GlucoseForecastMLFairAccuracy.measure(
+                    predictions: enginePredictions, actuals: actuals),
+                  let candidateAccuracy = GlucoseForecastMLFairAccuracy.measure(
+                    predictions: candidatePredictions, actuals: actuals),
+                  let unchangedAccuracy = GlucoseForecastMLFairAccuracy.measure(
+                    predictions: unchangedPredictions, actuals: actuals) else {
+                throw GlucoseForecastMLTrainingFailure.invalidModelOutput
+            }
             let mean: ([Double]) -> Double = { $0.reduce(0, +) / Double($0.count) }
             // With no successful ML line, every point falls back to the engine
             // and the candidate fails the improvement gate below.
             let medianWidth = GlucoseForecastMLChronology.median(widths) ?? 0
-            let engineMAE = mean(engineAbsolute)
-            let candidateMAE = mean(candidateAbsolute)
+            let engineMAE = engineAccuracy.maeMgdl
+            let candidateMAE = candidateAccuracy.maeMgdl
             let activeMAE = fairActive && activeAbsolute.count == cAnchors.count
                 ? mean(activeAbsolute) : nil
             selfCheckCounts[horizon] = cAnchors.count
             metrics[horizon] = GlucoseForecastMLHorizonMetrics(
                 count: cAnchors.count, engineMAE: engineMAE, candidateMAE: candidateMAE,
-                activeMAE: activeMAE, candidateBias: mean(candidateBiases),
+                activeMAE: activeMAE, candidateBias: candidateAccuracy.signedErrorMgdl,
                 candidateCoverage: Double(covered) / Double(cAnchors.count),
                 medianBandWidthMgdl: medianWidth,
                 candidateFallbackCount: candidateFallbacks,
-                activeFallbackCount: fairActive ? activeFallbacks : nil)
+                activeFallbackCount: fairActive ? activeFallbacks : nil,
+                engineBias: engineAccuracy.signedErrorMgdl,
+                unchangedMAE: unchangedAccuracy.maeMgdl,
+                unchangedBias: unchangedAccuracy.signedErrorMgdl)
             if !(candidateMAE < engineMAE) { rejections.append("candidateNotBetterThanEngineAt\(horizon)") }
             if let activeMAE, candidateMAE > activeMAE {
                 rejections.append("candidateWorseThanActiveAt\(horizon)")
@@ -773,9 +889,26 @@ enum GlucoseForecastMLTrainer {
                 periodStart: split.bStart, periodEnd: split.cStart)
         }
         let report = GlucoseForecastMLSelfCheck(
-            startedAt: split.cStart, endedAt: testEnd, horizons: metrics,
+            startedAt: split.cStart, endedAt: testEnd,
+            referenceEndAt: cAnchors.last?.referenceDate, horizons: metrics,
             activeComparisonWasFair: fairActive, promoted: rejections.isEmpty,
             rejectionReasons: rejections, retrospectiveUnknownCount: split.retrospectiveUnknownCount)
+        let reviewRows = cAnchors.map { anchor -> GlucoseForecastMLReviewRow in
+            let first = anchor.example(at: 30)
+            return GlucoseForecastMLReviewRow(
+                referenceDate: anchor.referenceDate, sourceIdentity: first.sourceIdentity,
+                glucoseMgdl: first.row.glucose,
+                engineMgdl: Dictionary(uniqueKeysWithValues:
+                    GlucoseForecastMLChronology.horizons.map { ($0, anchor.example(at: $0).engineTargetGlucoseMgdl) }),
+                mlMgdl: reviewMLValues[anchor.referenceDate] ?? [:],
+                actualMgdl: Dictionary(uniqueKeysWithValues:
+                    GlucoseForecastMLChronology.horizons.map { ($0, anchor.example(at: $0).targetGlucoseMgdl) }),
+                actualDate: Dictionary(uniqueKeysWithValues:
+                    GlucoseForecastMLChronology.horizons.map { ($0, anchor.example(at: $0).targetDate) }),
+                iobUnits: first.row.values[6], cobGrams: first.row.values[7],
+                bolusUnitsInWindow: first.bolusUnitsInWindow,
+                carbohydrateGramsInWindow: first.carbohydrateGramsInWindow)
+        }
         let metadata = GlucoseForecastMLModelMetadata(
             schemaVersion: GlucoseForecastMLModelMetadata.schemaVersion,
             modelID: UUID().uuidString.lowercased(), trainedAt: now, context: context,
@@ -786,7 +919,8 @@ enum GlucoseForecastMLTrainer {
             walkForwardCounts: walkCounts, calibrationCounts: calibrationCounts,
             selfCheckCounts: selfCheckCounts, calibrations: calibrations,
             selfCheck: report, retrospectiveUnknownCount: split.retrospectiveUnknownCount)
-        return GlucoseForecastMLTrainedCandidate(models: models, metadata: metadata)
+        return GlucoseForecastMLTrainedCandidate(models: models, metadata: metadata,
+                                                 reviewRows: reviewRows)
     }
 
     private static func fit(_ examples: [GlucoseForecastMLReplayExample],

@@ -20,9 +20,11 @@ final class StatisticsViewModel: ObservableObject {
     @Published private(set) var analytics: GlucoseReportAnalytics?
     @Published private(set) var availablePeriods: [GlucoseReportPeriod: Bool] = [:]
     @Published private(set) var isLoading = true
+    @Published private(set) var lowSoonStatistics: LowSoonStatisticsSummary?
 
     private let statisticsManager: StatisticsManager
     private var analyticsTask: Task<Void, Never>?
+    private var lowSoonTask: Task<Void, Never>?
 
     init(statisticsManager: StatisticsManager) {
         self.statisticsManager = statisticsManager
@@ -30,6 +32,12 @@ final class StatisticsViewModel: ObservableObject {
 
     /// Loads available periods before requesting analytics for the selected period.
     func load() {
+        lowSoonTask?.cancel()
+        lowSoonTask = Task {
+            let summary = await statisticsManager.lowSoonStatistics()
+            guard !Task.isCancelled else { return }
+            lowSoonStatistics = summary
+        }
         Task {
             isLoading = true
             let availability = await statisticsManager.availableReportPeriods()

@@ -14,7 +14,7 @@ struct GlucoseForecastMLFeatureRow: Sendable {
 enum GlucoseForecastMLFeatures {
     // The feature order is unchanged; the version also binds the corrected
     // historical data formation used to train the model.
-    static let featureVersion = "glucose-forecast-16-v3"
+    static let featureVersion = "glucose-forecast-16-mealduration-cutover-v4"
     static let featureNames = [
         "glucoseMgdl", "rawSlope15MgdlPerMinute", "rawSlope30MgdlPerMinute",
         "engineDeltaMgdl", "insulinNextUnits", "carbsNextGrams", "iobUnits",
@@ -77,9 +77,11 @@ enum GlucoseForecastMLFeatures {
                 insulinNext += current - future
             } else {
                 let current = TherapyCalculations.carbsRemaining(grams: treatment.amount,
-                    minutes: age, duration: input.settings.carbDuration)
+                    minutes: age,
+                    duration: treatment.carbohydrateDuration(or: input.settings.carbDuration))
                 let future = TherapyCalculations.carbsRemaining(grams: treatment.amount,
-                    minutes: futureAge, duration: input.settings.carbDuration)
+                    minutes: futureAge,
+                    duration: treatment.carbohydrateDuration(or: input.settings.carbDuration))
                 cob += current
                 carbsNext += current - future
             }

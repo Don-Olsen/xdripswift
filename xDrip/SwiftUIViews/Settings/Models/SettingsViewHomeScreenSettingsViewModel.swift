@@ -239,6 +239,7 @@ class SettingsViewHomeScreenSettingsViewModel: NSObject, SettingsViewModelProtoc
         // Treatments gates basal and curves without changing their saved preferences.
         let treatmentRows = [
             SettingsRow(id: "homeScreen.showTreatments", title: Texts_SettingsView.settingsviews_showTreatments, control: .toggle(isOn: { UserDefaults.standard.showTreatmentsOnChart }, setIsOn: { UserDefaults.standard.showTreatmentsOnChart = $0 }), reloadScope: .all),
+            quickCarbohydrateAmountRow(),
             SettingsRow(id: "homeScreen.showIOBCOB", title: TherapyTexts.text("curves"), control: .toggle(isOn: { UserDefaults.standard.showIOBCOB }, setIsOn: { UserDefaults.standard.showIOBCOB = $0 }), isVisible: UserDefaults.standard.showTreatmentsOnChart),
             SettingsRow(id: "homeScreen.renderBasalDownwards", title: Texts_SettingsView.basalPosition, control: .menu(
                 options: {
@@ -339,6 +340,29 @@ class SettingsViewHomeScreenSettingsViewModel: NSObject, SettingsViewModelProtoc
                     fieldTitle: Texts_Common.enterValue, unitText: "g/U",
                     actionTitle: Texts_Common.Ok, cancelTitle: Texts_Common.Cancel,
                     action: { input in defaults.glucoseForecastManualCarbRatioGramsPerUnit = GlucoseForecastSettingsInput.positiveNumber(input) },
+                    cancel: nil, validator: { input in GlucoseForecastSettingsInput.validationMessage(input) }
+                )
+            }
+        )
+    }
+
+    private func quickCarbohydrateAmountRow() -> SettingsRow {
+        let defaults = UserDefaults.standard
+        let title = "🍭 Hurtige kulhydrater"
+        let saved = defaults.quickCarbohydrateGrams
+        return SettingsRow(
+            id: "homeScreen.quickCarbohydrateGrams", title: title,
+            detail: saved.map { GlucoseForecastSettingsInput.displayNumber($0) + " g" } ?? "Ikke indstillet",
+            accessory: .disclosure, reloadScope: .all,
+            action: .textEntry {
+                SettingsTextEntryContent(
+                    title: title,
+                    message: "Vælg det antal gram, hurtigknappen skal registrere. Tomt felt slår knappen fra.",
+                    keyboardType: .decimalPad,
+                    text: saved.map(GlucoseForecastSettingsInput.displayNumber), placeholder: nil,
+                    fieldTitle: "Kulhydrater", unitText: "g",
+                    actionTitle: Texts_Common.Ok, cancelTitle: Texts_Common.Cancel,
+                    action: { input in defaults.quickCarbohydrateGrams = GlucoseForecastSettingsInput.positiveNumber(input) },
                     cancel: nil, validator: { input in GlucoseForecastSettingsInput.validationMessage(input) }
                 )
             }
