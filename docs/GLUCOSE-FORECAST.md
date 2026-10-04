@@ -377,7 +377,7 @@ the recorded ML model.
 
 ## Validation boundary
 
-### Pen calculator and planned meals after 4295
+### Pen calculator and planned meals in 4296
 
 The iPhone pen calculator recalculates its existing suggestion when its inputs change and
 on the existing screen clock as treatment effects and the time-based profile age. A
@@ -408,6 +408,12 @@ choice resets when a newer fresh reading has a usable trend; a manual entry rema
 selected until the user chooses CGM or closes the calculator.
 This fallback is local to the calculator and does not change stored CGM readings,
 forecast history, ML or alarms. It does not establish that a dose is clinically safe.
+
+The exact 4296 checkpoint passed 1,346 XCTest tests, 157 Python tests, 54
+synthetic Watch checks, both simulator builds and an unsigned iPhoneOS/arm64
+build. The exported five-bundle IPA was verified before the internal TestFlight
+upload. A physical iPhone and Watch have not yet verified the calculator flow
+or actual notification delivery.
 
 Unit tests cover model curves, timing, units, stale and gapped data, treatment selection, source ownership and missing settings. Real-world accuracy must be assessed at +30, +60 and +120 minutes separately against measured glucose, an unchanged-value baseline and a simple short trend. Inputs must be frozen at prediction time; later meals, insulin, corrections and changed settings must be reported separately. Historical xDrip treatment rows do not consistently retain a “known to the app at this time” timestamp, so a retrospective replay cannot prove that it avoided future information. Prospective snapshots or an external dataset with that provenance are needed before reporting comparative accuracy.
 

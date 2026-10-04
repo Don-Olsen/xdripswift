@@ -20,7 +20,7 @@ De følgende afsnit bevarer integrations- og testhistorikken før denne udgivels
 - Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
 <!-- testflight-7.1.1-4295:end -->
 
-## Kandidat efter 4295 — penberegner og måltidsplaner
+## Build 4296 — penberegner og måltidsplaner
 
 Beregnerens skærm samler kulhydrat, madtype, spisetid og en eksplicit kopierbar
 insulinanbefaling. Regnestykket vises fra ét fast beregningssnapshot i ⓘ.
@@ -40,16 +40,17 @@ Automatiske beregninger ændrer aldrig de indtastede mængder. Manuel
 glukose eller eksplicit valgt CGM uden trend ændrer ikke sensorhistorik,
 prognosemotor, alarmer eller ML.
 
-Den forberedende lokale `release-test` den 4. oktober bestod 1.346/1.346
-XCTest-tests, 157 Python-tests, de syntetiske Watch-kontroller og begge
-simulatorbuilds. En separat usigneret iPhoneOS-build frembragte et arm64-
-program med Xcode som også byggede den indlejrede Watch-app. En efterfølgende
-isoleringsoprydning i Swift-parametre ændrede ikke funktionen, men kræver
-friske kontroller på det præcise release-checkpoint; disse registreres af
-releaseproceduren. Simulatorbilleder gemmes uden for Git. Koden er ikke
-verificeret på en fysisk iPhone; faktisk notifikationslevering og brug i
-hverdagen kan ikke udledes af simulatortests. Ingen klinisk præcision eller
-sikker dosis er dokumenteret.
+Det præcise 4296-checkpoint bestod 1.346/1.346 XCTest-tests, 157 Python-tests,
+54 syntetiske Watch-kontroller og begge simulatorbuilds. Et separat usigneret
+iPhoneOS-build bestod og frembragte et arm64-program. Den signerede IPA og alle
+fem bundles blev verificeret før upload. Simulatorbilleder af tom beregner,
+🍕-måltid, planlagt måltid, manuel værdi uden trend og åbent tastatur ligger
+uden for Git. Simulatoren havde ikke komplette CGM- og behandlingsdata, så en
+gyldig sikkerhedsadvarsel, tilstanden med manglende trend fra CGM og det aktive
+ⓘ-ark kunne ikke fotograferes der. Koden er ikke verificeret på en fysisk
+iPhone eller et ur; faktisk notifikationslevering og brug i hverdagen kan ikke
+udledes af simulatortests. Ingen klinisk præcision eller sikker dosis er
+dokumenteret.
 
 De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
 
