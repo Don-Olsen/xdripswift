@@ -206,7 +206,8 @@ import OSLog
         treatmentEntry.uploaded = false
         treatmentEntry.modifiedAt = Date()
 
-        let saved = durableMutation ? (localSaveOverride?() ?? coreDataManager.saveChangesSynchronously()) :
+        let requiresPersistentSave = durableMutation || treatmentEntry.treatmentType == .BasalInjection
+        let saved = requiresPersistentSave ? (localSaveOverride?() ?? coreDataManager.saveChangesSynchronously()) :
             coreDataManager.saveChanges()
         guard saved, !durableMutation ||
             localSaveJournal.completeMutationVerified(coreDataManager: coreDataManager,
@@ -217,6 +218,9 @@ import OSLog
         }
         deletionFailureMessage = nil
         if durableMutation { HealthKitLocalTherapyWriter.shared.retryPending() }
+        if treatmentEntry.treatmentType == .BasalInjection {
+            BasalReminderScheduler.shared.refreshAfterTreatmentChange(coreDataManager: coreDataManager)
+        }
         if let uuid = treatmentEntry.localTreatmentUUID {
             if treatmentEntry.treatmentType == .Carbs {
                 let warning = MealPlanReminderCoordinator.refresh(coreDataManager: coreDataManager,
@@ -319,6 +323,7 @@ import OSLog
 
 enum TreatmentEditorState: Identifiable {
     case add
+    case basal
     case quickCarbs(Double)
     case edit(TreatmentSnapshot)
 
@@ -326,6 +331,8 @@ enum TreatmentEditorState: Identifiable {
         switch self {
         case .add:
             return "add"
+        case .basal:
+            return "basal"
         case .quickCarbs:
             return "quickCarbs"
         case .edit(let treatment):

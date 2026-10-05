@@ -190,6 +190,24 @@ final class WatchStateModel: NSObject, ObservableObject {
     private var lastManualTreatmentSendAt: [UUID: Date] = [:]
     private var manualTreatmentRetryScheduled = false
 
+    // Combined pen logs share the durable treatment queue. The operation is written
+    // before either an interactive message or an offline transfer is attempted.
+    @Published private(set) var pendingBolusOperations: [WatchBolusOperation] = []
+    @Published private(set) var lastStoredBolusOperation: WatchBolusOperation?
+    @Published private(set) var bolusStorageIssue: String?
+    @Published private(set) var bolusDeliveryIssue: String?
+    @Published private(set) var watchPenProfileSettings: WatchPenProfileSettings?
+    @Published private(set) var watchPenCalculation: WatchPenCalculationResponse?
+    @Published private(set) var watchPenCalculationIssue: String?
+    @Published private(set) var watchPenIsCalculating = false
+    private var watchPenDataSignature: String?
+    private var watchPenRequestID: UUID?
+    private var watchPenRequestInput: (carbs: Double, meal: String)?
+    private var bolusDirectSendInFlight = Set<UUID>()
+    private var lastBolusSendAt: [UUID: Date] = [:]
+    private var bolusRetryScheduled = false
+    private let watchPenSettingsStorageKey = "watchPenProfileSettings.v1"
+
     /// Original direct values are retained in memory so a newer iPhone calibration can
     /// recompute the Watch-only presentation without altering values sent back to iPhone.
     private var directReadingHistory: [LibreWatchDirectReadingPayload] = []
@@ -234,11 +252,17 @@ final class WatchStateModel: NSObject, ObservableObject {
 
         do {
             pendingManualTreatments = try Self.loadManualTreatments()
+            pendingBolusOperations = try Self.loadBolusOperations()
         } catch WatchManualTreatmentKind.DecodingError.unsupportedKind {
             manualTreatmentStorageIssue = "Ukendt behandlingstype · opdatér appen. Køen er bevaret på uret"
         } catch {
             manualTreatmentStorageIssue = "Kunne ikke læse gemte behandlinger på uret"
             log.error("Manual Watch treatment queue load failed: \(error.localizedDescription, privacy: .public)")
+        }
+        if let data = UserDefaults.standard.data(forKey: watchPenSettingsStorageKey),
+           let settings = try? JSONDecoder().decode(WatchPenProfileSettings.self, from: data),
+           settings.isValid {
+            watchPenProfileSettings = settings
         }
 
         if let pending = pendingPhoneReturn {
@@ -284,6 +308,7 @@ final class WatchStateModel: NSObject, ObservableObject {
             retryPendingPhoneReturn()
             flushWatchConnectivityOutbox()
             flushManualTreatmentQueue()
+            flushBolusOperationQueue()
         } else {
             requestSessionActivationIfNeeded()
         }
@@ -910,6 +935,7 @@ final class WatchStateModel: NSObject, ObservableObject {
         directReadingHistory.append(reading)
         directReadingHistory.sort { $0.receivedAt > $1.receivedAt }
         directReadingHistory.removeAll { $0.receivedAt < Date().addingTimeInterval(-12 * 60 * 60) }
+        invalidateWatchPenCalculation()
 
         upsertDirectReading(reading, displayedGlucose: displayed.glucose)
 
@@ -1479,6 +1505,14 @@ final class WatchStateModel: NSObject, ObservableObject {
         try WatchManualTreatmentQueue.persist(treatments, to: manualTreatmentQueueURL())
     }
 
+    private static func loadBolusOperations() throws -> [WatchBolusOperation] {
+        try WatchManualTreatmentQueue.loadBolusOperations(from: manualTreatmentQueueURL())
+    }
+
+    private static func persistBolusOperations(_ operations: [WatchBolusOperation]) throws {
+        try WatchManualTreatmentQueue.persistBolusOperations(operations, to: manualTreatmentQueueURL())
+    }
+
     /// Return success only after the entry is safely written on the Watch. No dose is calculated.
     @discardableResult
     func recordManualTreatment(kind: WatchManualTreatmentKind, amount: Double) -> Bool {
@@ -1492,6 +1526,7 @@ final class WatchStateModel: NSObject, ObservableObject {
         do {
             try Self.persistManualTreatments(updated)
             pendingManualTreatments = updated
+            invalidateWatchPenCalculation()
             flushManualTreatmentQueue()
             return true
         } catch {
@@ -1536,6 +1571,7 @@ final class WatchStateModel: NSObject, ObservableObject {
 
     func retryPendingManualTreatments() {
         flushManualTreatmentQueue()
+        flushBolusOperationQueue()
     }
 
     @discardableResult
@@ -1557,6 +1593,7 @@ final class WatchStateModel: NSObject, ObservableObject {
             try Self.persistManualTreatments(remaining)
             pendingManualTreatments = remaining
             lastStoredManualTreatment = confirmed
+            invalidateWatchPenCalculation()
             manualTreatmentDeliveryIssue = nil
             lastManualTreatmentSendAt[id] = nil
             log.info("iPhone confirmed manual Watch treatment \(idString, privacy: .public)")
@@ -1564,6 +1601,285 @@ final class WatchStateModel: NSObject, ObservableObject {
             // Retaining the Watch record is safe: the phone deduplicates by the stable UUID.
             manualTreatmentStorageIssue = "iPhone har gemt behandlingen, men uret kan ikke opdatere køen"
             log.error("Manual Watch treatment receipt write failed: \(error.localizedDescription, privacy: .public)")
+        }
+        return true
+    }
+
+    private func acceptWatchPenSettings(_ dictionary: [String: Any]) {
+        if dictionary[WatchPenMessageKey.profileAvailable] as? Bool == false {
+            watchPenProfileSettings = nil
+            UserDefaults.standard.removeObject(forKey: watchPenSettingsStorageKey)
+            invalidateWatchPenCalculation()
+        } else if dictionary[WatchPenMessageKey.profileAvailable] as? Bool == true {
+            let data: Data?
+            if let encoded = dictionary[WatchPenMessageKey.profileSettings] as? Data {
+                data = encoded
+            } else if let object = dictionary[WatchPenMessageKey.profileSettings] as? [String: Any] {
+                data = try? JSONSerialization.data(withJSONObject: object)
+            } else {
+                data = nil
+            }
+            guard let data,
+                  let settings = try? JSONDecoder().decode(WatchPenProfileSettings.self, from: data),
+                  settings.isValid else {
+                watchPenProfileSettings = nil
+                UserDefaults.standard.removeObject(forKey: watchPenSettingsStorageKey)
+                invalidateWatchPenCalculation()
+                return
+            }
+            if watchPenProfileSettings?.profileSignature != settings.profileSignature {
+                invalidateWatchPenCalculation()
+            }
+            watchPenProfileSettings = settings
+            UserDefaults.standard.set(data, forKey: watchPenSettingsStorageKey)
+        }
+        if let signature = dictionary[WatchPenMessageKey.dataSignature] as? String {
+            let changedDuringRequest = watchPenRequestID != nil &&
+                watchPenDataSignature != nil && watchPenDataSignature != signature
+            watchPenDataSignature = signature
+            if changedDuringRequest {
+                invalidateWatchPenCalculation()
+                watchPenCalculationIssue = "Beregningsdata er ændret. Tryk Beregn igen."
+            } else if let calculation = watchPenCalculation,
+               calculation.dataSignature != signature {
+                invalidateWatchPenCalculation()
+                watchPenCalculationIssue = "Beregningsdata er ændret. Tryk Beregn igen."
+            }
+        }
+    }
+
+    func invalidateWatchPenCalculation() {
+        watchPenRequestID = nil
+        watchPenRequestInput = nil
+        watchPenCalculation = nil
+        watchPenIsCalculating = false
+    }
+
+    func currentWatchPenSuggestion(carbohydrateGrams: Double, mealKindRaw: String,
+                                   at now: Date = Date()) -> Double? {
+        guard let calculation = watchPenCalculation,
+              let requested = watchPenRequestInput,
+              requested.carbs == carbohydrateGrams, requested.meal == mealKindRaw,
+              now.timeIntervalSince(calculation.calculatedAt) >= 0,
+              now.timeIntervalSince(calculation.calculatedAt) <= 120,
+              calculation.profileSignature == watchPenProfileSettings?.profileSignature,
+              watchPenDataSignature == nil || calculation.dataSignature == watchPenDataSignature,
+              calculation.unavailableReason == nil else { return nil }
+        return calculation.suggestedUnits
+    }
+
+    func expireWatchPenSuggestionIfNeeded(at now: Date = Date()) {
+        guard let calculation = watchPenCalculation,
+              calculation.suggestedUnits != nil,
+              now.timeIntervalSince(calculation.calculatedAt) > 120 else { return }
+        invalidateWatchPenCalculation()
+        watchPenCalculationIssue = "Forslaget er udløbet. Tryk Beregn igen."
+    }
+
+    func calculateWatchPenDose(carbohydrateGrams: Double, mealKindRaw: String) {
+        invalidateWatchPenCalculation()
+        watchPenCalculationIssue = nil
+        guard carbohydrateGrams.isFinite, (0...500).contains(carbohydrateGrams),
+              ["fast", "normal", "slow"].contains(mealKindRaw) else {
+            watchPenCalculationIssue = "Indtast 0–500 g kulhydrat."
+            return
+        }
+        guard let settings = watchPenProfileSettings, settings.isValid else {
+            watchPenCalculationIssue = "Penprofilen er ikke synkroniseret fra iPhone."
+            requestWatchStateUpdate()
+            return
+        }
+        guard phoneIsReachable else {
+            watchPenCalculationIssue = "Ikke forbundet med iPhone – logger uden beregning"
+            requestSessionActivationIfNeeded()
+            return
+        }
+
+        // Trigger the existing delivery paths before asking the phone to take its
+        // snapshot. The request lists anything still awaiting a durable receipt.
+        flushManualTreatmentQueue()
+        flushBolusOperationQueue()
+        flushWatchConnectivityOutbox()
+        let request = WatchPenCalculationRequest(
+            requestID: UUID(), carbohydrateGrams: carbohydrateGrams, mealKindRaw: mealKindRaw,
+            pendingTreatmentIDs: pendingManualTreatments.filter {
+                $0.kind == .insulin || $0.kind == .carbs
+            }.map(\.id) + pendingBolusOperations.map(\.id),
+            pendingReadingIDs: connectivityOutbox.items.filter {
+                $0.reading != nil && $0.sessionID == libreWatchDirectSession?.id
+            }.map(\.id),
+            latestWatchReadingAt: libreWatchOwnership == .watch ? directReadingHistory.first?.receivedAt : nil,
+            profileSignature: settings.profileSignature)
+        guard let data = try? JSONEncoder().encode(request) else {
+            watchPenCalculationIssue = "Kunne ikke sende beregningsanmodningen."
+            return
+        }
+        watchPenRequestID = request.requestID
+        watchPenRequestInput = (carbohydrateGrams, mealKindRaw)
+        watchPenIsCalculating = true
+        session.sendMessage([WatchPenMessageKey.calculationRequest: data], replyHandler: { [weak self] reply in
+            DispatchQueue.main.async {
+                self?.receiveWatchPenCalculation(reply, request: request)
+            }
+        }, errorHandler: { [weak self] _ in
+            DispatchQueue.main.async {
+                guard let self, self.watchPenRequestID == request.requestID else { return }
+                self.invalidateWatchPenCalculation()
+                self.watchPenCalculationIssue = "Ikke forbundet med iPhone – logger uden beregning"
+            }
+        })
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in
+            guard let self, self.watchPenRequestID == request.requestID else { return }
+            self.invalidateWatchPenCalculation()
+            self.watchPenCalculationIssue = "Ikke forbundet med iPhone – logger uden beregning"
+        }
+    }
+
+    private func receiveWatchPenCalculation(_ reply: [String: Any],
+                                             request: WatchPenCalculationRequest) {
+        guard watchPenRequestID == request.requestID else { return }
+        watchPenIsCalculating = false
+        if let reason = reply[WatchPenMessageKey.calculationError] as? String {
+            watchPenCalculationIssue = reason
+            watchPenRequestID = nil
+            return
+        }
+        guard let data = reply[WatchPenMessageKey.calculationResponse] as? Data,
+              let result = try? JSONDecoder().decode(WatchPenCalculationResponse.self, from: data),
+              result.requestID == request.requestID,
+              result.profileSignature == watchPenProfileSettings?.profileSignature else {
+            watchPenCalculationIssue = "iPhone sendte ikke et gyldigt beregningsresultat."
+            watchPenRequestID = nil
+            return
+        }
+        watchPenDataSignature = result.dataSignature
+        watchPenCalculation = result
+        watchPenCalculationIssue = result.unavailableReason
+        watchPenRequestID = nil
+    }
+
+    /// The user has already confirmed the frozen quantities in the Watch alert.
+    @discardableResult
+    func recordWatchBolus(carbohydrateGrams: Double, insulinUnits: Double,
+                          mealKindRaw: String, manualWithoutCurrentSuggestion: Bool,
+                          at recordedAt: Date = Date()) -> Bool {
+        let frozenProfile = insulinUnits > 0 ? watchPenProfileSettings : nil
+        let operation = WatchBolusOperation(operationID: UUID(), insulinID: UUID(), carbsID: UUID(),
+            recordedAt: recordedAt, insulinUnits: insulinUnits, carbohydrateGrams: carbohydrateGrams,
+            mealKindRaw: mealKindRaw,
+            pizzaReminderRequested: phoneIsReachable && carbohydrateGrams > 0 && mealKindRaw == "slow",
+            manualWithoutCurrentSuggestion: manualWithoutCurrentSuggestion,
+            penStepUnits: frozenProfile?.penStepUnits, maximumUnits: frozenProfile?.maximumUnits,
+            profileSignature: frozenProfile?.profileSignature)
+        guard operation.isValid(at: recordedAt) else {
+            bolusStorageIssue = "Indtast kulhydrater eller insulin med gyldige mængder."
+            return false
+        }
+        if insulinUnits > 0 && watchPenProfileSettings?.accepts(insulinUnits) != true {
+            bolusStorageIssue = "Pen-trin og maksimum mangler eller passer ikke. Synkronisér iPhone."
+            return false
+        }
+        guard manualTreatmentStorageIssue == nil else {
+            bolusStorageIssue = manualTreatmentStorageIssue
+            return false
+        }
+        do {
+            let updated = pendingBolusOperations + [operation]
+            try Self.persistBolusOperations(updated)
+            pendingBolusOperations = updated
+            invalidateWatchPenCalculation()
+            bolusStorageIssue = nil
+            bolusDeliveryIssue = nil
+            flushBolusOperationQueue()
+            return true
+        } catch {
+            bolusStorageIssue = "Registreringen kunne ikke gemmes på uret."
+            log.error("Watch bolus queue write failed: \(error.localizedDescription, privacy: .public)")
+            return false
+        }
+    }
+
+    private func flushBolusOperationQueue() {
+        guard manualTreatmentStorageIssue == nil, bolusStorageIssue == nil,
+              !pendingBolusOperations.isEmpty else { return }
+        guard session.activationState == .activated else {
+            requestSessionActivationIfNeeded()
+            return
+        }
+        let now = Date()
+        let outstandingIDs = Set(session.outstandingUserInfoTransfers.compactMap {
+            ($0.userInfo[WatchPenMessageKey.operationID] as? String).flatMap(UUID.init(uuidString:))
+        })
+        for operation in pendingBolusOperations {
+            guard !outstandingIDs.contains(operation.id),
+                  !bolusDirectSendInFlight.contains(operation.id) else { continue }
+            if let lastSend = lastBolusSendAt[operation.id],
+               now.timeIntervalSince(lastSend) < 5 * 60 { continue }
+            guard let data = try? JSONEncoder().encode(operation) else { continue }
+            let message: [String: Any] = [WatchPenMessageKey.operation: data,
+                WatchPenMessageKey.operationID: operation.id.uuidString]
+            lastBolusSendAt[operation.id] = now
+            if phoneIsReachable {
+                bolusDirectSendInFlight.insert(operation.id)
+                session.sendMessage(message, replyHandler: { [weak self] reply in
+                    DispatchQueue.main.async {
+                        guard let self else { return }
+                        self.bolusDirectSendInFlight.remove(operation.id)
+                        _ = self.processWatchPenLogReceipt(reply)
+                    }
+                }, errorHandler: { [weak self] _ in
+                    DispatchQueue.main.async {
+                        guard let self, self.bolusDirectSendInFlight.remove(operation.id) != nil else { return }
+                        self.bolusDeliveryIssue = "Gemt på uret – afventer iPhone"
+                        self.sendQueuedBolusTransfer(message, id: operation.id)
+                    }
+                })
+                DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in
+                    guard let self, self.bolusDirectSendInFlight.remove(operation.id) != nil else { return }
+                    self.bolusDeliveryIssue = "Gemt på uret – afventer iPhone"
+                    self.sendQueuedBolusTransfer(message, id: operation.id)
+                }
+            } else {
+                sendQueuedBolusTransfer(message, id: operation.id)
+            }
+        }
+        if !bolusRetryScheduled {
+            bolusRetryScheduled = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 5 * 60) { [weak self] in
+                self?.bolusRetryScheduled = false
+                self?.flushBolusOperationQueue()
+            }
+        }
+    }
+
+    private func sendQueuedBolusTransfer(_ message: [String: Any], id: UUID) {
+        guard pendingBolusOperations.contains(where: { $0.id == id }),
+              !session.outstandingUserInfoTransfers.contains(where: {
+                  $0.userInfo[WatchPenMessageKey.operationID] as? String == id.uuidString
+              }) else { return }
+        session.transferUserInfo(message)
+    }
+
+    @discardableResult
+    private func processWatchPenLogReceipt(_ message: [String: Any]) -> Bool {
+        guard let receipt = WatchPenLogReceipt(message) else { return false }
+        guard let confirmed = pendingBolusOperations.first(where: { $0.id == receipt.id }) else { return true }
+        guard receipt.stored else {
+            bolusDeliveryIssue = receipt.failureMessage
+            return true
+        }
+        do {
+            let remaining = pendingBolusOperations.filter { $0.id != receipt.id }
+            try Self.persistBolusOperations(remaining)
+            pendingBolusOperations = remaining
+            lastStoredBolusOperation = confirmed
+            invalidateWatchPenCalculation()
+            lastBolusSendAt[receipt.id] = nil
+            bolusDirectSendInFlight.remove(receipt.id)
+            bolusDeliveryIssue = nil
+        } catch {
+            bolusStorageIssue = "iPhone har gemt registreringen, men uret kan ikke opdatere køen."
+            log.error("Watch bolus receipt write failed: \(error.localizedDescription, privacy: .public)")
         }
         return true
     }
@@ -2109,6 +2425,8 @@ final class WatchStateModel: NSObject, ObservableObject {
             return false
         }
 
+        acceptWatchPenSettings(dictionary)
+
         isMgDl = dictionary["isMgDl"] as? Bool ?? true
         urgentLowLimitInMgDl = dictionary["urgentLowLimitInMgDl"] as? Double ?? 60
         lowLimitInMgDl = dictionary["lowLimitInMgDl"] as? Double ?? 70
@@ -2283,6 +2601,7 @@ extension WatchStateModel: WCSessionDelegate {
             self.synchronizeLocalAlarmState()
             self.flushWatchConnectivityOutbox()
             self.flushManualTreatmentQueue()
+            self.flushBolusOperationQueue()
         }
     }
 
@@ -2293,6 +2612,7 @@ extension WatchStateModel: WCSessionDelegate {
             self.phoneRefresh.reachabilityDidChange()
             self.flushWatchConnectivityOutbox()
             self.flushManualTreatmentQueue()
+            self.flushBolusOperationQueue()
         }
     }
 
@@ -2302,6 +2622,7 @@ extension WatchStateModel: WCSessionDelegate {
         DispatchQueue.main.async {
             if WatchDeliveryEvidenceTransfer.shared.handleRequest(message, session: session, reply: nil) { return }
             if self.processManualTreatmentReceipt(message) { return }
+            if self.processWatchPenLogReceipt(message) { return }
             if self.processLibreWatchDeliveryReceipt(message) { return }
             self.phoneRefresh.receivePush(message)
         }
@@ -2314,6 +2635,10 @@ extension WatchStateModel: WCSessionDelegate {
                 replyHandler([WatchManualTreatmentMessageKey.stored: true])
                 return
             }
+            if self.processWatchPenLogReceipt(message) {
+                replyHandler([WatchPenMessageKey.stored: true])
+                return
+            }
             // Reply after the synchronous main-queue validation/persistence, rather than
             // treating the dispatch itself as completion. Measurement receipts are separate.
             replyHandler(WatchSnapshotPushContract.reply(to: message) { self.phoneRefresh.receivePush($0) })
@@ -2323,6 +2648,7 @@ extension WatchStateModel: WCSessionDelegate {
     func session(_: WCSession, didReceiveUserInfo userInfo: [String: Any] = [:]) {
         DispatchQueue.main.async {
             if self.processManualTreatmentReceipt(userInfo) { return }
+            if self.processWatchPenLogReceipt(userInfo) { return }
             if self.processLibreWatchDeliveryReceipt(userInfo) { return }
             self.phoneRefresh.receivePush(userInfo)
         }

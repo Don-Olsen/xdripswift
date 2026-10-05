@@ -61,6 +61,14 @@ struct TreatmentEditorContainerView: View {
                     onSave: onSave,
                     onCancel: onCancel
                 )
+            case .basal:
+                TreatmentEditorScreen(
+                    coreDataManager: coreDataManager,
+                    treatmentToEdit: nil,
+                    initialType: .BasalInjection,
+                    onSave: onSave,
+                    onCancel: onCancel
+                )
             case .edit(let treatment):
                 // A stale or deleted row must not open an empty editor in add mode.
                 if let entry = TreatmentEntryAccessor(coreDataManager: coreDataManager)
@@ -814,14 +822,7 @@ struct PenDoseCalculatorScreen: View {
     }
 
     private func safetyMessage(_ safety: PenDoseSafetyState) -> String {
-        switch safety {
-        case .checked: return "Prognose for allerede registrerede behandlinger er beregnet."
-        case .eatFirst: return "Spis først. Blodsukkeret er under 3,9 mmol/L."
-        case .blockedCurrentLow: return "Intet insulinforslag. Blodsukkeret er under 3,0 mmol/L."
-        case .blockedForecastLow: return "Intet insulinforslag. Prognosen går under 3,0 mmol/L."
-        case .forecastUnchecked: return "Prognosetjek mangler. Forslaget er ikke prognosekontrolleret."
-        case .eatFirstForecastUnchecked: return "Spis først. Prognosetjekket kunne ikke gennemføres."
-        }
+        PenDoseCalculatorViewModel.safetyMessage(safety)
     }
 
     private var logBar: some View {

@@ -281,6 +281,7 @@
 		4C1000062F64000100000001 /* TreatmentsViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4C1000072F64000100000001 /* TreatmentsViewModel.swift */; };
 		4C1000082F64000100000001 /* TreatmentEditorViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4C1000092F64000100000001 /* TreatmentEditorViewModel.swift */; };
 		4C10000B2F64000100000001 /* MealPlanReminders.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4C10000A2F64000100000001 /* MealPlanReminders.swift */; };
+		BA0510260000000000000001 /* BasalReminderScheduler.swift in Sources */ = {isa = PBXBuildFile; fileRef = BA0510260000000000000002 /* BasalReminderScheduler.swift */; };
 		4C2000012F65000100000001 /* BluetoothPeripheralsViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4C2000022F65000100000001 /* BluetoothPeripheralsViewModel.swift */; };
 		4C2000032F65000100000001 /* BluetoothPeripheralsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4C2000042F65000100000001 /* BluetoothPeripheralsView.swift */; };
 		4C2000052F65000100000001 /* BluetoothPeripheralDetailState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4C2000062F65000100000001 /* BluetoothPeripheralDetailState.swift */; };
@@ -1235,6 +1236,7 @@
 		4C1000072F64000100000001 /* TreatmentsViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TreatmentsViewModel.swift; sourceTree = "<group>"; };
 		4C1000092F64000100000001 /* TreatmentEditorViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TreatmentEditorViewModel.swift; sourceTree = "<group>"; };
 		4C10000A2F64000100000001 /* MealPlanReminders.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MealPlanReminders.swift; sourceTree = "<group>"; };
+		BA0510260000000000000002 /* BasalReminderScheduler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BasalReminderScheduler.swift; sourceTree = "<group>"; };
 		4C2000022F65000100000001 /* BluetoothPeripheralsViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BluetoothPeripheralsViewModel.swift; sourceTree = "<group>"; };
 		4C2000042F65000100000001 /* BluetoothPeripheralsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BluetoothPeripheralsView.swift; sourceTree = "<group>"; };
 		4C2000062F65000100000001 /* BluetoothPeripheralDetailState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BluetoothPeripheralDetailState.swift; sourceTree = "<group>"; };
@@ -2620,6 +2622,7 @@
 				4C1000042F64000100000001 /* TreatmentEditorView.swift */,
 				4C1000092F64000100000001 /* TreatmentEditorViewModel.swift */,
 				4C10000A2F64000100000001 /* MealPlanReminders.swift */,
+				BA0510260000000000000002 /* BasalReminderScheduler.swift */,
 				4C1000022F64000100000001 /* TreatmentsView.swift */,
 				4C1000072F64000100000001 /* TreatmentsViewModel.swift */,
 			);
@@ -4943,6 +4946,7 @@
 				4C20000C2F65000100000001 /* TransmitterReadSuccessView.swift in Sources */,
 				4C1000082F64000100000001 /* TreatmentEditorViewModel.swift in Sources */,
 				4C10000B2F64000100000001 /* MealPlanReminders.swift in Sources */,
+				BA0510260000000000000001 /* BasalReminderScheduler.swift in Sources */,
 				4C1000032F64000100000001 /* TreatmentEditorView.swift in Sources */,
 				4C1000062F64000100000001 /* TreatmentsViewModel.swift in Sources */,
 				4C1000012F64000100000001 /* TreatmentsView.swift in Sources */,

@@ -19,6 +19,7 @@ struct TreatmentsView: View {
     @State private var showsPenCalculator = false
     @State private var calculatorReminderMealUUID: String?
     @State private var mealNotice: String?
+    @State private var basalNotice: String?
 
     // MARK: - initialization
 
@@ -45,7 +46,7 @@ struct TreatmentsView: View {
                 treatmentEditorState = .edit(treatment)
             }
         )
-        .sheet(item: $treatmentEditorState) { editorState in
+        .sheet(item: $treatmentEditorState, onDismiss: openRequestedBasal) { editorState in
             TreatmentEditorContainerView(
                 coreDataManager: viewModel.coreDataManager,
                 editorState: editorState,
@@ -60,6 +61,7 @@ struct TreatmentsView: View {
         }
         .sheet(isPresented: $showsPenCalculator, onDismiss: {
             calculatorReminderMealUUID = nil
+            openRequestedBasal()
         }) {
             PenDoseCalculatorScreen(coreDataManager: viewModel.coreDataManager,
                 reminderMealUUID: calculatorReminderMealUUID,
@@ -77,6 +79,10 @@ struct TreatmentsView: View {
         .onReceive(NotificationCenter.default.publisher(for: PizzaSplitReminder.openRequested)) { _ in
             openRequestedPizzaRecalculation()
         }
+        .onAppear(perform: openRequestedBasal)
+        .onReceive(NotificationCenter.default.publisher(for: BasalReminderScheduler.openRequested)) { _ in
+            openRequestedBasal()
+        }
         .onReceive(NotificationCenter.default.publisher(for: MealReminderIssueCenter.reported)) { notification in
             mealNotice = notification.object as? String
         }
@@ -87,6 +93,14 @@ struct TreatmentsView: View {
             Button("OK") { mealNotice = nil }
         } message: {
             Text(mealNotice ?? "")
+        }
+        .alert("Basal", isPresented: Binding(
+            get: { basalNotice != nil },
+            set: { if !$0 { basalNotice = nil } }
+        )) {
+            Button("OK") { basalNotice = nil }
+        } message: {
+            Text(basalNotice ?? "")
         }
     }
 
@@ -123,6 +137,17 @@ struct TreatmentsView: View {
         guard meal != nil else { return }
         calculatorReminderMealUUID = uuid
         showsPenCalculator = true
+    }
+
+    private func openRequestedBasal() {
+        guard BasalReminderScheduler.hasPendingOpen,
+              treatmentEditorState == nil, !showsPenCalculator else { return }
+        guard BasalReminderScheduler.prepareDraftPrefill(coreDataManager: viewModel.coreDataManager) else {
+            basalNotice = "Seneste registrerede basal kunne ikke læses. Prøv igen."
+            return
+        }
+        guard BasalReminderScheduler.consumePendingOpen() else { return }
+        treatmentEditorState = .basal
     }
 }
 

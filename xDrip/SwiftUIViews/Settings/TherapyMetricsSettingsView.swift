@@ -7,6 +7,8 @@
 //
 
 import SwiftUI
+import UIKit
+import UserNotifications
 
 /// Treatment settings and local-estimate explanations use the existing SettingsViews table.
 enum TherapyTexts {
@@ -147,11 +149,15 @@ struct TherapyMetricDetailsView: View {
 /// A suggested dose is unavailable until the user has checked these pen-specific values.
 /// They never change the glucose forecast's separate ISF and carbohydrate ratio.
 struct PenDoseSettingsView: View {
+    @ObservedObject private var basalScheduler = BasalReminderScheduler.shared
     @State private var profile = PenDoseProfile.load()
     @State private var draft = PenDoseProfileDraft(profile: .load())
     @State private var pizza = PizzaSplitSettings.load()
     @State private var percentageText = String(PizzaSplitSettings.load().percentageNow)
     @State private var reminderText = String(PizzaSplitSettings.load().reminderMinutes)
+    @State private var basalReminder = BasalReminderSettings.load()
+    @State private var basalReminderTime = Self.timeDate(for: BasalReminderSettings.load().minuteOfDay)
+    @State private var basalNotificationStatus: UNAuthorizationStatus = .notDetermined
     @State private var statusMessage: String?
     @FocusState private var fieldIsFocused: Bool
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
@@ -258,6 +264,31 @@ struct PenDoseSettingsView: View {
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
+            Section {
+                Toggle("Påmind mig om basal", isOn: $basalReminder.isEnabled)
+                if basalReminder.isEnabled {
+                    DatePicker("Klokkeslæt", selection: $basalReminderTime,
+                               displayedComponents: .hourAndMinute)
+                    if !BasalReminderPermission.isAvailable(basalNotificationStatus) {
+                        Text("Notifikationer er ikke tilladt. Aktivér dem i iPhone-indstillinger for at få påmindelsen.")
+                            .font(.footnote)
+                            .foregroundStyle(.orange)
+                        if basalNotificationStatus == .denied {
+                            Button("Åbn iPhone-indstillinger") {
+                                guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
+                                UIApplication.shared.open(url)
+                            }
+                        }
+                    }
+                    if let issue = basalScheduler.issueMessage {
+                        Text(issue).font(.footnote).foregroundStyle(.orange)
+                    }
+                }
+            } header: {
+                Text("Basal")
+            } footer: {
+                Text("Påmindelsen bruger registrerede basaldoser. Den udebliver, når basal er registreret inden for de seneste 12 timer før klokkeslættet.")
+            }
             if let statusMessage {
                 Section { Text(statusMessage).foregroundStyle(.secondary) }
             }
@@ -278,6 +309,33 @@ struct PenDoseSettingsView: View {
                 pizza = changed
                 NotificationCenter.default.post(name: .penDoseSettingsChanged, object: nil)
             }
+        }
+        .onChange(of: basalReminder.isEnabled) { _ in saveBasalReminderSettings() }
+        .onChange(of: basalReminderTime) { newTime in
+            let components = Calendar.current.dateComponents([.hour, .minute], from: newTime)
+            basalReminder.minuteOfDay = (components.hour ?? 0) * 60 + (components.minute ?? 0)
+            saveBasalReminderSettings()
+        }
+        .onAppear(perform: refreshBasalNotificationStatus)
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
+            refreshBasalNotificationStatus()
+        }
+    }
+
+    private static func timeDate(for minuteOfDay: Int) -> Date {
+        let calendar = Calendar.current
+        return calendar.date(bySettingHour: minuteOfDay / 60, minute: minuteOfDay % 60,
+                             second: 0, of: Date()) ?? Date()
+    }
+
+    private func saveBasalReminderSettings() {
+        basalReminder.persist()
+        BasalReminderScheduler.shared.refresh()
+    }
+
+    private func refreshBasalNotificationStatus() {
+        UNUserNotificationCenter.current().getNotificationSettings { settings in
+            DispatchQueue.main.async { basalNotificationStatus = settings.authorizationStatus }
         }
     }
 

@@ -330,6 +330,10 @@ struct InitialCalibrationRequestGate {
             
             self.setupApplicationData()
 
+            if let coreDataManager = self.coreDataManager {
+                BasalReminderScheduler.shared.configure(coreDataManager: coreDataManager)
+            }
+
             if let coreDataManager = self.coreDataManager,
                let statisticsManager = self.statisticsManager,
                let bgReadingsAccessor = self.bgReadingsAccessor,
@@ -590,7 +594,13 @@ struct InitialCalibrationRequestGate {
             trace("Application will enter foreground", log: self.log, category: ConstantsLog.categoryRootView, type: .info)
             self.loopManager?.shareMetadata()
             self.refreshSelectedFollower(fillNightscoutGaps: true)
+            BasalReminderScheduler.shared.refresh()
         })
+
+        NotificationCenter.default.addObserver(forName: UIApplication.significantTimeChangeNotification,
+                                               object: nil, queue: .main) { _ in
+            Task { @MainActor in BasalReminderScheduler.shared.refresh() }
+        }
         
         // add tracing when app will terminate - this only works for non-suspended apps, probably (not tested) also works for apps that crash in the background
         ApplicationManager.shared.addClosureToRunWhenAppWillTerminate(key: applicationManagerKeyTraceAppWillTerminate, closure: {
@@ -3491,6 +3501,8 @@ extension RootApplicationCoordinator: @preconcurrency UNUserNotificationCenterDe
             completionHandler([.banner, .list, .sound])
         } else if notification.request.identifier.hasPrefix(PizzaSplitReminder.identifierPrefix) {
             completionHandler([.banner, .list, .sound])
+        } else if notification.request.identifier.hasPrefix(BasalReminderScheduler.identifierPrefix) {
+            completionHandler([.banner, .list, .sound])
             // this will verify if it concerns an alert notification, if not pickerviewData will be nil
         } else if let pickerViewData = alertManager?.userNotificationCenter(center, willPresent: notification, withCompletionHandler: completionHandler) {
             presentPicker(pickerViewData)
@@ -3510,6 +3522,8 @@ extension RootApplicationCoordinator: @preconcurrency UNUserNotificationCenterDe
             // call completionhandler
             completionHandler()
         }
+
+        if BasalReminderScheduler.shared.handleResponse(response) { return }
         
         if response.notification.request.identifier == ConstantsNotifications.NotificationIdentifiersForCalibration.dexcomG6InitialCalibrationRequest {
             // Foreground entry may already have presented the same request.

@@ -1664,6 +1664,118 @@ final class WatchManualTreatmentTests: XCTestCase {
     }
 }
 
+final class WatchBolusQueueTests: XCTestCase {
+    private let recordedAt = Date(timeIntervalSince1970: 1_800_000_000)
+
+    private func queueURL() throws -> URL {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WatchBolusQueueTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        return directory.appendingPathComponent("WatchManualTreatments.v1.json")
+    }
+
+    private func operation(insulin: Double, carbs: Double, meal: String,
+                           reminder: Bool) -> WatchBolusOperation {
+        let profile = insulin > 0 ? WatchPenProfileSettings(penStepUnits: 0.5,
+            maximumUnits: 25, profileSignature: "confirmed-profile") : nil
+        return WatchBolusOperation(operationID: UUID(), insulinID: UUID(), carbsID: UUID(),
+            recordedAt: recordedAt, insulinUnits: insulin, carbohydrateGrams: carbs,
+            mealKindRaw: meal, pizzaReminderRequested: reminder,
+            manualWithoutCurrentSuggestion: insulin > 0,
+            penStepUnits: profile?.penStepUnits, maximumUnits: profile?.maximumUnits,
+            profileSignature: profile?.profileSignature)
+    }
+
+    func testLegacyBasalAndBolusQueueMigratesWithoutLosingEitherEntry() throws {
+        let url = try queueURL()
+        let oldBolus = WatchManualTreatment(id: UUID(), recordedAt: recordedAt,
+            kind: .insulin, amount: 2)
+        let oldBasal = WatchManualTreatment(id: UUID(), recordedAt: recordedAt,
+            kind: .basalInjection, amount: 20)
+        try JSONEncoder().encode([oldBolus, oldBasal]).write(to: url)
+        XCTAssertEqual(try WatchManualTreatmentQueue.load(from: url), [oldBolus, oldBasal])
+        XCTAssertTrue(try WatchManualTreatmentQueue.loadBolusOperations(from: url).isEmpty)
+
+        let combined = operation(insulin: 4.5, carbs: 30, meal: "slow", reminder: true)
+        try WatchManualTreatmentQueue.persistBolusOperations([combined], to: url)
+        XCTAssertEqual(try WatchManualTreatmentQueue.load(from: url), [oldBolus, oldBasal])
+        XCTAssertEqual(try WatchManualTreatmentQueue.loadBolusOperations(from: url), [combined])
+        try WatchManualTreatmentQueue.persist([oldBasal], to: url)
+        XCTAssertEqual(try WatchManualTreatmentQueue.load(from: url), [oldBasal])
+        XCTAssertEqual(try WatchManualTreatmentQueue.loadBolusOperations(from: url), [combined])
+
+        try WatchManualTreatmentQueue.persistBolusOperations([], to: url)
+        XCTAssertEqual(try JSONDecoder().decode([WatchManualTreatment].self,
+            from: Data(contentsOf: url)), [oldBasal])
+    }
+
+    func testFrozenConnectedAndOfflineOperationsSurviveRestartAndOnlyMatchingReceiptIsRemoved() throws {
+        let url = try queueURL()
+        let connected = operation(insulin: 4.5, carbs: 30, meal: "slow", reminder: true)
+        let offline = operation(insulin: 0, carbs: 18, meal: "fast", reminder: false)
+        XCTAssertTrue(connected.isValid(at: recordedAt))
+        XCTAssertTrue(offline.isValid(at: recordedAt))
+        try WatchManualTreatmentQueue.persistBolusOperations([connected, offline], to: url)
+        let afterRestart = try WatchManualTreatmentQueue.loadBolusOperations(from: url)
+        XCTAssertEqual(afterRestart, [connected, offline])
+        XCTAssertEqual(afterRestart[0].insulinID, connected.insulinID)
+        XCTAssertEqual(afterRestart[0].carbsID, connected.carbsID)
+        XCTAssertEqual(afterRestart[0].recordedAt, recordedAt)
+        XCTAssertTrue(afterRestart[0].pizzaReminderRequested)
+        XCTAssertFalse(afterRestart[1].pizzaReminderRequested)
+
+        let failed = try XCTUnwrap(WatchPenLogReceipt([
+            WatchPenMessageKey.operationID: connected.id.uuidString,
+            WatchPenMessageKey.stored: false,
+            WatchPenMessageKey.error: "persistenceFailed"]))
+        XCTAssertFalse(failed.stored)
+        XCTAssertEqual(try WatchManualTreatmentQueue.loadBolusOperations(from: url), afterRestart)
+        let stored = try XCTUnwrap(WatchPenLogReceipt([
+            WatchPenMessageKey.operationID: connected.id.uuidString,
+            WatchPenMessageKey.stored: true]))
+        XCTAssertTrue(stored.stored)
+        try WatchManualTreatmentQueue.persistBolusOperations(
+            afterRestart.filter { $0.id != stored.id }, to: url)
+        XCTAssertEqual(try WatchManualTreatmentQueue.loadBolusOperations(from: url), [offline])
+    }
+
+    func testMissingPenBoundsNeverPermitInsulinButCarbohydrateOnlyStillWorks() {
+        let carbohydrateOnly = operation(insulin: 0, carbs: 25, meal: "normal", reminder: false)
+        XCTAssertTrue(carbohydrateOnly.isValid(at: recordedAt))
+        let valid = operation(insulin: 4.5, carbs: 0, meal: "normal", reminder: false)
+        XCTAssertTrue(valid.isValid(at: recordedAt))
+        let missing = WatchBolusOperation(operationID: UUID(), insulinID: UUID(), carbsID: UUID(),
+            recordedAt: recordedAt, insulinUnits: 4.5, carbohydrateGrams: 0,
+            mealKindRaw: "normal", pizzaReminderRequested: false,
+            manualWithoutCurrentSuggestion: true, penStepUnits: nil,
+            maximumUnits: nil, profileSignature: nil)
+        XCTAssertFalse(missing.isValid(at: recordedAt))
+        XCTAssertFalse(WatchPenProfileSettings(penStepUnits: 0.5,
+            maximumUnits: 4, profileSignature: "confirmed-profile").accepts(4.5))
+        XCTAssertFalse(WatchPenProfileSettings(penStepUnits: 0.5,
+            maximumUnits: 25, profileSignature: "confirmed-profile").accepts(4.25))
+    }
+
+    func testFutureOrCorruptCombinedQueueCannotBeReplaced() throws {
+        let url = try queueURL()
+        let entry = operation(insulin: 0, carbs: 20, meal: "normal", reminder: false)
+        try WatchManualTreatmentQueue.persistBolusOperations([entry], to: url)
+        let original = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: url))
+            as? [String: Any])
+        for changed in ["version": 3, "futureField": 1] {
+            var future = original
+            future[changed.key] = changed.value
+            let data = try JSONSerialization.data(withJSONObject: future)
+            try data.write(to: url)
+            XCTAssertThrowsError(try WatchManualTreatmentQueue.loadBolusOperations(from: url))
+            XCTAssertThrowsError(try WatchManualTreatmentQueue.persistBolusOperations([], to: url))
+            XCTAssertThrowsError(try WatchManualTreatmentQueue.persist([], to: url))
+            XCTAssertEqual(try Data(contentsOf: url), data)
+        }
+    }
+}
+
 final class WatchBasalTreatmentTests: XCTestCase {
     private let at = Date(timeIntervalSince1970: 1_800_000_000)
 

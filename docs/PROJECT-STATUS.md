@@ -8,6 +8,51 @@
 - Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
 <!-- testflight-7.1.1-4300:end -->
 
+## Kandidat efter 4300: Watch-bolus og basalpåmindelse
+
+App-ikonets eksisterende genvej til bolusberegneren er gennemgået. Den bevarer
+en tidlig anmodning til scenen og Home er klar, reagerer på den publicerede
+klar-tilstand og bruger ikke Homes 15-sekunders timer. Den åbner samme ark som
+Home-knappen og forbruger anmodningen én gang. Der er ikke ændret i genvejens
+produktionskode; den fysiske svartid på en iPhone med denne kandidat er endnu
+ikke målt.
+
+På uret samler “Bolusberegner” kulhydrat, madtype, bolus, beregning og
+bekræftet registrering på én skærm. Beregningen sker kun på telefonen gennem
+den eksisterende penberegner og dens profil, behandlingssnapshot,
+CGM-baserede COB, sikkerhedskontrol og afrunding. Uret afstemmer ventende
+behandlinger og nyere Watch-CGM før et forslag, viser fejlårsagen ved
+ufuldstændigt grundlag og lader aldrig et gammelt forslag ændre den indtastede
+dosis. Uden telefon kan uret stadig lægge en bekræftet manuel registrering i
+sin holdbare Watch-kø; en manglende penprofil tillader kun kulhydratregistrering.
+Køen fryser identiteter, tidspunkt og madtype før første levering. Telefonen
+bruger den eksisterende PenDoseTreatmentLogger og journal; en gentagelse må
+ikke genskabe redigerede eller slettede poster. Gamle Watch-køposter, inklusive
+basal, kan fortsat læses. Ny basal registreres på telefonen.
+
+Pen-indstillingerne har en daglig, fra start deaktiveret basalpåmindelse med
+lokalt klokkeslæt. Den læser varigt gemte, ikke-slettede basaldoser og springer
+en dag over, når en dosis er registreret i de forudgående 12 timer. Den
+planlægger 14 dage frem som enkeltstående lokale kalendernotifikationer,
+genplanlægger ved relevante ændringer og forgrundsskift, og har én mulig
+udsættelse på 30 minutter. Et tryk åbner den eksisterende basalregistrering
+med seneste dosis og insulinnavn som kladde; det gemmer intet uden brugerens
+Gem. De planlagte notifikationer kræver ikke, at appen kører ved levering,
+men horisonten fornyes først, når appen igen åbnes. Planlægning er ikke bevis
+for faktisk levering eller lyd/vibration på den fysiske telefon.
+
+Lokal kandidatkontrol efter de målrettede rettelser: 1.416/1.416 XCTest-tests
+bestod, herunder de eksisterende Watch-/Libre-suiter. Projektets Python-kontroller
+bestod, og både iPhone- og Watch-simulatorbuilds samt en usigneret
+iPhoneOS/arm64-build bestod. De præcise release-kontroller køres igen på det
+Apple-nummererede checkpoint. Simulatorappen kunne starte på iPhone og Watch,
+og deres første skærme blev gemt uden for Git. Denne Mac har ingen Simulator-GUI
+eller UI-teststyring, så billeder af beregner, resultat, offline-tilstand,
+basalsektion og leveret notifikation kunne ikke tages. Der er ikke installeret
+en ny kandidat lokalt på brugerens telefon eller ur; GO UPLOAD omfatter kun den
+interne TestFlight-gruppe. Dosisforslag, Watch-levering og basalpåmindelse er
+derfor endnu ikke verificeret på de fysiske enheder.
+
 De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
 
 ## Kandidat efter 4299: hurtigere bolusgenvej fra app-ikonet

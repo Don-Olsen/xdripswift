@@ -11,6 +11,131 @@ enum WatchManualTreatmentMessageKey {
     static let error = "watchManualTreatmentError"
 }
 
+/// The pen calculator lives on iPhone. The Watch only carries frozen user input and
+/// an immutable log operation. These keys share the existing WCSession transport.
+enum WatchPenMessageKey {
+    static let operation = "watchPenLogOperation"
+    static let operationID = "watchPenLogOperationID"
+    static let stored = "watchPenLogStored"
+    static let error = "watchPenLogError"
+    static let calculationRequest = "watchPenCalculate"
+    static let calculationResponse = "watchPenCalculation"
+    static let calculationError = "watchPenCalculationError"
+    static let profileSettings = "watchPenProfileSettings"
+    static let profileAvailable = "watchPenProfileAvailable"
+    static let dataSignature = "watchPenDataSignature"
+}
+
+struct WatchPenProfileSettings: Codable, Equatable {
+    let penStepUnits: Double
+    let maximumUnits: Double
+    let profileSignature: String
+
+    var isValid: Bool {
+        penStepUnits.isFinite && penStepUnits > 0 && maximumUnits.isFinite &&
+            maximumUnits > 0 && maximumUnits >= penStepUnits && !profileSignature.isEmpty
+    }
+
+    func accepts(_ units: Double) -> Bool {
+        guard isValid, units.isFinite, (0...maximumUnits).contains(units) else { return false }
+        return abs(units / penStepUnits - (units / penStepUnits).rounded()) < 0.0001
+    }
+}
+
+struct WatchPenCalculationRequest: Codable, Equatable {
+    let requestID: UUID
+    let carbohydrateGrams: Double
+    let mealKindRaw: String
+    let pendingTreatmentIDs: [UUID]
+    let pendingReadingIDs: [UUID]
+    let latestWatchReadingAt: Date?
+    let profileSignature: String
+}
+
+/// Every displayed value comes from one calculation on iPhone. A nil suggestion
+/// means unavailable or blocked; it is never presented as an approved 0 E dose.
+struct WatchPenCalculationResponse: Codable, Equatable {
+    let requestID: UUID
+    let calculatedAt: Date
+    let suggestedUnits: Double?
+    let glucoseMgdl: Double?
+    let glucoseMeasuredAt: Date?
+    let glucoseTrendMgdl: Double?
+    let iobUnits: Double
+    let cobGrams: Double
+    let safetyRaw: String?
+    let safetyReason: String?
+    let unavailableReason: String?
+    let pizzaNowUnits: Double?
+    let pizzaReminderMinutes: Int?
+    let profileSignature: String
+    let dataSignature: String
+}
+
+struct WatchBolusOperation: Codable, Equatable, Identifiable {
+    let operationID: UUID
+    let insulinID: UUID
+    let carbsID: UUID
+    let recordedAt: Date
+    let insulinUnits: Double
+    let carbohydrateGrams: Double
+    let mealKindRaw: String
+    /// Decided at confirmation. Retries never turn an offline log into a reminder.
+    let pizzaReminderRequested: Bool
+    /// True when insulin was entered without a current checked matching suggestion.
+    let manualWithoutCurrentSuggestion: Bool
+    /// The confirmed pen bounds used when the user recorded an already-taken dose.
+    /// Carbohydrate-only entries need no pen profile and leave these nil.
+    let penStepUnits: Double?
+    let maximumUnits: Double?
+    let profileSignature: String?
+
+    var id: UUID { operationID }
+
+    func isValid(at now: Date = Date()) -> Bool {
+        let timestamp = recordedAt.timeIntervalSince1970
+        let penValid: Bool
+        if insulinUnits == 0 {
+            penValid = true
+        } else if let penStepUnits, let maximumUnits, let profileSignature {
+            penValid = WatchPenProfileSettings(penStepUnits: penStepUnits,
+                maximumUnits: maximumUnits, profileSignature: profileSignature).accepts(insulinUnits)
+        } else {
+            penValid = false
+        }
+        return insulinUnits.isFinite && insulinUnits >= 0 &&
+            carbohydrateGrams.isFinite && (0...500).contains(carbohydrateGrams) &&
+            (insulinUnits > 0 || carbohydrateGrams > 0) &&
+            ["fast", "normal", "slow"].contains(mealKindRaw) &&
+            penValid &&
+            timestamp.isFinite && timestamp >= 0 && recordedAt <= now.addingTimeInterval(60 * 60)
+    }
+}
+
+struct WatchPenLogReceipt {
+    let id: UUID
+    let stored: Bool
+    let error: String?
+
+    init?(_ message: [String: Any]) {
+        guard let rawID = message[WatchPenMessageKey.operationID] as? String,
+              let id = UUID(uuidString: rawID),
+              let stored = message[WatchPenMessageKey.stored] as? Bool else { return nil }
+        self.id = id
+        self.stored = stored
+        self.error = message[WatchPenMessageKey.error] as? String
+    }
+
+    var failureMessage: String {
+        switch error {
+        case "invalidOperation", "conflictingOperation", "invalidTreatment":
+            return "iPhone afviste registreringen · kontrollér mængder og profil. Den er bevaret på uret"
+        default:
+            return "iPhone kunne ikke gemme registreringen endnu · prøver igen"
+        }
+    }
+}
+
 enum WatchManualTreatmentKind: String, Codable, Equatable {
     // These wire values are permanent: older queued insulin/carbs entries retain their meaning.
     case insulin
@@ -89,17 +214,81 @@ struct WatchManualTreatment: Codable, Equatable, Identifiable {
 /// The durable queue fails closed on unknown/future types instead of silently dropping them.
 /// A downgrade or interrupted write must never overwrite the only unacknowledged record.
 enum WatchManualTreatmentQueue {
+    private struct Contents: Codable {
+        let version: Int
+        var manualTreatments: [WatchManualTreatment]
+        var bolusOperations: [WatchBolusOperation]
+
+        init(manualTreatments: [WatchManualTreatment] = [], bolusOperations: [WatchBolusOperation] = []) {
+            version = 2
+            self.manualTreatments = manualTreatments
+            self.bolusOperations = bolusOperations
+        }
+    }
+
+    private static func readContents(from url: URL) throws -> Contents {
+        guard FileManager.default.fileExists(atPath: url.path) else { return Contents() }
+        let data = try Data(contentsOf: url)
+        let object = try JSONSerialization.jsonObject(with: data, options: [])
+        // The old top-level array can include basal injections. Decode it before any
+        // migration, and never rewrite an unreadable or future queue.
+        if object is [Any] {
+            return Contents(manualTreatments: try JSONDecoder().decode([WatchManualTreatment].self, from: data))
+        }
+        guard let dictionary = object as? [String: Any],
+              Set(dictionary.keys).isSubset(of: ["version", "manualTreatments", "bolusOperations"]) else {
+            throw QueueError.unsupportedVersion
+        }
+        let contents = try JSONDecoder().decode(Contents.self, from: data)
+        guard contents.version == 2 else { throw QueueError.unsupportedVersion }
+        return contents
+    }
+
+    enum QueueError: Error { case unsupportedVersion }
+
     static func load(from url: URL) throws -> [WatchManualTreatment] {
-        guard FileManager.default.fileExists(atPath: url.path) else { return [] }
-        return try JSONDecoder().decode([WatchManualTreatment].self, from: Data(contentsOf: url))
+        try readContents(from: url).manualTreatments
     }
 
     static func persist(_ treatments: [WatchManualTreatment], to url: URL) throws {
         // Also re-read before a write: an unreadable/future queue remains intact even if it
         // changed after startup. Never replace such a file with an empty/current-version queue.
-        _ = try load(from: url)
-        let data = try JSONEncoder().encode(treatments)
+        var contents = try readContents(from: url)
+        contents.manualTreatments = treatments
+        try write(contents, to: url)
+    }
+
+    static func loadBolusOperations(from url: URL) throws -> [WatchBolusOperation] {
+        try readContents(from: url).bolusOperations
+    }
+
+    static func persistBolusOperations(_ operations: [WatchBolusOperation], to url: URL) throws {
+        var contents = try readContents(from: url)
+        contents.bolusOperations = operations
+        try write(contents, to: url)
+    }
+
+    private static func write(_ contents: Contents, to url: URL) throws {
+        let data = try JSONEncoder().encode(contents.bolusOperations.isEmpty
+            ? QueueEncoding.legacy(contents.manualTreatments) : .combined(contents))
         try data.write(to: url, options: .atomic)
+        // A dose operation must survive termination even when a legacy receipt
+        // rewrites the same queue file after it was first stored.
+        let handle = try FileHandle(forWritingTo: url)
+        handle.synchronizeFile()
+        handle.closeFile()
+    }
+
+    private enum QueueEncoding: Encodable {
+        case legacy([WatchManualTreatment])
+        case combined(Contents)
+
+        func encode(to encoder: Encoder) throws {
+            switch self {
+            case .legacy(let entries): try entries.encode(to: encoder)
+            case .combined(let contents): try contents.encode(to: encoder)
+            }
+        }
     }
 
     static func applying(_ receipt: WatchManualTreatmentReceipt,
@@ -108,6 +297,7 @@ enum WatchManualTreatmentQueue {
         return pending.filter { $0.id != receipt.id }
     }
 }
+
 
 /// A transport acknowledgement alone is not a durable phone-storage receipt.
 struct WatchManualTreatmentReceipt {

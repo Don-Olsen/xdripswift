@@ -14,6 +14,174 @@ import UserNotifications
 final class BasalInjectionTests: XCTestCase {
     private let date = Date(timeIntervalSince1970: 1_788_804_000)
 
+    func testBasalReminderDefaultsOffAndPersistsClockTime() {
+        let suiteName = "BasalReminderSettingsTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        XCTAssertEqual(BasalReminderSettings.load(from: defaults),
+                       BasalReminderSettings(isEnabled: false, minuteOfDay: 20 * 60))
+        BasalReminderSettings(isEnabled: true, minuteOfDay: 21 * 60 + 15).persist(to: defaults)
+        XCTAssertEqual(BasalReminderSettings.load(from: defaults),
+                       BasalReminderSettings(isEnabled: true, minuteOfDay: 21 * 60 + 15))
+        BasalReminderSettings(isEnabled: false, minuteOfDay: 21 * 60 + 15).persist(to: defaults)
+        XCTAssertFalse(BasalReminderSettings.load(from: defaults).isEnabled)
+    }
+
+    func testBasalReminderTwelveHourBoundaryAndDeletedOrEditedDose() throws {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = try XCTUnwrap(TimeZone(identifier: "Europe/Copenhagen"))
+        let due = try XCTUnwrap(calendar.date(from: DateComponents(year: 2026, month: 10, day: 5,
+                                                                    hour: 20, minute: 0)))
+        let now = due.addingTimeInterval(-60 * 60)
+        let settings = BasalReminderSettings(isEnabled: true, minuteOfDay: 20 * 60)
+        let boundary = try XCTUnwrap(BasalReminderInjection(date: due.addingTimeInterval(-12 * 60 * 60),
+                                                             units: 20, insulinDescription: "Tresiba"))
+        let beforeBoundary = try XCTUnwrap(BasalReminderInjection(date: boundary.date.addingTimeInterval(-1),
+                                                                   units: 20, insulinDescription: "Tresiba"))
+        XCTAssertTrue(BasalReminderPlanner.plan(now: now, settings: settings,
+            injections: [boundary], calendar: calendar, horizonDays: 1).isEmpty)
+        XCTAssertEqual(BasalReminderPlanner.plan(now: now, settings: settings,
+            injections: [beforeBoundary], calendar: calendar, horizonDays: 1).count, 1)
+        // An edit moves the persisted treatment into the window; deletion removes it again.
+        let edited = try XCTUnwrap(BasalReminderInjection(date: due.addingTimeInterval(-30 * 60),
+                                                           units: 22, insulinDescription: "Lantus"))
+        XCTAssertTrue(BasalReminderPlanner.plan(now: now, settings: settings,
+            injections: [edited], calendar: calendar, horizonDays: 1).isEmpty)
+        XCTAssertEqual(BasalReminderPlanner.plan(now: now, settings: settings,
+            injections: [], calendar: calendar, horizonDays: 1).count, 1)
+    }
+
+    func testBasalReminderCalendarUsesOneLocalOccurrenceAcrossDST() throws {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = try XCTUnwrap(TimeZone(identifier: "Europe/Copenhagen"))
+        let settings = BasalReminderSettings(isEnabled: true, minuteOfDay: 2 * 60 + 30)
+        let springNow = try XCTUnwrap(ISO8601DateFormatter().date(from: "2026-03-28T00:00:00Z"))
+        let spring = BasalReminderPlanner.plan(now: springNow, settings: settings,
+                                                injections: [], calendar: calendar, horizonDays: 3)
+        XCTAssertEqual(spring.map(\.dayKey), ["2026-03-28", "2026-03-29", "2026-03-30"])
+        XCTAssertEqual(calendar.component(.hour, from: spring[1].dueAt), 3)
+        XCTAssertEqual(Set(spring.map(\.dayKey)).count, 3)
+
+        let fallNow = try XCTUnwrap(ISO8601DateFormatter().date(from: "2026-10-24T00:00:00Z"))
+        let fall = BasalReminderPlanner.plan(now: fallNow, settings: settings,
+                                              injections: [], calendar: calendar, horizonDays: 3)
+        XCTAssertEqual(fall.map(\.dayKey), ["2026-10-24", "2026-10-25", "2026-10-26"])
+        XCTAssertEqual(calendar.component(.hour, from: fall[1].dueAt), 2)
+        XCTAssertEqual(calendar.timeZone.secondsFromGMT(for: fall[1].dueAt), 2 * 60 * 60)
+        XCTAssertEqual(Set(fall.map(\.dayKey)).count, 3)
+    }
+
+    func testBasalReminderTimeZoneReplansAtSameLocalHour() throws {
+        let now = try XCTUnwrap(ISO8601DateFormatter().date(from: "2026-10-05T06:00:00Z"))
+        let settings = BasalReminderSettings(isEnabled: true, minuteOfDay: 20 * 60)
+        var copenhagen = Calendar(identifier: .gregorian)
+        copenhagen.timeZone = try XCTUnwrap(TimeZone(identifier: "Europe/Copenhagen"))
+        var newYork = Calendar(identifier: .gregorian)
+        newYork.timeZone = try XCTUnwrap(TimeZone(identifier: "America/New_York"))
+        let danishDue = try XCTUnwrap(BasalReminderPlanner.plan(now: now, settings: settings,
+            injections: [], calendar: copenhagen, horizonDays: 1).first?.dueAt)
+        let americanDue = try XCTUnwrap(BasalReminderPlanner.plan(now: now, settings: settings,
+            injections: [], calendar: newYork, horizonDays: 1).first?.dueAt)
+        XCTAssertEqual(copenhagen.component(.hour, from: danishDue), 20)
+        XCTAssertEqual(newYork.component(.hour, from: americanDue), 20)
+        XCTAssertEqual(americanDue.timeIntervalSince(danishDue), 6 * 60 * 60)
+    }
+
+    @MainActor func testBasalReminderSnoozeOnlyOnceAndStopsAfterSavedDose() throws {
+        let due = Date(timeIntervalSince1970: 1_791_220_000)
+        let dayKey = "2026-10-05"
+        let now = due.addingTimeInterval(60)
+        XCTAssertTrue(BasalReminderPlanner.canSnooze(dayKey: dayKey, dueAt: due, now: now,
+            alreadySnoozed: [], injections: []))
+        XCTAssertFalse(BasalReminderPlanner.canSnooze(dayKey: dayKey, dueAt: due, now: now,
+            alreadySnoozed: [dayKey], injections: []))
+        let saved = try XCTUnwrap(BasalReminderInjection(date: now, units: 20,
+                                                         insulinDescription: "Tresiba"))
+        XCTAssertFalse(BasalReminderPlanner.canSnooze(dayKey: dayKey, dueAt: due, now: now,
+            alreadySnoozed: [], injections: [saved]))
+        XCTAssertEqual(BasalReminderScheduler.dailyIdentifier(for: dayKey),
+                       "xdrip.basalReminder.day.2026-10-05")
+        XCTAssertEqual(BasalReminderScheduler.snoozeIdentifier(for: dayKey),
+                       "xdrip.basalReminder.snooze.2026-10-05")
+    }
+
+    func testBasalSnoozeActionSurvivesColdStartUntilStoreIsReady() throws {
+        let suiteName = "BasalPendingSnoozeTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let first = Date(timeIntervalSince1970: 1_791_220_000)
+        let otherDay = first.addingTimeInterval(24 * 60 * 60)
+        BasalReminderPendingSnoozes.enqueue(dayKey: "2026-10-05", dueAt: first, defaults: defaults)
+        BasalReminderPendingSnoozes.enqueue(dayKey: "2026-10-05",
+                                             dueAt: first.addingTimeInterval(60), defaults: defaults)
+        BasalReminderPendingSnoozes.enqueue(dayKey: "2026-10-06", dueAt: otherDay, defaults: defaults)
+        // A new reader after cold-start configuration sees the original action exactly once.
+        let restored = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        XCTAssertEqual(BasalReminderPendingSnoozes.load(defaults: restored),
+                       ["2026-10-05": first, "2026-10-06": otherDay])
+        BasalReminderPendingSnoozes.remove(dayKey: "2026-10-05", defaults: restored)
+        XCTAssertEqual(BasalReminderPendingSnoozes.load(defaults: defaults),
+                       ["2026-10-06": otherDay])
+    }
+
+    @MainActor func testBasalReminderNotificationUsesHistoricDoseAndOneShotCalendarTrigger() throws {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = try XCTUnwrap(TimeZone(identifier: "Europe/Copenhagen"))
+        let now = try XCTUnwrap(ISO8601DateFormatter().date(from: "2026-10-05T06:00:00Z"))
+        let past = try XCTUnwrap(BasalReminderInjection(date: now.addingTimeInterval(-24 * 60 * 60),
+                                                        units: 20, insulinDescription: "Tresiba"))
+        let occurrence = try XCTUnwrap(BasalReminderPlanner.plan(now: now,
+            settings: BasalReminderSettings(isEnabled: true, minuteOfDay: 20 * 60),
+            injections: [past], calendar: calendar, horizonDays: 1).first)
+        let request = BasalReminderScheduler.dailyRequest(for: occurrence, calendar: calendar)
+        XCTAssertEqual(request.content.title, "Husk basal")
+        XCTAssertEqual(request.content.body, "Senest registreret: 20 E Tresiba")
+        XCTAssertEqual(request.identifier, BasalReminderScheduler.dailyIdentifier(for: "2026-10-05"))
+        let trigger = try XCTUnwrap(request.trigger as? UNCalendarNotificationTrigger)
+        XCTAssertFalse(trigger.repeats)
+        XCTAssertEqual(trigger.dateComponents.hour, 20)
+        XCTAssertEqual(trigger.dateComponents.minute, 0)
+        XCTAssertEqual(trigger.dateComponents.timeZone, calendar.timeZone)
+    }
+
+    func testBasalReminderPermissionIsShownWhenNotGranted() {
+        XCTAssertFalse(BasalReminderPermission.isAvailable(.notDetermined))
+        XCTAssertFalse(BasalReminderPermission.isAvailable(.denied))
+        XCTAssertTrue(BasalReminderPermission.isAvailable(.authorized))
+        XCTAssertTrue(BasalReminderPermission.isAvailable(.provisional))
+    }
+
+    @MainActor func testBasalReminderOpensPrefilledDraftWithoutWritingTreatment() throws {
+        try withRestoredDefaults {
+            let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+            let older = Date().addingTimeInterval(-36 * 60 * 60)
+            _ = TreatmentEntry(date: older, value: 18, treatmentType: .BasalInjection,
+                               nightscoutEventType: "Note", enteredBy: "Test", notes: "Lantus",
+                               nsManagedObjectContext: core.mainManagedObjectContext)
+            let latest = TreatmentEntry(date: Date().addingTimeInterval(-24 * 60 * 60), value: 20,
+                                        treatmentType: .BasalInjection, nightscoutEventType: "Note",
+                                        enteredBy: "Test", notes: "Tresiba",
+                                        nsManagedObjectContext: core.mainManagedObjectContext)
+            let deleted = TreatmentEntry(date: Date().addingTimeInterval(-60 * 60), value: 30,
+                                         treatmentType: .BasalInjection, nightscoutEventType: "Note",
+                                         enteredBy: "Test", notes: "Deleted",
+                                         nsManagedObjectContext: core.mainManagedObjectContext)
+            deleted.treatmentdeleted = true
+            XCTAssertTrue(core.saveChangesSynchronously())
+            UserDefaults.standard.lastBasalInjectionUnits = 99
+            UserDefaults.standard.lastBasalInjectionInsulinDescription = "Stale"
+            XCTAssertTrue(BasalReminderScheduler.prepareDraftPrefill(coreDataManager: core))
+            let draft = TreatmentEditorViewModel(coreDataManager: core, treatmentToEdit: nil,
+                                                 initialType: .BasalInjection)
+            XCTAssertEqual(draft.enteredValue, "20")
+            XCTAssertEqual(draft.enteredInsulinDescription, "Tresiba")
+            XCTAssertEqual(latest.value, 20)
+            XCTAssertEqual(try BasalReminderScheduler.storedInjections(coreDataManager: core).count, 2)
+            XCTAssertEqual(TreatmentEntryAccessor(coreDataManager: core).getLatestTreatments(howOld: nil).count, 3)
+            // Merely constructing and dismissing the draft cannot insert another treatment.
+        }
+    }
+
     /// Use the reported Note verbatim through the same JSON parser and storage path as follower sync.
     @MainActor func testReportedLantusNoteImportsAsBasalInjection() throws {
         let notes = """
@@ -955,6 +1123,33 @@ final class LocalTreatmentPlanningTests: XCTestCase {
             .getLatestTreatments(howOld: nil).first?.value, 2.25)
     }
 
+    @MainActor func testLoggerKeepsCarbohydrateOnlyLogAvailableWithoutPenBounds() throws {
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        var unavailable = PenDoseProfile.prefilledUnconfirmed.settings
+        unavailable.penStepUnits = 0
+        unavailable.maximumSuggestionUnits = 0
+        let journal = PenDoseLogJournal(directory: directory)
+        let metadata = MealPlanMetadataStore(directory: directory)
+        let food = PenDoseTreatmentLogger.log(coreDataManager: core, insulinUnits: 0,
+            carbohydrateGrams: 18, mealKind: .fast, plannedDate: nil,
+            journal: journal, penSettings: unavailable, metadataStore: metadata)
+        guard case .success = food else {
+            return XCTFail("Carbohydrates must be loggable without insulin pen bounds")
+        }
+        let insulin = PenDoseTreatmentLogger.log(coreDataManager: core, insulinUnits: 2,
+            carbohydrateGrams: 0, mealKind: .normal, plannedDate: nil,
+            journal: journal, penSettings: unavailable, metadataStore: metadata)
+        guard case .failure(.invalidInput) = insulin else {
+            return XCTFail("Insulin must still require valid pen bounds")
+        }
+        let entries = TreatmentEntryAccessor(coreDataManager: core).getLatestTreatments(howOld: nil)
+        XCTAssertEqual(entries.count, 1)
+        XCTAssertEqual(entries.first?.treatmentType, .Carbs)
+        XCTAssertEqual(entries.first?.value, 18)
+    }
+
     @MainActor func testConfirmedPizzaEditUpdatesFutureReminderWithoutRevivingPastOne() throws {
         let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -1348,4 +1543,204 @@ private final class BasalInjectionTestURLProtocol: URLProtocol {
         client?.urlProtocolDidFinishLoading(self)
     }
     override func stopLoading() {}
+}
+
+@MainActor final class WatchPenPhoneServiceTests: XCTestCase {
+    private func operation(insulin: Double, carbs: Double, meal: String = "normal",
+                           pizzaReminder: Bool = false,
+                           recordedAt: Date = Date()) -> WatchBolusOperation {
+        WatchBolusOperation(operationID: UUID(), insulinID: UUID(), carbsID: UUID(),
+            recordedAt: recordedAt, insulinUnits: insulin,
+            carbohydrateGrams: carbs, mealKindRaw: meal,
+            pizzaReminderRequested: pizzaReminder,
+            manualWithoutCurrentSuggestion: insulin > 0,
+            penStepUnits: insulin > 0 ? 0.5 : nil,
+            maximumUnits: insulin > 0 ? 25 : nil,
+            profileSignature: insulin > 0 ? "confirmed-on-watch" : nil)
+    }
+
+    func testCombinedWatchLogUsesFrozenIDsTimeMealAndSurvivesLostReceiptAndEdit() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let ledger = WatchPenOperationLedger(directory: root.appendingPathComponent("receipts"))
+        let journal = PenDoseLogJournal(directory: root)
+        let metadata = MealPlanMetadataStore(directory: root)
+        let when = Date().addingTimeInterval(-120)
+        let frozen = operation(insulin: 4.5, carbs: 30, meal: "slow",
+            pizzaReminder: false, recordedAt: when)
+
+        func submit(_ item: WatchBolusOperation,
+                    using receiptStore: WatchPenOperationLedger) -> WatchPenPhoneService.LogOutcome {
+            WatchPenPhoneService.log(item, coreDataManager: core, ledger: receiptStore,
+                journal: journal, metadataStore: metadata,
+                sourceReadyOverride: { true })
+        }
+        XCTAssertEqual(submit(frozen, using: ledger), .stored)
+        let entries = TreatmentEntryAccessor(coreDataManager: core).getLatestTreatments(howOld: nil)
+        XCTAssertEqual(entries.count, 2)
+        let bolus = try XCTUnwrap(entries.first { $0.localTreatmentUUID == frozen.insulinID.uuidString })
+        let meal = try XCTUnwrap(entries.first { $0.localTreatmentUUID == frozen.carbsID.uuidString })
+        XCTAssertEqual(bolus.date, when)
+        XCTAssertEqual(meal.date, when)
+        XCTAssertEqual(meal.mealKind, .slow)
+        XCTAssertEqual(meal.effectiveCarbohydrateDurationMinutes, 300)
+        XCTAssertEqual(bolus.notes, "Manuelt logget uden aktuelt kontrolleret forslag")
+        XCTAssertNil(try metadata.metadata(for: frozen.carbsID.uuidString)?.pizzaReminderAt,
+            "An offline Watch log must never acquire a pizza reminder during phone delivery")
+
+        // The first acknowledgement was lost; the process may have rebuilt its receipt store.
+        let reopenedLedger = WatchPenOperationLedger(directory: root.appendingPathComponent("receipts"))
+        XCTAssertEqual(submit(frozen, using: reopenedLedger), .stored)
+        bolus.value = 5
+        meal.treatmentdeleted = true
+        XCTAssertTrue(core.saveChangesSynchronously())
+        XCTAssertEqual(submit(frozen, using: reopenedLedger), .stored,
+            "A known retry acknowledges the original operation without restoring user edits")
+        let all = try core.mainManagedObjectContext.fetch(TreatmentEntry.fetchRequest())
+        XCTAssertEqual(all.count, 2)
+        XCTAssertEqual(bolus.value, 5)
+        XCTAssertTrue(meal.treatmentdeleted)
+
+        let conflicting = WatchBolusOperation(operationID: frozen.operationID,
+            insulinID: frozen.insulinID, carbsID: frozen.carbsID,
+            recordedAt: when, insulinUnits: 5, carbohydrateGrams: 30,
+            mealKindRaw: "slow", pizzaReminderRequested: false,
+            manualWithoutCurrentSuggestion: true,
+            penStepUnits: 0.5, maximumUnits: 25,
+            profileSignature: "confirmed-on-watch")
+        XCTAssertEqual(submit(conflicting, using: reopenedLedger), .conflictingOperation)
+        XCTAssertEqual(try core.mainManagedObjectContext.fetch(TreatmentEntry.fetchRequest()).count, 2)
+    }
+
+    func testDurableWatchLogRecoveryRefreshesFrozenPizzaReminderWithoutNewRows() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let ledger = WatchPenOperationLedger(directory: root.appendingPathComponent("receipts"))
+        let metadata = MealPlanMetadataStore(directory: root)
+        let now = Date()
+        let frozen = operation(insulin: 2.5, carbs: 30, meal: "slow",
+            pizzaReminder: true, recordedAt: now.addingTimeInterval(-60))
+        let pizza = PizzaSplitSettings(isEnabled: true, percentageNow: 70, reminderMinutes: 90)
+        guard case .pending = ledger.reserve(frozen, pizzaSettings: pizza) else {
+            return XCTFail("The operation must first have a durable pending receipt")
+        }
+        var staged = MealPlanMetadata(mealUUID: frozen.carbsID.uuidString,
+            bolusUUID: frozen.insulinID.uuidString, loggedAt: frozen.recordedAt,
+            plannedAt: nil, grams: frozen.carbohydrateGrams,
+            pizzaSettings: pizza, mealKind: .slow)
+        staged.pizzaReminderAt = nil // Prior process ended before its reminder refresh.
+        try metadata.stage(staged)
+        let bolus = TreatmentEntry(date: frozen.recordedAt, value: frozen.insulinUnits,
+            treatmentType: .Insulin, nightscoutEventType: nil,
+            enteredBy: "xDrip4iOS Watch", nsManagedObjectContext: core.mainManagedObjectContext)
+        bolus.localTreatmentUUID = frozen.insulinID.uuidString
+        let meal = TreatmentEntry(date: frozen.recordedAt, value: frozen.carbohydrateGrams,
+            treatmentType: .Carbs, nightscoutEventType: nil,
+            enteredBy: "xDrip4iOS Watch", nsManagedObjectContext: core.mainManagedObjectContext)
+        meal.localTreatmentUUID = frozen.carbsID.uuidString
+        meal.mealKindRaw = frozen.mealKindRaw
+        XCTAssertTrue(core.saveChangesSynchronously())
+
+        XCTAssertEqual(WatchPenPhoneService.log(frozen, coreDataManager: core,
+            ledger: ledger, metadataStore: metadata, now: now), .stored)
+        let recovered = try XCTUnwrap(metadata.metadata(for: frozen.carbsID.uuidString))
+        XCTAssertEqual(recovered.pizzaReminderAt,
+            MealPlanMetadata.pizzaDueAt(actualMealAt: frozen.recordedAt,
+                confirmedAt: now, intervalMinutes: 90))
+        XCTAssertEqual(try core.mainManagedObjectContext.fetch(TreatmentEntry.fetchRequest()).count, 2)
+        XCTAssertEqual(WatchPenPhoneService.log(frozen, coreDataManager: core,
+            ledger: ledger, metadataStore: metadata, now: now), .stored)
+        XCTAssertEqual(try core.mainManagedObjectContext.fetch(TreatmentEntry.fetchRequest()).count, 2)
+    }
+
+    func testWatchCarbsOnlyNeedsNoPenBoundsAndInsulinOnlyUsesFrozenBounds() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let ledger = WatchPenOperationLedger(directory: root.appendingPathComponent("receipts"))
+        let journal = PenDoseLogJournal(directory: root)
+        let metadata = MealPlanMetadataStore(directory: root)
+        let food = operation(insulin: 0, carbs: 18, meal: "fast")
+        XCTAssertEqual(WatchPenPhoneService.log(food, coreDataManager: core,
+            ledger: ledger, journal: journal, metadataStore: metadata,
+            sourceReadyOverride: { true }), .stored)
+        let insulin = operation(insulin: 2.5, carbs: 0)
+        XCTAssertEqual(WatchPenPhoneService.log(insulin, coreDataManager: core,
+            ledger: ledger, journal: journal, metadataStore: metadata,
+            sourceReadyOverride: { true }), .stored)
+        let entries = TreatmentEntryAccessor(coreDataManager: core).getLatestTreatments(howOld: nil)
+        XCTAssertEqual(entries.count, 2)
+        XCTAssertEqual(entries.first { $0.treatmentType == .Carbs }?.mealKind, .fast)
+        XCTAssertEqual(entries.first { $0.treatmentType == .Insulin }?.value, 2.5)
+    }
+
+    func testWatchCalculationRejectsPendingTherapyAndCGMBeforeReadingSnapshot() async {
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let request = WatchPenCalculationRequest(requestID: UUID(), carbohydrateGrams: 30,
+            mealKindRaw: "normal", pendingTreatmentIDs: [UUID()], pendingReadingIDs: [],
+            latestWatchReadingAt: nil, profileSignature: "stale")
+        let result = await WatchPenPhoneService.calculate(request, coreDataManager: core)
+        guard case .failure(let error) = result else {
+            return XCTFail("Unconfirmed Watch treatments must stop calculation")
+        }
+        XCTAssertTrue(error.message.contains("Ventende behandlinger"))
+
+        let legacyID = request.pendingTreatmentIDs[0]
+        let legacy = TreatmentEntry(date: Date(), value: 2,
+            treatmentType: .Insulin, nightscoutEventType: nil,
+            enteredBy: "xDrip4iOS Watch", nsManagedObjectContext: core.mainManagedObjectContext)
+        legacy.watchSourceUUID = legacyID.uuidString
+        XCTAssertTrue(core.saveChangesSynchronously())
+        let afterStorage = await WatchPenPhoneService.calculate(request, coreDataManager: core)
+        guard case .failure(let laterError) = afterStorage else {
+            return XCTFail("The deliberately stale profile should still reject calculation")
+        }
+        XCTAssertTrue(laterError.message.contains("Doseringsprofilen"),
+            "Durable legacy Watch treatment storage must satisfy the pending-ID gate")
+
+        let readingRequest = WatchPenCalculationRequest(requestID: UUID(),
+            carbohydrateGrams: 30, mealKindRaw: "normal", pendingTreatmentIDs: [],
+            pendingReadingIDs: [UUID()], latestWatchReadingAt: nil,
+            profileSignature: "stale")
+        let afterReadingStorage = await WatchPenPhoneService.calculate(readingRequest,
+            coreDataManager: core, confirmedReading: { $0 == readingRequest.pendingReadingIDs[0] })
+        guard case .failure(let readingError) = afterReadingStorage else {
+            return XCTFail("The deliberately stale profile should still reject calculation")
+        }
+        XCTAssertTrue(readingError.message.contains("Doseringsprofilen"),
+            "Existing Libre durable storage evidence must satisfy the pending CGM gate")
+    }
+
+    func testPendingWatchCGMRequiresValidatedParentStoreCommit() {
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let sensor = Sensor(startDate: Date().addingTimeInterval(-3600),
+            nsManagedObjectContext: core.mainManagedObjectContext)
+        let payloadID = UUID()
+        let reading = BgReading(timeStamp: Date(), sensor: sensor, calibration: nil,
+            rawData: 85, deviceName: nil,
+            nsManagedObjectContext: core.mainManagedObjectContext)
+        reading.id = payloadID.uuidString
+        reading.calculatedValue = 85
+        reading.ageAdjustedRawValue = 85
+        XCTAssertTrue(reading.isValidForDownstream)
+        XCTAssertFalse(WatchPenPhoneService.durablyStoredWatchReading(payloadID,
+            sensorID: sensor.id, coreDataManager: core),
+            "A validated row in the child context is not yet a durable CGM receipt")
+
+        XCTAssertTrue(core.saveChangesSynchronously())
+        XCTAssertTrue(WatchPenPhoneService.durablyStoredWatchReading(payloadID,
+            sensorID: sensor.id, coreDataManager: core))
+        XCTAssertFalse(WatchPenPhoneService.durablyStoredWatchReading(payloadID,
+            sensorID: UUID().uuidString, coreDataManager: core),
+            "A stored reading from another sensor cannot clear the pending ID")
+
+        reading.calculatedValue = 0
+        reading.ageAdjustedRawValue = 0
+        XCTAssertTrue(core.saveChangesSynchronously())
+        XCTAssertFalse(WatchPenPhoneService.durablyStoredWatchReading(payloadID,
+            sensorID: sensor.id, coreDataManager: core),
+            "A persisted reading that fails downstream validation is not confirmed")
+    }
 }

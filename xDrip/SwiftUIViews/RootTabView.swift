@@ -406,7 +406,8 @@ struct RootTabView: View {
             } else if stateModel.penCalculatorQuickActionRequest != nil {
                 selectHomeForCalculatorQuickAction()
             } else if PlannedMealReminder.pendingOpenUUID != nil ||
-                        PizzaSplitReminder.pendingOpenUUID != nil {
+                        PizzaSplitReminder.pendingOpenUUID != nil ||
+                        BasalReminderScheduler.hasPendingOpen {
                 selectedTab = .treatments
             }
             updateSupportedOrientations(for: selectedTab)
@@ -422,6 +423,9 @@ struct RootTabView: View {
             if scenePhase == .active {
                 updateSupportedOrientations(for: selectedTab)
                 selectHomeForCalculatorQuickAction()
+                if BasalReminderScheduler.hasPendingOpen {
+                    selectedTab = .treatments
+                }
             }
         }
         .onChange(of: stateModel.penCalculatorQuickActionRequest) { request in
@@ -449,6 +453,9 @@ struct RootTabView: View {
             selectedTab = .treatments
         }
         .onReceive(NotificationCenter.default.publisher(for: PizzaSplitReminder.openRequested)) { _ in
+            selectedTab = .treatments
+        }
+        .onReceive(NotificationCenter.default.publisher(for: BasalReminderScheduler.openRequested)) { _ in
             selectedTab = .treatments
         }
         .alert(

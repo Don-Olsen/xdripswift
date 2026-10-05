@@ -1905,14 +1905,22 @@ final class PenBolusCalculatorTests: XCTestCase {
 
 private actor PenDoseSnapshotFeed {
     private var samples: [GlucoseForecastSample]
+    private let treatments: [TherapyTreatment]
+    private let historicalGlucose: [GlucoseForecastSample]?
 
-    init(samples: [GlucoseForecastSample]) { self.samples = samples }
+    init(samples: [GlucoseForecastSample], treatments: [TherapyTreatment] = [],
+         historicalGlucose: [GlucoseForecastSample]? = nil) {
+        self.samples = samples
+        self.treatments = treatments
+        self.historicalGlucose = historicalGlucose
+    }
 
     func replace(with samples: [GlucoseForecastSample]) { self.samples = samples }
 
     func snapshot(at date: Date) -> Result<PenDoseInputSnapshot, PenDoseUnavailableReason> {
-        PenDoseInputSnapshot.make(capturedAt: date, glucose: samples, treatments: [],
-            therapySettings: TherapyModelSettings(), treatmentRevision: 1)
+        PenDoseInputSnapshot.make(capturedAt: date, glucose: samples,
+            treatments: treatments, therapySettings: TherapyModelSettings(),
+            treatmentRevision: 1, historicalGlucose: historicalGlucose)
     }
 }
 
@@ -2061,5 +2069,59 @@ private actor DelayedPenDoseSnapshotFeed {
         XCTAssertFalse(viewModel.isReviewCurrent,
             "reopening must not leave the previous copyable dose on screen")
         viewModel.stop()
+    }
+
+    func testWatchProjectionUsesSamePhoneCalculationSnapshotIncludingPizzaAndCOB() async throws {
+        let now = Date()
+        let readings = [31.0, 26, 21, 16, 11, 6, 1].enumerated().map { index, minutes in
+            sample(minutes, value: 115 + Double(index) * 5, at: now)
+        }
+        let existingMeal = TherapyTreatment(date: now.addingTimeInterval(-25 * 60),
+            amount: 40, isIOB: false, carbohydrateDurationMinutes: 300,
+            stableIdentity: "watch-parity-meal")
+        let feed = PenDoseSnapshotFeed(samples: Array(readings.suffix(6)),
+            treatments: [existingMeal], historicalGlucose: readings)
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        var profile = PenDoseProfile.prefilledUnconfirmed
+        XCTAssertTrue(profile.confirm(at: now.addingTimeInterval(-3600)))
+        let profileID = WatchPenPhoneService.profileSignature(profile)
+        XCTAssertEqual(profileID, WatchPenPhoneService.profileSignature(profile),
+            "Profile identity must be stable across independently encoded Watch requests")
+        let request = WatchPenCalculationRequest(requestID: UUID(), carbohydrateGrams: 30,
+            mealKindRaw: "slow", pendingTreatmentIDs: [], pendingReadingIDs: [],
+            latestWatchReadingAt: readings.last?.date, profileSignature: profileID)
+        let phoneResult = await WatchPenPhoneService.calculate(request,
+            coreDataManager: core, profileProvider: { profile },
+            sourceReadyOverride: { true },
+            snapshotProvider: { date, _ in await feed.snapshot(at: date) },
+            dataSignatureProvider: { "synthetic-snapshot" })
+        guard case .success(let phoneResponse) = phoneResult else {
+            if case .failure(let error) = phoneResult { XCTFail(error.message) }
+            return
+        }
+        let viewModel = PenDoseCalculatorViewModel(coreDataManager: core,
+            profileProvider: { profile }, sourceReadyOverride: { true },
+            snapshotProvider: { date, _ in await feed.snapshot(at: date) })
+        viewModel.carbohydratesText = "30"
+        viewModel.mealKind = .slow
+        await viewModel.calculate()
+        let details = try XCTUnwrap(viewModel.calculationDetails)
+        let response = viewModel.watchResponse(requestID: request.requestID,
+            profileSignature: profileID, dataSignature: "synthetic-snapshot")
+        XCTAssertEqual(phoneResponse.suggestedUnits, response.suggestedUnits)
+        XCTAssertEqual(phoneResponse.cobGrams, response.cobGrams, accuracy: 0.1)
+        XCTAssertEqual(phoneResponse.safetyRaw, response.safetyRaw)
+        XCTAssertEqual(phoneResponse.safetyReason, response.safetyReason)
+        XCTAssertEqual(phoneResponse.pizzaReminderMinutes, response.pizzaReminderMinutes)
+        XCTAssertEqual(phoneResponse.glucoseTrendMgdl, response.glucoseTrendMgdl)
+        XCTAssertEqual(response.suggestedUnits, details.suggestedNowUnits)
+        XCTAssertEqual(response.glucoseMgdl, details.glucoseMgdl)
+        XCTAssertEqual(response.glucoseMeasuredAt, details.glucoseMeasuredAt)
+        XCTAssertEqual(response.iobUnits, details.iobUnits)
+        XCTAssertEqual(response.cobGrams, details.cobGrams)
+        XCTAssertEqual(response.pizzaNowUnits, details.suggestedNowUnits)
+        XCTAssertEqual(response.pizzaReminderMinutes, details.pizzaReminderMinutes)
+        XCTAssertEqual(response.safetyReason,
+            viewModel.calculation?.safety.map(PenDoseCalculatorViewModel.safetyMessage))
     }
 }

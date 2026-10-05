@@ -8,6 +8,7 @@
 
 import Combine
 import CoreData
+import CryptoKit
 import Foundation
 import OSLog
 import UIKit
@@ -65,6 +66,14 @@ enum WatchManualTreatmentStore {
                 return
             }
 
+            if let existing,
+               (existing.treatmentType != (treatment.kind == .insulin ? .Insulin :
+                    treatment.kind == .carbs ? .Carbs : .BasalInjection) ||
+                existing.value != treatment.amount || existing.date != treatment.recordedAt ||
+                existing.treatmentdeleted) {
+                completion(.invalid)
+                return
+            }
             if existing == nil {
                 let type: TreatmentType
                 switch treatment.kind {
@@ -90,6 +99,373 @@ enum WatchManualTreatmentStore {
                 completion(stored ? (existing == nil ? .stored : .alreadyStored) : .failed)
             }
         }
+    }
+}
+
+/// A durable receipt for the single reviewed Watch Log action. The marker is written before
+/// the first phone insertion; its immutable payload survives an uncertain response and restart.
+@MainActor final class WatchPenOperationLedger {
+    private struct Record: Codable {
+        let operation: WatchBolusOperation
+        let pizzaEnabled: Bool
+        let pizzaPercentageNow: Int
+        let pizzaReminderMinutes: Int
+        var stored: Bool
+
+        var pizzaSettings: PizzaSplitSettings {
+            PizzaSplitSettings(isEnabled: pizzaEnabled,
+                percentageNow: pizzaPercentageNow, reminderMinutes: pizzaReminderMinutes)
+        }
+    }
+
+    enum Reservation {
+        case pending(PizzaSplitSettings)
+        case stored
+        case conflict
+        case failed
+    }
+
+    private let directory: URL
+    private let files: FileManager
+
+    init(directory: URL? = nil, files: FileManager = .default) {
+        self.files = files
+        self.directory = directory ?? files.urls(for: .applicationSupportDirectory,
+            in: .userDomainMask)[0].appendingPathComponent("PenDose/watch-operations", isDirectory: true)
+    }
+
+    private func url(for id: UUID) -> URL {
+        directory.appendingPathComponent(id.uuidString).appendingPathExtension("json")
+    }
+
+    private func read(_ id: UUID) throws -> Record? {
+        let path = url(for: id)
+        guard files.fileExists(atPath: path.path) else { return nil }
+        return try JSONDecoder().decode(Record.self, from: Data(contentsOf: path))
+    }
+
+    private func write(_ record: Record) throws {
+        try files.createDirectory(at: directory, withIntermediateDirectories: true)
+        try files.setAttributes([.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
+            ofItemAtPath: directory.path)
+        let path = url(for: record.operation.operationID)
+        try JSONEncoder().encode(record).write(to: path, options: .atomic)
+        try files.setAttributes([.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
+            ofItemAtPath: path.path)
+        let handle = try FileHandle(forWritingTo: path)
+        handle.synchronizeFile()
+        try handle.close()
+    }
+
+    func reserve(_ operation: WatchBolusOperation, pizzaSettings: PizzaSplitSettings) -> Reservation {
+        do {
+            if let prior = try read(operation.operationID) {
+                guard prior.operation == operation else { return .conflict }
+                return prior.stored ? .stored : .pending(prior.pizzaSettings)
+            }
+            let record = Record(operation: operation,
+                pizzaEnabled: operation.pizzaReminderRequested && pizzaSettings.isEnabled,
+                pizzaPercentageNow: pizzaSettings.percentageNow,
+                pizzaReminderMinutes: pizzaSettings.reminderMinutes, stored: false)
+            try write(record)
+            return .pending(record.pizzaSettings)
+        } catch { return .failed }
+    }
+
+    func markStored(_ operation: WatchBolusOperation) -> Bool {
+        do {
+            guard var record = try read(operation.operationID), record.operation == operation else {
+                return false
+            }
+            if record.stored { return true }
+            record.stored = true
+            try write(record)
+            return true
+        } catch { return false }
+    }
+
+    func lookup(_ id: UUID) -> (operation: WatchBolusOperation, stored: Bool)? {
+        guard let record = try? read(id) else { return nil }
+        return (record.operation, record.stored)
+    }
+}
+
+/// Watch uses the existing phone calculator and logger, independent of whether Home is open.
+@MainActor enum WatchPenPhoneService {
+    struct CalculationFailure: Error, Equatable {
+        let message: String
+        init(_ message: String) { self.message = message }
+    }
+
+    enum LogOutcome: Equatable {
+        case stored
+        case invalidOperation
+        case conflictingOperation
+        case persistenceFailed
+        case sourceUnavailable
+
+        var isStored: Bool { self == .stored }
+        var wireError: String {
+            switch self {
+            case .stored: return ""
+            case .invalidOperation: return "invalidOperation"
+            case .conflictingOperation: return "conflictingOperation"
+            case .persistenceFailed: return "persistenceFailed"
+            case .sourceUnavailable: return "sourceUnavailable"
+            }
+        }
+    }
+
+    private enum PersistedMatch { case none, exact, conflict, readFailed }
+
+    nonisolated static func profileSignature(_ profile: PenDoseProfile) -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        guard profile.isConfirmed, let data = try? encoder.encode(profile) else { return "" }
+        return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    nonisolated static func profileSettings() -> WatchPenProfileSettings? {
+        let profile = PenDoseProfile.load()
+        let signature = profileSignature(profile)
+        guard profile.isConfirmed, profile.settings.isValid, !signature.isEmpty else { return nil }
+        return WatchPenProfileSettings(penStepUnits: profile.settings.penStepUnits,
+            maximumUnits: profile.settings.maximumSuggestionUnits, profileSignature: signature)
+    }
+
+    nonisolated static func dataSignature(coreDataManager: CoreDataManager) -> String {
+        let therapy = TherapyMetricsManager.shared
+        let pizza = PizzaSplitSettings.load()
+        let latest = BgReadingsAccessor(coreDataManager: coreDataManager)
+            .getLatestBgReadingSnapshots(limit: 1, fromDate: nil, forSensor: nil,
+                ignoreRawData: true, ignoreCalculatedValue: false).first
+        let input = [profileSignature(PenDoseProfile.load()),
+            String(therapy.treatmentChangeRevision),
+            String(therapy.forecastInputChangeRevision),
+            String(therapy.hasUncommittedForecastInputChanges),
+            GlucoseForecastDataAdapter.presentationInputSignature(horizonMinutes: 120),
+            String(pizza.isEnabled), String(pizza.percentageNow), String(pizza.reminderMinutes),
+            latest?.id ?? "", String(latest?.timeStamp.timeIntervalSince1970 ?? 0),
+            String(latest?.finalValue ?? 0), latest?.sensorID ?? ""].joined(separator: "|")
+        return SHA256.hash(data: Data(input.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
+    static func calculate(_ request: WatchPenCalculationRequest,
+                          coreDataManager: CoreDataManager,
+                          ledger: WatchPenOperationLedger? = nil,
+                          confirmedReading: (UUID) -> Bool = { _ in false },
+                          profileProvider: @escaping () -> PenDoseProfile = { PenDoseProfile.load() },
+                          sourceReadyOverride: (() -> Bool)? = nil,
+                          snapshotProvider: ((Date, Bool) async -> Result<PenDoseInputSnapshot, PenDoseUnavailableReason>)? = nil,
+                          dataSignatureProvider: (() -> String)? = nil) async
+        -> Result<WatchPenCalculationResponse, CalculationFailure> {
+        guard request.carbohydrateGrams.isFinite,
+              (0...500).contains(request.carbohydrateGrams),
+              let mealKind = TreatmentMealKind(rawValue: request.mealKindRaw) else {
+            return .failure(.init("Indtast en gyldig mængde kulhydrat og madtype."))
+        }
+        let ledger = ledger ?? WatchPenOperationLedger()
+        func unresolved() -> (treatments: [UUID], readings: [UUID]) {
+            let treatments = request.pendingTreatmentIDs.filter { id in
+                guard let entry = ledger.lookup(id) else {
+                    return !legacyWatchTreatmentIsStored(id, coreDataManager: coreDataManager)
+                }
+                if entry.stored { return false }
+                guard case .exact = persistedMatch(entry.operation,
+                    coreDataManager: coreDataManager) else { return true }
+                return !ledger.markStored(entry.operation)
+            }
+            return (treatments, request.pendingReadingIDs.filter { !confirmedReading($0) })
+        }
+        // Interactive Watch queue sends and this request may overtake one another. Give the
+        // existing durable phone receipts a brief chance to arrive, without assuming delivery.
+        var pending = unresolved()
+        for _ in 0..<8 where !pending.treatments.isEmpty || !pending.readings.isEmpty {
+            try? await Task.sleep(for: .milliseconds(250))
+            pending = unresolved()
+        }
+        guard pending.treatments.isEmpty else {
+            return .failure(.init("Ventende behandlinger på uret er ikke bekræftet gemt på iPhone."))
+        }
+        guard pending.readings.isEmpty else {
+            return .failure(.init("Nyere Watch-CGM er endnu ikke bekræftet gemt på iPhone."))
+        }
+        let profile = profileProvider()
+        let profileID = profileSignature(profile)
+        guard profile.isConfirmed, profile.settings.isValid,
+              !profileID.isEmpty, profileID == request.profileSignature else {
+            return .failure(.init("Doseringsprofilen er ændret eller ikke bekræftet. Synkronisér uret og prøv igen."))
+        }
+        let signature = dataSignatureProvider ?? { dataSignature(coreDataManager: coreDataManager) }
+        let before = signature()
+        let calculator = PenDoseCalculatorViewModel(coreDataManager: coreDataManager,
+            profileProvider: profileProvider, sourceReadyOverride: sourceReadyOverride,
+            snapshotProvider: snapshotProvider)
+        calculator.carbohydratesText = String(request.carbohydrateGrams)
+        calculator.mealKind = mealKind
+        await calculator.calculate()
+        let after = signature()
+        guard before == after,
+              profileID == profileSignature(profileProvider()) else {
+            return .failure(.init("Beregningsgrundlaget ændrede sig. Tryk Beregn igen."))
+        }
+        if let newestWatchReading = request.latestWatchReadingAt {
+            guard newestWatchReading <= Date().addingTimeInterval(60),
+                  let received = calculator.latestGlucoseDate,
+                  received.addingTimeInterval(1) >= newestWatchReading else {
+                return .failure(.init("Nyere Watch-CGM er endnu ikke behandlet på iPhone."))
+            }
+        }
+        return .success(calculator.watchResponse(requestID: request.requestID,
+            profileSignature: profileID, dataSignature: after))
+    }
+
+    static func log(_ operation: WatchBolusOperation,
+                    coreDataManager: CoreDataManager,
+                    ledger: WatchPenOperationLedger? = nil,
+                    journal: PenDoseLogJournal? = nil,
+                    metadataStore: MealPlanMetadataStore? = nil,
+                    sourceReadyOverride: (() -> Bool)? = nil,
+                    now: Date = .now) -> LogOutcome {
+        let ledger = ledger ?? WatchPenOperationLedger()
+        let journal = journal ?? .shared
+        let metadataStore = metadataStore ?? .shared
+        guard operation.isValid(at: now),
+              operation.operationID != operation.insulinID,
+              operation.operationID != operation.carbsID,
+              operation.insulinID != operation.carbsID,
+              let mealKind = TreatmentMealKind(rawValue: operation.mealKindRaw) else {
+            return .invalidOperation
+        }
+        let settings = PenDoseProfile.load().settings
+        let pizza = PizzaSplitSettings.load()
+        switch ledger.reserve(operation, pizzaSettings: pizza) {
+        case .stored: return .stored
+        case .conflict: return .conflictingOperation
+        case .failed: return .persistenceFailed
+        case .pending(let storedPizza):
+            let logOperation = PenDoseLogOperation(bolusUUID: operation.insulinID.uuidString,
+                mealUUID: operation.carbsID.uuidString)
+            switch persistedMatch(operation, coreDataManager: coreDataManager) {
+            case .exact:
+                // A prior attempt may have committed the treatments but ended before
+                // its existing meal reminder refresh. Reconcile the staged frozen meal
+                // metadata without writing either treatment again.
+                if operation.carbohydrateGrams > 0,
+                   let warning = MealPlanReminderCoordinator.refresh(
+                    coreDataManager: coreDataManager,
+                    mealUUID: operation.carbsID.uuidString,
+                    confirmedAt: now, now: now,
+                    store: metadataStore, onIssue: MealReminderIssueCenter.report) {
+                    MealReminderIssueCenter.report(warning)
+                }
+                return ledger.markStored(operation) ? .stored : .persistenceFailed
+            case .conflict:
+                return .conflictingOperation
+            case .readFailed:
+                return .persistenceFailed
+            case .none:
+                break
+            }
+            let defaults = UserDefaults.standard
+            guard sourceReadyOverride?() ?? TherapyMetricsManager.doseSourceIsReady(
+                defaults.dataFlowPolicy,
+                cutover: TreatmentSourceCutover.current(defaults: defaults), defaults: defaults) else {
+                return .sourceUnavailable
+            }
+            let result = PenDoseTreatmentLogger.log(coreDataManager: coreDataManager,
+                insulinUnits: operation.insulinUnits,
+                carbohydrateGrams: operation.carbohydrateGrams,
+                mealKind: mealKind, plannedDate: nil, operation: logOperation,
+                now: operation.recordedAt, journal: journal,
+                penSettings: settings,
+                frozenPenStepUnits: operation.penStepUnits,
+                frozenMaximumUnits: operation.maximumUnits,
+                enteredBy: "xDrip4iOS Watch",
+                manualWithoutCurrentSuggestion: operation.manualWithoutCurrentSuggestion,
+                pizzaSettings: storedPizza,
+                metadataStore: metadataStore,
+                onReminderIssue: MealReminderIssueCenter.report)
+            switch result {
+            case .success:
+                guard case .exact = persistedMatch(operation, coreDataManager: coreDataManager) else {
+                    return .persistenceFailed
+                }
+                return ledger.markStored(operation) ? .stored : .persistenceFailed
+            case .failure(.invalidInput): return .invalidOperation
+            case .failure(.storageFailed), .failure(.metadataFailed): return .persistenceFailed
+            }
+        }
+    }
+
+    private static func persistedMatch(_ operation: WatchBolusOperation,
+                                       coreDataManager: CoreDataManager) -> PersistedMatch {
+        guard let coordinator = coreDataManager.privateManagedObjectContext.persistentStoreCoordinator else {
+            return .readFailed
+        }
+        let context = NSManagedObjectContext(concurrencyType: .privateQueueConcurrencyType)
+        context.persistentStoreCoordinator = coordinator
+        var match: PersistedMatch = .readFailed
+        context.performAndWait {
+            let request: NSFetchRequest<TreatmentEntry> = TreatmentEntry.fetchRequest()
+            request.predicate = NSPredicate(format: "localTreatmentUUID IN %@",
+                [operation.insulinID.uuidString, operation.carbsID.uuidString])
+            guard let rows = try? context.fetch(request) else { return }
+            if rows.isEmpty { match = .none; return }
+            let expected = (operation.insulinUnits > 0 ? 1 : 0) +
+                (operation.carbohydrateGrams > 0 ? 1 : 0)
+            guard rows.count == expected else { match = .conflict; return }
+            let insulin = rows.filter { $0.localTreatmentUUID == operation.insulinID.uuidString }
+            let carbs = rows.filter { $0.localTreatmentUUID == operation.carbsID.uuidString }
+            let insulinMatches = insulin.count == (operation.insulinUnits > 0 ? 1 : 0) &&
+                insulin.allSatisfy { $0.treatmentType == .Insulin && !$0.treatmentdeleted &&
+                    $0.value == operation.insulinUnits && $0.date == operation.recordedAt }
+            let carbsMatches = carbs.count == (operation.carbohydrateGrams > 0 ? 1 : 0) &&
+                carbs.allSatisfy { $0.treatmentType == .Carbs && !$0.treatmentdeleted &&
+                    $0.value == operation.carbohydrateGrams && $0.date == operation.recordedAt &&
+                    $0.mealKindRaw == operation.mealKindRaw }
+            match = insulinMatches && carbsMatches ? .exact : .conflict
+        }
+        return match
+    }
+
+    private static func legacyWatchTreatmentIsStored(_ id: UUID,
+                                                      coreDataManager: CoreDataManager) -> Bool {
+        guard let coordinator = coreDataManager.privateManagedObjectContext.persistentStoreCoordinator else {
+            return false
+        }
+        let context = NSManagedObjectContext(concurrencyType: .privateQueueConcurrencyType)
+        context.persistentStoreCoordinator = coordinator
+        var stored = false
+        context.performAndWait {
+            let request: NSFetchRequest<TreatmentEntry> = TreatmentEntry.fetchRequest()
+            request.predicate = NSPredicate(format: "watchSourceUUID == %@", id.uuidString)
+            guard let rows = try? context.fetch(request), rows.count == 1 else { return }
+            stored = rows[0].treatmentType == .Insulin || rows[0].treatmentType == .Carbs
+        }
+        return stored
+    }
+
+    /// A Watch CGM payload is reconciled only after the validated reading reached SQLite.
+    /// The application's main context may already contain a row while its parent save is
+    /// still pending or has failed, so it cannot prove durability for a dose snapshot.
+    static func durablyStoredWatchReading(_ id: UUID, sensorID: String,
+                                          coreDataManager: CoreDataManager) -> Bool {
+        guard let coordinator = coreDataManager.privateManagedObjectContext.persistentStoreCoordinator else {
+            return false
+        }
+        let context = NSManagedObjectContext(concurrencyType: .privateQueueConcurrencyType)
+        context.persistentStoreCoordinator = coordinator
+        var stored = false
+        context.performAndWait {
+            let request: NSFetchRequest<BgReading> = BgReading.fetchRequest()
+            request.predicate = NSPredicate(format: "id == %@ AND sensor.id == %@",
+                id.uuidString, sensorID)
+            request.fetchLimit = 1
+            guard let reading = try? context.fetch(request).first else { return }
+            stored = reading.isValidForDownstream
+        }
+        return stored
     }
 }
 
@@ -129,6 +505,7 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
     private var libreWatchReadingAcceptance = LibreWatchReadingAcceptancePolicy()
     private var libreWatchDiagnosticReceipts = LibreWatchSessionStore.loadDiagnosticReceipts()
     private var libreWatchObservers: [NSObjectProtocol] = []
+    private var lastPenConfigurationSignature = ""
 
     /// Statistics manager used to build compact AGP backgrounds for the Watch chart
     private var statisticsManager: StatisticsManager
@@ -164,7 +541,20 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
             if streams.contains("status") {
                 self.status = self.currentStatus(therapyMetrics: self.pendingTherapyMetrics)
                 self.pendingTherapyMetrics = nil
-                result["status"] = self.status.asDictionary
+                var status = self.status.asDictionary ?? [:]
+                if let settings = WatchPenPhoneService.profileSettings() {
+                    status[WatchPenMessageKey.profileAvailable] = true
+                    status[WatchPenMessageKey.profileSettings] = [
+                        "penStepUnits": settings.penStepUnits,
+                        "maximumUnits": settings.maximumUnits,
+                        "profileSignature": settings.profileSignature
+                    ] as [String: Any]
+                } else {
+                    status[WatchPenMessageKey.profileAvailable] = false
+                }
+                status[WatchPenMessageKey.dataSignature] = WatchPenPhoneService.dataSignature(
+                    coreDataManager: self.coreDataManager)
+                result["status"] = status
                 if self.status.libreAlarmSettings?.revision != self.handoffSnapshotCache.snapshot?.alarmSettings?.revision {
                     self.sendLibreWatchSession()
                 }
@@ -286,6 +676,25 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
             self?.sendLibreWatchSession()
         })
 
+        lastPenConfigurationSignature = penConfigurationSignature()
+        libreWatchObservers.append(NotificationCenter.default.addObserver(
+            forName: UserDefaults.didChangeNotification, object: UserDefaults.standard,
+            queue: nil) { [weak self] _ in
+            // UserDefaults may post on a worker while main waits for that worker.
+            // A main OperationQueue observer would block the posting thread.
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let signature = self.penConfigurationSignature()
+                guard signature != self.lastPenConfigurationSignature else { return }
+                self.lastPenConfigurationSignature = signature
+                self.processWatchUpdate(updateTypes: [.status], forceComplicationUpdate: false)
+            }
+        })
+        libreWatchObservers.append(NotificationCenter.default.addObserver(
+            forName: TherapyMetricsManager.changed, object: nil, queue: .main) { [weak self] _ in
+            self?.processWatchUpdate(updateTypes: [.status], forceComplicationUpdate: false)
+        })
+
         if let transmitter = bluetoothPeripheralManager.getCGMTransmitter() as? CGMLibre2Transmitter {
             if startupDecision.phoneConnectionIsBlocked, let libreWatchDirectSession {
                 transmitter.restoreWatchOwnership(libreWatchDirectSession)
@@ -357,6 +766,13 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
         case status
         case bgReadings
         case agp
+    }
+
+    private func penConfigurationSignature() -> String {
+        let pizza = PizzaSplitSettings.load()
+        return [WatchPenPhoneService.profileSignature(PenDoseProfile.load()),
+            String(pizza.isEnabled), String(pizza.percentageNow),
+            String(pizza.reminderMinutes)].joined(separator: "|")
     }
 
     private func activateSessionIfNeeded() {
@@ -1361,6 +1777,13 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
             }
             WatchManualTreatmentStore.save(treatment, coreDataManager: self.coreDataManager) { [weak self] outcome in
                 guard let self else { return }
+                if outcome.isStored, treatment.kind == .basalInjection {
+                    DispatchQueue.main.async {
+                        BasalReminderScheduler.shared.refreshAfterTreatmentChange(
+                            coreDataManager: self.coreDataManager,
+                            savedBasalAt: treatment.recordedAt)
+                    }
+                }
                 var response: [String: Any] = [
                     WatchManualTreatmentMessageKey.treatmentID: treatment.id.uuidString,
                     WatchManualTreatmentMessageKey.stored: outcome.isStored
@@ -1371,6 +1794,68 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
                 }
                 if let reply { reply(response) } else { self.sendManualWatchTreatmentReceipt(response) }
             }
+        }
+        return true
+    }
+
+    @discardableResult
+    private func handleWatchPenCalculation(_ message: [String: Any],
+                                           reply: (([String: Any]) -> Void)?) -> Bool {
+        guard let data = message[WatchPenMessageKey.calculationRequest] as? Data else { return false }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            guard let request = try? JSONDecoder().decode(WatchPenCalculationRequest.self,
+                from: data) else {
+                reply?([WatchPenMessageKey.calculationError: "Beregnerens forespørgsel er ugyldig."])
+                return
+            }
+            let sensorID = self.libreWatchCalibrationSnapshot?.activeSensorID
+            let result = await WatchPenPhoneService.calculate(request,
+                coreDataManager: self.coreDataManager,
+                confirmedReading: { id in
+                    guard let sensorID else { return false }
+                    return WatchPenPhoneService.durablyStoredWatchReading(id,
+                        sensorID: sensorID, coreDataManager: self.coreDataManager)
+                })
+            switch result {
+            case .success(let response):
+                guard let encoded = try? JSONEncoder().encode(response) else {
+                    reply?([WatchPenMessageKey.calculationError: "Beregningen kunne ikke sendes til uret."])
+                    return
+                }
+                reply?([WatchPenMessageKey.calculationResponse: encoded])
+            case .failure(let reason):
+                reply?([WatchPenMessageKey.calculationError: reason.message])
+            }
+        }
+        return true
+    }
+
+    @discardableResult
+    private func handleWatchPenLog(_ message: [String: Any],
+                                   reply: (([String: Any]) -> Void)?) -> Bool {
+        guard let data = message[WatchPenMessageKey.operation] as? Data else { return false }
+        let rawID = message[WatchPenMessageKey.operationID] as? String ?? ""
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            guard let operation = try? JSONDecoder().decode(WatchBolusOperation.self,
+                from: data), operation.operationID.uuidString == rawID else {
+                let response: [String: Any] = [WatchPenMessageKey.operationID: rawID,
+                    WatchPenMessageKey.stored: false,
+                    WatchPenMessageKey.error: "invalidOperation"]
+                if let reply { reply(response) }
+                else { self.sendManualWatchTreatmentReceipt(response) }
+                return
+            }
+            let outcome = WatchPenPhoneService.log(operation,
+                coreDataManager: self.coreDataManager)
+            var response: [String: Any] = [
+                WatchPenMessageKey.operationID: operation.operationID.uuidString,
+                WatchPenMessageKey.stored: outcome.isStored
+            ]
+            if !outcome.isStored { response[WatchPenMessageKey.error] = outcome.wireError }
+            if let reply { reply(response) }
+            else { self.sendManualWatchTreatmentReceipt(response) }
         }
         return true
     }
@@ -1471,6 +1956,8 @@ extension WatchManager: WCSessionDelegate {
 
     // process any received messages from the watch app
     func session(_ session: WCSession, didReceiveMessage message: [String: Any]) {
+        if handleWatchPenLog(message, reply: nil) { return }
+        if handleWatchPenCalculation(message, reply: nil) { return }
         if handleManualWatchTreatment(message, reply: nil) { return }
         if handleLibreWatchMessage(message, transport: .interactiveMessage, reply: nil) { return }
         if let kind = message["requestWatchUpdate"] as? String {
@@ -1490,6 +1977,8 @@ extension WatchManager: WCSessionDelegate {
         didReceiveMessage message: [String: Any],
         replyHandler: @escaping ([String: Any]) -> Void
     ) {
+        if handleWatchPenLog(message, reply: replyHandler) { return }
+        if handleWatchPenCalculation(message, reply: replyHandler) { return }
         if handleManualWatchTreatment(message, reply: replyHandler) { return }
         if handleLibreWatchMessage(message, transport: .interactiveMessage, reply: replyHandler) { return }
         DispatchQueue.main.async {
@@ -1504,6 +1993,7 @@ extension WatchManager: WCSessionDelegate {
     }
 
     func session(_: WCSession, didReceiveUserInfo userInfo: [String: Any] = [:]) {
+        if handleWatchPenLog(userInfo, reply: nil) { return }
         if handleManualWatchTreatment(userInfo, reply: nil) { return }
         _ = handleLibreWatchMessage(userInfo, transport: .queuedUserInfo, reply: nil)
     }
