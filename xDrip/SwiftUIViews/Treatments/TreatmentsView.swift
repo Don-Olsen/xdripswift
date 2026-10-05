@@ -350,12 +350,12 @@ struct TreatmentsListView: View {
             get: { pendingLocalDeletion != nil },
             set: { if !$0 { pendingLocalDeletion = nil } }
         ), titleVisibility: .visible) {
-            Button("Slet lokalt", role: .destructive) {
+            Button("Slet behandling", role: .destructive) {
                 if let pendingLocalDeletion { viewModel.deleteTreatment(pendingLocalDeletion) }
                 pendingLocalDeletion = nil
             }
         } message: {
-            Text("Posten slettes i xDrip. En kopi kan stadig findes i Apple Sundhed og skal i så fald kontrolleres dér.")
+            Text("Behandlingen slettes først i xDrip. En tidligere eksporteret kopi fjernes derefter fra Sundhed, når adgang er tilgængelig. Se status under Apple Health, hvis fjernelsen afventer eller fejler.")
         }
         .alert("Lagring usikker", isPresented: Binding(
             get: { viewModel.deletionFailureMessage != nil },

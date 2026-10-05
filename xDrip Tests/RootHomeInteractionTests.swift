@@ -13,6 +13,43 @@ import XCTest
 
 final class RootHomeInteractionTests: XCTestCase {
 
+    @MainActor func testIconCalculatorActionIsFirstAndSpeakingActionStillSwitches() {
+        XCTAssertEqual(QuickActionsManager.availableActions(calculatorVisible: true,
+            speakReadings: false), [.penCalculator, .speakReadings])
+        XCTAssertEqual(QuickActionsManager.availableActions(calculatorVisible: true,
+            speakReadings: true), [.penCalculator, .stopSpeakingReadings])
+        XCTAssertEqual(QuickActionsManager.availableActions(calculatorVisible: false,
+            speakReadings: false), [.speakReadings])
+        XCTAssertNotNil(QuickActionType.penCalculator.shortcutItem.icon)
+    }
+
+    @MainActor func testIconCalculatorRequestSurvivesStartupAndCoalescesRepeatedTaps() {
+        let root = RootTabStateModel()
+        XCTAssertNil(root.dependencies)
+        root.requestPenCalculatorQuickAction()
+        let first = root.penCalculatorQuickActionRequest
+        XCTAssertNotNil(first)
+        root.requestPenCalculatorQuickAction()
+        XCTAssertEqual(root.penCalculatorQuickActionRequest, first)
+        root.consumePenCalculatorQuickAction(UUID())
+        XCTAssertEqual(root.penCalculatorQuickActionRequest, first)
+        root.consumePenCalculatorQuickAction(first!)
+        XCTAssertNil(root.penCalculatorQuickActionRequest)
+    }
+
+    @MainActor func testIconActionDefaultsNotificationDoesNotWaitForMainThread() {
+        _ = QuickActionsManager.shared
+        let posted = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            NotificationCenter.default.post(name: UserDefaults.didChangeNotification,
+                object: UserDefaults.standard)
+            posted.signal()
+        }
+        // Main may synchronously wait on a worker for forecast evidence. A main-queue
+        // NotificationCenter observer would make that worker wait back on main.
+        XCTAssertEqual(posted.wait(timeout: .now() + 1), .success)
+    }
+
     func testForecastPreferenceDefaultsTo60AndSupportsOffAnd120() throws {
         let suite = "ForecastPresentationTests-" + UUID().uuidString
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))

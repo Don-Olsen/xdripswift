@@ -216,6 +216,9 @@ struct RootHomeView: View {
     private let coreDataManager: CoreDataManager
     private let nightscoutSyncManager: NightscoutSyncManager
     private let forecastDataAdapter: GlucoseForecastDataAdapter
+    private let penCalculatorQuickActionRequest: UUID?
+    private let allowsCalculatorQuickAction: Bool
+    private let consumeCalculatorQuickAction: (UUID) -> Void
     @State private var selectedRange: RootHomeChartRange
     @State private var isLoadingChart = false
     @State private var isBackgroundLoadingChart = false
@@ -304,7 +307,10 @@ struct RootHomeView: View {
         sensorHealthIssueManager: SensorHealthIssueManager,
         coreDataManager: CoreDataManager,
         nightscoutSyncManager: NightscoutSyncManager,
-        actions: RootHomeActions
+        actions: RootHomeActions,
+        penCalculatorQuickActionRequest: UUID? = nil,
+        allowsCalculatorQuickAction: Bool = true,
+        consumeCalculatorQuickAction: @escaping (UUID) -> Void = { _ in }
     ) {
         let initialRange = RootHomeChartRange.closest(to: UserDefaults.standard.chartWidthInHours)
 
@@ -313,6 +319,9 @@ struct RootHomeView: View {
         self.actions = actions
         self.coreDataManager = coreDataManager
         self.nightscoutSyncManager = nightscoutSyncManager
+        self.penCalculatorQuickActionRequest = penCalculatorQuickActionRequest
+        self.allowsCalculatorQuickAction = allowsCalculatorQuickAction
+        self.consumeCalculatorQuickAction = consumeCalculatorQuickAction
         self.forecastDataAdapter = GlucoseForecastDataAdapter(coreDataManager: coreDataManager)
         // only the main chart can show sensor noise background bands. The mini-chart keeps the
         // same clean overview behaviour and does not need the extra Core Data fetch.
@@ -345,6 +354,19 @@ struct RootHomeView: View {
             }
             requestChartState(forceReset: true)
             requestMiniChartState(forceReset: true)
+            Task { @MainActor in
+                await Task.yield()
+                openPendingCalculatorQuickAction()
+            }
+        }
+        .onChange(of: penCalculatorQuickActionRequest) { _ in
+            openPendingCalculatorQuickAction()
+        }
+        .onChange(of: allowsCalculatorQuickAction) { _ in
+            openPendingCalculatorQuickAction()
+        }
+        .onChange(of: showsExpandedIPadChart) { _ in
+            openPendingCalculatorQuickAction()
         }
         .onDisappear {
             scrollCoordinator.stopDeceleration()
@@ -357,8 +379,10 @@ struct RootHomeView: View {
             forecastFreshnessCheckTime = now
             refreshCurrentTimeRangeIfNeeded(showsLoading: false)
             requestMiniChartState(forceReset: false)
+            if penCalculatorQuickActionRequest != nil { openPendingCalculatorQuickAction() }
         }
         .onReceive(NotificationCenter.default.publisher(for: HealthKitTherapyImportManager.statusDidChange)) { _ in
+            if penCalculatorQuickActionRequest != nil { openPendingCalculatorQuickAction() }
             forecastFreshnessCheckTime = Date()
             let signature = currentHealthTherapySelectionSignature
             if signature != healthTherapySelectionSignature {
@@ -372,6 +396,7 @@ struct RootHomeView: View {
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: TherapyMetricsManager.changed)) { _ in
+            if penCalculatorQuickActionRequest != nil { openPendingCalculatorQuickAction() }
             let routine = HealthKitTherapyImportManager.shared.routineRefreshState()
             if routine?.allEnabledKindsCommitted != false
                 && TherapyMetricsManager.shared.pendingHomeTreatmentCommitState() == nil {
@@ -1295,6 +1320,23 @@ struct RootHomeView: View {
             localInputsComplete: !TherapyMetricsManager.shared.hasUncommittedForecastInputChanges
                 && !HealthKitTherapyImportManager.shared.localInputIsIncomplete(.insulin)
                 && !HealthKitTherapyImportManager.shared.localInputIsIncomplete(.carbohydrates))
+    }
+
+    private func openPendingCalculatorQuickAction() {
+        guard let request = penCalculatorQuickActionRequest,
+              allowsCalculatorQuickAction,
+              !showsExpandedIPadChart,
+              scenePhase == .active else { return }
+        if showsPenCalculator {
+            // Repeated icon taps leave the open calculator and its entered values intact.
+            consumeCalculatorQuickAction(request)
+            return
+        }
+        guard !state.usesScreenLockNightLayout,
+              showsCalculatorShortcut(state.loop) else { return }
+        resetChartsToNow()
+        showsPenCalculator = true
+        consumeCalculatorQuickAction(request)
     }
 
     private func showsTherapyRow(_ loop: RootHomeLoopState) -> Bool {

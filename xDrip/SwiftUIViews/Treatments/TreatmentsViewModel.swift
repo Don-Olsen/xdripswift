@@ -216,6 +216,7 @@ import OSLog
             return false
         }
         deletionFailureMessage = nil
+        if durableMutation { HealthKitLocalTherapyWriter.shared.retryPending() }
         if let uuid = treatmentEntry.localTreatmentUUID {
             if treatmentEntry.treatmentType == .Carbs {
                 let warning = MealPlanReminderCoordinator.refresh(coreDataManager: coreDataManager,

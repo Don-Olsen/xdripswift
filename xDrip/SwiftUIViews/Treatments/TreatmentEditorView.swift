@@ -166,7 +166,7 @@ private struct TreatmentEditorScreen: View {
                     if viewModel.cancelPlannedMeal() { onSave() }
                 }
             case .deleteWithHealthWarning:
-                Button("Slet lokalt", role: .destructive) {
+                Button("Slet behandling", role: .destructive) {
                     if viewModel.deleteTreatment() { onSave() }
                 }
             case .none:
@@ -177,7 +177,7 @@ private struct TreatmentEditorScreen: View {
             case .confirmMeal:
                 Text("Bekræft, at maden er spist. Det planlagte tidspunkt er ikke automatisk spisetidspunktet. Ret dato og klokkeslæt ovenfor ved behov.")
             case .deleteWithHealthWarning:
-                Text("Posten slettes i xDrip. En kopi kan stadig findes i Apple Sundhed og skal i så fald kontrolleres dér.")
+                Text("Behandlingen slettes først i xDrip. En tidligere eksporteret kopi fjernes derefter fra Sundhed, når adgang er tilgængelig. Se status under Apple Health, hvis fjernelsen afventer eller fejler.")
             case .cancelMeal:
                 Text("Kun måltidsplanen annulleres. Den registrerede insulin bevares.")
             case .none:

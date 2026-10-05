@@ -5,6 +5,29 @@ import Combine
 import UserNotifications
 @testable import xdrip
 
+private final class FakePhoneHealthAuthorizationStore: HealthKitAuthorizationStoring {
+    var requests: [(share: Set<HKSampleType>?, read: Set<HKObjectType>?)] = []
+    var requestCompletions: [@Sendable (Bool, Error?) -> Void] = []
+    var statusRequests: [(share: Set<HKSampleType>, read: Set<HKObjectType>)] = []
+    var sharing: [String: HKAuthorizationStatus] = [:]
+
+    func requestAuthorization(toShare: Set<HKSampleType>?, read: Set<HKObjectType>?,
+                              completion: @escaping @Sendable (Bool, Error?) -> Void) {
+        requests.append((toShare, read))
+        requestCompletions.append(completion)
+    }
+
+    func getRequestStatusForAuthorization(toShare: Set<HKSampleType>, read: Set<HKObjectType>,
+                                          completion: @escaping @Sendable (HKAuthorizationRequestStatus, Error?) -> Void) {
+        statusRequests.append((toShare, read))
+        completion(.unnecessary, nil)
+    }
+
+    func authorizationStatus(for type: HKObjectType) -> HKAuthorizationStatus {
+        sharing[type.identifier] ?? .notDetermined
+    }
+}
+
 // Explicit instants make a sleeping Watch deterministic: ContinuousClock advances while the
 // injected system-uptime values used by the other Bluetooth budgets can remain unchanged.
 private let pendingConnectionTestEpoch = ContinuousClock().now
@@ -6219,6 +6242,166 @@ final class LibreWatchValuePipelineTests: XCTestCase {
         )
         state.synchronizeLatestStoredTimeStamp(first)
         XCTAssertEqual(state.latestStoredTimeStamp, second)
+    }
+
+    func testHealthKitBacklogPagesCover2015Through5000Rows() {
+        let checkpoint = Date(timeIntervalSince1970: 1_800_000_000)
+        for total in [2015, 2016, 2017, 5000] {
+            let source = Array(1...total)
+            let page: (Int) -> (rows: [Int], scannedCount: Int?) = { offset in
+                let raw = Array(source.dropFirst(offset).prefix(256))
+                return (raw, raw.count)
+            }
+            let timestamp: (Int) -> Date = { checkpoint.addingTimeInterval(Double($0) * 360) }
+            XCTAssertEqual(HealthKitGlucoseBacklog.countEligible(after: checkpoint,
+                frequent: false, pageSize: 256, page: page, time: timestamp), total)
+
+            var stored = [Int]()
+            var latest = checkpoint
+            while let next = HealthKitGlucoseBacklog.oldestEligible(after: latest,
+                frequent: false, pageSize: 256,
+                page: { offset in
+                    let remaining = source.drop(while: { timestamp($0) <= latest })
+                    let raw = Array(remaining.dropFirst(offset).prefix(256))
+                    return (raw, raw.count)
+                }, time: timestamp) {
+                stored.append(next)
+                latest = timestamp(next)
+            }
+            XCTAssertEqual(stored, source)
+        }
+    }
+
+    func testHealthKitBacklogScansPastEntireFilteredPagesAndKeepsFailedCheckpoint() {
+        let checkpoint = Date(timeIntervalSince1970: 1_800_000_000)
+        let source = Array(1...600)
+        let timestamp: (Int) -> Date = { checkpoint.addingTimeInterval(Double($0) * 360) }
+        let page: (Int) -> (rows: [Int], scannedCount: Int?) = { offset in
+            let raw = Array(source.dropFirst(offset).prefix(256))
+            return (raw.filter { $0 > 300 }, raw.count)
+        }
+        XCTAssertEqual(HealthKitGlucoseBacklog.oldestEligible(after: checkpoint,
+            frequent: false, pageSize: 256, page: page, time: timestamp), 301)
+        XCTAssertEqual(HealthKitGlucoseBacklog.countEligible(after: checkpoint,
+            frequent: false, pageSize: 256, page: page, time: timestamp), 300)
+
+        var state = HealthKitUploadState(latestStoredTimeStamp: checkpoint)
+        let first = timestamp(301)
+        XCTAssertTrue(state.begin(timeStamp: first, now: checkpoint))
+        XCTAssertEqual(state.finish(timeStamp: first, succeeded: false, now: checkpoint),
+            .retry(checkpoint.addingTimeInterval(30)))
+        XCTAssertEqual(state.latestStoredTimeStamp, checkpoint)
+        state.allowImmediateRetry()
+        XCTAssertTrue(state.begin(timeStamp: first, now: checkpoint))
+        XCTAssertEqual(state.finish(timeStamp: first, succeeded: true, now: checkpoint), .stored(first))
+        XCTAssertEqual(HealthKitGlucoseBacklog.oldestEligible(after: first,
+            frequent: false, pageSize: 256,
+            page: { offset in
+                let raw = Array(source.filter { timestamp($0) > first }.dropFirst(offset).prefix(256))
+                return (raw, raw.count)
+            }, time: timestamp), 302)
+    }
+
+    func testHealthKitStatusRecordsOnlyConfirmedWritesAndTechnicalErrors() throws {
+        let suite = "HealthKitExportStatus.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = HealthKitExportStatusStore(defaults: defaults)
+        XCTAssertNil(store.snapshot(.glucose).lastConfirmedWrite)
+        XCTAssertNil(store.snapshot(.glucose).pendingWrites)
+        store.setPending(kind: .glucose, writes: 5000)
+        store.recordFailure(kind: .glucose, operation: "skrivning",
+            error: NSError(domain: "HKErrorDomain", code: 4,
+                userInfo: [NSLocalizedDescriptionKey: "private glucose value 123"]))
+        XCTAssertNil(store.snapshot(.glucose).lastConfirmedWrite)
+        XCTAssertEqual(store.snapshot(.glucose).pendingWrites, 5000)
+        XCTAssertEqual(store.snapshot(.glucose).lastErrorDomain, "HKErrorDomain")
+        XCTAssertEqual(store.snapshot(.glucose).lastErrorCode, 4)
+        XCTAssertFalse(defaults.dictionaryRepresentation().description.contains("private glucose value"))
+        store.recordSuccess(kind: .glucose, operation: "skrivning")
+        XCTAssertNotNil(store.snapshot(.glucose).lastConfirmedWrite)
+        store.setPending(kind: .glucose, writes: 4999, deletes: 2)
+        store.invalidatePendingWrites(kind: .glucose)
+        XCTAssertNil(store.snapshot(.glucose).pendingWrites,
+            "A changed local glucose queue must be unknown until the next full count")
+        XCTAssertEqual(store.snapshot(.glucose).pendingDeletes, 2)
+        XCTAssertNotNil(store.snapshot(.glucose).lastConfirmedWrite)
+        XCTAssertEqual(store.snapshot(.glucose).lastErrorDomain, "HKErrorDomain")
+        store.recordSuccess(kind: .insulin, operation: "sletning")
+        XCTAssertNil(store.snapshot(.insulin).lastConfirmedWrite)
+        store.clearPending(kind: .glucose)
+        XCTAssertNil(store.snapshot(.glucose).pendingWrites)
+    }
+
+    func testPhoneHealthAuthorizationCoalescesRequestsAndChecksEachWriteType() {
+        let fake = FakePhoneHealthAuthorizationStore()
+        let center = HealthKitPhoneAuthorizationCenter(store: fake, isAvailable: { true })
+        let identifiers = Set(HealthKitExportKind.allCases.map { $0.quantityIdentifier.rawValue })
+        let callbacks = expectation(description: "both callers finish")
+        callbacks.expectedFulfillmentCount = 2
+        center.request { completed, error in
+            XCTAssertTrue(completed)
+            XCTAssertNil(error)
+            callbacks.fulfill()
+        }
+        center.request { completed, error in
+            XCTAssertTrue(completed)
+            XCTAssertNil(error)
+            callbacks.fulfill()
+        }
+        DispatchQueue.main.async {
+            XCTAssertEqual(fake.requests.count, 1)
+            XCTAssertEqual(Set(fake.requests[0].share?.map(\.identifier) ?? []), identifiers)
+            XCTAssertEqual(Set(fake.requests[0].read?.map(\.identifier) ?? []), identifiers)
+            fake.sharing[HKQuantityTypeIdentifier.bloodGlucose.rawValue] = .sharingAuthorized
+            fake.sharing[HKQuantityTypeIdentifier.insulinDelivery.rawValue] = .sharingDenied
+            fake.sharing[HKQuantityTypeIdentifier.dietaryCarbohydrates.rawValue] = .notDetermined
+            fake.requestCompletions[0](true, nil)
+        }
+        wait(for: [callbacks], timeout: 2)
+        XCTAssertEqual(center.sharingStatus(for: .glucose), .sharingAuthorized)
+        XCTAssertEqual(center.sharingStatus(for: .insulin), .sharingDenied)
+        XCTAssertEqual(center.sharingStatus(for: .carbohydrates), .notDetermined)
+
+        let status = expectation(description: "request status")
+        center.requestStatus { result, error in
+            XCTAssertEqual(result, .unnecessary)
+            XCTAssertNil(error)
+            status.fulfill()
+        }
+        wait(for: [status], timeout: 2)
+        XCTAssertEqual(Set(fake.statusRequests[0].share.map(\.identifier)), identifiers)
+        XCTAssertEqual(Set(fake.statusRequests[0].read.map(\.identifier)), identifiers)
+    }
+
+    func testPhoneHealthAuthorizationReturnsFailureAndUnavailableToEveryCaller() {
+        let fake = FakePhoneHealthAuthorizationStore()
+        let center = HealthKitPhoneAuthorizationCenter(store: fake, isAvailable: { true })
+        let failed = expectation(description: "both failures")
+        failed.expectedFulfillmentCount = 2
+        for _ in 0..<2 {
+            center.request { completed, error in
+                XCTAssertFalse(completed)
+                XCTAssertEqual((error as NSError?)?.domain, "HKErrorDomain")
+                failed.fulfill()
+            }
+        }
+        DispatchQueue.main.async {
+            XCTAssertEqual(fake.requests.count, 1)
+            fake.requestCompletions[0](false, NSError(domain: "HKErrorDomain", code: 17))
+        }
+        wait(for: [failed], timeout: 2)
+
+        let unavailable = HealthKitPhoneAuthorizationCenter(store: fake, isAvailable: { false })
+        XCTAssertNil(unavailable.sharingStatus(for: .glucose))
+        let unavailableResult = expectation(description: "unavailable result")
+        unavailable.request { completed, error in
+            XCTAssertFalse(completed)
+            XCTAssertEqual((error as NSError?)?.domain, "HealthKitAuthorization")
+            unavailableResult.fulfill()
+        }
+        wait(for: [unavailableResult], timeout: 2)
+        XCTAssertEqual(fake.requests.count, 1)
     }
 
     func testColdLaunchWithMatchingWatchOwnerBlocksPhoneBeforeBluetoothStarts() {

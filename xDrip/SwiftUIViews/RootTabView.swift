@@ -118,6 +118,7 @@ struct RootTabDependencies {
     @Published private(set) var isPreparingIncomingBackup = false
     @Published private(set) var alertRequest: RootAlertRequest?
     @Published private(set) var sensorHealthHomeRequest = 0
+    @Published private(set) var penCalculatorQuickActionRequest: UUID?
     @Published var textInputRequest: RootTextInputRequest?
     @Published var textInput = ""
     @Published var pickerData: SnoozePickerData?
@@ -212,6 +213,19 @@ struct RootTabDependencies {
     /// The banner owns navigation to Sensor Management or Bluetooth detail.
     func showHomeForSensorHealthNotification() {
         sensorHealthHomeRequest += 1
+    }
+
+    /// A scene shortcut can arrive before startup publishes dependencies or mounts Home.
+    /// Keep one pending request in root navigation state until Home actually presents it.
+    func requestPenCalculatorQuickAction() {
+        if penCalculatorQuickActionRequest == nil {
+            penCalculatorQuickActionRequest = UUID()
+        }
+    }
+
+    func consumePenCalculatorQuickAction(_ id: UUID) {
+        guard penCalculatorQuickActionRequest == id else { return }
+        penCalculatorQuickActionRequest = nil
     }
 
     /// Copies a document supplied by iOS before handing it to the restore workflow.
@@ -389,6 +403,8 @@ struct RootTabView: View {
         .onAppear {
             if stateModel.incomingBackupRequest != nil {
                 selectedTab = .settings
+            } else if stateModel.penCalculatorQuickActionRequest != nil {
+                selectHomeForCalculatorQuickAction()
             } else if PlannedMealReminder.pendingOpenUUID != nil ||
                         PizzaSplitReminder.pendingOpenUUID != nil {
                 selectedTab = .treatments
@@ -405,6 +421,20 @@ struct RootTabView: View {
         .onChange(of: scenePhase) { scenePhase in
             if scenePhase == .active {
                 updateSupportedOrientations(for: selectedTab)
+                selectHomeForCalculatorQuickAction()
+            }
+        }
+        .onChange(of: stateModel.penCalculatorQuickActionRequest) { request in
+            if request != nil { selectHomeForCalculatorQuickAction() }
+        }
+        .task(id: stateModel.penCalculatorQuickActionRequest) {
+            // A shortcut tapped while another tab has a modal waits for that modal to close;
+            // switching tabs immediately could discard text already entered there.
+            while stateModel.penCalculatorQuickActionRequest != nil && selectedTab != .home {
+                selectHomeForCalculatorQuickAction()
+                if selectedTab == .home { break }
+                do { try await Task.sleep(nanoseconds: 250_000_000) }
+                catch { break }
             }
         }
         .onChange(of: stateModel.incomingBackupRequest?.id) { requestID in
@@ -501,6 +531,12 @@ struct RootTabView: View {
                         dependencies: stateModel.dependencies,
                         snoozeDismissalRequest: stateModel.snoozeDismissalRequest,
                         isLandscape: isLandscape,
+                        penCalculatorQuickActionRequest: stateModel.penCalculatorQuickActionRequest,
+                        allowsCalculatorQuickAction: stateModel.alertRequest == nil
+                            && stateModel.pickerData == nil
+                            && stateModel.textInputRequest == nil
+                            && !stateModel.isPreparingIncomingBackup,
+                        consumeCalculatorQuickAction: stateModel.consumePenCalculatorQuickAction,
                         showBluetooth: {
                             bluetoothDetailNavigationRequest += 1
                             selectedTab = .bluetooth
@@ -596,6 +632,28 @@ struct RootTabView: View {
         }
     }
 
+    private func selectHomeForCalculatorQuickAction() {
+        guard let request = stateModel.penCalculatorQuickActionRequest else { return }
+        guard !stateModel.isPreparingIncomingBackup,
+              stateModel.incomingBackupRequest == nil else { return }
+        if stateModel.dependencies != nil &&
+            !TherapyMetricsManager.doseSourceIsReady(UserDefaults.standard.dataFlowPolicy,
+                cutover: TreatmentSourceCutover.current()) {
+            stateModel.consumePenCalculatorQuickAction(request)
+            QuickActionsManager.shared.updateAvailableQuickActions()
+            return
+        }
+        if selectedTab != .home,
+           UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene })
+            .first(where: { $0.activationState == .foregroundActive })?
+            .keyWindow?.rootViewController?.presentedViewController != nil {
+            return
+        }
+        // The shortcut requests the existing Home calculator; it never creates a treatment.
+        selectedTab = .home
+        stateModel.dependencies?.cancelScreenLock()
+    }
+
     /// Home supports the landscape AGP comparison view. The remaining tabs stay portrait.
     private func updateSupportedOrientations(for tab: Tab) {
         let supportedOrientations: UIInterfaceOrientationMask
@@ -676,6 +734,9 @@ private struct RootHomeTabView: View {
     let dependencies: RootTabDependencies?
     let snoozeDismissalRequest: Int
     let isLandscape: Bool
+    let penCalculatorQuickActionRequest: UUID?
+    let allowsCalculatorQuickAction: Bool
+    let consumeCalculatorQuickAction: (UUID) -> Void
     let showBluetooth: () -> Void
 
     // MARK: - View
@@ -695,7 +756,10 @@ private struct RootHomeTabView: View {
                         sensorHealthIssueManager: dependencies.sensorHealthIssueManager,
                         coreDataManager: dependencies.coreDataManager,
                         nightscoutSyncManager: dependencies.nightscoutSyncManager,
-                        actions: rootHomeActions(from: dependencies)
+                        actions: rootHomeActions(from: dependencies),
+                        penCalculatorQuickActionRequest: penCalculatorQuickActionRequest,
+                        allowsCalculatorQuickAction: allowsCalculatorQuickAction && presentedView == nil,
+                        consumeCalculatorQuickAction: consumeCalculatorQuickAction
                     )
                     .ignoresSafeArea(.keyboard, edges: .bottom)
                 }

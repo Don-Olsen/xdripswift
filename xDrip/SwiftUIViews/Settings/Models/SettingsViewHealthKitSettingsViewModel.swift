@@ -69,6 +69,12 @@ class SettingsViewHealthKitSettingsViewModel:SettingsViewModelProtocol {
     func settingsRows(sectionID: Int) -> [SettingsRow] {
         let writeToHealth = nativeSettingsRow(id: "healthKit.enabledHealthKit",
             index: Setting.enabledHealthKit.rawValue, sectionID: sectionID)
+        let permissionRequest = SettingsRow(
+            id: "healthKit.requestWriteAccess", title: "Giv skriveadgang i Sundhed",
+            control: .custom(content: { AnyView(HealthKitPermissionRequestRow()) }))
+        let exportStatus = SettingsRow(
+            id: "healthKit.exportStatus", title: "Sundhed-status",
+            control: .custom(content: { AnyView(HealthKitExportStatusRow()) }))
         let localCutover = SettingsRow(
             id: "healthKit.localTreatmentCutover",
             title: "Log behandlinger i xDrip",
@@ -79,10 +85,12 @@ class SettingsViewHealthKitSettingsViewModel:SettingsViewModelProtocol {
             })
         )
         if hasConsistentLocalCutover {
-            return [writeToHealth, localCutover]
+            return [writeToHealth, permissionRequest, exportStatus, localCutover]
         }
         return [
             writeToHealth,
+            permissionRequest,
+            exportStatus,
             nativeSettingsRow(id: "healthKit.importBolusInsulin", index: Setting.importBolusInsulin.rawValue, sectionID: sectionID),
             SettingsRow(
                 id: "healthKit.insulinSource",
@@ -239,40 +247,154 @@ class SettingsViewHealthKitSettingsViewModel:SettingsViewModelProtocol {
     private func setStoreReadingsInHealthKit(_ isOn: Bool) {
         trace("storeReadingsInHealthkit changed by user to %{public}@", log: log, category: ConstantsLog.categorySettingsViewHealthKitSettingsViewModel, type: .info, isOn.description)
 
-        // if value change to on, then verify authorization status and if needed ask authorization
+        // Request the complete iPhone type set. Completion is not evidence of consent;
+        // check glucose sharing separately and leave existing read flows independent.
         if isOn {
-            // if creation of bloodGlucoseType fails, then we result in an inconsistent situation
-            if let bloodGlucoseType = HKObjectType.quantityType(forIdentifier: .bloodGlucose) {
-                let healthStore = HKHealthStore()
-                let authorizationStatus = healthStore.authorizationStatus(for: bloodGlucoseType)
-                switch authorizationStatus {
-                case .notDetermined:
-                    var shareTypes = Set<HKSampleType>()
-                    shareTypes.insert(bloodGlucoseType)
-                    healthStore.requestAuthorization(toShare: shareTypes, read: nil, completion: { (success: Bool, error: Error?) in
-                        UserDefaults.standard.storeReadingsInHealthkitAuthorized = success
-
-                        if let error = error {
-                            trace("user did not authorize to store bg readings in  healthkit, error = %{public}@", log: self.log, category: ConstantsLog.categorySettingsViewHealthKitSettingsViewModel, type: .error, error.localizedDescription)
-                        }
-                    })
-                case .sharingDenied:
-                    UserDefaults.standard.storeReadingsInHealthkitAuthorized = false
-                    // user must have removed the authorization in the healt app - when user tries to enable healthkit , user will not be informed that he should first go back to the healt app and allow upload bgreadings - let's do such info in a later phase, eg with an info button next to the setting
-                    trace("user removed authorization to store bgreadings in healthkit", log: log, category: ConstantsLog.categorySettingsViewHealthKitSettingsViewModel, type: .error)
-                case .sharingAuthorized:
-                    break
-                @unknown default:
-                    trace("unknown authorizationstatus for healthkit - SettingsViewHealthKitSettingsViewModel", log: log, category: ConstantsLog.categorySettingsViewHealthKitSettingsViewModel, type: .error)
+            HealthKitPhoneAuthorizationCenter.shared.request { _, error in
+                UserDefaults.standard.storeReadingsInHealthkitAuthorized =
+                    HealthKitPhoneAuthorizationCenter.shared.sharingStatus(for: .glucose) == .sharingAuthorized
+                if let error {
+                    HealthKitExportStatusStore.shared.recordFailure(kind: .glucose,
+                        operation: "tilladelse", error: error)
                 }
-            } else {
-                trace("user enabled HealthKit however failed to create bloodGlucoseType", log: log, category: ConstantsLog.categorySettingsViewHealthKitSettingsViewModel, type: .error)
-                return
             }
         }
 
         // set UserDefaults.standard.storeReadingsInHealthkit to isOn
         UserDefaults.standard.storeReadingsInHealthkit = isOn
+    }
+}
+
+private struct HealthKitPermissionRequestRow: View {
+    @State private var isRequesting = false
+    @State private var expectedDialog: HKAuthorizationRequestStatus?
+    @State private var requestError: NSError?
+    @State private var revision = 0
+
+    private var availability: Bool { HKHealthStore.isHealthDataAvailable() }
+    private var missingAccess: Bool {
+        _ = revision
+        return HealthKitExportKind.allCases.contains {
+            HealthKitPhoneAuthorizationCenter.shared.sharingStatus(for: $0) != .sharingAuthorized
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Button {
+                guard !isRequesting else { return }
+                isRequesting = true
+                requestError = nil
+                HealthKitPhoneAuthorizationCenter.shared.request { _, error in
+                    isRequesting = false
+                    requestError = error as NSError?
+                    refresh()
+                }
+            } label: {
+                Label("Giv skriveadgang i Sundhed", systemImage: "heart.text.square")
+            }
+            .disabled(isRequesting || !availability)
+
+            if !availability {
+                Text("HealthKit er ikke tilgængeligt på denne enhed.")
+            } else {
+                Text(dialogDescription)
+                if missingAccess {
+                    Text("Hvis skriveadgang stadig mangler, åbn Sundhed og kontrollér xDrips adgang til Blodsukker, Insulinadministration og Kulhydrater. Appen kan ikke fremtvinge en ny iOS-dialog eller ændre tilladelserne for dig.")
+                }
+            }
+            if let requestError {
+                Text("Tilladelsesanmodning: \(requestError.domain)/\(requestError.code)")
+            }
+        }
+        .font(.footnote)
+        .foregroundStyle(.secondary)
+        .onAppear(perform: refresh)
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in refresh() }
+        .onReceive(NotificationCenter.default.publisher(for: .healthKitPhoneAuthorizationDidChange)) { _ in refresh() }
+    }
+
+    private var dialogDescription: String {
+        switch expectedDialog {
+        case .shouldRequest: "HealthKit forventer en tilladelsesdialog ved næste anmodning. Det siger ikke, hvilke typer der bliver godkendt."
+        case .unnecessary: "HealthKit forventer ingen ny dialog. Se den faktiske skriveadgang nedenfor."
+        case .unknown, nil: "HealthKit kunne ikke afklare, om der vises en dialog. Se den faktiske skriveadgang nedenfor."
+        @unknown default: "HealthKits dialogstatus er ukendt. Se den faktiske skriveadgang nedenfor."
+        }
+    }
+
+    private func refresh() {
+        revision += 1
+        guard availability else { expectedDialog = nil; return }
+        HealthKitPhoneAuthorizationCenter.shared.requestStatus { status, error in
+            expectedDialog = status
+            if let error { requestError = error as NSError }
+        }
+    }
+}
+
+private struct HealthKitExportStatusRow: View {
+    @State private var revision = 0
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            if !HKHealthStore.isHealthDataAvailable() {
+                Text("HealthKit er ikke tilgængeligt på denne enhed; eksport og sletning kan ikke udføres her.")
+                    .foregroundStyle(.orange)
+            }
+            ForEach(HealthKitExportKind.allCases, id: \.self) { kind in
+                let status = HealthKitExportStatusStore.shared.snapshot(kind)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(title(kind)).font(.subheadline.weight(.semibold))
+                    Text("Skriveadgang: \(accessDescription(kind))")
+                    Text("Senest bekræftede skrivning: \(dateDescription(status.lastConfirmedWrite))")
+                    Text("Ventende skrivninger: \(status.pendingWrites.map(String.init) ?? "ukendt")")
+                    Text("Ventende sletninger: \(status.pendingDeletes.map(String.init) ?? "ikke registreret")")
+                    Text("Seneste registrerede fejl: \(errorDescription(status))")
+                }
+            }
+        }
+        .font(.footnote)
+        .foregroundStyle(.secondary)
+        .onAppear {
+            revision += 1
+            HealthKitManager.active?.refreshGlucosePendingStatus(force: true)
+            HealthKitLocalTherapyWriter.shared.refreshPendingCounts()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in revision += 1 }
+        .onReceive(NotificationCenter.default.publisher(for: .healthKitPhoneAuthorizationDidChange)) { _ in revision += 1 }
+        .onReceive(NotificationCenter.default.publisher(for: .healthKitExportStatusDidChange)) { _ in revision += 1 }
+    }
+
+    private func title(_ kind: HealthKitExportKind) -> String {
+        switch kind {
+        case .glucose: "Blodsukker"
+        case .insulin: "Insulin"
+        case .carbohydrates: "Kulhydrater"
+        }
+    }
+
+    private func accessDescription(_ kind: HealthKitExportKind) -> String {
+        _ = revision
+        return switch HealthKitPhoneAuthorizationCenter.shared.sharingStatus(for: kind) {
+        case .sharingAuthorized: "tilladt"
+        case .sharingDenied: "nægtet"
+        case .notDetermined: "ikke spurgt"
+        case nil: "ikke tilgængelig"
+        @unknown default: "ukendt"
+        }
+    }
+
+    private func dateDescription(_ date: Date?) -> String {
+        guard let date else { return "ikke registreret" }
+        return DateFormatter.localizedString(from: date, dateStyle: .medium, timeStyle: .short)
+    }
+
+    private func errorDescription(_ status: HealthKitExportStatus) -> String {
+        guard let operation = status.lastErrorOperation,
+              let domain = status.lastErrorDomain,
+              let code = status.lastErrorCode else { return "ikke registreret" }
+        return "\(operation), \(domain)/\(code)"
     }
 }
 

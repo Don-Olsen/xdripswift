@@ -8,6 +8,39 @@
 - Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
 <!-- testflight-7.1.1-4298:end -->
 
+## Kandidat efter 4298: Sundhed-eksport, sletning og bolusgenvej
+
+Den almindelige blodsukkereksport havde to dokumenterede begrænsninger:
+`HealthKitManager` kunne blive stående med en tidligere falsk
+`healthKitInitialized`, og efterslæbet blev hentet fra de **nyeste** 2016
+målinger. Den nye sti genlæser skriveadgang, gennemgår gyldige målinger fra
+den ældste ubehandlede i begrænsede batches og flytter først checkpointet
+efter HealthKits bekræftede skrivning. Den eksisterende kadence, suppression,
+`finalValue`, sync-id og køen for historiske rettelser er bevaret. En fælles
+iPhone-forespørgsel beder om læse- og skriveadgang til blodsukker, insulin og
+kulhydrater; faktisk skriveadgang kontrolleres særskilt pr. type. Den ændrer
+ikke Watch-workout-tilladelsen eller den valgte behandlingskilde.
+
+Sundhed-siden viser nu dialogforventning adskilt fra faktisk skriveadgang,
+senest bekræftet skrivning, hele kendte efterslæb, ventende sletninger og
+tekniske fejl uden helbredsværdier. En verificeret lokal sletning efterlader
+en holdbar tombstone, indtil en eksakt app-ejet Sundhed-kopi med samme type og
+sync-id er fjernet. Også tidligere dokumenterede sletninger før kildeskiftet
+gennemgås; en ufuldstændig behandlingsliste bruges ikke som sletningsbevis.
+App-ikonets første genvej kan åbne den eksisterende Home-bolusberegner, når
+den samme lokale kildebetingelse som Home-knappen er opfyldt. En koldstart
+bevarer åbningsanmodningen, indtil Home er klar; genvejen logger intet selv.
+
+`HealthKitManager` er uændret mellem 4292 og 4298. Tidsmæssig sammenhæng med
+4293 beviser derfor ikke, at 4293 fratog Sundhed-adgang. Den faktiske udløser
+på brugerens telefon, HealthKit-dialogen, den installerede bundleidentitet og
+Sundheds kilde skal kontrolleres fysisk. Hverken simulator eller en grøn
+HealthKit-mocktest beviser en virkelig skrivning, sletning eller levering af
+ikon-genvejen på telefonen. Den ældre tekst om efterladte Sundhed-kopier
+beskriver den tidligere adfærd; denne kandidat gør fjernelsen automatisk,
+men fysisk endnu uverificeret. Endelig test- og udgivelsesstatus tilføjes
+først fra det præcise release-checkpoint.
+
 De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
 
 <!-- testflight-7.1.1-4297:start -->

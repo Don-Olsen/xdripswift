@@ -34,6 +34,8 @@ import SwiftUI
         )
         _stateModel = StateObject(wrappedValue: stateModel)
 
+        QuickActionsManager.shared.attachRoot(stateModel)
+
         applicationCoordinator.start(rootTabStateModel: stateModel)
     }
 

@@ -4,6 +4,172 @@ import HealthKit
 import os
 import UIKit
 
+extension Notification.Name {
+    static let healthKitPhoneAuthorizationDidChange = Notification.Name("HealthKitPhoneAuthorizationDidChange")
+    static let healthKitExportStatusDidChange = Notification.Name("HealthKitExportStatusDidChange")
+}
+
+enum HealthKitExportKind: String, CaseIterable {
+    case glucose, insulin, carbohydrates
+
+    var quantityIdentifier: HKQuantityTypeIdentifier {
+        switch self {
+        case .glucose: .bloodGlucose
+        case .insulin: .insulinDelivery
+        case .carbohydrates: .dietaryCarbohydrates
+        }
+    }
+}
+
+/// All iPhone authorization prompts use the same nonempty read and write sets. A completed
+/// request only means HealthKit processed the sheet; sharing status remains type-specific.
+protocol HealthKitAuthorizationStoring: AnyObject {
+    func requestAuthorization(toShare: Set<HKSampleType>?, read: Set<HKObjectType>?,
+                              completion: @escaping @Sendable (Bool, Error?) -> Void)
+    func getRequestStatusForAuthorization(toShare: Set<HKSampleType>, read: Set<HKObjectType>,
+                                          completion: @escaping @Sendable (HKAuthorizationRequestStatus, Error?) -> Void)
+    func authorizationStatus(for type: HKObjectType) -> HKAuthorizationStatus
+}
+
+extension HKHealthStore: HealthKitAuthorizationStoring {}
+
+final class HealthKitPhoneAuthorizationCenter {
+    static let shared = HealthKitPhoneAuthorizationCenter()
+
+    private let store: HealthKitAuthorizationStoring
+    private let isAvailable: () -> Bool
+    private var inFlight = false
+    private var callbacks: [(Bool, Error?) -> Void] = []
+
+    init(store: HealthKitAuthorizationStoring = HKHealthStore(),
+         isAvailable: @escaping () -> Bool = { HKHealthStore.isHealthDataAvailable() }) {
+        self.store = store
+        self.isAvailable = isAvailable
+    }
+
+    private var types: [HKQuantityType]? {
+        guard isAvailable() else { return nil }
+        let values = HealthKitExportKind.allCases.compactMap {
+            HKObjectType.quantityType(forIdentifier: $0.quantityIdentifier)
+        }
+        return values.count == HealthKitExportKind.allCases.count ? values : nil
+    }
+
+    func sharingStatus(for kind: HealthKitExportKind) -> HKAuthorizationStatus? {
+        guard let type = HKObjectType.quantityType(forIdentifier: kind.quantityIdentifier),
+              isAvailable() else { return nil }
+        return store.authorizationStatus(for: type)
+    }
+
+    func requestStatus(completion: @escaping (HKAuthorizationRequestStatus?, Error?) -> Void) {
+        DispatchQueue.main.async {
+            guard let types = self.types else {
+                completion(nil, NSError(domain: "HealthKitAuthorization", code: 1)); return
+            }
+            self.store.getRequestStatusForAuthorization(toShare: Set(types.map { $0 as HKSampleType }),
+                read: Set(types.map { $0 as HKObjectType })) { status, error in
+                DispatchQueue.main.async { completion(status, error) }
+            }
+        }
+    }
+
+    func request(completion: @escaping (Bool, Error?) -> Void) {
+        DispatchQueue.main.async {
+            self.callbacks.append(completion)
+            guard !self.inFlight else { return }
+            guard let types = self.types else {
+                self.complete(false, NSError(domain: "HealthKitAuthorization", code: 1)); return
+            }
+            self.inFlight = true
+            self.store.requestAuthorization(toShare: Set(types.map { $0 as HKSampleType }),
+                read: Set(types.map { $0 as HKObjectType })) { completed, error in
+                DispatchQueue.main.async { self.complete(completed, error) }
+            }
+        }
+    }
+
+    private func complete(_ completed: Bool, _ error: Error?) {
+        inFlight = false
+        let waiting = callbacks
+        callbacks.removeAll()
+        NotificationCenter.default.post(name: .healthKitPhoneAuthorizationDidChange, object: nil)
+        waiting.forEach { $0(completed, error) }
+    }
+}
+
+struct HealthKitExportStatus {
+    let lastConfirmedWrite: Date?
+    let pendingWrites: Int?
+    let pendingDeletes: Int?
+    let lastErrorOperation: String?
+    let lastErrorDomain: String?
+    let lastErrorCode: Int?
+}
+
+/// Stores only technical receipts. Never persist a sample, dose, amount or HealthKit userInfo.
+final class HealthKitExportStatusStore {
+    static let shared = HealthKitExportStatusStore()
+    private let defaults: UserDefaults
+    init(defaults: UserDefaults = .standard) { self.defaults = defaults }
+
+    func snapshot(_ kind: HealthKitExportKind) -> HealthKitExportStatus {
+        let prefix = "healthKitExportStatus.\(kind.rawValue)."
+        return HealthKitExportStatus(
+            lastConfirmedWrite: defaults.object(forKey: prefix + "lastWrite") as? Date,
+            pendingWrites: defaults.object(forKey: prefix + "pendingWrites") as? Int,
+            pendingDeletes: defaults.object(forKey: prefix + "pendingDeletes") as? Int,
+            lastErrorOperation: defaults.string(forKey: prefix + "errorOperation"),
+            lastErrorDomain: defaults.string(forKey: prefix + "errorDomain"),
+            lastErrorCode: defaults.object(forKey: prefix + "errorCode") as? Int)
+    }
+
+    func recordSuccess(kind: HealthKitExportKind, operation: String) {
+        let prefix = "healthKitExportStatus.\(kind.rawValue)."
+        if operation == "skrivning" { defaults.set(Date(), forKey: prefix + "lastWrite") }
+        notify()
+    }
+
+    func recordFailure(kind: HealthKitExportKind, operation: String, error: Error?) {
+        let nsError = (error ?? NSError(domain: "HealthKit", code: -1)) as NSError
+        let prefix = "healthKitExportStatus.\(kind.rawValue)."
+        defaults.set(operation, forKey: prefix + "errorOperation")
+        defaults.set(nsError.domain, forKey: prefix + "errorDomain")
+        defaults.set(nsError.code, forKey: prefix + "errorCode")
+        notify()
+    }
+
+    func setPending(kind: HealthKitExportKind, writes: Int? = nil, deletes: Int? = nil) {
+        let prefix = "healthKitExportStatus.\(kind.rawValue)."
+        if let writes { defaults.set(writes, forKey: prefix + "pendingWrites") }
+        if let deletes { defaults.set(deletes, forKey: prefix + "pendingDeletes") }
+        notify()
+    }
+
+    func clearPending(kind: HealthKitExportKind) {
+        let prefix = "healthKitExportStatus.\(kind.rawValue)."
+        defaults.removeObject(forKey: prefix + "pendingWrites")
+        defaults.removeObject(forKey: prefix + "pendingDeletes")
+        notify()
+    }
+
+    func invalidatePendingWrites(kind: HealthKitExportKind) {
+        let key = "healthKitExportStatus.\(kind.rawValue).pendingWrites"
+        guard defaults.object(forKey: key) != nil else { return }
+        defaults.removeObject(forKey: key)
+        notify()
+    }
+
+    private func notify() {
+        if Thread.isMainThread {
+            NotificationCenter.default.post(name: .healthKitExportStatusDidChange, object: nil)
+        } else {
+            DispatchQueue.main.async {
+                NotificationCenter.default.post(name: .healthKitExportStatusDidChange, object: nil)
+            }
+        }
+    }
+}
+
 struct HealthKitExportReading: Codable, Equatable {
     let id: String
     let timeStamp: Date
@@ -97,6 +263,10 @@ struct HealthKitUploadState: Equatable {
         latestStoredTimeStamp = max(latestStoredTimeStamp, timeStamp)
     }
 
+    mutating func allowImmediateRetry() {
+        retryNotBefore = nil
+    }
+
     mutating func begin(timeStamp: Date, now: Date = Date()) -> Bool {
         guard inFlightTimeStamp == nil,
               !replacementTimeStampsInFlight.contains(timeStamp),
@@ -145,7 +315,48 @@ struct HealthKitUploadState: Equatable {
     }
 }
 
+enum HealthKitGlucoseBacklog {
+    static func isEligible(_ timestamp: Date, after checkpoint: Date, frequent: Bool) -> Bool {
+        timestamp.timeIntervalSince(checkpoint) >
+            (frequent ? 50 : ConstantsHealthKit.minimiumTimeBetweenTwoReadingsInMinutes * 60)
+    }
+
+    static func oldestEligible<Row>(after checkpoint: Date, frequent: Bool, pageSize: Int,
+                                    page: (Int) -> (rows: [Row], scannedCount: Int?),
+                                    time: (Row) -> Date) -> Row? {
+        var offset = 0
+        while true {
+            let batch = page(offset)
+            guard let scanned = batch.scannedCount else { return nil }
+            if let first = batch.rows.first(where: { isEligible(time($0), after: checkpoint, frequent: frequent) }) {
+                return first
+            }
+            guard scanned == pageSize else { return nil }
+            offset += scanned
+        }
+    }
+
+    static func countEligible<Row>(after checkpoint: Date, frequent: Bool, pageSize: Int,
+                                   page: (Int) -> (rows: [Row], scannedCount: Int?),
+                                   time: (Row) -> Date) -> Int? {
+        var offset = 0
+        var lastEligible = checkpoint
+        var count = 0
+        while true {
+            let batch = page(offset)
+            guard let scanned = batch.scannedCount else { return nil }
+            for row in batch.rows where isEligible(time(row), after: lastEligible, frequent: frequent) {
+                count += 1
+                lastEligible = time(row)
+            }
+            guard scanned == pageSize else { return count }
+            offset += scanned
+        }
+    }
+}
+
 public class HealthKitManager: NSObject {
+    static weak var active: HealthKitManager?
     // MARK: - public properties
     
     // MARK: - private properties
@@ -180,6 +391,8 @@ public class HealthKitManager: NSObject {
     private var replacementInFlight = false
     private var replacementQueue = HealthKitReplacementQueue()
     private let replacementQueueKey = "healthKitPendingReplacements.v1"
+    private let glucosePageSize = 256
+    private var lastGlucoseStatusScan: Date?
     
     /// metadata key used to identify individual BG readings in HealthKit
     private let bgReadingIdMetadataKey = "BgReadingId"
@@ -193,6 +406,7 @@ public class HealthKitManager: NSObject {
         
         // call super.init
         super.init()
+        Self.active = self
 
         if let data = UserDefaults.standard.data(forKey: replacementQueueKey),
            let stored = try? JSONDecoder().decode(HealthKitReplacementQueue.self, from: data) {
@@ -211,10 +425,13 @@ public class HealthKitManager: NSObject {
         // call initializeHealthKit, set healthKitInitialized according to result of initialization
         healthKitInitialized = initializeHealthKit()
 
-        NotificationCenter.default.addObserver(self, selector: #selector(storeBgReadings), name: UIApplication.protectedDataDidBecomeAvailableNotification, object: nil)
-        NotificationCenter.default.addObserver(self, selector: #selector(storeBgReadings), name: UIApplication.didBecomeActiveNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(resumeHealthKitExports), name: UIApplication.protectedDataDidBecomeAvailableNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(resumeHealthKitExports), name: UIApplication.didBecomeActiveNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(resumeHealthKitExports), name: .healthKitPhoneAuthorizationDidChange, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(glucoseContextDidSave(_:)), name: .NSManagedObjectContextDidSave, object: nil)
         
         // do first store
+        refreshGlucosePendingStatus(force: true)
         storeBgReadings()
     }
     
@@ -247,18 +464,51 @@ public class HealthKitManager: NSObject {
             if UserDefaults.standard.storeReadingsInHealthkit {
                 trace("HealthKit sharing is not authorized", log: log, category: ConstantsLog.categoryHealthKitManager, type: .info, troubleshooting: .detailed(.integration(name: .healthKit, activity: .permissionDenied)))
             }
-            UserDefaults.standard.storeReadingsInHealthkitAuthorized = false
+            if UserDefaults.standard.storeReadingsInHealthkitAuthorized {
+                UserDefaults.standard.storeReadingsInHealthkitAuthorized = false
+            }
             return false
         case .sharingAuthorized:
-            break
+            if !UserDefaults.standard.storeReadingsInHealthkitAuthorized {
+                UserDefaults.standard.storeReadingsInHealthkitAuthorized = true
+            }
         @unknown default:
             trace("unknown authorizationstatus for healthkit - HealthKitManager.swift", log: log, category: ConstantsLog.categoryHealthKitManager, type: .error, troubleshooting: .detailed(.integration(name: .healthKit, activity: .failed)))
-            UserDefaults.standard.storeReadingsInHealthkitAuthorized = false
+            if UserDefaults.standard.storeReadingsInHealthkitAuthorized {
+                UserDefaults.standard.storeReadingsInHealthkitAuthorized = false
+            }
             return false
         }
         
         // all checks ok , return true
         return true
+    }
+
+    @objc private func resumeHealthKitExports() {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in self?.resumeHealthKitExports() }
+            return
+        }
+        healthKitInitialized = initializeHealthKit()
+        guard healthKitInitialized else { refreshGlucosePendingStatus(force: true); return }
+        uploadState.allowImmediateRetry()
+        healthKitRetryWorkItem?.cancel()
+        healthKitRetryWorkItem = nil
+        replacementRetryWorkItem?.cancel()
+        replacementRetryWorkItem = nil
+        refreshGlucosePendingStatus(force: true)
+        storeBgReadings()
+    }
+
+    @objc private func glucoseContextDidSave(_ notification: Notification) {
+        guard let context = notification.object as? NSManagedObjectContext,
+              context === coreDataManager.mainManagedObjectContext ||
+                context === coreDataManager.privateManagedObjectContext else { return }
+        let changedKeys = [NSInsertedObjectsKey, NSUpdatedObjectsKey, NSDeletedObjectsKey]
+        guard changedKeys.contains(where: {
+            (notification.userInfo?[$0] as? Set<NSManagedObject>)?.contains(where: { $0 is BgReading }) == true
+        }) else { return }
+        HealthKitExportStatusStore.shared.invalidatePendingWrites(kind: .glucose)
     }
     
     /// stores latest readings in healthkit, only if HK supported, authorized, enabled in settings
@@ -270,8 +520,11 @@ public class HealthKitManager: NSObject {
             }
             return
         }
-        // healthkit setting must be on, and healthkit must be initialized successfully
-        if !UserDefaults.standard.storeReadingsInHealthkit || !healthKitInitialized {
+        // A former denied status is not permanent. A foreground or authorization callback
+        // rechecks the current per-type sharing status without displaying a dialog.
+        healthKitInitialized = initializeHealthKit()
+        if !UserDefaults.standard.storeReadingsInHealthkit || !healthKitInitialized ||
+            !UIApplication.shared.isProtectedDataAvailable || uploadState.inFlightTimeStamp != nil {
             return
         }
         
@@ -284,28 +537,15 @@ public class HealthKitManager: NSObject {
         uploadState.synchronizeLatestStoredTimeStamp(persistedLatestTimeStamp)
         let strictLatestHealthKitStoredTimeStamp = uploadState.latestStoredTimeStamp
         
-        // user setting to allow more frequent HealthKit writes (e.g. Libre 2 Direct 60-second cadence)
-        let storeFrequentReadingsInHealthKit = UserDefaults.standard.storeFrequentReadingsInHealthKit
-        
-        // get readings to store, limit to 2016 = maximum 1 week - just to avoid a huge array is being returned here, applying minimumTimeBetweenTwoReadingsInMinutes filter
-        let bgReadingsToStore = bgReadingsAccessor.getLatestBgReadingSnapshots(limit: 2016, fromDate: strictLatestHealthKitStoredTimeStamp, forSensor: nil, ignoreRawData: true, ignoreCalculatedValue: false).filter(minimumTimeBetweenTwoReadingsInMinutes: storeFrequentReadingsInHealthKit ? 0 : ConstantsHealthKit.minimiumTimeBetweenTwoReadingsInMinutes, lastConnectionStatusChangeTimeStamp: nil, timeStampLastProcessedBgReading: strictLatestHealthKitStoredTimeStamp)
-        
-        let bgReadingsToStoreAfterApplyingStrictBoundary = bgReadingsToStore.filter {
-            let isAfterStrictBoundary = $0.timeStamp > strictLatestHealthKitStoredTimeStamp
-            let respectsFrequentWriteSpacing = !storeFrequentReadingsInHealthKit || ($0.timeStamp.timeIntervalSince(strictLatestHealthKitStoredTimeStamp) > 50)
-            return isAfterStrictBoundary
-                && respectsFrequentWriteSpacing
-                && $0.isValidForDownstream
-                && !uploadState.isInFlight(timeStamp: $0.timeStamp)
-        }
-        
         let bloodGlucoseUnit = HKUnit(from: "mg/dL")
-        
-        // The accessor returns newest first. Upload the oldest eligible reading and drain the
-        // remaining catch-up set from each asynchronous completion.
-        guard let bgReading = bgReadingsToStoreAfterApplyingStrictBoundary.last,
-              uploadState.begin(timeStamp: bgReading.timeStamp)
-        else { return }
+        // Scan bounded Core Data pages from the oldest row. Even a page containing only
+        // invalid or cadence-filtered rows cannot hide a valid later reading.
+        guard let bgReading = oldestEligibleGlucose(after: strictLatestHealthKitStoredTimeStamp) else { return }
+        if HealthKitExportStatusStore.shared.snapshot(.glucose).pendingWrites == 0 {
+            // A new reading arrived after a previously empty backlog was counted.
+            refreshGlucosePendingStatus(force: true)
+        }
+        guard uploadState.begin(timeStamp: bgReading.timeStamp) else { return }
 
         saveBgReadingInHealthKit(
             bgReading: HealthKitExportReading(id: bgReading.id, timeStamp: bgReading.timeStamp, value: bgReading.finalValue, revision: 1),
@@ -313,6 +553,48 @@ public class HealthKitManager: NSObject {
             bloodGlucoseUnit: bloodGlucoseUnit,
             shouldUpdateLatestTimeStamp: true
         )
+    }
+
+    private func oldestEligibleGlucose(after checkpoint: Date) -> BgReadingSnapshot? {
+        HealthKitGlucoseBacklog.oldestEligible(after: checkpoint,
+            frequent: UserDefaults.standard.storeFrequentReadingsInHealthKit,
+            pageSize: glucosePageSize,
+            page: { offset in
+                let result = bgReadingsAccessor.getOldestBgReadingSnapshotPage(
+                    limit: glucosePageSize, fromDate: checkpoint, offset: offset)
+                return (result.snapshots, result.scannedCount)
+            }, time: { $0.timeStamp })
+    }
+
+    /// Full pending count is computed on entry/foreground, then maintained from confirmed
+    /// callbacks. The throttle avoids re-reading the entire backlog after every sample.
+    func refreshGlucosePendingStatus(force: Bool = false) {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in self?.refreshGlucosePendingStatus(force: force) }
+            return
+        }
+        guard force || lastGlucoseStatusScan.map({ Date().timeIntervalSince($0) > 60 }) ?? true
+        else { return }
+        guard UIApplication.shared.isProtectedDataAvailable else {
+            HealthKitExportStatusStore.shared.clearPending(kind: .glucose)
+            return
+        }
+        let checkpoint = UserDefaults.standard.timeStampLatestHealthKitStoreBgReading ?? .distantPast
+        let count = HealthKitGlucoseBacklog.countEligible(after: checkpoint,
+            frequent: UserDefaults.standard.storeFrequentReadingsInHealthKit,
+            pageSize: glucosePageSize,
+            page: { offset in
+                let result = bgReadingsAccessor.getOldestBgReadingSnapshotPage(
+                    limit: glucosePageSize, fromDate: checkpoint, offset: offset)
+                return (result.snapshots, result.scannedCount)
+            }, time: { $0.timeStamp })
+        guard let count else {
+            HealthKitExportStatusStore.shared.clearPending(kind: .glucose)
+            return
+        }
+        lastGlucoseStatusScan = Date()
+        HealthKitExportStatusStore.shared.setPending(kind: .glucose,
+            writes: count + replacementQueue.entries.count)
     }
     
     /// Backfill respects destination cadence using surrounding stored readings, not just
@@ -415,8 +697,14 @@ public class HealthKitManager: NSObject {
         uploadState.finishReplacement(timeStamp: reading.timeStamp)
         replacementInFlight = false
         if succeeded {
+            let previousCount = replacementQueue.entries.count
             replacementQueue.confirm(reading)
             persistHealthKitReplacements()
+            HealthKitExportStatusStore.shared.recordSuccess(kind: .glucose, operation: "skrivning")
+            if replacementQueue.entries.count < previousCount,
+               let pending = HealthKitExportStatusStore.shared.snapshot(.glucose).pendingWrites {
+                HealthKitExportStatusStore.shared.setPending(kind: .glucose, writes: max(0, pending - 1))
+            }
             drainHealthKitReplacements()
             storeBgReadings()
         } else {
@@ -440,6 +728,7 @@ public class HealthKitManager: NSObject {
             return
         }
 
+        healthKitInitialized = initializeHealthKit()
         guard UserDefaults.standard.storeReadingsInHealthkit,
               healthKitInitialized,
               let bloodGlucoseType = bloodGlucoseType,
@@ -514,7 +803,8 @@ public class HealthKitManager: NSObject {
     
     private func deleteExistingBgReadingsFromHealthKit(bgReading: HealthKitExportReading, bloodGlucoseType: HKQuantityType, bloodGlucoseUnit: HKUnit) {
         HealthKitLegacyReplacement.perform(isEnabled: {
-            UserDefaults.standard.storeReadingsInHealthkit && self.healthKitInitialized
+            UserDefaults.standard.storeReadingsInHealthkit &&
+                self.healthStore.authorizationStatus(for: bloodGlucoseType) == .sharingAuthorized
         }, query: { completion in
             let predicate = NSCompoundPredicate(andPredicateWithSubpredicates: [
                 HKQuery.predicateForObjects(withMetadataKey: self.bgReadingIdMetadataKey, allowedValues: [bgReading.id]),
@@ -543,6 +833,7 @@ public class HealthKitManager: NSObject {
         }, failed: {
             trace("HealthKit legacy replacement query/delete failed; value remains queued", log: self.log, category: ConstantsLog.categoryHealthKitManager, type: .error,
                   troubleshooting: .detailed(.integration(name: .healthKit, activity: .failed)))
+            HealthKitExportStatusStore.shared.recordFailure(kind: .glucose, operation: "skrivning", error: nil)
             self.finishHealthKitReplacement(bgReading, succeeded: false)
         })
     }
@@ -558,7 +849,9 @@ public class HealthKitManager: NSObject {
         if !shouldUpdateLatestTimeStamp, !replacementQueue.entries.contains(bgReading) {
             // A correction or explicit cadence deletion arrived during query/delete. Retire
             // only this operation; its newer revision, if any, stays queued for the next drain.
-            finishHealthKitReplacement(bgReading, succeeded: true)
+            uploadState.finishReplacement(timeStamp: bgReading.timeStamp)
+            replacementInFlight = false
+            drainHealthKitReplacements()
             return
         }
         // Callers validate the canonical BgReading before creating this immutable export value.
@@ -566,10 +859,10 @@ public class HealthKitManager: NSObject {
         let sample = HKQuantitySample(type: bloodGlucoseType, quantity: quantity, start: bgReading.timeStamp, end: bgReading.timeStamp, metadata: bgReading.metadata)
         let timeStampLastReadingToUpload = bgReading.timeStamp
 
-        healthStore.save(sample, withCompletion: { [weak self]
+        let completion: (Bool, Error?) -> Void = { [weak self]
             (success: Bool, error: Error?) in
             guard let self = self else { return }
-            DispatchQueue.main.async {
+            DispatchQueue.main.async { [self] in
                 if !shouldUpdateLatestTimeStamp {
                     self.finishHealthKitReplacement(bgReading, succeeded: success)
                 }
@@ -583,6 +876,10 @@ public class HealthKitManager: NSObject {
                        ) {
                         let persisted = UserDefaults.standard.timeStampLatestHealthKitStoreBgReading ?? .distantPast
                         UserDefaults.standard.timeStampLatestHealthKitStoreBgReading = max(persisted, latestTimeStamp)
+                        HealthKitExportStatusStore.shared.recordSuccess(kind: .glucose, operation: "skrivning")
+                        if let pending = HealthKitExportStatusStore.shared.snapshot(.glucose).pendingWrites {
+                            HealthKitExportStatusStore.shared.setPending(kind: .glucose, writes: max(0, pending - 1))
+                        }
                         self.healthKitRetryWorkItem?.cancel()
                         self.healthKitRetryWorkItem = nil
                         self.storeBgReadings()
@@ -590,8 +887,12 @@ public class HealthKitManager: NSObject {
                     return
                 }
 
-                let errorDescription = error?.localizedDescription ?? "HealthKit save returned no error"
-                trace("failed store reading in healthkit, error = %{public}@", log: self.log, category: ConstantsLog.categoryHealthKitManager, type: .error, troubleshooting: .detailed(.integration(name: .healthKit, activity: .failed)), errorDescription)
+                let nsError = (error ?? NSError(domain: "HealthKit", code: -1)) as NSError
+                trace("failed store reading in healthkit, domain=%{public}@ code=%{public}ld", log: self.log, category: ConstantsLog.categoryHealthKitManager, type: .error, troubleshooting: .detailed(.integration(name: .healthKit, activity: .failed)), nsError.domain, nsError.code)
+                HealthKitExportStatusStore.shared.recordFailure(kind: .glucose, operation: "skrivning", error: nsError)
+                // New rows can arrive after the last Settings/foreground count. A failed
+                // write leaves them pending, so recalculate the complete count now.
+                self.refreshGlucosePendingStatus(force: true)
 
                 guard shouldUpdateLatestTimeStamp,
                       case let .retry(retryDate) = self.uploadState.finish(
@@ -611,6 +912,12 @@ public class HealthKitManager: NSObject {
                     execute: retry
                 )
             }
-        })
+        }
+        guard UserDefaults.standard.storeReadingsInHealthkit,
+              healthStore.authorizationStatus(for: bloodGlucoseType) == .sharingAuthorized else {
+            completion(false, NSError(domain: "HealthKitAuthorization", code: 2))
+            return
+        }
+        healthStore.save(sample, withCompletion: completion)
     }
 }

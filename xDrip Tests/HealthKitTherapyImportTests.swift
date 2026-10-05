@@ -22,7 +22,8 @@ final class HealthKitTherapyImportTests: XCTestCase {
         XCTAssertTrue(TreatmentSourceCutover.persist(boundary, defaults: defaults))
         let model = SettingsViewHealthKitSettingsViewModel(defaults: defaults)
         XCTAssertEqual(model.settingsRows(sectionID: 1).map(\.id), [
-            "healthKit.enabledHealthKit", "healthKit.localTreatmentCutover"
+            "healthKit.enabledHealthKit", "healthKit.requestWriteAccess",
+            "healthKit.exportStatus", "healthKit.localTreatmentCutover"
         ])
         XCTAssertNil(model.sectionFooter())
         XCTAssertTrue(HealthKitLocalCutoverPresentation.isActive(
@@ -34,12 +35,12 @@ final class HealthKitTherapyImportTests: XCTestCase {
         XCTAssertFalse(HealthKitLocalCutoverPresentation.cutoffDescription(cutoff).isEmpty)
 
         defaults.set(true, forKey: TreatmentSourceCutover.restoreRequiresSourceSetupKey)
-        XCTAssertEqual(model.settingsRows(sectionID: 1).count, 8)
+        XCTAssertEqual(model.settingsRows(sectionID: 1).count, 10)
         XCTAssertNotNil(model.sectionFooter())
         defaults.removeObject(forKey: TreatmentSourceCutover.restoreRequiresSourceSetupKey)
         defaults.therapyDataSourceType = .nightscout
         defaults.nightscoutEnabled = true
-        XCTAssertEqual(model.settingsRows(sectionID: 1).count, 8)
+        XCTAssertEqual(model.settingsRows(sectionID: 1).count, 10)
         XCTAssertNotNil(model.sectionFooter())
     }
 
@@ -51,7 +52,7 @@ final class HealthKitTherapyImportTests: XCTestCase {
         defaults.therapyDataSourceType = .none
         defaults.set(Data("corrupted".utf8), forKey: TreatmentSourceCutover.defaultsKey)
         let model = SettingsViewHealthKitSettingsViewModel(defaults: defaults)
-        XCTAssertEqual(model.settingsRows(sectionID: 1).count, 8)
+        XCTAssertEqual(model.settingsRows(sectionID: 1).count, 10)
         XCTAssertNotNil(model.sectionFooter())
     }
 
@@ -168,6 +169,10 @@ final class HealthKitTherapyImportTests: XCTestCase {
         fixture.query.setPage(page([sample(.carbohydrates, source: sourceA)], next: "c0"),
                               for: .carbohydrates, after: nil)
         enable(.insulin, source: sourceA, fixture: fixture)
+        waitUntil("insulin initial import complete before enabling carbohydrates") {
+            fixture.anchor(for: .insulin) == self.anchor("i0") &&
+                !fixture.manager.status(.insulin).isIncomplete
+        }
         enable(.carbohydrates, source: sourceA, fixture: fixture)
         waitUntil("both initial imports complete") {
             !fixture.manager.status(.insulin).isIncomplete && !fixture.manager.status(.carbohydrates).isIncomplete
@@ -1093,21 +1098,248 @@ final class HealthKitTherapyImportTests: XCTestCase {
         }
     }
 
+    private func persistedSyncState(_ uuid: String, in core: CoreDataManager) -> String? {
+        guard let coordinator = core.privateManagedObjectContext.persistentStoreCoordinator else { return nil }
+        let context = NSManagedObjectContext(concurrencyType: .privateQueueConcurrencyType)
+        context.persistentStoreCoordinator = coordinator
+        var state: String?
+        context.performAndWait {
+            let request: NSFetchRequest<TreatmentEntry> = TreatmentEntry.fetchRequest()
+            request.predicate = NSPredicate(format: "localTreatmentUUID == %@", uuid)
+            state = (try? context.fetch(request).first)?.healthKitSyncStateRaw
+        }
+        return state
+    }
+
+    @MainActor func testListAndEditorDeletionRemoveOnlyTheirStableHealthIdentities() throws {
+        let suite = "HealthTherapyDeleteUI.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        XCTAssertTrue(TreatmentSourceCutover.persist(.init(cutoff: Date().addingTimeInterval(-3600),
+            insulinSourceBundleID: "mysugr.insulin", carbohydrateSourceBundleID: "mysugr.carbs"),
+            defaults: defaults))
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let journal = PenDoseLogJournal(directory: directory)
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let insulin = TreatmentEntry(date: Date().addingTimeInterval(-120), value: 2,
+            treatmentType: .Insulin, nightscoutEventType: nil, enteredBy: "xDrip",
+            nsManagedObjectContext: core.mainManagedObjectContext)
+        insulin.localTreatmentUUID = UUID().uuidString
+        insulin.healthKitSyncVersion = NSNumber(value: 1)
+        insulin.healthKitSyncStateRaw = "synced"
+        let carbs = TreatmentEntry(date: Date().addingTimeInterval(-60), value: 20,
+            treatmentType: .Carbs, nightscoutEventType: nil, enteredBy: "xDrip",
+            nsManagedObjectContext: core.mainManagedObjectContext)
+        carbs.localTreatmentUUID = UUID().uuidString
+        carbs.healthKitSyncVersion = NSNumber(value: 2)
+        carbs.healthKitSyncStateRaw = "synced"
+        XCTAssertTrue(core.saveChangesSynchronously())
+        let store = FakeWriteStore()
+        let writer = HealthKitLocalTherapyWriter(store: store, defaults: defaults,
+            deletionIsVerified: { journal.recoveryState(coreDataManager: $0) == .ready })
+        writer.configure(coreDataManager: core)
+
+        let list = TreatmentsViewModel(coreDataManager: core, localSaveJournal: journal)
+        XCTAssertTrue(list.deleteTreatment(TreatmentSnapshot(treatmentEntry: insulin)))
+        waitUntil("list Health copy removed") {
+            store.deletionRequests.count == 1 &&
+                self.persistedSyncState(insulin.localTreatmentUUID!, in: core) == HealthLocalTherapySyncState.deleted
+        }
+        let editor = TreatmentEditorViewModel(coreDataManager: core, treatmentToEdit: carbs,
+            localSaveJournal: journal)
+        XCTAssertTrue(editor.deleteTreatment())
+        waitUntil("editor Health copy removed") {
+            store.deletionRequests.count == 2 &&
+                self.persistedSyncState(carbs.localTreatmentUUID!, in: core) == HealthLocalTherapySyncState.deleted
+        }
+        XCTAssertEqual(store.deletionRequests.map(\.syncIdentifier), [
+            HealthLocalTherapyIdentity.syncPrefix + insulin.localTreatmentUUID!,
+            HealthLocalTherapyIdentity.syncPrefix + carbs.localTreatmentUUID!
+        ])
+        XCTAssertEqual(store.deletionRequests.map(\.kind), [.insulin, .carbohydrates])
+        XCTAssertTrue(insulin.treatmentdeleted)
+        XCTAssertTrue(carbs.treatmentdeleted)
+        XCTAssertTrue(store.requests.isEmpty, "Deleted treatments must not be exported again")
+    }
+
+    @MainActor func testUnverifiedLocalDeletionNeverStartsHealthDeletionEvenAfterLaterStoreSave() throws {
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let journal = PenDoseLogJournal(directory: directory)
+        let entry = TreatmentEntry(date: Date().addingTimeInterval(-60), value: 2,
+            treatmentType: .Insulin, nightscoutEventType: nil, enteredBy: "xDrip",
+            nsManagedObjectContext: core.mainManagedObjectContext)
+        entry.localTreatmentUUID = UUID().uuidString
+        entry.healthKitSyncVersion = NSNumber(value: 1)
+        entry.healthKitSyncStateRaw = "synced"
+        XCTAssertTrue(core.saveChangesSynchronously())
+        let store = FakeWriteStore()
+        let writer = HealthKitLocalTherapyWriter(store: store,
+            deletionIsVerified: { journal.recoveryState(coreDataManager: $0) == .ready })
+        writer.configure(coreDataManager: core)
+        let list = TreatmentsViewModel(coreDataManager: core, localSaveJournal: journal,
+            localSaveOverride: {
+                try? core.mainManagedObjectContext.save()
+                return false
+            })
+        XCTAssertFalse(list.deleteTreatment(TreatmentSnapshot(treatmentEntry: entry)))
+        XCTAssertEqual(journal.recoveryState(coreDataManager: core), .awaitingRestart)
+        XCTAssertTrue(core.saveChangesSynchronously(), "A later unrelated save can commit a failed child mutation")
+        writer.retryPending()
+        let settled = expectation(description: "journal blocks Health deletion")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { settled.fulfill() }
+        wait(for: [settled], timeout: 2)
+        XCTAssertTrue(store.deletionRequests.isEmpty)
+        XCTAssertEqual(persistedSyncState(entry.localTreatmentUUID!, in: core), "synced")
+    }
+
+    @MainActor func testDeletionDuringInFlightWriteCannotRecreateHealthCopy() throws {
+        let suite = "HealthTherapyDeleteRace.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        XCTAssertTrue(TreatmentSourceCutover.persist(.init(cutoff: Date().addingTimeInterval(-3600),
+            insulinSourceBundleID: "mysugr.insulin", carbohydrateSourceBundleID: "mysugr.carbs"),
+            defaults: defaults))
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let journal = PenDoseLogJournal(directory: directory)
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let entry = TreatmentEntry(date: Date().addingTimeInterval(-60), value: 2,
+            treatmentType: .Insulin, nightscoutEventType: nil, enteredBy: "xDrip",
+            nsManagedObjectContext: core.mainManagedObjectContext)
+        entry.localTreatmentUUID = UUID().uuidString
+        entry.healthKitSyncVersion = NSNumber(value: 1)
+        entry.healthKitSyncStateRaw = "pending"
+        XCTAssertTrue(core.saveChangesSynchronously())
+        let store = FakeWriteStore()
+        store.holdNext = true
+        let writer = HealthKitLocalTherapyWriter(store: store, defaults: defaults,
+            deletionIsVerified: { journal.recoveryState(coreDataManager: $0) == .ready })
+        writer.configure(coreDataManager: core)
+        waitUntil("Health write in flight") { store.requests.count == 1 }
+        let list = TreatmentsViewModel(coreDataManager: core, localSaveJournal: journal)
+        XCTAssertTrue(list.deleteTreatment(TreatmentSnapshot(treatmentEntry: entry)))
+        store.completeHeld()
+        waitUntil("in-flight write followed by exact deletion") {
+            store.deletionRequests.count == 1 &&
+                self.persistedSyncState(entry.localTreatmentUUID!, in: core) == HealthLocalTherapySyncState.deleted
+        }
+        XCTAssertEqual(store.requests.count, 1)
+        XCTAssertEqual(store.requests.first?.syncIdentifier, store.deletionRequests.first?.syncIdentifier)
+        writer.retryPending()
+        writer.retryPending()
+        let settled = expectation(description: "repeat triggers do not recreate the copy")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { settled.fulfill() }
+        wait(for: [settled], timeout: 2)
+        XCTAssertEqual(store.requests.count, 1)
+        XCTAssertEqual(store.deletionRequests.count, 1)
+    }
+
+    func testHistoricalDeletedRowsRetryAcrossRestartWithoutTouchingOtherOrigins() throws {
+        let suite = "HealthTherapyDeleteCleanup.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let cutoff = Date().addingTimeInterval(-3600)
+        XCTAssertTrue(TreatmentSourceCutover.persist(.init(cutoff: cutoff,
+            insulinSourceBundleID: "mysugr.insulin", carbohydrateSourceBundleID: "mysugr.carbs"),
+            defaults: defaults))
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let storeURL = directory.appendingPathComponent("therapy.sqlite")
+        let core = try CoreDataManager(testModelName: ConstantsCoreData.modelName,
+            persistentStoreURL: storeURL)
+        func row(_ kind: TreatmentType, _ date: Date, deleted: Bool,
+                 imported: Bool = false, watch: Bool = false, alreadyRemoved: Bool = false) -> TreatmentEntry {
+            let entry = TreatmentEntry(date: date, value: 2, treatmentType: kind,
+                nightscoutEventType: nil, enteredBy: "xDrip",
+                nsManagedObjectContext: core.mainManagedObjectContext)
+            entry.localTreatmentUUID = UUID().uuidString
+            entry.healthKitSyncVersion = NSNumber(value: 1)
+            entry.healthKitSyncStateRaw = alreadyRemoved ? HealthLocalTherapySyncState.deleted : "synced"
+            entry.treatmentdeleted = deleted
+            if imported { entry.healthKitSampleUUID = UUID().uuidString }
+            if watch { entry.watchSourceUUID = UUID().uuidString }
+            return entry
+        }
+        let oldInsulin = row(.Insulin, cutoff.addingTimeInterval(-7200), deleted: true)
+        let oldCarbs = row(.Carbs, cutoff.addingTimeInterval(-3600), deleted: true)
+        let insulinUUID = oldInsulin.localTreatmentUUID!
+        let carbsUUID = oldCarbs.localTreatmentUUID!
+        _ = row(.Insulin, cutoff.addingTimeInterval(-1800), deleted: false)
+        _ = row(.Insulin, cutoff.addingTimeInterval(-1700), deleted: true, imported: true)
+        _ = row(.Carbs, cutoff.addingTimeInterval(-1600), deleted: true, watch: true)
+        _ = row(.Insulin, cutoff.addingTimeInterval(-1500), deleted: true, alreadyRemoved: true)
+        XCTAssertTrue(core.saveChangesSynchronously())
+        let store = FakeWriteStore()
+        store.failNextDeletion = true
+        let first = HealthKitLocalTherapyWriter(store: store, defaults: defaults,
+            deletionIsVerified: { _ in true })
+        first.configure(coreDataManager: core)
+        waitUntil("first historical delete fails") { store.deletionRequests.count == 1 }
+        XCTAssertEqual(store.deletionRequests.first?.localUUID, insulinUUID)
+        XCTAssertEqual(persistedSyncState(insulinUUID, in: core), "synced")
+        waitUntil("full pending cleanup count") {
+            HealthKitExportStatusStore.shared.snapshot(.insulin).pendingDeletes == 1 &&
+                HealthKitExportStatusStore.shared.snapshot(.carbohydrates).pendingDeletes == 1
+        }
+        try core.disconnectPersistentStoresForTesting()
+        let reopened = try CoreDataManager(testModelName: ConstantsCoreData.modelName,
+            persistentStoreURL: storeURL)
+        let resumed = HealthKitLocalTherapyWriter(store: store, defaults: defaults,
+            deletionIsVerified: { _ in true })
+        resumed.configure(coreDataManager: reopened)
+        waitUntil("all historical deletes confirmed after restart") {
+            store.deletionRequests.count == 3 &&
+                self.persistedSyncState(insulinUUID, in: reopened) == HealthLocalTherapySyncState.deleted &&
+                self.persistedSyncState(carbsUUID, in: reopened) == HealthLocalTherapySyncState.deleted
+        }
+        XCTAssertEqual(store.deletionRequests.map(\.localUUID), [
+            insulinUUID, insulinUUID, carbsUUID
+        ])
+        resumed.retryPending()
+        let settled = expectation(description: "completed cleanup is idempotent")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { settled.fulfill() }
+        wait(for: [settled], timeout: 2)
+        XCTAssertEqual(store.deletionRequests.count, 3)
+        waitUntil("pending counts reach zero") {
+            HealthKitExportStatusStore.shared.snapshot(.insulin).pendingDeletes == 0 &&
+                HealthKitExportStatusStore.shared.snapshot(.carbohydrates).pendingDeletes == 0
+        }
+    }
+
     private final class FakeWriteStore: HealthLocalTherapyWriting {
         private let lock = NSLock()
         private var values: [HealthLocalTherapyWriteRequest] = []
+        private var deletedValues: [HealthLocalTherapyDeleteRequest] = []
         private var heldCompletion: ((Bool, Error?) -> Void)?
+        private var heldDeletionCompletion: ((Bool, Error?) -> Void)?
         var failNext = false
         var failWithoutErrorNext = false
         var holdNext = false
+        var failNextDeletion = false
+        var holdNextDeletion = false
         var requests: [HealthLocalTherapyWriteRequest] {
             lock.lock(); defer { lock.unlock() }
             return values
+        }
+        var deletionRequests: [HealthLocalTherapyDeleteRequest] {
+            lock.lock(); defer { lock.unlock() }
+            return deletedValues
         }
         func completeHeld() {
             lock.lock()
             let completion = heldCompletion
             heldCompletion = nil
+            lock.unlock()
+            completion?(true, nil)
+        }
+        func completeHeldDeletion() {
+            lock.lock()
+            let completion = heldDeletionCompletion
+            heldDeletionCompletion = nil
             lock.unlock()
             completion?(true, nil)
         }
@@ -1128,6 +1360,21 @@ final class HealthKitTherapyImportTests: XCTestCase {
             lock.unlock()
             completion(!shouldFail && !failWithoutError,
                 shouldFail ? ReadFailure.locked : nil)
+        }
+        func delete(_ request: HealthLocalTherapyDeleteRequest,
+                    completion: @escaping (Bool, Error?) -> Void) {
+            lock.lock()
+            deletedValues.append(request)
+            if holdNextDeletion {
+                holdNextDeletion = false
+                heldDeletionCompletion = completion
+                lock.unlock()
+                return
+            }
+            let shouldFail = failNextDeletion
+            failNextDeletion = false
+            lock.unlock()
+            completion(!shouldFail, shouldFail ? ReadFailure.locked : nil)
         }
     }
 

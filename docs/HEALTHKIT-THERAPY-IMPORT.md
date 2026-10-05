@@ -11,8 +11,11 @@ entries to Health. Imported entries are never echoed back. The existing
 
 1. On the iPhone, open **xDrip Settings → Sharing and Services → Apple Health**.
 2. Turn on **Import bolus insulin** and/or **Import carbohydrates**. Both are off
-   until you choose to enable them. In Apple's permission dialog, grant read access
-   to **Insulin Delivery** and/or **Dietary Carbohydrates** for the types you enabled.
+   until you choose to enable them. The iPhone uses one coordinated HealthKit
+   request for read and write access to blood glucose, insulin delivery and
+   dietary carbohydrates. Grant the access you intend to use in Apple's dialog.
+   A completed dialog is not proof that every individual permission was granted;
+   the Apple Health settings page shows each actual write status separately.
 3. Choose **Insulin source** and **Carbohydrate source** separately. Each menu lists
    sources Apple Health actually reports for that type. Pick the app or device
    that writes your records. If the list is empty, check that the source has saved
@@ -36,6 +39,12 @@ read or write is shown as incomplete and retried later. Switching a preferred
 source changes which imported records are eligible for the local estimate;
 existing manual treatments are retained. An empty Health query never deletes
 previously imported records.
+
+The **Giv skriveadgang i Sundhed** button can repeat the shared request even
+after HealthKit reports that no new dialog is needed. In that case, use the
+Health app to check xDrip's access. The request never changes the selected
+source or re-enables continuous import after local cutover. HealthKit does not
+disclose denied read access per type, so an empty query remains ambiguous.
 
 ## Switch from mySugr to local logging
 
@@ -88,10 +97,17 @@ the intended state must be read back from the persistent store. If that cannot
 be confirmed, xDrip blocks another dose log until the app has been restarted
 and the user has checked the treatment history and, if applicable, Health.
 An unrelated later database save cannot silently clear this gate.
-Deleting a previously synced local treatment currently does **not** delete its
-Health copy; xDrip will not reimport that copy. The Health record can be removed
-in Apple's Health app. Automatic Health deletion needs separate authorization
-and is not part of this build.
+After a local insulin or confirmed carbohydrate deletion is verified in the
+persistent store, xDrip removes its own exported Health copy with the same
+treatment sync ID and exact Health type. HealthKit also limits deletion to
+objects saved by this app. The local deletion remains even when Health access
+is unavailable or removal fails; the durable deleted row stays pending and is
+retried after foreground, protected-data availability, permission changes or
+restart. The Apple Health settings page shows pending removals and the latest
+technical error. Previously documented deleted local rows are processed through
+the same path regardless of the current history filter or source cutoff. There
+is no broad removal of unmatched Health samples, and unresolved deletions are
+never treated as completed cleanup.
 
 When another active import has the same documented external or sync identifier,
 its treatment takes precedence. Some source apps do not share an identifier with

@@ -224,15 +224,12 @@ final class GlucoseForecastMLTrainingCoordinator: @unchecked Sendable {
         guard HKHealthStore.isHealthDataAvailable(),
               types.count == historicalReadIdentifiers.count
         else { return "Sundhed-historik er ikke tilgængelig på denne enhed" }
-        let store = HKHealthStore()
-        let readTypes = Set(types.map { $0 as HKObjectType })
         // HealthKit deliberately does not disclose read authorization. The
         // completion only tells us that the request was processed, not whether
         // samples are readable. Never treat it as proof of permission.
         return await withCheckedContinuation { (continuation: CheckedContinuation<String?, Never>) in
             DispatchQueue.main.async {
-                store.requestAuthorization(toShare: [],
-                    read: readTypes) { completed, error in
+                HealthKitPhoneAuthorizationCenter.shared.request { completed, error in
                     if let error {
                         let details = error as NSError
                         continuation.resume(returning:

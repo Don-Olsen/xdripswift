@@ -223,13 +223,32 @@ class BgReadingsAccessor: ObservableObject {
     /// - returns: an array with 'Snapshot" readings, can be empty array.
     ///     Order by timestamp, descending meaning the reading at index 0 is the youngest
     func getLatestBgReadingSnapshots(limit: Int?, fromDate: Date?, forSensor sensor: Sensor?, ignoreRawData: Bool, ignoreCalculatedValue: Bool, includingSuppressed: Bool = false) -> [BgReadingSnapshot] {
+        getBgReadingSnapshots(limit: limit, fromDate: fromDate, forSensor: sensor,
+            ignoreRawData: ignoreRawData, ignoreCalculatedValue: ignoreCalculatedValue,
+            includingSuppressed: includingSuppressed, ascending: false, offset: 0).snapshots
+    }
+
+    /// HealthKit catch-up starts at the oldest unprocessed row. This leaves the ordering
+    /// contract of getLatestBgReadingSnapshots unchanged for every other caller.
+    func getOldestBgReadingSnapshotPage(limit: Int, fromDate: Date?, offset: Int) ->
+        (snapshots: [BgReadingSnapshot], scannedCount: Int?) {
+        getBgReadingSnapshots(limit: limit, fromDate: fromDate, forSensor: nil,
+            ignoreRawData: true, ignoreCalculatedValue: false,
+            includingSuppressed: false, ascending: true, offset: offset)
+    }
+
+    private func getBgReadingSnapshots(limit: Int?, fromDate: Date?, forSensor sensor: Sensor?,
+                                       ignoreRawData: Bool, ignoreCalculatedValue: Bool,
+                                       includingSuppressed: Bool, ascending: Bool, offset: Int) ->
+        (snapshots: [BgReadingSnapshot], scannedCount: Int?) {
         var returnValue: [BgReadingSnapshot] = []
+        var scannedCount: Int?
 
         // Core Data contexts are not thread-safe. We must run fetches/updates inside
         // performAndWait to ensure all access happens on the context's own queue.
         coreDataManager.mainManagedObjectContext.performAndWait {
             let fetchRequest: NSFetchRequest<BgReading> = BgReading.fetchRequest()
-            fetchRequest.sortDescriptors = [NSSortDescriptor(key: #keyPath(BgReading.timeStamp), ascending: false)]
+            fetchRequest.sortDescriptors = [NSSortDescriptor(key: #keyPath(BgReading.timeStamp), ascending: ascending)]
             fetchRequest.returnsObjectsAsFaults = false
             fetchRequest.includesPropertyValues = true
             fetchRequest.relationshipKeyPathsForPrefetching = ["sensor"]
@@ -259,9 +278,11 @@ class BgReadingsAccessor: ObservableObject {
             if let limit = limit, limit >= 0 {
                 fetchRequest.fetchLimit = limit
             }
+            fetchRequest.fetchOffset = offset
 
             do {
                 let bgReadings = try fetchRequest.execute()
+                scannedCount = bgReadings.count
                 let sensorId = sensor?.id
                 let ignoreSensorId = (sensorId == nil)
 
@@ -288,12 +309,11 @@ class BgReadingsAccessor: ObservableObject {
                 }
             } catch {
                 let fetchError = error as NSError
-
-                trace("in getLatestBgReadingSnapshots, Unable to Execute BgReading Fetch Request: %{public}@", log: self.log, category: ConstantsLog.categoryApplicationDataBgReadings, type: .error, fetchError.localizedDescription)
+                trace("in getLatestBgReadingSnapshots, unable to fetch, domain=%{public}@ code=%{public}ld", log: self.log, category: ConstantsLog.categoryApplicationDataBgReadings, type: .error, fetchError.domain, fetchError.code)
             }
         }
 
-        return returnValue
+        return (returnValue, scannedCount)
     }
 
     /// Returns plain Date timestamps for readings in the last 24 hours up to endingAt.

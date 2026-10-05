@@ -541,6 +541,7 @@ import UserNotifications
             return false
         }
         if durableMutation { localSaveGateState = .ready }
+        if durableMutation { HealthKitLocalTherapyWriter.shared.retryPending() }
 
         if let uuid = treatmentToEdit.localTreatmentUUID {
             if treatmentToEdit.treatmentType == .Carbs {
@@ -588,7 +589,9 @@ import UserNotifications
         guard localSaveGateState == .foundPriorEntry ||
                 localSaveGateState == .noLocalEntryHealthUncertain ||
                 localSaveGateState == .uncertainMutationAfterRestart else { return }
-        localSaveGateState = localSaveJournal.complete() ? .ready : .partialOrUnreadable
+        let completed = localSaveJournal.complete()
+        localSaveGateState = completed ? .ready : .partialOrUnreadable
+        if completed { HealthKitLocalTherapyWriter.shared.retryPending() }
     }
 
     private var wouldChangeHealthSyncedTreatmentType: Bool {

@@ -37,8 +37,8 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
 }
 
 /// Receives shortcuts while SwiftUI continues to own the scene's window and content.
-final class QuickActionsSceneDelegate: NSObject, UIWindowSceneDelegate {
-    private let quickActionsManager = QuickActionsManager()
+@MainActor final class QuickActionsSceneDelegate: NSObject, UIWindowSceneDelegate {
+    private let quickActionsManager = QuickActionsManager.shared
 
     func scene(_ scene: UIScene, willConnectTo session: UISceneSession, options connectionOptions: UIScene.ConnectionOptions) {
         // A shortcut that launches the app arrives with the scene connection.
@@ -51,8 +51,7 @@ final class QuickActionsSceneDelegate: NSObject, UIWindowSceneDelegate {
     func windowScene(_ windowScene: UIWindowScene, performActionFor shortcutItem: UIApplicationShortcutItem, completionHandler: @escaping (Bool) -> Void) {
         // An existing scene receives the action directly when the app resumes.
         if let quickActionType = QuickActionType(rawValue: shortcutItem.type) {
-            quickActionsManager.handleQuickAction(quickActionType)
-            completionHandler(true)
+            completionHandler(quickActionsManager.handleQuickAction(quickActionType))
         } else {
             completionHandler(false)
         }
