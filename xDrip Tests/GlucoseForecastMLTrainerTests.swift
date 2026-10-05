@@ -349,6 +349,155 @@ final class GlucoseForecastMLTrainerTests: XCTestCase {
         XCTAssertTrue(temporary.isEmpty)
     }
 
+    func testCleanLocalLoggingTransitionAcceptsPreviouslySerializedMetadata() throws {
+        let cutoff = Date(timeIntervalSince1970: 1_800_000_000)
+        let transition = TreatmentSourceCutover(cutoff: cutoff,
+            insulinSourceBundleID: "com.example.insulin",
+            carbohydrateSourceBundleID: "com.example.carbs")
+        let currentPolicy = transitionPolicy(.none, nightscoutEnabled: false)
+        let oldPolicy = transitionPolicy(.automatic, nightscoutEnabled: false)
+        let old = transitionContext(policy: oldPolicy, transition: transition, old: true)
+        let current = transitionContext(policy: currentPolicy, transition: transition, old: false)
+        // Decode serialized metadata from an earlier model. This checks the legacy
+        // source signature after a restart; package loading of all six model files
+        // remains covered by the model-store validation path.
+        let oldJSON = try JSONEncoder().encode(reviewMetadata(context: old))
+        let persisted = try JSONDecoder().decode(GlucoseForecastMLModelMetadata.self, from: oldJSON)
+        XCTAssertEqual(GlucoseForecastMLModelCompatibility.assess(persisted,
+            current: current, currentPolicy: currentPolicy, cutover: transition),
+            .transitionCompatible(transition))
+        XCTAssertNotEqual(persisted.context, current)
+        XCTAssertEqual(GlucoseForecastMLModelCompatibility.assess(persisted,
+            current: old, currentPolicy: oldPolicy, cutover: nil), .exact)
+    }
+
+    func testTransitionRejectsUnverifiedSourcesAndChangedParameters() {
+        let transition = TreatmentSourceCutover(cutoff: Date(timeIntervalSince1970: 1_800_000_000),
+            insulinSourceBundleID: "com.example.insulin",
+            carbohydrateSourceBundleID: "com.example.carbs")
+        let currentPolicy = transitionPolicy(.none, nightscoutEnabled: false)
+        let oldPolicy = transitionPolicy(.automatic, nightscoutEnabled: false)
+        let old = transitionContext(policy: oldPolicy, transition: transition, old: true)
+        let current = transitionContext(policy: currentPolicy, transition: transition, old: false)
+        let metadata = reviewMetadata(context: old)
+        typealias Compatibility = GlucoseForecastMLModelCompatibility
+        XCTAssertEqual(Compatibility.assess(metadata, current: current,
+            currentPolicy: currentPolicy, cutover: nil), .invalid(.sourceChanged))
+        XCTAssertEqual(Compatibility.assess(metadata, current: current,
+            currentPolicy: currentPolicy, cutover: transition, restoreRequiresSetup: true),
+            .invalid(.sourceSetupIncomplete))
+        let wrongID = TreatmentSourceCutover(cutoff: transition.cutoff,
+            insulinSourceBundleID: "com.example.other",
+            carbohydrateSourceBundleID: transition.carbohydrateSourceBundleID)
+        XCTAssertEqual(Compatibility.assess(metadata, current: current,
+            currentPolicy: currentPolicy, cutover: wrongID),
+            .invalid(.transitionUnverified))
+        let changed = GlucoseForecastMLContext(sensitivityMgdlPerUnit: 41,
+            carbohydrateRatioGramsPerUnit: 10, settings: TherapyModelSettings(),
+            sourceSignature: current.sourceSignature)!
+        XCTAssertEqual(Compatibility.assess(metadata, current: changed,
+            currentPolicy: currentPolicy, cutover: transition), .invalid(.parametersChanged))
+        let malformed = GlucoseForecastMLContext(sensitivityMgdlPerUnit: 40,
+            carbohydrateRatioGramsPerUnit: 10, settings: TherapyModelSettings(),
+            sourceSignature: "opaque-source")!
+        XCTAssertEqual(Compatibility.assess(metadata, current: malformed,
+            currentPolicy: currentPolicy, cutover: transition), .invalid(.malformedSignature))
+
+        let remotePolicy = transitionPolicy(.nightscout, nightscoutEnabled: true)
+        let remoteOld = transitionContext(policy: remotePolicy, transition: transition, old: true)
+        XCTAssertEqual(Compatibility.assess(reviewMetadata(context: remoteOld), current: current,
+            currentPolicy: currentPolicy, cutover: transition), .invalid(.transitionUnverified))
+    }
+
+    func testProspectivePairsSurviveRestartAndMissingLedgerFailsClosed() throws {
+        let files = FileManager.default
+        let directory = files.temporaryDirectory.appendingPathComponent(UUID().uuidString,
+            isDirectory: true)
+        let suiteName = "test.forecast.transition.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer {
+            try? files.removeItem(at: directory)
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+        let modelID = UUID().uuidString.lowercased()
+        let cutoff = Date(timeIntervalSince1970: 1_800_000_000)
+        let reference = cutoff.addingTimeInterval(3600)
+        let prediction = GlucoseForecastMLTransitionEvidence.Prediction(
+            referenceDate: reference, computedAt: reference.addingTimeInterval(15),
+            sensorID: "sensor-a", engine60Mgdl: 150, model60Mgdl: 140)
+        let first = GlucoseForecastMLTransitionEvidence(directory: directory, defaults: defaults)
+        first.capture(prediction, modelID: modelID, cutoff: cutoff, onChange: {})
+        if case .awaiting(_, let pairs) = first.status(modelID: modelID, cutoff: cutoff) {
+            XCTAssertEqual(pairs, 0)
+        } else { XCTFail("Expected pending comparison") }
+        let restarted = GlucoseForecastMLTransitionEvidence(directory: directory, defaults: defaults)
+        // A different sensor cannot furnish the target, even with an exact timestamp.
+        restarted.observe([.init(date: prediction.targetDate, glucoseMgdl: 140,
+            sensorID: "sensor-b")], at: prediction.targetDate.addingTimeInterval(180),
+            modelID: modelID, cutoff: cutoff, onChange: {})
+        restarted.observe([.init(date: prediction.targetDate.addingTimeInterval(30),
+            glucoseMgdl: 145, sensorID: "sensor-a")],
+            at: prediction.targetDate.addingTimeInterval(240),
+            modelID: modelID, cutoff: cutoff, onChange: {})
+        if case .awaiting(_, let pairs) = restarted.status(modelID: modelID, cutoff: cutoff) {
+            XCTAssertEqual(pairs, 1)
+        } else { XCTFail("Expected one paired result after restart") }
+        let ledger = try XCTUnwrap(files.contentsOfDirectory(at: directory,
+            includingPropertiesForKeys: nil).first(where: { $0.lastPathComponent.hasPrefix("transition-") }))
+        try files.removeItem(at: ledger)
+        let afterLoss = GlucoseForecastMLTransitionEvidence(directory: directory, defaults: defaults)
+        if case .unreadable = afterLoss.status(modelID: modelID, cutoff: cutoff) {
+            // Loss of the only prospective ledger disables transition inference.
+        } else { XCTFail("Missing ledger must not start a fresh comparison") }
+    }
+
+    func testProspectiveSevenUsableDaysUsePairedLatestLocalDays() {
+        typealias Evidence = GlucoseForecastMLTransitionEvidence
+        XCTAssertGreaterThanOrEqual(Evidence.State.minimumPairsPerDay * 7,
+            GlucoseForecastMLChronology.minimumSelfCheckRows)
+        let start = Date(timeIntervalSince1970: 1_800_000_000)
+        let pairs: [Evidence.Pair] = (0..<8).flatMap { day in
+            (0..<Evidence.State.minimumPairsPerDay).map { index in
+                let reference = start.addingTimeInterval(Double(day * 86400 + 12 * 3600 + index * 600))
+                let prediction = Evidence.Prediction(referenceDate: reference,
+                    computedAt: reference.addingTimeInterval(10), sensorID: "sensor-a",
+                    engine60Mgdl: 150, model60Mgdl: day == 0 ? 180 : 145)
+                return Evidence.Pair(prediction: prediction,
+                    actualDate: prediction.targetDate, actualMgdl: 145)
+            }
+        }
+        let result = Evidence.State.evaluate(pairs, timeZoneIdentifier: "UTC")
+        XCTAssertEqual(result?.usableDays, 7)
+        XCTAssertEqual(result?.pairCount, 7 * Evidence.State.minimumPairsPerDay)
+        XCTAssertEqual(result?.modelMAE, 0)
+        XCTAssertEqual(result?.engineMAE, 5)
+    }
+
+    private func transitionPolicy(_ source: TherapyDataSourceType,
+                                  nightscoutEnabled: Bool) -> DataFlowPolicy {
+        DataFlowPolicy(isMaster: true, followerDataSource: .nightscout,
+            therapyDataSourceSelection: source, nightscoutEnabled: nightscoutEnabled,
+            masterUploadsGlucoseToNightscout: false,
+            followerUploadsGlucoseToNightscout: false,
+            nightscoutFollowType: .none)
+    }
+
+    private func transitionContext(policy: DataFlowPolicy,
+                                   transition: TreatmentSourceCutover,
+                                   old: Bool) -> GlucoseForecastMLContext {
+        let settings = TherapyModelSettings()
+        let flags = old ? "true" : "false"
+        let tail = old ? "cutover:0.0::" :
+            "cutover:\(transition.cutoff.timeIntervalSince1970):" +
+                "\(transition.insulinSourceBundleID):\(transition.carbohydrateSourceBundleID)"
+        let signature = "\(policy)|\(settings)|120|40.0|10.0|" +
+            "\(flags):\(transition.insulinSourceBundleID)|" +
+            "\(flags):\(transition.carbohydrateSourceBundleID)|\(tail)"
+        return GlucoseForecastMLContext(sensitivityMgdlPerUnit: 40,
+            carbohydrateRatioGramsPerUnit: 10, settings: settings,
+            sourceSignature: signature)!
+    }
+
     private func reviewMetadata(schemaVersion: Int = GlucoseForecastMLModelMetadata.schemaVersion,
                                 context: GlucoseForecastMLContext? = nil)
         -> GlucoseForecastMLModelMetadata {

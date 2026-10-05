@@ -553,6 +553,75 @@ final class RootHomeInteractionTests: XCTestCase {
         XCTAssertTrue(coordinator.isShowingCurrentTimeRange)
     }
 
+    func testPenProposalLabelsCGMCOBAsEstimateAndFallbackAsCurve() {
+        let estimated = PenCOBEvidence(curveGrams: 12, estimatedGrams: 5,
+            usedGrams: 5, fallbackReason: nil)
+        let estimateText = PenDoseCOBPresentation.proposalText(estimated)
+        XCTAssertTrue(estimateText.contains("CGM-estimat"))
+        XCTAssertTrue(estimateText.contains("\(PenDoseDisplayFormatter.carbs(5)) g"))
+        XCTAssertFalse(estimateText.contains("\(PenDoseDisplayFormatter.carbs(12)) g"))
+
+        let fallback = PenCOBEvidence(curveGrams: 12, estimatedGrams: nil,
+            usedGrams: 12, fallbackReason: .historyGap)
+        let fallbackText = PenDoseCOBPresentation.proposalText(fallback)
+        XCTAssertTrue(fallbackText.contains("kurve"))
+        XCTAssertTrue(fallbackText.contains("hul i glukosehistorikken"))
+        XCTAssertFalse(fallbackText.contains("CGM-estimeret"))
+    }
+
+    func testHomeCalculatorShortcutRequiresConsistentLocalOwnerAndLocalMetricSources() throws {
+        let suite = "HomeCalculatorShortcut-" + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let local = DataFlowPolicy(isMaster: true, followerDataSource: .careLink,
+            therapyDataSourceSelection: .none, nightscoutEnabled: true,
+            masterUploadsGlucoseToNightscout: false,
+            followerUploadsGlucoseToNightscout: false, nightscoutFollowType: .none)
+        let remote = DataFlowPolicy(isMaster: true, followerDataSource: .careLink,
+            therapyDataSourceSelection: .nightscout, nightscoutEnabled: true,
+            masterUploadsGlucoseToNightscout: false,
+            followerUploadsGlucoseToNightscout: false, nightscoutFollowType: .none)
+        let boundary = TreatmentSourceCutover(cutoff: Date(),
+            insulinSourceBundleID: "insulin.source", carbohydrateSourceBundleID: "carb.source")
+        func visible(_ policy: DataFlowPolicy, _ iob: TherapyMetricSource? = nil,
+                     _ cob: TherapyMetricSource? = nil, historical: Bool = false,
+                     localInputsComplete: Bool = true,
+                     cutover: TreatmentSourceCutover? = boundary) -> Bool {
+            RootHomeCalculatorShortcutPolicy.isVisible(policy: policy, cutover: cutover,
+                iobSource: iob, cobSource: cob, isHistorical: historical,
+                localInputsComplete: localInputsComplete, defaults: defaults)
+        }
+        XCTAssertTrue(visible(local), "No CGM or metric value must not hide local calculator")
+        XCTAssertTrue(visible(local, .local, .local))
+        XCTAssertFalse(visible(local, .nightscout, .local), "Unavailable external IOB still blocks")
+        XCTAssertFalse(visible(local, .local, .careLink), "Unavailable external COB still blocks")
+        XCTAssertFalse(visible(remote, .local, .local))
+        XCTAssertFalse(visible(local, .local, .local, historical: true))
+        XCTAssertFalse(visible(local, localInputsComplete: false))
+        XCTAssertFalse(visible(local, cutover: nil))
+        defaults.set(true, forKey: TreatmentSourceCutover.restoreRequiresSourceSetupKey)
+        XCTAssertFalse(visible(local))
+        defaults.removeObject(forKey: TreatmentSourceCutover.restoreRequiresSourceSetupKey)
+        defaults.set(Data("corrupted".utf8), forKey: TreatmentSourceCutover.defaultsKey)
+        XCTAssertFalse(visible(local))
+    }
+
+    @MainActor
+    func testHomeCalculatorShortcutReservesFullTouchHeightAtAllTextSizes() {
+        var state = RootHomeLoopState()
+        state.showsIOB = true
+        state.showsCOB = true
+        let host = UIHostingController(rootView: RootHomeLoopView(state: state,
+            actions: RootHomeActions(), showsCalculatorShortcut: true))
+        XCTAssertEqual(host.sizeThatFits(in: CGSize(width: 320, height: 240)).height,
+            44, accuracy: 0.5)
+        let accessibleHost = UIHostingController(rootView: RootHomeLoopView(
+            state: state, actions: RootHomeActions(), showsCalculatorShortcut: true)
+            .environment(\.dynamicTypeSize, .accessibility3))
+        XCTAssertGreaterThanOrEqual(accessibleHost.sizeThatFits(in:
+            CGSize(width: 320, height: 240)).height, 44)
+    }
+
     @MainActor
     func testTherapyStripKeepsCompactHeightWhenHomeHasExtraVerticalSpace() {
         let host = UIHostingController(rootView: RootHomeLoopView(

@@ -307,6 +307,74 @@ edited after the anchor, or now deleted when an earlier revision may have
 existed. The earlier value cannot be reconstructed from the current row; these
 anchors are omitted rather than evaluated with a falsely empty treatment set.
 
+## Historical therapy and local-source cutover after 4297 (candidate)
+
+The 4297 iPhone showed a 365-day history pass but zero historical Health insulin
+and carbohydrate rows. A read-only check of that installed app's preferences on
+5 October 2026 found a **valid** local-treatment cutover with both selected
+mySugr bundle identifiers present; ongoing import was off as intended. Thus a
+missing cutover is a reproducible failure mode, but is not the observed state
+on that iPhone. The actual empty-history cause remains unverified.
+
+The user-initiated training path had requested read access for blood glucose
+alone. It now includes read-only requests for insulin delivery and dietary
+carbohydrates even when ongoing treatment import is disabled. That omission is
+a concrete code defect; whether it accounts for the zero rows on this iPhone
+still requires a new on-device read. The history loader reports the cutover
+state/date/source identifiers, effective ongoing-import flags, per-kind
+executed/skipped query counts and reasons, requested periods, exact selected
+bundle identifiers, and row counts returned by HealthKit before the source
+filter, after the exact source filter, excluded by cutover, and accepted after
+validation. A source query lists available source names and bundle identifiers
+without changing the selected source. The live adapter counts raw **therapy**
+rows before application filtering; glucose selection remains unchanged. Query
+failure, cancellation, timeout and a successful empty response remain distinct.
+An invalid stored cutover stops training with an explicit status before any
+historical query. The 60-day, chronology, calibration and self-check thresholds
+are unchanged.
+
+On the next on-device run, skipped queries identify a missing/invalid setup;
+executed queries with raw rows but no source matches identify a source-ID
+mismatch. An executed query with zero raw rows is still ambiguous: HealthKit
+does not reveal whether read access is denied or the source has no records.
+No diagnosis of the user's actual HealthKit response is claimed until that
+run's new status is collected.
+
+Before a valid cutover, replay accepts treatments only from the saved Health
+source. At or after the cutover it accepts confirmed local treatments only;
+Health copies and later imported rows cannot count twice. Evidence for a
+treatment window that crosses the cutover must exist on both sides for insulin
+and carbohydrates separately. An unknown side is never treated as zero.
+
+A previously self-checked model may remain usable across a documented, clean
+transition to local logging if the **actual six-model package** is readable,
+its existing approval remains valid, all non-source signature components and
+model/engine/features/settings match, and its old source identifiers match the
+saved cutover. This is a compatibility decision, not rewritten model metadata
+or a claim that the model was retrained. The same result governs Settings and
+live inference. A prospective check compares the old model's and engine's
++60-minute errors on paired readings from the same input snapshots. It needs
+seven usable days after cutover; absent pairs or immature targets do not count
+as zero error. If the old model is worse, its model-ID/cutover pair is disabled
+durably. This check is limited to the transition model and does not establish
+clinical accuracy or improvement at +30/+120 minutes.
+
+The separate pen calculator can optionally reduce its curve-based COB using a
+model-based **CGM-estimeret COB**. It reads a bounded glucose/treatment window
+for that calculation only, models each rapid bolus's interval effect, allocates
+positive residual to active meals and applies a minimum-absorption floor. The
+calculator uses `min(curve COB, estimated COB)`; missing, inconsistent or noisy
+history, an unknown relevant profile, manual/explicit fallback glucose, or a
+changed snapshot leave curve COB in force with an explanation. This feature
+does not alter Home COB, the forecast engine, ML, alarms or stored treatments.
+It has not been verified as a clinically reliable measure of absorption.
+
+The combined local candidate passed 1,379/1,379 XCTest tests, all project
+Python controls, both simulator builds and an unsigned iPhoneOS/arm64 build.
+The exact Apple-numbered release checkpoint must be tested again. Synthetic
+HealthKit answers cannot establish the actual iPhone's read permission or
+sample/source counts.
+
 ## After 4294: local treatment data (step B)
 
 Treatment logging can use local xDrip entries as the primary source after an

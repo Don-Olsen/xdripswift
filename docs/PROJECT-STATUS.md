@@ -8,6 +8,59 @@
 - Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
 <!-- testflight-7.1.1-4297:end -->
 
+## Combined candidate after 4297: ML history, model transition and pen calculator
+
+The installed 4297 app was checked read-only on the paired iPhone. Its saved
+treatment cutover is valid, records mySugr for both former sources, and disables
+ongoing Health import as intended. The training path nevertheless requested
+Health read access only for glucose; it omitted insulin delivery and dietary
+carbohydrates. The candidate requests all three read-only when training starts,
+independent of ongoing import. It traces raw HealthKit therapy rows before any
+app filter, source IDs and exact match, cutover/validation/dedup exclusions,
+and query failures separately from empty responses. The loader keeps selected
+Health treatments before the saved cutoff and confirmed local treatments from
+it, with separate source evidence across the cutoff. A test database and mocked
+real query adapter exercise that path. The actual cause of zero therapy rows on
+this iPhone is not yet proven; the next physical training attempt must show the
+new raw counts and source match, and 60 usable days are not promised.
+
+A prior self-checked six-model package may stay active across a clean local
+logging transition only when its real files, full non-source context and former
+source IDs pass the same compatibility decision used by inference and Settings.
+Its original metadata remain intact. The transition model is checked
+prospectively on paired +60-minute results over seven usable days after the
+cutoff and disabled durably for that model/cutoff if worse than the engine.
+Insufficient paired evidence remains pending; it is not a successful check.
+Normal retraining and self-check thresholds are unchanged.
+
+After a valid cutover, Apple Health settings hide the retired import switches,
+pickers, status rows and English footer, while retaining Health write settings
+and showing the stored date and prior source(s) in Danish. Home adds a 44-point
+accessibility target opening the existing pen calculator only when local source
+ownership is valid. The calculator alone can use a conservative CGM-estimated
+COB bounded above by curve COB; it falls back to the original curve input when
+historical glucose, treatments or profile information is insufficient. Home
+COB, the forecast/ML inputs, alarms, Libre/Watch and Nightscout are unchanged.
+This is a model-based estimate, not a measurement of actual carbohydrate
+absorption or evidence of clinical dosing accuracy.
+
+Local candidate validation: 1,379/1,379 XCTest tests passed after two
+asynchronous HealthKit **test-fixture** races were stabilized; all project
+Python controls and both iPhone/Watch simulator builds passed. An unsigned
+iPhoneOS build produced an arm64 executable and compiled the Create ML path.
+One current-build Home screenshot with a synthetic local-source cutoff shows
+the blue calculator shortcut; the synthetic preference was removed afterward.
+The other requested simulator screenshots could not be reached on this Mac:
+this Xcode installation has no Simulator GUI or UI-test target, and the empty
+simulator cannot produce a completed ML or pen calculation. No screenshots or
+health data were added to Git. The release checkpoint must re-run validation
+on the exact Apple-numbered source tree; its results and Apple status belong in
+the block created by the release procedure. Simulator tests cannot prove that
+historical HealthKit rows are readable on this iPhone, that an actual model
+remains clinically suitable, or that a calculated bolus is safe. A fresh
+on-device history run and observation of the calculator are still required
+after the candidate becomes available.
+
 De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
 
 <!-- testflight-7.1.1-4296:start -->

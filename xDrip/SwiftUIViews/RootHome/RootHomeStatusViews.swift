@@ -42,44 +42,102 @@ struct RootHomePumpView: View {
     }
 }
 
+/// Only an authoritative local treatment boundary can open the pen calculator from Home.
+/// Source identity, rather than metric availability, keeps external IOB/COB out of this action.
+enum RootHomeCalculatorShortcutPolicy {
+    static func isVisible(policy: DataFlowPolicy, cutover: TreatmentSourceCutover?,
+                          iobSource: TherapyMetricSource?, cobSource: TherapyMetricSource?,
+                          isHistorical: Bool, localInputsComplete: Bool = true,
+                          defaults: UserDefaults = .standard) -> Bool {
+        guard !isHistorical, localInputsComplete,
+              TherapyMetricsManager.doseSourceIsReady(policy, cutover: cutover,
+                                                       defaults: defaults) else { return false }
+        return (iobSource == nil || iobSource == .local)
+            && (cobSource == nil || cobSource == .local)
+    }
+}
+
 /// Loop status row displayed below the pump and glucose values.
 struct RootHomeLoopView: View {
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @State private var selectedMetric: Bool?
     @State private var showsMetricDetails = false
     let state: RootHomeLoopState
     let actions: RootHomeActions
+    let showsCalculatorShortcut: Bool
+    let onBolusCalculator: () -> Void
+
+    init(state: RootHomeLoopState, actions: RootHomeActions,
+         showsCalculatorShortcut: Bool = false,
+         onBolusCalculator: @escaping () -> Void = {}) {
+        self.state = state
+        self.actions = actions
+        self.showsCalculatorShortcut = showsCalculatorShortcut
+        self.onBolusCalculator = onBolusCalculator
+    }
 
     private enum Layout {
         static let statusSymbolSize: CGFloat = 18
         static let inlineMetricWidth: CGFloat = 78
         static let height: CGFloat = 34
+        static let calculatorTouchSize: CGFloat = 44
     }
 
     var body: some View {
         HStack(spacing: 0) {
-                if state.showsIOB {
-                    metricButton(isIOB: true)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
+            if state.showsIOB {
+                metricButton(isIOB: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            } else if showsCalculatorShortcut {
+                Spacer(minLength: 0)
+            }
 
-                if state.showsCOB {
+            if showsCalculatorShortcut {
+                Button(action: onBolusCalculator) {
+                    Image(systemName: "plus.circle.fill")
+                        .font(.system(size: 24, weight: .medium))
+                        .foregroundStyle(ConstantsAppColors.accent)
+                        .frame(width: Layout.calculatorTouchSize,
+                               height: Layout.calculatorTouchSize)
+                        .contentShape(Rectangle())
+                }
+                .frame(width: Layout.calculatorTouchSize,
+                       height: Layout.calculatorTouchSize)
+                .accessibilityLabel("Bolusberegner")
+                .accessibilityIdentifier("home.bolusCalculator")
+                .layoutPriority(1)
+            }
+
+            if state.showsCOB {
+                if showsCalculatorShortcut {
+                    metricButton(isIOB: false)
+                        .frame(maxWidth: .infinity, alignment: .trailing)
+                } else {
                     metricButton(isIOB: false)
                         .frame(width: Layout.inlineMetricWidth, alignment: .leading)
                 }
-
-                if state.showsAIDStatus {
-                    Button(action: actions.showAIDStatus) { loopStatusView }
-                        .frame(maxWidth: .infinity, alignment: .trailing)
-                }
+            } else if showsCalculatorShortcut {
+                Spacer(minLength: 0)
             }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 2)
-            .frame(maxWidth: .infinity)
-            // Keep the strip at 34 points. An expanding outer frame competes with the flexible
-            // glucose chart for vertical space when Home first lays out or updates.
-            .frame(height: Layout.height)
-            .background(panelBackground(isHistorical: state.isHistorical))
-            .clipShape(RoundedRectangle(cornerRadius: ConstantsHomeView.standardCornerRadius, style: .continuous))
+
+            if state.showsAIDStatus {
+                Button(action: actions.showAIDStatus) { loopStatusView }
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 2)
+        .frame(maxWidth: .infinity)
+        // Give the entire hit region its own 44-point layout. The painted strip remains
+        // 34 points at ordinary text sizes, so no hit target spills into neighboring rows.
+        .frame(height: showsCalculatorShortcut ? Layout.calculatorTouchSize : Layout.height)
+        .background {
+            RoundedRectangle(cornerRadius: ConstantsHomeView.standardCornerRadius,
+                             style: .continuous)
+                .fill(panelBackground(isHistorical: state.isHistorical))
+                .frame(height: showsCalculatorShortcut && dynamicTypeSize.isAccessibilitySize
+                    ? Layout.calculatorTouchSize : Layout.height)
+        }
         .buttonStyle(.plain)
         .sheet(isPresented: $showsMetricDetails) {
             NavigationStack {

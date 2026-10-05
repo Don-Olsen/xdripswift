@@ -64,6 +64,23 @@ struct GlucoseForecastMLHealthSample: Sendable {
     }
 }
 
+/// Counts are captured from the HealthKit callback before the adapter applies
+/// any source or sample conversion filter. The loader keeps only aggregate
+/// evidence; no HealthKit quantities are written to diagnostics.
+struct GlucoseForecastMLHealthSampleBatch: Sendable {
+    let samples: [GlucoseForecastMLHealthSample]
+    let rawCount: Int
+    let rawSourceCounts: [String: Int]
+
+    init(samples: [GlucoseForecastMLHealthSample], rawCount: Int? = nil,
+         rawSourceCounts: [String: Int]? = nil) {
+        self.samples = samples
+        self.rawCount = rawCount ?? samples.count
+        self.rawSourceCounts = rawSourceCounts ??
+            Dictionary(grouping: samples, by: \.sourceBundleIdentifier).mapValues(\.count)
+    }
+}
+
 final class GlucoseForecastMLHealthQueryTicket {
     private let lock = NSLock()
     private var cancelAction: (() -> Void)?
@@ -87,9 +104,11 @@ protocol GlucoseForecastMLHealthQuerying: AnyObject {
         -> GlucoseForecastMLHealthQueryTicket
 
     @discardableResult
+    /// Glucose remains source-filtered. Therapy returns all same-day sources so
+    /// the loader can count rows before applying its existing exact source rule.
     func samples(for kind: GlucoseForecastMLHealthKind, from start: Date, to end: Date,
                  sourceBundleIdentifier: String,
-                 completion: @escaping (Result<[GlucoseForecastMLHealthSample], Error>) -> Void)
+                 completion: @escaping (Result<GlucoseForecastMLHealthSampleBatch, Error>) -> Void)
         -> GlucoseForecastMLHealthQueryTicket
 }
 
@@ -118,7 +137,7 @@ final class GlucoseForecastMLLiveHealthQuery: GlucoseForecastMLHealthQuerying {
 
     func samples(for kind: GlucoseForecastMLHealthKind, from start: Date, to end: Date,
                  sourceBundleIdentifier: String,
-                 completion: @escaping (Result<[GlucoseForecastMLHealthSample], Error>) -> Void)
+                 completion: @escaping (Result<GlucoseForecastMLHealthSampleBatch, Error>) -> Void)
         -> GlucoseForecastMLHealthQueryTicket {
         guard HKHealthStore.isHealthDataAvailable(), start < end,
               let type = HKObjectType.quantityType(forIdentifier: kind.quantityIdentifier) else {
@@ -133,10 +152,15 @@ final class GlucoseForecastMLLiveHealthQuery: GlucoseForecastMLHealthQuerying {
                                     key: HKSampleSortIdentifierStartDate, ascending: true)]) {
             _, samples, error in
             if let error { completion(.failure(error)); return }
+            let rawSamples = samples ?? []
+            let rawSourceCounts = Dictionary(grouping: rawSamples,
+                by: { $0.sourceRevision.source.bundleIdentifier }).mapValues(\.count)
             let values = (samples ?? []).compactMap { object -> GlucoseForecastMLHealthSample? in
                 guard let sample = object as? HKQuantitySample,
-                      sample.sourceRevision.source.bundleIdentifier == sourceBundleIdentifier,
-                      sample.startDate >= start, sample.startDate < end else { return nil }
+                      (kind != .glucose ||
+                        sample.sourceRevision.source.bundleIdentifier == sourceBundleIdentifier),
+                      (kind != .glucose ||
+                        (sample.startDate >= start && sample.startDate < end)) else { return nil }
                 return GlucoseForecastMLHealthSample(uuid: sample.uuid,
                     sourceBundleIdentifier: sample.sourceRevision.source.bundleIdentifier,
                     startDate: sample.startDate, endDate: sample.endDate,
@@ -145,7 +169,8 @@ final class GlucoseForecastMLLiveHealthQuery: GlucoseForecastMLHealthQuerying {
                     hasUndeterminedDuration: sample.hasUndeterminedDuration,
                     sampleCount: sample.count)
             }
-            completion(.success(values))
+            completion(.success(GlucoseForecastMLHealthSampleBatch(samples: values,
+                rawCount: rawSamples.count, rawSourceCounts: rawSourceCounts)))
         }
         store.execute(query)
         return GlucoseForecastMLHealthQueryTicket { [store] in store.stop(query) }

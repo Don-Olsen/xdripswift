@@ -1253,10 +1253,32 @@ final class PenBolusCalculatorTests: XCTestCase {
     }
 
     private func snapshot(glucose: [GlucoseForecastSample]? = nil,
-                          treatments: [TherapyTreatment] = []) throws -> PenDoseInputSnapshot {
+                          treatments: [TherapyTreatment] = [],
+                          historicalGlucose: [GlucoseForecastSample]? = nil) throws -> PenDoseInputSnapshot {
         try PenDoseInputSnapshot.make(capturedAt: now,
             glucose: glucose ?? self.glucose(), treatments: treatments,
-            therapySettings: TherapyModelSettings(), treatmentRevision: 4).get()
+            therapySettings: TherapyModelSettings(), treatmentRevision: 4,
+            historicalGlucose: historicalGlucose, sourceSignature: "source-a").get()
+    }
+
+    private func historicalProfile() -> PenDoseProfile {
+        var candidate = PenDoseProfile.prefilledUnconfirmed
+        XCTAssertTrue(candidate.confirm(at: now.addingTimeInterval(-36 * 60 * 60)))
+        return candidate
+    }
+
+    private func historicalSamples(_ values: [Double], firstMinute: Int = -35)
+        -> [GlucoseForecastSample] {
+        values.enumerated().map { offset, value in
+            GlucoseForecastSample(date: now.addingTimeInterval(Double(firstMinute + offset * 5) * 60),
+                glucoseMgdl: value, sensorID: "sensor-a")
+        }
+    }
+
+    private func fallbackReason<Value>(_ result: Result<Value, PenCOBFallbackReason>)
+        -> PenCOBFallbackReason? {
+        if case .failure(let reason) = result { return reason }
+        return nil
     }
 
     func testPrefilledProfileIsUnconfirmedAndEditingInvalidatesConfirmation() throws {
@@ -1571,6 +1593,314 @@ final class PenBolusCalculatorTests: XCTestCase {
         XCTAssertEqual(defaults.glucoseForecastHorizonMinutes, 0,
             "Home chart setting must not govern the safety engine")
     }
+
+    func testCGMCOBReducesOnlyDoseCOBAndNeverRaisesRawProposal() throws {
+        let samples = historicalSamples([120, 120, 130, 140, 150, 160, 170, 180])
+        let meal = TherapyTreatment(date: now.addingTimeInterval(-30 * 60),
+            amount: 60, isIOB: false, carbohydrateDurationMinutes: 300,
+            stableIdentity: "meal:slow")
+        let withHistory = try snapshot(glucose: Array(samples.suffix(7)),
+            treatments: [meal], historicalGlucose: samples)
+        let withoutHistory = try snapshot(glucose: Array(samples.suffix(7)),
+            treatments: [meal])
+        let estimated = PenBolusCalculator.calculate(snapshot: withHistory,
+            profile: historicalProfile(), glucose: .currentCGM,
+            newCarbs: .unrecorded(grams: 20), safetyForecast: nil, at: now)
+        let fallback = PenBolusCalculator.calculate(snapshot: withoutHistory,
+            profile: historicalProfile(), glucose: .currentCGM,
+            newCarbs: .unrecorded(grams: 20), safetyForecast: nil, at: now)
+        let evidence = try XCTUnwrap(estimated.cobEvidence)
+        XCTAssertNil(evidence.fallbackReason)
+        XCTAssertLessThan(try XCTUnwrap(evidence.estimatedGrams), evidence.curveGrams)
+        XCTAssertEqual(evidence.usedGrams, try XCTUnwrap(evidence.estimatedGrams), accuracy: 0.001)
+        XCTAssertEqual(fallback.cobEvidence?.fallbackReason, .missingHistory)
+        XCTAssertEqual(fallback.cobEvidence?.usedGrams, fallback.cobEvidence?.curveGrams)
+        let baselineProfile = try XCTUnwrap(historicalProfile().values(at: now))
+        let baselineTrend = try XCTUnwrap(PenBolusCalculator.twentyMinuteChange(
+            withoutHistory.glucose, at: now))
+        let oldRaw = (withoutHistory.cobGrams + 20) / baselineProfile.carbohydrateRatio +
+            (180 / PenBolusCalculator.mgdlPerMmol - baselineProfile.targetMmol) /
+                baselineProfile.correctionMmolPerUnit +
+            (baselineTrend / PenBolusCalculator.mgdlPerMmol) /
+                baselineProfile.correctionMmolPerUnit - withoutHistory.iobUnits
+        XCTAssertEqual(try XCTUnwrap(fallback.lines?.rawUnits), oldRaw, accuracy: 0.0001,
+            "fallback must reproduce the original curve-COB pen formula")
+        XCTAssertLessThanOrEqual(try XCTUnwrap(estimated.lines?.rawUnits),
+            try XCTUnwrap(fallback.lines?.rawUnits))
+        XCTAssertEqual((estimated.lines?.carbohydratesUnits ?? 0) -
+            evidence.usedGrams / 6, 20 / 6, accuracy: 0.0001,
+            "new grams must be added once, after selecting dose COB")
+    }
+
+    func testCGMCOBFlatGlucoseCreditsModeledPremealRapidInsulinWithUnitParity() throws {
+        let samples = historicalSamples(Array(repeating: 120, count: 8))
+        let meal = TherapyTreatment(date: now.addingTimeInterval(-30 * 60),
+            amount: 60, isIOB: false, carbohydrateDurationMinutes: 300,
+            stableIdentity: "meal:1")
+        let bolus = TherapyTreatment(date: now.addingTimeInterval(-35 * 60),
+            amount: 10, isIOB: true, stableIdentity: "bolus:before")
+        let input = try snapshot(glucose: Array(samples.suffix(7)),
+            treatments: [meal, bolus], historicalGlucose: samples)
+        let estimate = try PenCGMCOBEstimator.estimate(snapshot: input,
+            profile: historicalProfile(), at: now).get()
+        let model = TherapyModelSettings()
+        let absorbedUnits = TherapyCalculations.insulinRemaining(units: 10,
+            minutes: 5, duration: model.insulinDuration, peak: model.insulinPeak) -
+            TherapyCalculations.insulinRemaining(units: 10,
+                minutes: 35, duration: model.insulinDuration, peak: model.insulinPeak)
+        let floorAbsorbed = 60 * 30 / (1.5 * 300)
+        XCTAssertEqual(estimate, 60 - max(floorAbsorbed, absorbedUnits * 6), accuracy: 0.001,
+            "mg/dL and mmol/L conversion must cancel in the insulin/food residual")
+        let noBolus = try snapshot(glucose: Array(samples.suffix(7)),
+            treatments: [meal], historicalGlucose: samples)
+        XCTAssertLessThan(estimate, try PenCGMCOBEstimator.estimate(snapshot: noBolus,
+            profile: historicalProfile(), at: now).get())
+    }
+
+    func testCGMCOBHandlesMidIntervalBolusAndOverlappingMealRedistribution() throws {
+        let samples = historicalSamples(Array(repeating: 120, count: 8))
+        let meal = TherapyTreatment(date: now.addingTimeInterval(-30 * 60),
+            amount: 60, isIOB: false, carbohydrateDurationMinutes: 300,
+            stableIdentity: "meal:1")
+        let before = TherapyTreatment(date: now.addingTimeInterval(-35 * 60),
+            amount: 10, isIOB: true, stableIdentity: "bolus:1")
+        let midway = TherapyTreatment(date: now.addingTimeInterval(-27 * 60),
+            amount: 10, isIOB: true, stableIdentity: "bolus:1")
+        let beforeInput = try snapshot(glucose: Array(samples.suffix(7)),
+            treatments: [meal, before], historicalGlucose: samples)
+        let midwayInput = try snapshot(glucose: Array(samples.suffix(7)),
+            treatments: [meal, midway], historicalGlucose: samples)
+        let beforeRemaining = try PenCGMCOBEstimator.estimate(snapshot: beforeInput,
+            profile: historicalProfile(), at: now).get()
+        let midwayRemaining = try PenCGMCOBEstimator.estimate(snapshot: midwayInput,
+            profile: historicalProfile(), at: now).get()
+        XCTAssertLessThan(beforeRemaining, midwayRemaining,
+            "a bolus already active at interval start has more modeled effect")
+
+        let small = TherapyTreatment(date: now.addingTimeInterval(-30 * 60),
+            amount: 10, isIOB: false, carbohydrateDurationMinutes: 30,
+            stableIdentity: "meal:small")
+        let large = TherapyTreatment(date: small.date, amount: 100, isIOB: false,
+            carbohydrateDurationMinutes: 300, stableIdentity: "meal:large")
+        var absorbed = [0.0, 0.0]
+        PenCGMCOBEstimator.allocate(effectUnits: 10, from: small.date,
+            to: small.date.addingTimeInterval(10 * 60), meals: [small, large],
+            carbohydrateRatios: [6, 6], settings: TherapyModelSettings(), absorbed: &absorbed)
+        XCTAssertEqual(absorbed[0], 10, accuracy: 0.001)
+        XCTAssertEqual(absorbed[1], 50, accuracy: 0.001,
+            "surplus is redistributed only to the concurrent active meal")
+    }
+
+    func testCGMCOBOscillationCancelsAndFastMealUsesOwnDuration() throws {
+        let samples = historicalSamples([120, 120, 140, 120, 140, 120, 140, 120])
+        let slow = TherapyTreatment(date: now.addingTimeInterval(-30 * 60),
+            amount: 60, isIOB: false, carbohydrateDurationMinutes: 300,
+            stableIdentity: "meal:slow")
+        let fast = TherapyTreatment(date: slow.date, amount: 60, isIOB: false,
+            carbohydrateDurationMinutes: 30, stableIdentity: "meal:fast")
+        let slowInput = try snapshot(glucose: Array(samples.suffix(7)),
+            treatments: [slow], historicalGlucose: samples)
+        let fastInput = try snapshot(glucose: Array(samples.suffix(7)),
+            treatments: [fast], historicalGlucose: samples)
+        let slowRemaining = try PenCGMCOBEstimator.estimate(snapshot: slowInput,
+            profile: historicalProfile(), at: now).get()
+        let fastRemaining = try PenCGMCOBEstimator.estimate(snapshot: fastInput,
+            profile: historicalProfile(), at: now).get()
+        XCTAssertEqual(slowRemaining, 60 - 60 * 30 / (1.5 * 300), accuracy: 0.001,
+            "alternating five-minute noise contributes no net absorption")
+        XCTAssertEqual(fastRemaining, 60 - 60 * 30 / (1.5 * 30), accuracy: 0.001)
+        XCTAssertLessThan(fastRemaining, slowRemaining)
+    }
+
+    func testCGMCOBRepeatedTwentyMinuteOscillationFallsBackToCurve() throws {
+        let samples = historicalSamples([120, 120, 140, 140, 120, 120, 140, 140, 120],
+            firstMinute: -40)
+        let meal = TherapyTreatment(date: now.addingTimeInterval(-35 * 60),
+            amount: 60, isIOB: false, carbohydrateDurationMinutes: 300,
+            stableIdentity: "meal:oscillation")
+        let input = try snapshot(glucose: Array(samples.suffix(7)),
+            treatments: [meal], historicalGlucose: samples)
+        XCTAssertEqual(fallbackReason(PenCGMCOBEstimator.estimate(snapshot: input,
+            profile: historicalProfile(), at: now)), .oscillatingSignal,
+            "two rises fully reversed by falls cannot be counted twice as absorption")
+        let dose = PenBolusCalculator.calculate(snapshot: input, profile: historicalProfile(),
+            glucose: .currentCGM, newCarbs: .alreadyRecorded, safetyForecast: nil, at: now)
+        XCTAssertEqual(dose.cobEvidence?.usedGrams, input.cobGrams)
+    }
+
+    func testCGMCOBTransitiveMealOverlapIncludesEarlierCompletedMeal() {
+        let settings = TherapyModelSettings()
+        let old = TherapyTreatment(date: now.addingTimeInterval(-75 * 60),
+            amount: 30, isIOB: false, carbohydrateDurationMinutes: 30,
+            stableIdentity: "meal:old")
+        let middle = TherapyTreatment(date: now.addingTimeInterval(-40 * 60),
+            amount: 30, isIOB: false, carbohydrateDurationMinutes: 30,
+            stableIdentity: "meal:middle")
+        let active = TherapyTreatment(date: now.addingTimeInterval(-10 * 60),
+            amount: 30, isIOB: false, carbohydrateDurationMinutes: 30,
+            stableIdentity: "meal:active")
+        XCTAssertEqual(PenCGMCOBEstimator.historyStart(treatments: [old, middle, active],
+            settings: settings, at: now), old.date)
+    }
+
+    func testCGMCOBTreatmentReadCoversOldMealOverlappingTwentyFourHourWindow() throws {
+        let settings = TherapyModelSettings()
+        let old = TherapyTreatment(date: now.addingTimeInterval(-35 * 60 * 60),
+            amount: 30, isIOB: false, carbohydrateDurationMinutes: 480,
+            stableIdentity: "meal:35h")
+        let middle = TherapyTreatment(date: now.addingTimeInterval(-23 * 60 * 60),
+            amount: 30, isIOB: false, carbohydrateDurationMinutes: 480,
+            stableIdentity: "meal:23h")
+        let active = TherapyTreatment(date: now.addingTimeInterval(-11 * 60 * 60),
+            amount: 30, isIOB: false, carbohydrateDurationMinutes: 480,
+            stableIdentity: "meal:11h")
+        let lookback = PenCGMCOBEstimator.requiredTreatmentLookbackMinutes(settings: settings)
+        XCTAssertGreaterThan(lookback, 35 * 60)
+        XCTAssertEqual(PenCGMCOBEstimator.historyStart(
+            treatments: [old, middle, active], settings: settings, at: now), old.date)
+        let input = try snapshot(treatments: [old, middle, active])
+        XCTAssertEqual(fallbackReason(PenCGMCOBEstimator.estimate(snapshot: input,
+            profile: historicalProfile(), at: now)), .missingHistory,
+            "an overlap extending beyond the bounded CGM history must use curve COB")
+    }
+
+    func testCGMCOBScopedHistoryRejectsNewerInvalidReadingOnSameSensor() throws {
+        let latestValidDate = now.addingTimeInterval(-60)
+        let valid = [PenCOBGlucoseRow(date: now.addingTimeInterval(-6 * 60),
+                        sensorID: "sensor-a", valueMgdl: 120,
+                        isValid: true, isSuppressed: false),
+                     PenCOBGlucoseRow(date: latestValidDate,
+                        sensorID: "sensor-a", valueMgdl: 121,
+                        isValid: true, isSuppressed: false)]
+        let newerRejected = PenCOBGlucoseRow(date: now, sensorID: "sensor-a",
+            valueMgdl: 0, isValid: false, isSuppressed: false)
+        XCTAssertEqual(fallbackReason(TherapyMetricsManager.scopedPenCOBHistory(
+            rows: valid + [newerRejected], sensorID: "sensor-a",
+            latestDate: latestValidDate)), .invalidHistory,
+            "the old valid CGM remains usable for ordinary dosing but cannot justify a COB reduction")
+        let newerSuppressed = PenCOBGlucoseRow(date: now, sensorID: "sensor-a",
+            valueMgdl: 0, isValid: false, isSuppressed: true)
+        let accepted = try TherapyMetricsManager.scopedPenCOBHistory(
+            rows: valid + [newerSuppressed], sensorID: "sensor-a",
+            latestDate: latestValidDate).get()
+        XCTAssertEqual(accepted.last?.date, latestValidDate)
+        let newerValid = PenCOBGlucoseRow(date: now, sensorID: "sensor-a",
+            valueMgdl: 122, isValid: true, isSuppressed: false)
+        XCTAssertEqual(fallbackReason(TherapyMetricsManager.scopedPenCOBHistory(
+            rows: valid + [newerValid], sensorID: "sensor-a",
+            latestDate: latestValidDate)), .changedInputs)
+    }
+
+    func testCGMCOBAllocatesGlucoseEffectWithEachMealsScheduledRatio() throws {
+        let calendar = Calendar.current
+        let day = try XCTUnwrap(calendar.date(from: DateComponents(year: 2026, month: 10,
+            day: 4, hour: 9, minute: 40)))
+        let first = day.addingTimeInterval(-15 * 60) // 09:25, 5 g/E
+        let second = day.addingTimeInterval(-5 * 60) // 09:35, 6 g/E
+        let meals = [TherapyTreatment(date: first, amount: 60, isIOB: false,
+                        carbohydrateDurationMinutes: 240, stableIdentity: "meal:early"),
+                     TherapyTreatment(date: second, amount: 60, isIOB: false,
+                        carbohydrateDurationMinutes: 240, stableIdentity: "meal:late")]
+        var profile = PenDoseProfile.prefilledUnconfirmed
+        XCTAssertTrue(profile.confirm(at: day.addingTimeInterval(-36 * 60 * 60)))
+        let ratios = try meals.map { meal in
+            try XCTUnwrap(profile.values(at: meal.date)?.carbohydrateRatio)
+        }
+        XCTAssertEqual(ratios, [5, 6])
+        var absorbed = [0.0, 0.0]
+        PenCGMCOBEstimator.allocate(effectUnits: 2, from: day,
+            to: day.addingTimeInterval(10 * 60), meals: meals,
+            carbohydrateRatios: ratios, settings: TherapyModelSettings(), absorbed: &absorbed)
+        XCTAssertEqual(absorbed[0], 5, accuracy: 0.001)
+        XCTAssertEqual(absorbed[1], 6, accuracy: 0.001,
+            "equal effect shares use each meal's historical ratio, not one interval ratio")
+    }
+
+    @MainActor func testCGMCOBReviewRejectsEditedDeletedOrChangedSourceEvidence() throws {
+        let samples = historicalSamples(Array(repeating: 120, count: 8))
+        let meal = TherapyTreatment(date: now.addingTimeInterval(-30 * 60),
+            amount: 60, isIOB: false, carbohydrateDurationMinutes: 300,
+            stableIdentity: "meal:one")
+        let original = try snapshot(glucose: Array(samples.suffix(7)),
+            treatments: [meal], historicalGlucose: samples)
+        let editedMeal = TherapyTreatment(date: meal.date, amount: 40, isIOB: false,
+            carbohydrateDurationMinutes: 300, stableIdentity: "meal:one")
+        let edited = try PenDoseInputSnapshot.make(capturedAt: now,
+            glucose: Array(samples.suffix(7)), treatments: [editedMeal],
+            therapySettings: TherapyModelSettings(), treatmentRevision: 5,
+            historicalGlucose: samples, sourceSignature: "source-a").get()
+        let deleted = try PenDoseInputSnapshot.make(capturedAt: now,
+            glucose: Array(samples.suffix(7)), treatments: [],
+            therapySettings: TherapyModelSettings(), treatmentRevision: 5,
+            historicalGlucose: samples, sourceSignature: "source-a").get()
+        let switchedSource = try PenDoseInputSnapshot.make(capturedAt: now,
+            glucose: Array(samples.suffix(7)), treatments: [meal],
+            therapySettings: TherapyModelSettings(), treatmentRevision: 4,
+            historicalGlucose: samples, sourceSignature: "source-b").get()
+        XCTAssertFalse(PenDoseCalculatorViewModel.reviewInputsMatch(original, edited))
+        XCTAssertFalse(PenDoseCalculatorViewModel.reviewInputsMatch(original, deleted))
+        XCTAssertFalse(PenDoseCalculatorViewModel.reviewInputsMatch(original, switchedSource))
+        XCTAssertTrue(PenDoseCalculatorViewModel.reviewInputsMatch(original, original))
+    }
+
+    @MainActor func testCGMCOBFailsBackForGapsSensorProfileAndUnidentifiedTreatment() throws {
+        let samples = historicalSamples(Array(repeating: 120, count: 8))
+        let meal = TherapyTreatment(date: now.addingTimeInterval(-30 * 60),
+            amount: 60, isIOB: false, carbohydrateDurationMinutes: 300,
+            stableIdentity: "meal:1")
+        let gap = samples.filter { $0.date != now.addingTimeInterval(-20 * 60) &&
+            $0.date != now.addingTimeInterval(-15 * 60) &&
+            $0.date != now.addingTimeInterval(-10 * 60) }
+        let gapInput = try snapshot(glucose: Array(samples.suffix(7)),
+            treatments: [meal], historicalGlucose: gap)
+        XCTAssertEqual(fallbackReason(PenCGMCOBEstimator.estimate(snapshot: gapInput,
+            profile: historicalProfile(), at: now)), .historyGap)
+        let switched = samples.enumerated().map { index, sample in
+            GlucoseForecastSample(date: sample.date, glucoseMgdl: sample.glucoseMgdl,
+                sensorID: index == 2 ? "sensor-b" : "sensor-a")
+        }
+        let switchInput = try snapshot(glucose: Array(samples.suffix(7)),
+            treatments: [meal], historicalGlucose: switched)
+        XCTAssertEqual(fallbackReason(PenCGMCOBEstimator.estimate(snapshot: switchInput,
+            profile: historicalProfile(), at: now)), .sensorMismatch)
+        let oldProfile = profile() // confirmed after the meal and cannot explain historical absorption
+        let input = try snapshot(glucose: Array(samples.suffix(7)),
+            treatments: [meal], historicalGlucose: samples)
+        XCTAssertEqual(fallbackReason(PenCGMCOBEstimator.estimate(snapshot: input,
+            profile: oldProfile, at: now)), .historicalProfileUnknown)
+        let unidentified = TherapyTreatment(date: meal.date, amount: meal.amount,
+            isIOB: false, carbohydrateDurationMinutes: 300)
+        let unidentifiedInput = try snapshot(glucose: Array(samples.suffix(7)),
+            treatments: [unidentified], historicalGlucose: samples)
+        XCTAssertEqual(fallbackReason(PenCGMCOBEstimator.estimate(snapshot: unidentifiedInput,
+            profile: historicalProfile(), at: now)), .missingTreatmentIdentity)
+
+        let manual = PenBolusCalculator.calculate(snapshot: input,
+            profile: historicalProfile(), glucose: .manual(valueMgdl: 120, measuredAt: now),
+            newCarbs: .alreadyRecorded, safetyForecast: nil, at: now)
+        XCTAssertEqual(manual.cobEvidence?.fallbackReason, .manualOrUntrendedGlucose)
+        XCTAssertEqual(manual.cobEvidence?.usedGrams, input.cobGrams)
+        let changed = try PenDoseInputSnapshot.make(capturedAt: now,
+            glucose: Array(samples.suffix(7)), treatments: [meal],
+            therapySettings: TherapyModelSettings(), treatmentRevision: 4,
+            historicalGlucoseIssue: .changedInputs, sourceSignature: "source-a").get()
+        XCTAssertEqual(fallbackReason(PenCGMCOBEstimator.estimate(snapshot: changed,
+            profile: historicalProfile(), at: now)), .changedInputs)
+        XCTAssertFalse(PenDoseCalculatorViewModel.reviewInputsMatch(input, changed),
+            "a changed historical read must invalidate the reviewed proposal")
+        let uncovered = try PenDoseInputSnapshot.make(capturedAt: now,
+            glucose: Array(samples.suffix(7)), treatments: [meal],
+            therapySettings: TherapyModelSettings(), treatmentRevision: 4,
+            historicalGlucose: samples,
+            historicalGlucoseIssue: .incompleteTreatmentHistory,
+            sourceSignature: "source-a").get()
+        XCTAssertEqual(fallbackReason(PenCGMCOBEstimator.estimate(snapshot: uncovered,
+            profile: historicalProfile(), at: now)), .incompleteTreatmentHistory)
+        let duplicate = try snapshot(glucose: Array(samples.suffix(7)),
+            treatments: [meal, meal], historicalGlucose: samples)
+        XCTAssertEqual(fallbackReason(PenCGMCOBEstimator.estimate(snapshot: duplicate,
+            profile: historicalProfile(), at: now)), .duplicateTreatmentIdentity)
+    }
 }
 
 private actor PenDoseSnapshotFeed {
@@ -1710,6 +2040,26 @@ private actor DelayedPenDoseSnapshotFeed {
         XCTAssertTrue(viewModel.isCalculating,
             "The existing 15-second clock must invalidate a dose at the next minute boundary")
         XCTAssertFalse(viewModel.isReviewCurrent)
+        viewModel.stop()
+    }
+
+    func testReopeningDoseScreenInvalidatesPreviousSuggestionBeforeRefresh() async throws {
+        let now = Date()
+        let feed = PenDoseSnapshotFeed(samples: [sample(5, value: 120, at: now)])
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let profile = confirmedProfile()
+        let viewModel = PenDoseCalculatorViewModel(coreDataManager: core,
+            profileProvider: { profile }, sourceReadyOverride: { true },
+            snapshotProvider: { date, _ in await feed.snapshot(at: date) })
+        viewModel.start()
+        await viewModel.calculate()
+        viewModel.selectDisplayedCGMWithoutTrend()
+        await viewModel.calculate()
+        XCTAssertTrue(viewModel.isReviewCurrent)
+        viewModel.stop()
+        viewModel.start()
+        XCTAssertFalse(viewModel.isReviewCurrent,
+            "reopening must not leave the previous copyable dose on screen")
         viewModel.stop()
     }
 }

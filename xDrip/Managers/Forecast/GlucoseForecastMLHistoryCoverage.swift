@@ -26,6 +26,44 @@ struct GlucoseForecastMLHistoryReadSpan: Sendable {
     }
 }
 
+enum GlucoseForecastMLHistoryCutoverState: String, Sendable {
+    case missing
+    case valid
+    case invalid
+}
+
+enum GlucoseForecastMLTreatmentQuerySkipReason: String, Sendable {
+    case importDisabledWithoutCutover
+    case missingSelectedSource
+}
+
+/// Counts only. Raw HealthKit results are never retained in diagnostic status.
+struct GlucoseForecastMLTreatmentQueryEvidence: Sendable {
+    let effectiveImportEnabled: Bool
+    var executedQueries = 0
+    var skippedQueries = 0
+    var skipReason: GlucoseForecastMLTreatmentQuerySkipReason?
+    /// The adapter records this at the HKSampleQuery callback, before any app filter.
+    var returnedCount = 0
+    var returnedSourceCounts = [String: Int]()
+    var unconvertedCount = 0
+    var sourceExcludedCount = 0
+    var dateExcludedCount = 0
+    var sourceMatchedCount = 0
+    var cutoffExcludedCount = 0
+    var invalidExcludedCount = 0
+    var duplicateExcludedCount = 0
+    var acceptedCount = 0
+
+    mutating func include(_ batch: GlucoseForecastMLHealthSampleBatch) {
+        returnedCount += batch.rawCount
+        unconvertedCount += max(0, batch.rawCount - batch.samples.count)
+        for (bundle, count) in batch.rawSourceCounts {
+            returnedSourceCounts[bundle, default: 0] += count
+        }
+    }
+}
+
 struct GlucoseForecastMLHistoryCoverage: Sendable {
     let requestedDays: Int
     let requestedStart: Date
@@ -38,6 +76,14 @@ struct GlucoseForecastMLHistoryCoverage: Sendable {
     let localCarbohydrateRead: GlucoseForecastMLHistoryReadSpan
     let insulinSourceBundleID: String?
     let carbohydrateSourceBundleID: String?
+    let cutoverState: GlucoseForecastMLHistoryCutoverState
+    let cutoverDate: Date?
+    let cutoverInsulinSourceBundleID: String?
+    let cutoverCarbohydrateSourceBundleID: String?
+    let discoveredInsulinSources: [GlucoseForecastMLHealthSource]
+    let discoveredCarbohydrateSources: [GlucoseForecastMLHealthSource]
+    let insulinQuery: GlucoseForecastMLTreatmentQueryEvidence
+    let carbohydrateQuery: GlucoseForecastMLTreatmentQueryEvidence
     let acceptedHealthInsulinCount: Int
     let acceptedHealthCarbohydrateCount: Int
     let completedDays: Int
@@ -91,6 +137,34 @@ struct GlucoseForecastMLTherapyEvidence {
                 return false
             }
             day = next
+        }
+        return true
+    }
+}
+
+/// A switch may occur midway through a calendar day. Evidence from one side
+/// cannot certify an interval owned by the other side merely because both
+/// intervals share the same day key. Crossing windows require both sources.
+struct GlucoseForecastMLCutoverTherapyEvidence {
+    let cutoff: Date
+    let importedBefore: GlucoseForecastMLTherapyEvidence
+    let localAfter: GlucoseForecastMLTherapyEvidence
+
+    func covers(from start: Date, to end: Date, calendar: Calendar) -> Bool {
+        guard start <= end else { return false }
+        if start < cutoff {
+            let lastImportedInstant = Date(timeIntervalSinceReferenceDate:
+                cutoff.timeIntervalSinceReferenceDate.nextDown)
+            guard importedBefore.covers(from: start, to: min(end, lastImportedInstant),
+                                        calendar: calendar, usingLocalImport: false) else {
+                return false
+            }
+        }
+        if end >= cutoff {
+            guard localAfter.covers(from: max(start, cutoff), to: end,
+                                   calendar: calendar, usingLocalImport: false) else {
+                return false
+            }
         }
         return true
     }

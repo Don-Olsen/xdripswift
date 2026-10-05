@@ -337,6 +337,12 @@ final class GlucoseForecastDataAdapter {
             slope15MgdlPerMinute: Self.rawSlope15(input.glucose),
             lowSoonActive: LowSoonAlertState.isActive(at: input.now, defaults: defaults))
         guard let selectedML else { return engineResult }
+        // Record only a model that passed the final presentation guard. Compare the
+        // raw old-model curve with the engine, so a display-only low-glucose cap
+        // cannot contaminate the model's measured MAE.
+        GlucoseForecastMLManager.shared.recordTransitionPair(
+            engine: engineResult, modelForecast: mlForecast, input: input,
+            sourceSignature: sourceSignature)
         return GlucoseForecastResult(points: engineResult.points,
                                      referenceDate: engineResult.referenceDate,
                                      reason: engineResult.reason,
@@ -430,6 +436,36 @@ final class GlucoseForecastDataAdapter {
             }
         }
         return result
+    }
+
+    /// Called from the existing saved-glucose event, independently of Home visibility.
+    /// Both readings and the prospective engine/old-model pair are captured through this adapter's
+    /// normal validated path; no retrospective model inference is used at outcome time.
+    func monitorTransitionAfterSavedReading(at now: Date = .now) async {
+        let defaults = self.defaults
+        guard let sensitivity = defaults.glucoseForecastManualSensitivityMgdlPerUnit,
+              let ratio = defaults.glucoseForecastManualCarbRatioGramsPerUnit else { return }
+        let signature = Self.presentationInputSignature(horizonMinutes: 120,
+            defaults: defaults, importer: healthImporter)
+        guard let context = GlucoseForecastMLContext(
+            sensitivityMgdlPerUnit: sensitivity,
+            carbohydrateRatioGramsPerUnit: ratio,
+            settings: TherapyModelSettings(defaults: defaults),
+            sourceSignature: signature),
+              GlucoseForecastMLManager.shared.needsTransitionObservation(context: context)
+        else { return }
+        let readings: [GlucoseForecastSample]? = await withCheckedContinuation { continuation in
+            worker.async(execute: DispatchWorkItem { [self] in
+                continuation.resume(returning: recentGlucose(at: now))
+            })
+        }
+        if let readings {
+            GlucoseForecastMLManager.shared.observeTransition(readings: readings,
+                at: now, context: context)
+        }
+        // The same immutable input goes through ordinary source/freshness guards and
+        // captures the actual model +60 curve before the target glucose can exist.
+        _ = await forecastForPresentation(horizonMinutes: 60, at: now)
     }
 
     static func manualParameters(sensitivity: Double?, ratio: Double?)

@@ -26,6 +26,9 @@ final class GlucoseForecastMLTrainingCoordinator: @unchecked Sendable {
     private var backgroundObservers: [NSObjectProtocol] = []
     private static let automaticRetryInterval: TimeInterval = 24 * 60 * 60
     private static let stoppedStatus = "Historiklæsningen blev stoppet, da appen blev forladt."
+    static let historicalReadIdentifiers: [HKQuantityTypeIdentifier] = [
+        .bloodGlucose, .insulinDelivery, .dietaryCarbohydrates
+    ]
 
     private init() {
         #if canImport(UIKit)
@@ -66,6 +69,15 @@ final class GlucoseForecastMLTrainingCoordinator: @unchecked Sendable {
     func scheduleIfNeeded(coreDataManager: CoreDataManager, policy: DataFlowPolicy,
                           settings: TherapyModelSettings, sensitivity: Double, ratio: Double,
                           sourceSignature: String, force: Bool = false, now: Date = .now) {
+        if TreatmentSourceCutover.hasInvalidStoredValue() {
+            let importer = HealthKitTherapyImportManager.shared
+            updateStatus("Historisk kildeovergang: ugyldig; dato og kilde-id'er kan ikke læses. " +
+                "Løbende import: insulin \(importer.isEnabled(.insulin) ? "til" : "fra"), " +
+                "kulhydrat \(importer.isEnabled(.carbohydrates) ? "til" : "fra"). " +
+                "Behandlingsforespørgsler: 0 udført, sprunget over pga. ugyldig overgang. " +
+                "Træning er stoppet uden at ændre behandlinger.")
+            return
+        }
         guard GlucoseForecastDataAdapter.sourceAllowsForecast(policy),
               GlucoseForecastDataAdapter.treatmentSourcesAreUnambiguous(policy,
                   healthInsulinEnabled: HealthKitTherapyImportManager.shared.isEnabled(.insulin),
@@ -107,7 +119,12 @@ final class GlucoseForecastMLTrainingCoordinator: @unchecked Sendable {
             // A successful HealthKit authorization request does not reveal whether
             // read access was granted. Empty results are handled as missing data;
             // the history loader applies the same coverage rules to local fallback.
-            await Self.requestBloodGlucoseReadAccessIfAvailable()
+            if let authorizationFailure = await Self.requestHistoricalReadAccessIfAvailable() {
+                cancellation.recordReadFailure(authorizationFailure)
+                self.finishPreparation("Historiklæsning stoppet: \(authorizationFailure). " +
+                    "Prognosemotoren bruges fortsat.", cancellation: cancellation)
+                return
+            }
             guard await Self.waitForActiveAfterAuthorization(cancellation: cancellation),
                   !Task.isCancelled, !cancellation.isCancelled else {
                 cancellation.cancel()
@@ -144,7 +161,7 @@ final class GlucoseForecastMLTrainingCoordinator: @unchecked Sendable {
                 let reason = cancellation.readFailure.map { "Historiklæsning stoppet: \($0)." }
                     ?? "Historikken kunne ikke læses sikkert."
                 self.finishPreparation("\(reason) Prognosemotoren bruges fortsat.",
-                    cancellation: cancellation)
+                    cancellation: cancellation, diagnostic: cancellation.readDiagnostic)
             }
         }
         lock.lock()
@@ -200,17 +217,30 @@ final class GlucoseForecastMLTrainingCoordinator: @unchecked Sendable {
         #endif
     }
 
-    private static func requestBloodGlucoseReadAccessIfAvailable() async {
+    private static func requestHistoricalReadAccessIfAvailable() async -> String? {
+        let types = historicalReadIdentifiers.compactMap {
+            HKObjectType.quantityType(forIdentifier: $0)
+        }
         guard HKHealthStore.isHealthDataAvailable(),
-              let glucose = HKObjectType.quantityType(forIdentifier: .bloodGlucose) else { return }
+              types.count == historicalReadIdentifiers.count
+        else { return "Sundhed-historik er ikke tilgængelig på denne enhed" }
         let store = HKHealthStore()
+        let readTypes = Set(types.map { $0 as HKObjectType })
         // HealthKit deliberately does not disclose read authorization. The
         // completion only tells us that the request was processed, not whether
         // samples are readable. Never treat it as proof of permission.
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+        return await withCheckedContinuation { (continuation: CheckedContinuation<String?, Never>) in
             DispatchQueue.main.async {
-                store.requestAuthorization(toShare: [], read: [glucose]) { _, _ in
-                    continuation.resume()
+                store.requestAuthorization(toShare: [],
+                    read: readTypes) { completed, error in
+                    if let error {
+                        let details = error as NSError
+                        continuation.resume(returning:
+                            "Sundhed-tilladelsesanmodning: \(details.domain)/\(details.code)")
+                    } else {
+                        continuation.resume(returning: completed ? nil :
+                            "Sundhed-tilladelsesanmodning blev ikke gennemført")
+                    }
                 }
             }
         }
@@ -231,7 +261,8 @@ final class GlucoseForecastMLTrainingCoordinator: @unchecked Sendable {
     }
 
     private func finishPreparation(_ status: String,
-                                   cancellation: GlucoseForecastMLHistoryCancellation) {
+                                   cancellation: GlucoseForecastMLHistoryCancellation,
+                                   diagnostic: String? = nil) {
         lock.lock()
         guard preparationCancellation === cancellation else { lock.unlock(); return }
         preparationInProgress = false
@@ -239,6 +270,7 @@ final class GlucoseForecastMLTrainingCoordinator: @unchecked Sendable {
         preparationCancellation = nil
         if cancellation.isCancelled { previousAutomaticAttempt = nil }
         preparationStatus = cancellation.isCancelled ? Self.stoppedStatus : status
+        if let diagnostic { preparationCoverage = diagnostic }
         lock.unlock()
         NotificationCenter.default.post(name: Self.statusDidChange, object: nil)
     }
@@ -282,6 +314,56 @@ final class GlucoseForecastMLTrainingCoordinator: @unchecked Sendable {
             "Sundhed-tidspunkter: \(coverage.mergedHealthGlucoseTimestamps) samlet fra kopier · \(coverage.discardedHealthGlucoseTimestamps) kasseret ved konflikt",
             "Ønsket: \(formatter.string(from: coverage.requestedStart))–\(formatter.string(from: coverage.requestedEnd)) · læst \(coverage.completedDays) af \(coverage.requestedDays) dage"
         ]
+        if coverage.cutoverState == .valid, let cutoff = coverage.cutoverDate {
+            formatter.timeStyle = .short
+            lines.append("Kildeovergang: gyldig \(formatter.string(from: cutoff)) · insulin \(coverage.cutoverInsulinSourceBundleID ?? "ukendt") · kulhydrat \(coverage.cutoverCarbohydrateSourceBundleID ?? "ukendt")")
+            formatter.timeStyle = .none
+        } else {
+            lines.append("Kildeovergang: \(coverage.cutoverState == .invalid ? "ugyldig" : "mangler")")
+        }
+        func queryText(_ evidence: GlucoseForecastMLTreatmentQueryEvidence) -> String {
+            let reason: String
+            switch evidence.skipReason {
+            case .importDisabledWithoutCutover:
+                reason = " · springes over: løbende import fra og ingen gyldig overgang"
+            case .missingSelectedSource:
+                reason = " · springes over: intet valgt kilde-id"
+            case nil:
+                reason = ""
+            }
+            let bundles = evidence.returnedSourceCounts.keys.sorted().map {
+                "\($0): \(evidence.returnedSourceCounts[$0, default: 0])"
+            }.joined(separator: ", ")
+            return "løbende import \(evidence.effectiveImportEnabled ? "til" : "fra") · " +
+                "forespørgsler \(evidence.executedQueries) startet / \(evidence.skippedQueries) sprunget over\(reason) · " +
+                "HK-adapter rå \(evidence.returnedCount) [\(bundles.isEmpty ? "ingen kilde" : bundles)] · " +
+                "frasorteret: kilde \(evidence.sourceExcludedCount), tid \(evidence.dateExcludedCount), " +
+                "overgang \(evidence.cutoffExcludedCount), ugyldig \(evidence.invalidExcludedCount), " +
+                "dublet \(evidence.duplicateExcludedCount), ikke-konverterbar \(evidence.unconvertedCount) · " +
+                "efter kilde og tid \(evidence.sourceMatchedCount) · godkendt \(evidence.acceptedCount)"
+        }
+        func discoveredSources(_ values: [GlucoseForecastMLHealthSource], selected: String?) -> String {
+            guard !values.isEmpty else { return "ingen synlige kilder" }
+            return values.sorted { $0.bundleIdentifier < $1.bundleIdentifier }.map {
+                "\($0.name) [\($0.bundleIdentifier)]\($0.bundleIdentifier == selected ? " (eksakt match)" : "")"
+            }.joined(separator: ", ")
+        }
+        func noAcceptedRows(_ label: String,
+                            evidence: GlucoseForecastMLTreatmentQueryEvidence,
+                            selected: String?) -> String? {
+            guard evidence.executedQueries > 0, evidence.acceptedCount == 0 else { return nil }
+            if evidence.returnedCount == 0 {
+                return "Ingen læsbar \(label)historik fra \(selected ?? "valgt kilde") i perioden. " +
+                    "Et tomt Sundhed-svar skelner ikke mellem manglende poster og manglende læseadgang. " +
+                    "Kontrollér appens læseadgang i Sundhed."
+            }
+            if evidence.sourceMatchedCount == 0 {
+                return "Sundhed returnerede \(label)poster, men ingen matchede det gemte kilde-id " +
+                    "\(selected ?? "ukendt"). Ingen anden kilde blev valgt automatisk."
+            }
+            return "Sundhed returnerede \(label)poster fra den valgte kilde, men ingen bestod " +
+                "tid, kildeovergang og validering; se frasorteringstallene ovenfor."
+        }
         if coverage.healthGlucoseByBundle.isEmpty {
             lines.append("Sundhed glukose: ingen læsbare xDrip-kilder fundet")
         } else {
@@ -293,7 +375,21 @@ final class GlucoseForecastMLTrainingCoordinator: @unchecked Sendable {
         }
         lines.append("App glukose: \(spanText(coverage.localGlucoseRead))")
         lines.append("Sundhed insulin (\(coverage.insulinSourceBundleID ?? "ingen kilde")): \(spanText(coverage.healthInsulinRead)) · \(coverage.acceptedHealthInsulinCount) gyldige bolusposter")
+        lines.append("Insulinkilder fundet: \(discoveredSources(coverage.discoveredInsulinSources, selected: coverage.insulinSourceBundleID))")
+        lines.append("Insulinlæsning: \(queryText(coverage.insulinQuery))")
         lines.append("Sundhed kulhydrat (\(coverage.carbohydrateSourceBundleID ?? "ingen kilde")): \(spanText(coverage.healthCarbohydrateRead)) · \(coverage.acceptedHealthCarbohydrateCount) gyldige poster")
+        lines.append("Kulhydratkilder fundet: \(discoveredSources(coverage.discoveredCarbohydrateSources, selected: coverage.carbohydrateSourceBundleID))")
+        lines.append("Kulhydratlæsning: \(queryText(coverage.carbohydrateQuery))")
+        if let message = noAcceptedRows("insulin", evidence: coverage.insulinQuery,
+                                        selected: coverage.insulinSourceBundleID) {
+            lines.append(message + (coverage.insulinQuery.returnedCount == 0 ?
+                " (Insulinlevering)" : ""))
+        }
+        if let message = noAcceptedRows("kulhydrat", evidence: coverage.carbohydrateQuery,
+                                        selected: coverage.carbohydrateSourceBundleID) {
+            lines.append(message + (coverage.carbohydrateQuery.returnedCount == 0 ?
+                " (Kulhydrater)" : ""))
+        }
         lines.append("App-database insulin/kulhydrat: \(spanText(coverage.localInsulinRead)) / \(spanText(coverage.localCarbohydrateRead))")
         lines.append("Dage uden påvist behandlingsdækning: insulin \(coverage.unknownInsulinDays) · kulhydrat \(coverage.unknownCarbohydrateDays)")
         if let median = coverage.healthLocalAbsoluteDifferenceMedianMgdl,

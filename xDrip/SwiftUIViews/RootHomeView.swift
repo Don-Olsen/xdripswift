@@ -173,6 +173,7 @@ struct RootHomeView: View {
         static let ipadGlanceCardVerticalPadding: CGFloat = 10
         static let ipadLoopRowSpacing: CGFloat = 6
         static let ipadLoopRowHeight: CGFloat = 34
+        static let ipadCalculatorRowHeight: CGFloat = 44
         static let ipadPumpGlucoseSpacing: CGFloat = 80
         static let ipadMinimumGlucoseReadingWidth: CGFloat = 180
         static let ipadChartExpansionButtonTrailingInset: CGFloat = 52
@@ -221,6 +222,7 @@ struct RootHomeView: View {
     @State private var showOriginalBGReadingsOnly = false
     @State private var chartYAxisResetRevision = 0
     @State private var showsExpandedIPadChart = false
+    @State private var showsPenCalculator = false
     @State private var healthTherapySelectionSignature = ""
     @State private var forecastPresentation = RootHomeForecastPresentationState()
     @State private var forecastDataRevision = 0
@@ -537,6 +539,15 @@ struct RootHomeView: View {
         .fullScreenCover(isPresented: $showsExpandedIPadChart) {
             expandedIPadChart
         }
+        .sheet(isPresented: $showsPenCalculator) {
+            PenDoseCalculatorScreen(coreDataManager: coreDataManager,
+                reminderMealUUID: nil,
+                onSave: {
+                    showsPenCalculator = false
+                    actions.refreshPumpAndLoopStatus()
+                },
+                onCancel: { showsPenCalculator = false })
+        }
     }
 
     @ViewBuilder
@@ -717,7 +728,9 @@ struct RootHomeView: View {
                 glucoseStatusRow
 
                 if showsTherapyRow(loop) {
-                    RootHomeLoopView(state: loop, actions: actions)
+                    RootHomeLoopView(state: loop, actions: actions,
+                        showsCalculatorShortcut: showsCalculatorShortcut(loop),
+                        onBolusCalculator: { showsPenCalculator = true })
                 }
 
                 mainChart
@@ -854,7 +867,9 @@ struct RootHomeView: View {
     private func ipadGlanceCardHeight(_ loop: RootHomeLoopState) -> CGFloat {
         let currentStatusHeight = Layout.glucoseStatusRowHeight
             + (Layout.ipadGlanceCardVerticalPadding * 2)
-            + (showsTherapyRow(loop) ? Layout.ipadLoopRowSpacing + Layout.ipadLoopRowHeight : 0)
+            + (showsTherapyRow(loop) ? Layout.ipadLoopRowSpacing
+                + (showsCalculatorShortcut(loop)
+                    ? Layout.ipadCalculatorRowHeight : Layout.ipadLoopRowHeight) : 0)
 
         guard state.visibility.showsStatistics else { return currentStatusHeight }
 
@@ -901,7 +916,9 @@ struct RootHomeView: View {
             glucoseStatusRow(spacing: pumpGlucoseSpacing)
 
             if showsTherapyRow(loop) {
-                RootHomeLoopView(state: loop, actions: actions)
+                RootHomeLoopView(state: loop, actions: actions,
+                    showsCalculatorShortcut: showsCalculatorShortcut(loop),
+                    onBolusCalculator: { showsPenCalculator = true })
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
@@ -1268,8 +1285,22 @@ struct RootHomeView: View {
         showTreatments && showTherapySummary && state.visibility.showsPump
     }
 
+    private func showsCalculatorShortcut(_ loop: RootHomeLoopState) -> Bool {
+        RootHomeCalculatorShortcutPolicy.isVisible(
+            policy: UserDefaults.standard.dataFlowPolicy,
+            cutover: TreatmentSourceCutover.current(),
+            iobSource: loop.therapyMetrics?.iob.source,
+            cobSource: loop.therapyMetrics?.cob.source,
+            isHistorical: loop.isHistorical,
+            localInputsComplete: !TherapyMetricsManager.shared.hasUncommittedForecastInputChanges
+                && !HealthKitTherapyImportManager.shared.localInputIsIncomplete(.insulin)
+                && !HealthKitTherapyImportManager.shared.localInputIsIncomplete(.carbohydrates))
+    }
+
     private func showsTherapyRow(_ loop: RootHomeLoopState) -> Bool {
-        showTreatments && showTherapySummary && !state.usesScreenLockNightLayout && (loop.showsIOB || loop.showsCOB || loop.showsAIDStatus)
+        showTreatments && showTherapySummary && !state.usesScreenLockNightLayout
+            && (loop.showsIOB || loop.showsCOB || loop.showsAIDStatus
+                || showsCalculatorShortcut(loop))
     }
 
     private var loopDisplayState: RootHomeLoopState {

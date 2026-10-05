@@ -19,6 +19,30 @@ fileprivate enum Setting: Int, CaseIterable {
     case importCarbohydrates
 }
 
+/// A completed local source switch changes the controls, not the historical Health data.
+/// Resolve source names only against the identifiers captured at the switch boundary.
+enum HealthKitLocalCutoverPresentation {
+    static func isActive(policy: DataFlowPolicy, cutover: TreatmentSourceCutover?,
+                         defaults: UserDefaults = .standard) -> Bool {
+        TherapyMetricsManager.doseSourceIsReady(policy, cutover: cutover, defaults: defaults)
+    }
+
+    static func priorSourceName(_ selected: HealthTherapyImportSource?,
+                                expectedBundleID: String) -> String {
+        guard selected?.bundleIdentifier == expectedBundleID else { return expectedBundleID }
+        return selected?.name ?? expectedBundleID
+    }
+
+    static func cutoffDescription(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "da_DK")
+        formatter.timeZone = .autoupdatingCurrent
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return formatter.string(from: date)
+    }
+}
+
 /// conforms to SettingsViewModelProtocol for all healthkit settings in the first sections screen
 class SettingsViewHealthKitSettingsViewModel:SettingsViewModelProtocol {
     
@@ -27,12 +51,38 @@ class SettingsViewHealthKitSettingsViewModel:SettingsViewModelProtocol {
     /// for logging
     private var log = OSLog(subsystem: ConstantsLog.subSystem, category: ConstantsLog.categoryHealthKitManager)
     private var sectionReloadClosure: (() -> Void)?
-    
+    private let defaults: UserDefaults
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+    }
+
     // MARK: - Native SwiftUI rows
     
+    private var hasConsistentLocalCutover: Bool {
+        HealthKitLocalCutoverPresentation.isActive(
+            policy: defaults.dataFlowPolicy,
+            cutover: TreatmentSourceCutover.current(defaults: defaults),
+            defaults: defaults)
+    }
+
     func settingsRows(sectionID: Int) -> [SettingsRow] {
-        [
-            nativeSettingsRow(id: "healthKit.enabledHealthKit", index: Setting.enabledHealthKit.rawValue, sectionID: sectionID),
+        let writeToHealth = nativeSettingsRow(id: "healthKit.enabledHealthKit",
+            index: Setting.enabledHealthKit.rawValue, sectionID: sectionID)
+        let localCutover = SettingsRow(
+            id: "healthKit.localTreatmentCutover",
+            title: "Log behandlinger i xDrip",
+            control: .custom(content: {
+                AnyView(HealthTherapyLocalCutoverRow(onCutoverChanged: { [weak self] in
+                    self?.sectionReloadClosure?()
+                }))
+            })
+        )
+        if hasConsistentLocalCutover {
+            return [writeToHealth, localCutover]
+        }
+        return [
+            writeToHealth,
             nativeSettingsRow(id: "healthKit.importBolusInsulin", index: Setting.importBolusInsulin.rawValue, sectionID: sectionID),
             SettingsRow(
                 id: "healthKit.insulinSource",
@@ -67,11 +117,7 @@ class SettingsViewHealthKitSettingsViewModel:SettingsViewModelProtocol {
                     AnyView(HealthTherapyImportStatusRow(kind: .carbohydrates, title: Texts_SettingsView.healthKitCarbohydrateStatus))
                 })
             ),
-            SettingsRow(
-                id: "healthKit.localTreatmentCutover",
-                title: "Log behandlinger i xDrip",
-                control: .custom(content: { AnyView(HealthTherapyLocalCutoverRow()) })
-            )
+            localCutover
         ]
     }
 
@@ -113,7 +159,7 @@ class SettingsViewHealthKitSettingsViewModel:SettingsViewModelProtocol {
     }
 
     func sectionFooter() -> String? {
-        Texts_SettingsView.healthKitTherapyImportExplanation
+        hasConsistentLocalCutover ? nil : Texts_SettingsView.healthKitTherapyImportExplanation
     }
     
     func numberOfRows() -> Int {
@@ -231,6 +277,7 @@ class SettingsViewHealthKitSettingsViewModel:SettingsViewModelProtocol {
 }
 
 private struct HealthTherapyLocalCutoverRow: View {
+    let onCutoverChanged: () -> Void
     @State private var switching = false
     @State private var message: String?
     @State private var cutover = TreatmentSourceCutover.current()
@@ -243,10 +290,24 @@ private struct HealthTherapyLocalCutoverRow: View {
                     .font(.footnote)
                     .foregroundStyle(.orange)
             }
-            if let cutover {
-                Text("Aktiv siden \(cutover.cutoff.formatted(date: .abbreviated, time: .shortened)). Tidligere importerede behandlinger fra før skiftet bevares.")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
+            if let cutover,
+               HealthKitLocalCutoverPresentation.isActive(
+                policy: UserDefaults.standard.dataFlowPolicy, cutover: cutover) {
+                let insulin = HealthKitLocalCutoverPresentation.priorSourceName(
+                    HealthKitTherapyImportManager.shared.selectedSource(.insulin),
+                    expectedBundleID: cutover.insulinSourceBundleID)
+                let carbohydrate = HealthKitLocalCutoverPresentation.priorSourceName(
+                    HealthKitTherapyImportManager.shared.selectedSource(.carbohydrates),
+                    expectedBundleID: cutover.carbohydrateSourceBundleID)
+                Text("Lokal registrering siden \(HealthKitLocalCutoverPresentation.cutoffDescription(cutover.cutoff)).")
+                    .font(.footnote).foregroundStyle(.secondary)
+                Text("Tidligere kilde · insulin: \(insulin) · kulhydrater: \(carbohydrate).")
+                    .font(.footnote).foregroundStyle(.secondary)
+                Text("Behandlinger fra før skiftet vises kun, hvis de findes og kan læses.")
+                    .font(.footnote).foregroundStyle(.secondary)
+            } else if cutover != nil {
+                Text("Kildeopsætningen er ufuldstændig. Kontroller behandlingskilden før brug.")
+                    .font(.footnote).foregroundStyle(.orange)
             } else {
                 let insulinSource = HealthKitTherapyImportManager.shared.selectedSource(.insulin)
                 let carbohydrateSource = HealthKitTherapyImportManager.shared.selectedSource(.carbohydrates)
@@ -260,6 +321,7 @@ private struct HealthTherapyLocalCutoverRow: View {
                     HealthKitTherapyImportManager.shared.switchToLocalLogging { error in
                         switching = false
                         cutover = TreatmentSourceCutover.current()
+                        if error == nil { onCutoverChanged() }
                         if error != nil {
                             message = "Skiftet blev ikke gennemført. Vælg og aktivér mySugr som både insulin- og kulhydratkilde, og prøv igen. Intet er ændret."
                         }

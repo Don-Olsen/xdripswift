@@ -20,6 +20,9 @@ struct TherapyTreatment: Sendable {
     let date: Date
     let amount: Double
     let isIOB: Bool
+    /// Stable, source-qualified identity for the optional CGM-based pen COB calculation.
+    /// A missing identity does not alter ordinary IOB/COB or forecast calculations.
+    let stableIdentity: String?
     /// A nil value is retained for older test callers; persisted carbohydrate rows supply 240.
     let carbohydrateDurationMinutes: Double?
     /// A local revision is usable in historical replay only after this instant.
@@ -33,10 +36,12 @@ struct TherapyTreatment: Sendable {
     init(date: Date, amount: Double, isIOB: Bool,
          carbohydrateDurationMinutes: Double? = nil, knownAt: Date? = nil,
          createdAt: Date? = nil, modifiedAt: Date? = nil,
-         isAppLocal: Bool = false, isDeletedCurrentRevision: Bool = false) {
+         isAppLocal: Bool = false, isDeletedCurrentRevision: Bool = false,
+         stableIdentity: String? = nil) {
         self.date = date
         self.amount = amount
         self.isIOB = isIOB
+        self.stableIdentity = stableIdentity
         self.carbohydrateDurationMinutes = carbohydrateDurationMinutes
         self.knownAt = knownAt
         self.createdAt = createdAt
@@ -48,6 +53,22 @@ struct TherapyTreatment: Sendable {
     func carbohydrateDuration(or fallback: Double) -> Double {
         carbohydrateDurationMinutes ?? fallback
     }
+}
+
+/// Detached CGM evidence for the calculator's optional historical COB estimate.
+/// Rejected newer readings must remain visible to this check even when the normal
+/// latest-valid-CGM selection correctly omits them.
+struct PenCOBGlucoseRow {
+    let date: Date
+    let sensorID: String?
+    let valueMgdl: Double
+    let isValid: Bool
+    let isSuppressed: Bool
+}
+
+private struct PenCOBHistoryRead: Equatable {
+    let samples: [GlucoseForecastSample]?
+    let issue: PenCOBFallbackReason?
 }
 
 struct TherapyChartLoad {
@@ -358,11 +379,38 @@ final class TherapyMetricsManager {
         guard firstGlucose != nil || allowMissingGlucose else {
             return .failure(.missingGlucose)
         }
-        let windowMinutes = max(settings.insulinDuration, 480)
+        // Include a meal that began before the CGM window but still overlaps it,
+        // plus any rapid bolus already active when that overlap began.
+        let windowMinutes = PenCGMCOBEstimator.requiredTreatmentLookbackMinutes(
+            settings: settings)
         guard let treatments = treatments(from: date.addingTimeInterval(-windowMinutes * 60),
                                            to: date, policy: policy, settings: settings) else {
             return .failure(.treatmentReadFailed)
         }
+        let historyStart = PenCGMCOBEstimator.historyStart(treatments: treatments,
+            settings: settings, at: date)
+        let historicalTreatmentCoverageUnknown: Bool = {
+            guard let start = historyStart,
+                  let cutover = TreatmentSourceCutover.current(defaults: defaults) else { return false }
+            let priorActiveBolus = treatments.filter { $0.isIOB && $0.date < start &&
+                $0.date.addingTimeInterval(settings.insulinDuration * 60) > start
+            }.map(\.date).min()
+            let provenanceStart = min(start, priorActiveBolus ?? start)
+            guard provenanceStart < cutover.cutoff else { return false }
+            return HealthTherapyImportKind.allCases.contains { kind in
+                guard let coveredSince = importer.historyStart(kind) else { return true }
+                return coveredSince > provenanceStart
+            }
+        }()
+        func readScopedHistory(for glucose: [GlucoseForecastSample]?) -> PenCOBHistoryRead {
+            guard let start = historyStart else { return PenCOBHistoryRead(samples: nil, issue: nil) }
+            guard let latest = glucose?.last else {
+                return PenCOBHistoryRead(samples: nil, issue: .missingHistory)
+            }
+            return penCOBGlucoseHistory(from: start.addingTimeInterval(
+                -PenCGMCOBEstimator.maximumRawGapSeconds), through: date, latest: latest)
+        }
+        let firstHistory = readScopedHistory(for: firstGlucose)
         let finalGlucose = glucoseReader.recentGlucose(at: date)
         guard firstGlucose == finalGlucose,
               finalGlucose != nil || allowMissingGlucose,
@@ -377,9 +425,81 @@ final class TherapyMetricsManager {
                   horizonMinutes: 120, defaults: defaults, importer: importer) else {
             return .failure(.treatmentChangedDuringRead)
         }
+        let finalHistory = readScopedHistory(for: finalGlucose)
+        guard revision == treatmentChangeRevision,
+              !hasUncommittedForecastInputChanges,
+              !importer.localInputIsIncomplete(.insulin),
+              !importer.localInputIsIncomplete(.carbohydrates),
+              sourceSignature == GlucoseForecastDataAdapter.presentationInputSignature(
+                  horizonMinutes: 120, defaults: defaults, importer: importer) else {
+            return .failure(.treatmentChangedDuringRead)
+        }
+        let historyChanged = firstHistory != finalHistory
         return PenDoseInputSnapshot.make(capturedAt: date, glucose: finalGlucose ?? [],
             treatments: treatments.filter { $0.date <= date }, therapySettings: settings,
-            treatmentRevision: revision)
+            treatmentRevision: revision,
+            historicalGlucose: historyChanged ? nil : finalHistory.samples,
+            historicalGlucoseIssue: historicalTreatmentCoverageUnknown ? .incompleteTreatmentHistory :
+                historyChanged ? .changedInputs :
+                finalHistory.issue,
+            sourceSignature: sourceSignature)
+    }
+
+    /// The optional calculator estimate reads only its relevant historical window. A failed
+    /// read or mismatched sensor leaves the original curve COB available as the fallback.
+    private func penCOBGlucoseHistory(from start: Date, through end: Date,
+                                      latest: GlucoseForecastSample) -> PenCOBHistoryRead {
+        guard let coreDataManager, let sensorID = latest.sensorID, !sensorID.isEmpty,
+              start < end else { return PenCOBHistoryRead(samples: nil, issue: .missingHistory) }
+        let context = coreDataManager.privateManagedObjectContext
+        var result = PenCOBHistoryRead(samples: nil, issue: .missingHistory)
+        context.performAndWait {
+            let request: NSFetchRequest<BgReading> = BgReading.fetchRequest()
+            request.predicate = NSPredicate(format: "timeStamp >= %@ AND timeStamp <= %@",
+                start as NSDate, end as NSDate)
+            request.sortDescriptors = [NSSortDescriptor(key: #keyPath(BgReading.timeStamp), ascending: true)]
+            request.fetchBatchSize = 200
+            request.relationshipKeyPathsForPrefetching = ["sensor"]
+            do {
+                let readings = try context.fetch(request)
+                let rows = readings.map { reading in
+                    PenCOBGlucoseRow(date: reading.timeStamp, sensorID: reading.sensor?.id,
+                        valueMgdl: reading.finalValue,
+                        isValid: reading.isValidForDownstream,
+                        isSuppressed: reading.isSuppressedByFiveMinuteCadence)
+                }
+                switch Self.scopedPenCOBHistory(rows: rows, sensorID: sensorID,
+                                                 latestDate: latest.date) {
+                case .success(let samples):
+                    result = PenCOBHistoryRead(samples: samples, issue: nil)
+                case .failure(let reason):
+                    result = PenCOBHistoryRead(samples: nil, issue: reason)
+                }
+            } catch { result = PenCOBHistoryRead(samples: nil, issue: .missingHistory) }
+        }
+        return result
+    }
+
+    static func scopedPenCOBHistory(rows: [PenCOBGlucoseRow], sensorID: String,
+                                    latestDate: Date)
+        -> Result<[GlucoseForecastSample], PenCOBFallbackReason> {
+        guard !sensorID.isEmpty else { return .failure(.sensorMismatch) }
+        var values = [Date: Double]()
+        for row in rows.sorted(by: { $0.date < $1.date }) where !row.isSuppressed {
+            guard row.sensorID == sensorID else { return .failure(.sensorMismatch) }
+            guard row.isValid, row.valueMgdl.isFinite,
+                  (20...600).contains(row.valueMgdl) else { return .failure(.invalidHistory) }
+            // A newer rejected reading must be seen above; a newer valid reading means
+            // latest-valid selection changed during the read. Neither proves absorption.
+            guard row.date <= latestDate else { return .failure(.changedInputs) }
+            if let previous = values[row.date], previous != row.valueMgdl {
+                return .failure(.invalidHistory)
+            }
+            values[row.date] = row.valueMgdl
+        }
+        let samples = values.map { GlucoseForecastSample(date: $0.key,
+            glucoseMgdl: $0.value, sensorID: sensorID) }.sorted { $0.date < $1.date }
+        return samples.isEmpty ? .failure(.missingHistory) : .success(samples)
     }
 
     private static func sourceInputsUnambiguousForDose(policy: DataFlowPolicy,
@@ -591,7 +711,8 @@ final class TherapyMetricsManager {
                             knownAt: $0.isAppLocalTreatment ? $0.knownAtForCurrentRevision : nil,
                             createdAt: $0.isAppLocalTreatment ? $0.createdAt : nil,
                             modifiedAt: $0.isAppLocalTreatment ? $0.modifiedAt : nil,
-                            isAppLocal: $0.isAppLocalTreatment)
+                            isAppLocal: $0.isAppLocalTreatment,
+                            stableIdentity: Self.stablePenTreatmentIdentity($0))
                     }
             } catch { result = nil }
         }
@@ -603,6 +724,15 @@ final class TherapyMetricsManager {
         treatmentCache[cacheKey] = result
         if result == nil { failedReads[cacheKey] = Date() }
         return result
+    }
+
+    private static func stablePenTreatmentIdentity(_ entry: TreatmentEntry) -> String? {
+        if let value = entry.localTreatmentUUID, !value.isEmpty { return "local:\(value)" }
+        if let value = entry.watchSourceUUID, !value.isEmpty { return "watch:\(value)" }
+        if let value = entry.healthKitSampleUUID, !value.isEmpty { return "health:\(value)" }
+        if let value = entry.careLinkSourceIdentifier, !value.isEmpty { return "carelink:\(value)" }
+        if !entry.id.isEmpty { return "nightscout:\(entry.id)" }
+        return nil
     }
 
     /// Source selection and cross-import precedence are pure so synthetic Core Data tests can

@@ -30,6 +30,114 @@ enum GlucoseForecastMLTrainingProgress: Equatable, Sendable {
 }
 
 enum GlucoseForecastMLModelCompatibility {
+    enum InvalidReason: Equatable {
+        case packageUnavailable
+        case generationChanged
+        case parametersChanged
+        case sourceChanged
+        case malformedSignature
+        case transitionUnverified
+        case sourceSetupIncomplete
+        case prospectiveWorse
+        case evidenceUnreadable
+    }
+
+    enum Assessment: Equatable {
+        case exact
+        case transitionCompatible(TreatmentSourceCutover)
+        case invalid(InvalidReason)
+    }
+
+    /// Parse the complete historical signature, rather than replacing substrings
+    /// in an opaque string. This accepts only the two known serialized layouts:
+    /// before the cutoff field existed, and the layout with an explicit cutoff.
+    private struct SourceSignature {
+        struct Import: Equatable {
+            let enabled: Bool
+            let bundleID: String
+        }
+        let unchangedFields: [String]
+        let imports: [Import]
+        let cutoff: String?
+
+        init?(_ raw: String) {
+            let fields = raw.split(separator: "|", omittingEmptySubsequences: false).map(String.init)
+            guard fields.count == 7 || fields.count == 8,
+                  fields[0...4].allSatisfy({ !$0.isEmpty }), fields[2] == "120" else { return nil }
+            var parsed = [Import]()
+            for field in fields[5...6] {
+                let parts = field.split(separator: ":", omittingEmptySubsequences: false)
+                guard parts.count == 2, let enabled = Bool(String(parts[0])) else { return nil }
+                parsed.append(Import(enabled: enabled, bundleID: String(parts[1])))
+            }
+            if fields.count == 8 {
+                let parts = fields[7].split(separator: ":", omittingEmptySubsequences: false)
+                guard parts.count == 4, parts[0] == "cutover",
+                      let seconds = Double(parts[1]), seconds.isFinite,
+                      seconds >= 0 else { return nil }
+            }
+            unchangedFields = Array(fields[0...4])
+            imports = parsed
+            cutoff = fields.count == 8 ? fields[7] : nil
+        }
+    }
+
+    static func assess(_ metadata: GlucoseForecastMLModelMetadata,
+                       current: GlucoseForecastMLContext,
+                       currentPolicy: DataFlowPolicy,
+                       cutover: TreatmentSourceCutover?, restoreRequiresSetup: Bool = false)
+        -> Assessment {
+        guard isUsable(metadata), metadata.context.engineVersion == current.engineVersion,
+              metadata.context.featureVersion == current.featureVersion else {
+            return .invalid(.generationChanged)
+        }
+        guard !restoreRequiresSetup else { return .invalid(.sourceSetupIncomplete) }
+        guard metadata.context.sensitivityMgdlPerUnit == current.sensitivityMgdlPerUnit,
+              metadata.context.carbohydrateRatioGramsPerUnit == current.carbohydrateRatioGramsPerUnit,
+              metadata.context.insulinDurationMinutes == current.insulinDurationMinutes,
+              metadata.context.insulinPeakMinutes == current.insulinPeakMinutes,
+              metadata.context.carbohydrateDurationMinutes == current.carbohydrateDurationMinutes else {
+            return .invalid(.parametersChanged)
+        }
+        if metadata.context == current { return .exact }
+        guard let old = SourceSignature(metadata.context.sourceSignature),
+              let new = SourceSignature(current.sourceSignature) else {
+            return .invalid(.malformedSignature)
+        }
+        guard let cutover, cutover.cutoff > metadata.trainedAt else {
+            return .invalid(.sourceChanged)
+        }
+        guard old.unchangedFields.dropFirst() == new.unchangedFields.dropFirst(),
+              currentPolicy.therapyDataSource == .none,
+              new.unchangedFields[0] == String(describing: currentPolicy),
+              TherapyDataSourceType.allCases.contains(where: { selection in
+                  let previous = DataFlowPolicy(
+                      isMaster: currentPolicy.isMaster,
+                      followerDataSource: currentPolicy.followerDataSource,
+                      therapyDataSourceSelection: selection,
+                      nightscoutEnabled: currentPolicy.nightscoutEnabled,
+                      masterUploadsGlucoseToNightscout: currentPolicy.masterUploadsGlucoseToNightscout,
+                      followerUploadsGlucoseToNightscout: currentPolicy.followerUploadsGlucoseToNightscout,
+                      nightscoutFollowType: currentPolicy.nightscoutFollowType)
+                  return previous.therapyDataSource == .none
+                      && !previous.importsTreatmentsFromNightscout
+                      && !previous.importsTherapyFromCareLink
+                      && old.unchangedFields[0] == String(describing: previous)
+              }),
+              old.cutoff == nil || old.cutoff == "cutover:0.0::",
+              new.cutoff == "cutover:\(cutover.cutoff.timeIntervalSince1970):"
+                    + "\(cutover.insulinSourceBundleID):\(cutover.carbohydrateSourceBundleID)",
+              old.imports == [
+                  .init(enabled: true, bundleID: cutover.insulinSourceBundleID),
+                  .init(enabled: true, bundleID: cutover.carbohydrateSourceBundleID)
+              ],
+              new.imports == [
+                  .init(enabled: false, bundleID: cutover.insulinSourceBundleID),
+                  .init(enabled: false, bundleID: cutover.carbohydrateSourceBundleID)
+              ] else { return .invalid(.transitionUnverified) }
+        return .transitionCompatible(cutover)
+    }
+
     static func matchesGeneration(_ metadata: GlucoseForecastMLModelMetadata) -> Bool {
         metadata.schemaVersion == GlucoseForecastMLModelMetadata.schemaVersion
             && metadata.featureNames == GlucoseForecastMLFeatures.featureNames
@@ -497,6 +605,292 @@ final class GlucoseForecastMLModelStore {
 /// Thread-safe process owner. Training runs on one utility Task, while inference
 /// reads an already loaded, immutable bundle. No disk or Create ML work occurs in
 /// the forecast adapter's calculation path.
+/// Prospective, paired evidence for the *specific* pre-cutover package. Predictions
+/// are frozen before their target reading exists; neither retrospective replay nor
+/// later re-inference is allowed to manufacture a comparison. File IO is serialized
+/// off the forecast worker and an interrupted atomic write preserves the last state.
+final class GlucoseForecastMLTransitionEvidence: @unchecked Sendable {
+    struct Prediction: Codable, Equatable {
+        let referenceDate: Date
+        let computedAt: Date
+        let sensorID: String
+        let engine60Mgdl: Double
+        let model60Mgdl: Double
+        var targetDate: Date { referenceDate.addingTimeInterval(60 * 60) }
+    }
+
+    struct Pair: Codable {
+        let prediction: Prediction
+        let actualDate: Date
+        let actualMgdl: Double
+    }
+
+    struct Result: Codable, Equatable {
+        let usableDays: Int
+        let pairCount: Int
+        let engineMAE: Double
+        let modelMAE: Double
+        var modelIsWorse: Bool { modelMAE > engineMAE }
+    }
+
+    struct State: Codable {
+        static let schemaVersion = 1
+        let schemaVersion: Int
+        let modelID: String
+        let cutoff: Date
+        let dayTimeZoneIdentifier: String
+        var pending: [Prediction]
+        var pairs: [Pair]
+        var result: Result?
+
+        init(modelID: String, cutoff: Date, dayTimeZone: TimeZone = .current) {
+            schemaVersion = Self.schemaVersion
+            self.modelID = modelID
+            self.cutoff = cutoff
+            dayTimeZoneIdentifier = dayTimeZone.identifier
+            pending = []
+            pairs = []
+            result = nil
+        }
+
+        /// Derive a conservative per-day floor from the existing 100-row ML
+        /// self-check minimum. Seven days therefore provide at least 105 paired
+        /// forecasts; a single isolated Home glance is not a usable day.
+        static let minimumPairsPerDay =
+            (GlucoseForecastMLChronology.minimumSelfCheckRows + minimumUsableDays - 1)
+                / minimumUsableDays
+        static let minimumUsableDays = 7
+
+        mutating func add(_ prediction: Prediction) -> Bool {
+            guard result == nil, prediction.referenceDate >= cutoff,
+                  prediction.referenceDate.timeIntervalSinceReferenceDate.isFinite,
+                  prediction.computedAt.timeIntervalSinceReferenceDate.isFinite,
+                  prediction.computedAt < prediction.targetDate.addingTimeInterval(-120),
+                  !prediction.sensorID.isEmpty,
+                  (20...600).contains(prediction.engine60Mgdl),
+                  (20...600).contains(prediction.model60Mgdl),
+                  !pending.contains(where: { $0.referenceDate == prediction.referenceDate &&
+                      $0.sensorID == prediction.sensorID }),
+                  !pairs.contains(where: { $0.prediction.referenceDate == prediction.referenceDate &&
+                      $0.prediction.sensorID == prediction.sensorID }) else { return false }
+            let bucket = Int(prediction.referenceDate.timeIntervalSince1970 / 600)
+            guard !pending.contains(where: { Int($0.referenceDate.timeIntervalSince1970 / 600) == bucket }),
+                  !pairs.contains(where: { Int($0.prediction.referenceDate.timeIntervalSince1970 / 600) == bucket })
+            else { return false }
+            pending.append(prediction)
+            return true
+        }
+
+        mutating func observe(_ readings: [GlucoseForecastSample], at now: Date) -> Bool {
+            guard result == nil, now.timeIntervalSinceReferenceDate.isFinite else { return false }
+            var changed = false
+            var remaining = [Prediction]()
+            for prediction in pending {
+                let target = prediction.targetDate
+                // Wait for the entire ±2-minute matching window. Reading only
+                // the first early sample would bias the joined target.
+                if now < target.addingTimeInterval(120) {
+                    remaining.append(prediction)
+                    continue
+                }
+                let matches = readings.filter {
+                    $0.sensorID == prediction.sensorID && $0.date > prediction.computedAt &&
+                    abs($0.date.timeIntervalSince(target)) <= 120 &&
+                    $0.glucoseMgdl.isFinite && (20...600).contains($0.glucoseMgdl)
+                }
+                if let closest = matches.min(by: { lhs, rhs in
+                    let left = abs(lhs.date.timeIntervalSince(target))
+                    let right = abs(rhs.date.timeIntervalSince(target))
+                    return left == right ? lhs.date < rhs.date : left < right
+                }) {
+                    pairs.append(Pair(prediction: prediction, actualDate: closest.date,
+                                      actualMgdl: closest.glucoseMgdl))
+                    changed = true
+                } else if now < target.addingTimeInterval(45 * 60) {
+                    // A late but timestamped reading can still arrive. Never
+                    // fabricate an actual value from the latest live glucose.
+                    remaining.append(prediction)
+                } else {
+                    changed = true
+                }
+            }
+            pending = remaining
+            if changed { result = Self.evaluate(pairs, timeZoneIdentifier: dayTimeZoneIdentifier) }
+            return changed
+        }
+
+        static func evaluate(_ pairs: [Pair], timeZoneIdentifier: String) -> Result? {
+            guard let timeZone = TimeZone(identifier: timeZoneIdentifier) else { return nil }
+            var calendar = Calendar(identifier: .gregorian)
+            calendar.timeZone = timeZone
+            let byDay = Dictionary(grouping: pairs) {
+                calendar.startOfDay(for: $0.prediction.referenceDate)
+            }
+            let latest = byDay.filter { $0.value.count >= minimumPairsPerDay }
+                .sorted { $0.key < $1.key }.suffix(minimumUsableDays)
+            guard latest.count == minimumUsableDays else { return nil }
+            let common = latest.flatMap { $0.value }
+            let engineMAE = common.reduce(0.0) {
+                $0 + abs($1.prediction.engine60Mgdl - $1.actualMgdl)
+            } / Double(common.count)
+            let modelMAE = common.reduce(0.0) {
+                $0 + abs($1.prediction.model60Mgdl - $1.actualMgdl)
+            } / Double(common.count)
+            guard engineMAE.isFinite, modelMAE.isFinite else { return nil }
+            return Result(usableDays: latest.count, pairCount: common.count,
+                          engineMAE: engineMAE, modelMAE: modelMAE)
+        }
+
+        func isValid() -> Bool {
+            guard schemaVersion == Self.schemaVersion,
+                  cutoff.timeIntervalSinceReferenceDate.isFinite,
+                  TimeZone(identifier: dayTimeZoneIdentifier) != nil,
+                  pending.allSatisfy({ prediction in
+                      prediction.referenceDate >= cutoff &&
+                          prediction.computedAt < prediction.targetDate.addingTimeInterval(-120) &&
+                          !prediction.sensorID.isEmpty &&
+                          (20...600).contains(prediction.engine60Mgdl) &&
+                          (20...600).contains(prediction.model60Mgdl)
+                  }),
+                  pairs.allSatisfy({ pair in
+                      pair.prediction.referenceDate >= cutoff &&
+                          pair.prediction.computedAt < pair.actualDate &&
+                          abs(pair.actualDate.timeIntervalSince(pair.prediction.targetDate)) <= 120 &&
+                          (20...600).contains(pair.actualMgdl)
+                  }),
+                  result == Self.evaluate(pairs,
+                      timeZoneIdentifier: dayTimeZoneIdentifier) else { return false }
+            let references = pending.map { "\($0.sensorID):\($0.referenceDate.timeIntervalSince1970)" }
+                + pairs.map { "\($0.prediction.sensorID):\($0.prediction.referenceDate.timeIntervalSince1970)" }
+            return Set(references).count == references.count
+        }
+    }
+
+    enum Status {
+        case awaiting(usableDays: Int, pairs: Int)
+        case passed(Result)
+        case disabled(Result)
+        case unreadable
+    }
+
+    private let directory: URL
+    private let fileManager = FileManager.default
+    private let defaults: UserDefaults
+    private let queue = DispatchQueue(label: "glucose.forecast.ml.transition", qos: .utility)
+    private var cached = [String: State]()
+    private var invalidKeys = Set<String>()
+
+    init(directory: URL, defaults: UserDefaults = .standard) {
+        self.directory = directory
+        self.defaults = defaults
+    }
+
+    private func key(modelID: String, cutoff: Date) -> String {
+        "\(modelID)-\(String(cutoff.timeIntervalSince1970.bitPattern, radix: 16))"
+    }
+
+    private func url(for key: String) -> URL {
+        directory.appendingPathComponent("transition-\(key).json")
+    }
+
+    private func marker(for key: String) -> String {
+        "glucoseForecastML.transitionEvidence.\(key)"
+    }
+
+    private func invalidMarker(for key: String) -> String {
+        "glucoseForecastML.transitionEvidenceInvalid.\(key)"
+    }
+
+    private func state(modelID: String, cutoff: Date) -> State? {
+        guard GlucoseForecastMLStoragePolicy.isGeneratedUUID(modelID),
+              cutoff.timeIntervalSinceReferenceDate.isFinite else { return nil }
+        let id = key(modelID: modelID, cutoff: cutoff)
+        if invalidKeys.contains(id) || defaults.bool(forKey: invalidMarker(for: id)) {
+            return nil
+        }
+        if let cached = cached[id] { return cached }
+        let file = url(for: id)
+        let loaded: State
+        if fileManager.fileExists(atPath: file.path) {
+            guard let data = try? Data(contentsOf: file),
+                  let decoded = try? JSONDecoder().decode(State.self, from: data),
+                  decoded.isValid(),
+                  decoded.modelID == modelID, decoded.cutoff == cutoff else {
+                invalidKeys.insert(id)
+                defaults.set(true, forKey: invalidMarker(for: id))
+                return nil
+            }
+            defaults.set(true, forKey: marker(for: id))
+            loaded = decoded
+        } else {
+            guard !defaults.bool(forKey: marker(for: id)) else {
+                invalidKeys.insert(id)
+                defaults.set(true, forKey: invalidMarker(for: id))
+                return nil
+            }
+            loaded = State(modelID: modelID, cutoff: cutoff)
+        }
+        cached[id] = loaded
+        return loaded
+    }
+
+    private func save(_ state: State) -> Bool {
+        let id = key(modelID: state.modelID, cutoff: state.cutoff)
+        do {
+            try GlucoseForecastMLStoragePolicy.secureDirectory(directory)
+            let file = url(for: id)
+            // Persist the existence marker first. If an interrupted first write leaves
+            // no file, a restart must fail closed instead of silently starting anew.
+            defaults.set(true, forKey: marker(for: id))
+            try JSONEncoder().encode(state).write(to: file, options: .atomic)
+            #if os(iOS)
+            try fileManager.setAttributes([.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
+                                          ofItemAtPath: file.path)
+            #endif
+            cached[id] = state
+            return true
+        } catch {
+            invalidKeys.insert(id)
+            defaults.set(true, forKey: invalidMarker(for: id))
+            return false
+        }
+    }
+
+    func status(modelID: String, cutoff: Date) -> Status {
+        queue.sync {
+            guard let value = state(modelID: modelID, cutoff: cutoff) else { return .unreadable }
+            if let result = value.result {
+                return result.modelIsWorse ? .disabled(result) : .passed(result)
+            }
+            let dayCount = Dictionary(grouping: value.pairs) { pair -> Date in
+                var calendar = Calendar(identifier: .gregorian)
+                calendar.timeZone = TimeZone(identifier: value.dayTimeZoneIdentifier)!
+                return calendar.startOfDay(for: pair.prediction.referenceDate)
+            }.values.filter { $0.count >= State.minimumPairsPerDay }.count
+            return .awaiting(usableDays: dayCount, pairs: value.pairs.count)
+        }
+    }
+
+    func capture(_ prediction: Prediction, modelID: String, cutoff: Date,
+                 onChange: @escaping () -> Void) {
+        queue.async { [self] in
+            guard var value = state(modelID: modelID, cutoff: cutoff),
+                  value.add(prediction) else { return }
+            if !save(value) { onChange() }
+        }
+    }
+
+    func observe(_ readings: [GlucoseForecastSample], at now: Date,
+                 modelID: String, cutoff: Date, onChange: @escaping () -> Void) {
+        queue.async { [self] in
+            guard var value = state(modelID: modelID, cutoff: cutoff),
+                  value.observe(readings, at: now) else { return }
+            _ = save(value)
+            onChange()
+        }
+    }
+}
+
 final class GlucoseForecastMLManager: @unchecked Sendable {
     static let shared = GlucoseForecastMLManager()
     static let modelDidChange = Notification.Name("GlucoseForecastMLModelDidChange")
@@ -504,6 +898,7 @@ final class GlucoseForecastMLManager: @unchecked Sendable {
 
     private let lock = NSLock()
     private let store: GlucoseForecastMLModelStore
+    private let transitionEvidence: GlucoseForecastMLTransitionEvidence
     private var loaded: GlucoseForecastMLLoadedBundle?
     private var loading = true
     private var isTraining = false
@@ -522,6 +917,7 @@ final class GlucoseForecastMLManager: @unchecked Sendable {
                                                             in: .userDomainMask)[0]
         .appendingPathComponent("GlucoseForecastML", isDirectory: true)) {
         store = GlucoseForecastMLModelStore(directory: directory)
+        transitionEvidence = GlucoseForecastMLTransitionEvidence(directory: directory)
         #if canImport(UIKit)
         lifecycleObservers.append(NotificationCenter.default.addObserver(
             forName: UIApplication.willResignActiveNotification,
@@ -564,6 +960,99 @@ final class GlucoseForecastMLManager: @unchecked Sendable {
     }
 
     var selfCheckCSVURL: URL? { lock.withLock { lastReviewCSVURL } }
+
+    /// Settings and inference use precisely the same verdict. A package appears
+    /// here only after the store has reloaded and validated all six Core ML models.
+    func compatibility(current: GlucoseForecastMLContext?)
+        -> GlucoseForecastMLModelCompatibility.Assessment {
+        guard let current else { return .invalid(.parametersChanged) }
+        let bundle = lock.withLock { loaded }
+        guard let bundle else { return .invalid(.packageUnavailable) }
+        return compatibility(bundle: bundle, current: current)
+    }
+
+    private func compatibility(bundle: GlucoseForecastMLLoadedBundle,
+                               current: GlucoseForecastMLContext)
+        -> GlucoseForecastMLModelCompatibility.Assessment {
+        let defaults = UserDefaults.standard
+        let cutover = TreatmentSourceCutover.current(defaults: defaults)
+        let base = GlucoseForecastMLModelCompatibility.assess(
+            bundle.metadata, current: current, currentPolicy: defaults.dataFlowPolicy,
+            cutover: cutover,
+            restoreRequiresSetup: defaults.bool(forKey: TreatmentSourceCutover.restoreRequiresSourceSetupKey)
+                || TreatmentSourceCutover.hasInvalidStoredValue(defaults: defaults))
+        guard case .transitionCompatible(let verifiedCutover) = base else { return base }
+        switch transitionEvidence.status(modelID: bundle.metadata.modelID,
+                                         cutoff: verifiedCutover.cutoff) {
+        case .disabled: return .invalid(.prospectiveWorse)
+        case .unreadable: return .invalid(.evidenceUnreadable)
+        case .awaiting, .passed: return base
+        }
+    }
+
+    func transitionStatus(current: GlucoseForecastMLContext?)
+        -> GlucoseForecastMLTransitionEvidence.Status? {
+        guard let current, let bundle = lock.withLock({ loaded }),
+              case .transitionCompatible(let cutover) =
+                  GlucoseForecastMLModelCompatibility.assess(
+                      bundle.metadata, current: current,
+                      currentPolicy: UserDefaults.standard.dataFlowPolicy,
+                      cutover: TreatmentSourceCutover.current(),
+                      restoreRequiresSetup: UserDefaults.standard.bool(
+                          forKey: TreatmentSourceCutover.restoreRequiresSourceSetupKey))
+        else { return nil }
+        return transitionEvidence.status(modelID: bundle.metadata.modelID,
+                                         cutoff: cutover.cutoff)
+    }
+
+    /// Cheap eligibility check before the independent, event-driven comparison.
+    /// It deliberately does not depend on a Home presentation being visible.
+    func needsTransitionObservation(context: GlucoseForecastMLContext) -> Bool {
+        guard let bundle = lock.withLock({ loaded }) else { return false }
+        if case .transitionCompatible = compatibility(bundle: bundle, current: context) {
+            return true
+        }
+        return false
+    }
+
+    /// Freeze the exact engine and old model +60 values before the outcome exists.
+    /// In particular, later retraining or changed settings cannot manufacture a pair.
+    func recordTransitionPair(engine: GlucoseForecastResult,
+                              modelForecast: GlucoseForecastMLForecast,
+                              input: GlucoseForecastInput,
+                              sourceSignature: String) {
+        guard let bundle = lock.withLock({ loaded }),
+              let context = GlucoseForecastMLContext(input: input,
+                  sourceSignature: sourceSignature),
+              case .transitionCompatible(let cutover) = compatibility(bundle: bundle,
+                  current: context),
+              let reference = engine.referenceDate,
+              let sensorID = engine.referenceSensorID, !sensorID.isEmpty,
+              modelForecast.modelID == bundle.metadata.modelID,
+              let engine60 = engine.points.first(where: {
+                  abs($0.date.timeIntervalSince(reference) - 3600) < 1
+              })?.glucoseMgdl,
+              let model60 = modelForecast.points.first(where: {
+                  abs($0.date.timeIntervalSince(reference) - 3600) < 1
+              })?.glucoseMgdl else { return }
+        let prediction = GlucoseForecastMLTransitionEvidence.Prediction(
+            referenceDate: reference, computedAt: input.now, sensorID: sensorID,
+            engine60Mgdl: engine60, model60Mgdl: model60)
+        transitionEvidence.capture(prediction, modelID: bundle.metadata.modelID,
+            cutoff: cutover.cutoff) { [weak self] in self?.notifyStatus() }
+    }
+
+    func observeTransition(readings: [GlucoseForecastSample], at now: Date,
+                           context: GlucoseForecastMLContext) {
+        guard let bundle = lock.withLock({ loaded }),
+              case .transitionCompatible(let cutover) = compatibility(bundle: bundle,
+                  current: context) else { return }
+        transitionEvidence.observe(readings, at: now,
+            modelID: bundle.metadata.modelID, cutoff: cutover.cutoff) { [weak self] in
+                self?.notifyStatus()
+                self?.notifyModel()
+            }
+    }
 
     func shouldTrain(context: GlucoseForecastMLContext, now: Date = .now) -> Bool {
         lock.lock(); defer { lock.unlock() }
@@ -679,9 +1168,9 @@ final class GlucoseForecastMLManager: @unchecked Sendable {
         lock.lock()
         let bundle = loaded
         lock.unlock()
-        guard let bundle, bundle.metadata.context == context,
-              GlucoseForecastMLModelCompatibility.isUsable(bundle.metadata),
-              let reference = result.referenceDate else { return nil }
+        guard let bundle, let reference = result.referenceDate else { return nil }
+        let assessment = compatibility(bundle: bundle, current: context)
+        if case .invalid = assessment { return nil }
         let selected = GlucoseForecastMLChronology.horizons.filter { $0 <= input.horizonMinutes }
         guard !selected.isEmpty else { return nil }
         var knots = [GlucoseForecastMLChronology.Knot(minute: 0, correction: 0, halfWidth: 0)]

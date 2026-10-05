@@ -164,10 +164,17 @@ struct PenDoseInputSnapshot: Sendable {
     let treatmentRevision: Int
     let iobUnits: Double
     let cobGrams: Double
+    /// A second, scoped read of CGM history for the optional COB reduction. Nil means
+    /// no usable historical evidence; it never changes the proven curve COB above.
+    let historicalGlucose: [GlucoseForecastSample]?
+    let historicalGlucoseIssue: PenCOBFallbackReason?
+    let sourceSignature: String
 
     static func make(capturedAt: Date, glucose: [GlucoseForecastSample],
                      treatments: [TherapyTreatment], therapySettings: TherapyModelSettings,
-                     treatmentRevision: Int) -> Result<Self, PenDoseUnavailableReason> {
+                     treatmentRevision: Int, historicalGlucose: [GlucoseForecastSample]? = nil,
+                     historicalGlucoseIssue: PenCOBFallbackReason? = nil,
+                     sourceSignature: String = "") -> Result<Self, PenDoseUnavailableReason> {
         guard therapySettings.validInsulin, therapySettings.validCarbs else {
             return .failure(.invalidTreatment)
         }
@@ -189,7 +196,8 @@ struct PenDoseInputSnapshot: Sendable {
                     peak: therapySettings.insulinPeak)
             } else {
                 let duration = treatment.carbohydrateDuration(or: therapySettings.carbDuration)
-                guard duration.isFinite, (30...480).contains(duration) else {
+                guard duration.isFinite,
+                      (30.0...PenCGMCOBEstimator.maximumCarbohydrateDurationMinutes).contains(duration) else {
                     return .failure(.invalidTreatment)
                 }
                 cob += TherapyCalculations.carbsRemaining(grams: treatment.amount,
@@ -199,7 +207,226 @@ struct PenDoseInputSnapshot: Sendable {
         guard iob.isFinite, cob.isFinite else { return .failure(.invalidTreatment) }
         return .success(Self(capturedAt: capturedAt, glucose: glucose,
             treatments: treatments, therapySettings: therapySettings,
-            treatmentRevision: treatmentRevision, iobUnits: iob, cobGrams: cob))
+            treatmentRevision: treatmentRevision, iobUnits: iob, cobGrams: cob,
+            historicalGlucose: historicalGlucose,
+            historicalGlucoseIssue: historicalGlucoseIssue,
+            sourceSignature: sourceSignature))
+    }
+}
+
+enum PenCOBFallbackReason: String, Error, Sendable {
+    case noCurrentMeal
+    case manualOrUntrendedGlucose
+    case missingHistory
+    case incompleteTreatmentHistory
+    case changedInputs
+    case historicalProfileUnknown
+    case missingTreatmentIdentity
+    case duplicateTreatmentIdentity
+    case sensorMismatch
+    case historyGap
+    case invalidHistory
+    case oscillatingSignal
+    case insufficientIntervals
+}
+
+/// An optional reduction of the existing curve COB, scoped to one reviewed dose snapshot.
+/// The estimated value can never increase the carbohydrate contribution to a dose.
+struct PenCOBEvidence: Sendable {
+    let curveGrams: Double
+    let estimatedGrams: Double?
+    let usedGrams: Double
+    let fallbackReason: PenCOBFallbackReason?
+}
+
+/// A deterministic, retrospective CGM estimate of already absorbed meal carbohydrate.
+/// It is not a replacement for the shared therapy curve, Home COB, forecast or alarms.
+enum PenCGMCOBEstimator {
+    static let maximumHistorySeconds: TimeInterval = 24 * 60 * 60
+    static let intervalSeconds: TimeInterval = 5 * 60
+    static let maximumRawGapSeconds: TimeInterval = 15 * 60
+    static let maximumCarbohydrateDurationMinutes = 480.0
+
+    /// The treatment read must prove that no older meal can overlap a meal inside
+    /// the 24-hour glucose window, and must include any earlier active rapid bolus.
+    static func requiredTreatmentLookbackMinutes(settings: TherapyModelSettings) -> Double {
+        maximumHistorySeconds / 60 + 1.5 * maximumCarbohydrateDurationMinutes +
+            settings.insulinDuration
+    }
+
+    /// Includes earlier meals that overlap the earliest still-active meal. Earlier rapid
+    /// boluses are retained separately for their modeled effect in these intervals.
+    static func historyStart(treatments: [TherapyTreatment], settings: TherapyModelSettings,
+                             at now: Date) -> Date? {
+        let meals = treatments.filter { !$0.isIOB && $0.date <= now && $0.amount > 0 }
+        func end(_ meal: TherapyTreatment) -> Date {
+            meal.date.addingTimeInterval(1.5 * meal.carbohydrateDuration(or: settings.carbDuration) * 60)
+        }
+        guard var start = meals.filter({ end($0) > now }).map(\.date).min() else { return nil }
+        // Overlap is transitive: an expired meal may overlap an earlier meal that in turn
+        // overlaps the current one. Its glucose response still belongs to the same period.
+        while let earlier = meals.filter({ end($0) >= start }).map(\.date).min(), earlier < start {
+            start = earlier
+        }
+        return start
+    }
+
+    static func estimate(snapshot: PenDoseInputSnapshot, profile: PenDoseProfile,
+                         at now: Date) -> Result<Double, PenCOBFallbackReason> {
+        guard let start = historyStart(treatments: snapshot.treatments,
+                                       settings: snapshot.therapySettings, at: now) else {
+            return .failure(.noCurrentMeal)
+        }
+        if let issue = snapshot.historicalGlucoseIssue { return .failure(issue) }
+        guard now.timeIntervalSince(start) <= maximumHistorySeconds,
+              let latest = snapshot.glucose.last, let sensorID = latest.sensorID,
+              !sensorID.isEmpty, let history = snapshot.historicalGlucose,
+              !history.isEmpty else { return .failure(.missingHistory) }
+
+        let meals = snapshot.treatments.filter { !$0.isIOB && $0.date <= now &&
+            $0.date.addingTimeInterval(1.5 * $0.carbohydrateDuration(or: snapshot.therapySettings.carbDuration) * 60) >= start
+        }.sorted {
+            $0.date == $1.date ? ($0.stableIdentity ?? "") < ($1.stableIdentity ?? "") : $0.date < $1.date
+        }
+        let boluses = snapshot.treatments.filter { $0.isIOB && $0.date <= latest.date &&
+            $0.date.addingTimeInterval(snapshot.therapySettings.insulinDuration * 60) > start
+        }.sorted {
+            $0.date == $1.date ? ($0.stableIdentity ?? "") < ($1.stableIdentity ?? "") : $0.date < $1.date
+        }
+        let relevant = meals + boluses
+        guard relevant.allSatisfy({ $0.stableIdentity?.isEmpty == false }) else {
+            return .failure(.missingTreatmentIdentity)
+        }
+        let identities = relevant.compactMap(\.stableIdentity)
+        guard Set(identities).count == identities.count else { return .failure(.duplicateTreatmentIdentity) }
+        let earliestEvent = min(start, boluses.map(\.date).min() ?? start)
+        guard profile.isConfirmed, let confirmedAt = profile.confirmedAt,
+              confirmedAt <= earliestEvent else { return .failure(.historicalProfileUnknown) }
+        let mealRatios = meals.compactMap { profile.values(at: $0.date)?.carbohydrateRatio }
+        guard mealRatios.count == meals.count,
+              mealRatios.allSatisfy({ $0.isFinite && $0 > 0 }) else {
+            return .failure(.historicalProfileUnknown)
+        }
+        guard history.last == latest else { return .failure(.missingHistory) }
+        guard history.allSatisfy({ $0.sensorID == sensorID }) else {
+            return .failure(.sensorMismatch)
+        }
+        guard history.allSatisfy({ $0.glucoseMgdl.isFinite &&
+            (20...600).contains($0.glucoseMgdl)
+        }) else { return .failure(.invalidHistory) }
+        guard zip(history, history.dropFirst()).allSatisfy({
+            $0.0.date < $0.1.date &&
+                $0.1.date.timeIntervalSince($0.0.date) <= maximumRawGapSeconds
+        }) else { return .failure(.historyGap) }
+
+        let firstTick = ceil(start.timeIntervalSince1970 / intervalSeconds) * intervalSeconds
+        let lastTick = floor(latest.date.timeIntervalSince1970 / intervalSeconds) * intervalSeconds
+        guard lastTick - firstTick >= 2 * intervalSeconds else { return .failure(.insufficientIntervals) }
+        let times = stride(from: firstTick, through: lastTick, by: intervalSeconds)
+            .map { Date(timeIntervalSince1970: $0) }
+        var levels = [Double]()
+        levels.reserveCapacity(times.count)
+        for time in times {
+            guard let level = interpolatedGlucose(at: time, history: history) else {
+                return .failure(.historyGap)
+            }
+            levels.append(level)
+        }
+        var absorbed = [Double](repeating: 0, count: meals.count)
+        var positiveResidualMgdl = 0.0
+        var netResidualMgdl = 0.0
+        // Non-overlapping ten-minute nets cancel a five-minute up/down oscillation.
+        // A residual must persist across the pair before it can reduce dose COB.
+        for index in stride(from: 0, to: times.count - 2, by: 2) {
+            let from = times[index], to = times[index + 2]
+            let insulinUnits = boluses.reduce(0.0) { partial, bolus in
+                partial + absorbedInsulin(bolus, at: to, settings: snapshot.therapySettings)
+                    - absorbedInsulin(bolus, at: from, settings: snapshot.therapySettings)
+            }
+            let insulinEffectMgdl = -insulinUnits * profile.settings.correctionMmolPerUnit *
+                PenBolusCalculator.mgdlPerMmol
+            let residualMgdl = levels[index + 2] - levels[index] - insulinEffectMgdl
+            guard residualMgdl.isFinite else {
+                return .failure(.invalidHistory)
+            }
+            netResidualMgdl += residualMgdl
+            positiveResidualMgdl += max(0, residualMgdl)
+            let effectUnits = max(0, residualMgdl) /
+                (profile.settings.correctionMmolPerUnit * PenBolusCalculator.mgdlPerMmol)
+            guard effectUnits.isFinite else { return .failure(.invalidHistory) }
+            allocate(effectUnits: effectUnits, from: from, to: to, meals: meals,
+                     carbohydrateRatios: mealRatios, settings: snapshot.therapySettings,
+                     absorbed: &absorbed)
+        }
+        // Summing only upward fluctuations would count a later reversal as another meal.
+        // Without evidence of a sustained net response, retain the established curve COB.
+        guard positiveResidualMgdl.isFinite, netResidualMgdl.isFinite,
+              positiveResidualMgdl <= max(0, netResidualMgdl) + 5 else {
+            return .failure(.oscillatingSignal)
+        }
+        var remaining = 0.0
+        for (index, meal) in meals.enumerated() {
+            let duration = meal.carbohydrateDuration(or: snapshot.therapySettings.carbDuration)
+            let elapsed = max(0, now.timeIntervalSince(meal.date) / 60)
+            let floorAbsorbed = meal.amount * min(1, elapsed / (1.5 * duration))
+            let finalAbsorbed = min(meal.amount, max(absorbed[index], floorAbsorbed))
+            remaining += max(0, meal.amount - finalAbsorbed)
+        }
+        guard remaining.isFinite, remaining >= 0 else { return .failure(.invalidHistory) }
+        return .success(remaining)
+    }
+
+    private static func absorbedInsulin(_ bolus: TherapyTreatment, at date: Date,
+                                        settings: TherapyModelSettings) -> Double {
+        guard date > bolus.date else { return 0 }
+        let minutes = date.timeIntervalSince(bolus.date) / 60
+        return bolus.amount - TherapyCalculations.insulinRemaining(units: bolus.amount,
+            minutes: minutes, duration: settings.insulinDuration, peak: settings.insulinPeak)
+    }
+
+    private static func interpolatedGlucose(at date: Date,
+                                             history: [GlucoseForecastSample]) -> Double? {
+        if let exact = history.first(where: { $0.date == date }) { return exact.glucoseMgdl }
+        guard let rightIndex = history.firstIndex(where: { $0.date > date }), rightIndex > 0 else { return nil }
+        let left = history[rightIndex - 1], right = history[rightIndex]
+        let span = right.date.timeIntervalSince(left.date)
+        guard span > 0, span <= maximumRawGapSeconds else { return nil }
+        let fraction = date.timeIntervalSince(left.date) / span
+        return left.glucoseMgdl + fraction * (right.glucoseMgdl - left.glucoseMgdl)
+    }
+
+    static func allocate(effectUnits: Double, from: Date, to: Date,
+                         meals: [TherapyTreatment], carbohydrateRatios: [Double],
+                         settings: TherapyModelSettings,
+                         absorbed: inout [Double]) {
+        guard effectUnits > 0, carbohydrateRatios.count == meals.count else { return }
+        var left = effectUnits
+        var eligible = meals.indices.filter { index in
+            let meal = meals[index]
+            let duration = meal.carbohydrateDuration(or: settings.carbDuration)
+            return meal.date <= from &&
+                meal.date.addingTimeInterval(1.5 * duration * 60) >= to &&
+                absorbed[index] < meal.amount &&
+                carbohydrateRatios[index].isFinite && carbohydrateRatios[index] > 0
+        }
+        while left > 1e-9 && !eligible.isEmpty {
+            let weights = eligible.map { meals[$0].amount /
+                (1.5 * meals[$0].carbohydrateDuration(or: settings.carbDuration)) }
+            let totalWeight = weights.reduce(0, +)
+            guard totalWeight.isFinite, totalWeight > 0 else { return }
+            let roundInput = left
+            var assigned = 0.0
+            for (position, index) in eligible.enumerated() {
+                let ratio = carbohydrateRatios[index]
+                let roomUnits = max(0, meals[index].amount - absorbed[index]) / ratio
+                let portionUnits = min(roomUnits, roundInput * weights[position] / totalWeight)
+                absorbed[index] += portionUnits * ratio
+                assigned += portionUnits
+            }
+            guard assigned > 1e-9 else { return }
+            left -= assigned
+            eligible.removeAll { absorbed[$0] >= meals[$0].amount - 1e-9 }
+        }
     }
 }
 
@@ -231,6 +458,7 @@ struct PenDoseCalculation: Sendable {
     let glucoseSensorID: String?
     let trendWasIntentionallyZero: Bool
     let forecastMinimumMgdl: Double?
+    let cobEvidence: PenCOBEvidence?
     var isAvailable: Bool { suggestedUnits != nil && unavailableReason == nil }
 }
 
@@ -288,7 +516,8 @@ enum PenBolusCalculator {
             PenDoseCalculation(suggestedUnits: nil, lines: nil, safety: nil,
                 unavailableReason: reason, glucoseMgdl: nil, glucoseMeasuredAt: nil,
                 glucoseSensorID: nil,
-                trendWasIntentionallyZero: false, forecastMinimumMgdl: nil)
+                trendWasIntentionallyZero: false, forecastMinimumMgdl: nil,
+                cobEvidence: nil)
         }
         guard profile.settings.isValid else { return unavailable(.invalidProfile) }
         guard let profileValues = profile.values(at: now) else { return unavailable(.unconfirmedProfile) }
@@ -351,8 +580,25 @@ enum PenBolusCalculator {
               glucoseDate <= now.addingTimeInterval(30) else {
             return unavailable(.invalidGlucose)
         }
+        let cobEvidence: PenCOBEvidence
+        if zeroTrend {
+            cobEvidence = PenCOBEvidence(curveGrams: snapshot.cobGrams,
+                estimatedGrams: nil, usedGrams: snapshot.cobGrams,
+                fallbackReason: .manualOrUntrendedGlucose)
+        } else {
+            switch PenCGMCOBEstimator.estimate(snapshot: snapshot, profile: profile, at: now) {
+            case .success(let estimated):
+                let used = min(snapshot.cobGrams, max(0, estimated))
+                cobEvidence = PenCOBEvidence(curveGrams: snapshot.cobGrams,
+                    estimatedGrams: estimated, usedGrams: used, fallbackReason: nil)
+            case .failure(let reason):
+                cobEvidence = PenCOBEvidence(curveGrams: snapshot.cobGrams,
+                    estimatedGrams: nil, usedGrams: snapshot.cobGrams,
+                    fallbackReason: reason)
+            }
+        }
         let glucoseMmol = glucoseValue / mgdlPerMmol
-        let carbUnits = (snapshot.cobGrams + extraCarbs) / profileValues.carbohydrateRatio
+        let carbUnits = (cobEvidence.usedGrams + extraCarbs) / profileValues.carbohydrateRatio
         let correctionUnits = (glucoseMmol - profileValues.targetMmol) /
             profileValues.correctionMmolPerUnit
         let trendUnits = (trendMgdl / mgdlPerMmol) / profileValues.correctionMmolPerUnit
@@ -398,7 +644,8 @@ enum PenBolusCalculator {
             lines: lines, safety: safety, unavailableReason: nil,
             glucoseMgdl: glucoseValue, glucoseMeasuredAt: glucoseDate,
             glucoseSensorID: glucoseSensorID,
-            trendWasIntentionallyZero: zeroTrend, forecastMinimumMgdl: forecastMinimum)
+            trendWasIntentionallyZero: zeroTrend, forecastMinimumMgdl: forecastMinimum,
+            cobEvidence: cobEvidence)
     }
 
     /// Use a real 15–20-minute span from one sensor; never extrapolate a shorter movement.

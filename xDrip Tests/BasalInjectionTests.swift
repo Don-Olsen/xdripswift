@@ -551,7 +551,10 @@ final class LocalTreatmentPlanningTests: XCTestCase {
         defaults.showCarbsTreatmentsInList = true
 
         let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
-        let noon = Calendar.current.startOfDay(for: Date()).addingTimeInterval(12 * 3600)
+        // Keep the chart window in the past and all list entries on one calendar day.
+        let previousDay = try XCTUnwrap(Calendar.current.date(byAdding: .day, value: -1,
+            to: Calendar.current.startOfDay(for: Date())))
+        let noon = previousDay.addingTimeInterval(12 * 3600)
         let cutoff = noon.addingTimeInterval(-3600)
         XCTAssertTrue(TreatmentSourceCutover.persist(.init(
             cutoff: cutoff, insulinSourceBundleID: "test.mysugr",
@@ -583,6 +586,7 @@ final class LocalTreatmentPlanningTests: XCTestCase {
 
         let list = TreatmentsViewModel(coreDataManager: core)
         list.reloadTreatments()
+        list.selectedDateChanged(noon)
         let listIDs = Set(list.filteredTreatments.map(\.objectID))
         XCTAssertEqual(listIDs, Set([historic, consumedLocal, planned, cancelled].map(\.objectID)),
                        "Old selected mySugr history and local plans remain visible after importer shutdown")

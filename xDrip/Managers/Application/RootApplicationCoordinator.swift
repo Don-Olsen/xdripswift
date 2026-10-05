@@ -2411,6 +2411,11 @@ struct InitialCalibrationRequestGate {
                 adapter = GlucoseForecastDataAdapter(coreDataManager: coreDataManager)
                 self.lowSoonForecastAdapter = adapter
             }
+            // Prospective transition evidence follows the same durable saved-reading event
+            // in master and follower mode. This utility task never waits on the sensor path.
+            Task.detached(priority: .utility) {
+                await adapter.monitorTransitionAfterSavedReading(at: .now)
+            }
             Task { @MainActor [weak self] in
                 let outcome = await adapter.engineOnlyForecast(horizonMinutes: 60, at: .now)
                 guard let self else { return }

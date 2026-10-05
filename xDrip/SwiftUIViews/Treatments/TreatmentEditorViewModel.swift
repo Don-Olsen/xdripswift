@@ -822,7 +822,11 @@ struct PenDoseCalculationDetails {
     let glucoseMgdl: Double?
     let glucoseMeasuredAt: Date?
     let iobUnits: Double
+    /// COB actually used by the proposed dose; it never exceeds curve COB.
     let cobGrams: Double
+    let curveCOBGrams: Double
+    let estimatedCOBGrams: Double?
+    let cobFallbackReason: PenCOBFallbackReason?
     let newCarbsGrams: Double
     let carbohydrateRatio: Double
     let targetMmol: Double
@@ -1120,7 +1124,11 @@ struct PenDoseCalculationDetails {
         if let values {
             calculationDetails = PenDoseCalculationDetails(calculation: result, calculatedAt: now,
                 glucoseMgdl: result.glucoseMgdl, glucoseMeasuredAt: result.glucoseMeasuredAt,
-                iobUnits: snapshot.iobUnits, cobGrams: snapshot.cobGrams,
+                iobUnits: snapshot.iobUnits,
+                cobGrams: result.cobEvidence?.usedGrams ?? snapshot.cobGrams,
+                curveCOBGrams: result.cobEvidence?.curveGrams ?? snapshot.cobGrams,
+                estimatedCOBGrams: result.cobEvidence?.estimatedGrams,
+                cobFallbackReason: result.cobEvidence?.fallbackReason,
                 newCarbsGrams: reminderMealUUID == nil ? (parsedCarbs ?? 0) : 0,
                 carbohydrateRatio: values.carbohydrateRatio, targetMmol: values.targetMmol,
                 correctionMmolPerUnit: values.correctionMmolPerUnit,
@@ -1332,9 +1340,13 @@ struct PenDoseCalculationDetails {
          String(plannedDate.timeIntervalSince1970), glucoseChoice.rawValue,
          manualGlucoseText, String(manualGlucoseDate.timeIntervalSince1970),
          reminderMealUUID ?? "", String(describing: profile.settings),
-         String(profile.isConfirmed), String(pizza.isEnabled),
+         String(profile.isConfirmed), String(profile.confirmedAt?.timeIntervalSince1970 ?? 0),
+         String(pizza.isEnabled),
          String(pizza.percentageNow), String(pizza.reminderMinutes),
          String(describing: UserDefaults.standard.dataFlowPolicy),
+         String(TherapyMetricsManager.shared.treatmentChangeRevision),
+         String(TherapyMetricsManager.shared.forecastInputChangeRevision),
+         String(TherapyMetricsManager.shared.hasUncommittedForecastInputChanges),
          forecastInputSignature].joined(separator: "|")
     }
     private func glucoseInput(snapshot: PenDoseInputSnapshot, now: Date) async -> PenDoseGlucoseInput? {
@@ -1382,7 +1394,10 @@ struct PenDoseCalculationDetails {
     static func reviewInputsMatch(_ old: PenDoseInputSnapshot,
                                   _ fresh: PenDoseInputSnapshot) -> Bool {
         guard old.treatmentRevision == fresh.treatmentRevision,
+              old.sourceSignature == fresh.sourceSignature,
               old.glucose == fresh.glucose,
+              old.historicalGlucose == fresh.historicalGlucose,
+              old.historicalGlucoseIssue == fresh.historicalGlucoseIssue,
               old.therapySettings == fresh.therapySettings,
               old.iobUnits == fresh.iobUnits,
               old.cobGrams == fresh.cobGrams,
@@ -1395,7 +1410,8 @@ struct PenDoseCalculationDetails {
                 left.createdAt == right.createdAt &&
                 left.modifiedAt == right.modifiedAt &&
                 left.isAppLocal == right.isAppLocal &&
-                left.isDeletedCurrentRevision == right.isDeletedCurrentRevision
+                left.isDeletedCurrentRevision == right.isDeletedCurrentRevision &&
+                left.stableIdentity == right.stableIdentity
         }
     }
     static func unavailableText(_ reason: PenDoseUnavailableReason) -> String {

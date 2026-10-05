@@ -90,6 +90,9 @@ struct GlucoseForecastMLSettingsView: View {
     @State private var coverageText = GlucoseForecastMLTrainingCoordinator.shared.coverageText
     @State private var isPreparing = GlucoseForecastMLTrainingCoordinator.shared.isPreparing
     @State private var currentContext: GlucoseForecastMLContext?
+    @State private var compatibility: GlucoseForecastMLModelCompatibility.Assessment =
+        .invalid(.packageUnavailable)
+    @State private var transitionStatus: GlucoseForecastMLTransitionEvidence.Status?
     @State private var selfCheckCSVURL: URL?
 
     private func t(_ key: String, _ fallback: String) -> String {
@@ -100,15 +103,34 @@ struct GlucoseForecastMLSettingsView: View {
         Form {
             Section {
                 if let metadata {
-                    if currentContext.map({ metadata.context == $0 }) == true,
-                       GlucoseForecastMLModelCompatibility.isUsable(metadata) {
+                    switch compatibility {
+                    case .exact:
                         LabeledContent(t("forecast.mlCompatible", "Model matches current settings"),
                                        value: metadata.trainedAt.formatted())
-                    } else {
+                    case .transitionCompatible:
+                        LabeledContent(t("forecast.mlTransitionCompatible",
+                            "Previous model is compatible with local treatment logging"),
+                            value: metadata.trainedAt.formatted())
+                        switch transitionStatus {
+                        case .awaiting(let days, let pairs):
+                            Text(String(format: t("forecast.mlTransitionAwaiting",
+                                "Comparing the model with the engine: %d of 7 usable days, %d paired +60-minute results. The model remains available."),
+                                days, pairs))
+                                .foregroundStyle(.secondary)
+                        case .passed(let result):
+                            Text(String(format: t("forecast.mlTransitionPassed",
+                                "The prior model passed the local +60-minute comparison on %d paired results."),
+                                result.pairCount))
+                                .foregroundStyle(.secondary)
+                        case .disabled, .unreadable, .none:
+                            Text(t("forecast.mlTransitionUnavailable",
+                                "The engine is used because the model comparison is unavailable."))
+                                .foregroundStyle(.secondary)
+                        }
+                    case .invalid(let reason):
                         LabeledContent(t("forecast.mlIncompatible", "Saved model does not match current settings"),
                                        value: metadata.trainedAt.formatted())
-                        Text(t("forecast.mlIncompatibleFallback",
-                               "The forecast engine is used until a model for the current settings and treatment sources passes self-check."))
+                        Text(invalidReasonText(reason))
                             .foregroundStyle(.secondary)
                     }
                     LabeledContent(t("forecast.mlUsableDays", "Usable data days"), value: "\(metadata.usableDayCount)")
@@ -227,6 +249,31 @@ struct GlucoseForecastMLSettingsView: View {
                     horizonMinutes: 120, defaults: defaults, importer: .shared))
         } else {
             currentContext = nil
+        }
+        compatibility = GlucoseForecastMLManager.shared.compatibility(current: currentContext)
+        transitionStatus = GlucoseForecastMLManager.shared.transitionStatus(current: currentContext)
+    }
+
+    private func invalidReasonText(_ reason: GlucoseForecastMLModelCompatibility.InvalidReason) -> String {
+        switch reason {
+        case .packageUnavailable:
+            return t("forecast.mlReasonPackage", "The saved model package is unavailable. The engine is used.")
+        case .generationChanged:
+            return t("forecast.mlReasonGeneration", "The forecast engine or model format changed. The engine is used.")
+        case .parametersChanged:
+            return t("forecast.mlReasonParameters", "Personal therapy settings changed. The engine is used until a matching model passes self-check.")
+        case .sourceChanged:
+            return t("forecast.mlReasonSource", "The treatment source changed. The engine is used.")
+        case .malformedSignature:
+            return t("forecast.mlReasonSignature", "The saved source description cannot be verified. The engine is used.")
+        case .transitionUnverified:
+            return t("forecast.mlReasonTransition", "The earlier treatment-source transition cannot be verified. The engine is used.")
+        case .sourceSetupIncomplete:
+            return t("forecast.mlReasonSetup", "Treatment sources still need setup. The engine is used.")
+        case .prospectiveWorse:
+            return t("forecast.mlReasonWorse", "After seven usable days, the earlier model performed worse than the engine at +60 minutes and was disabled. The engine is used.")
+        case .evidenceUnreadable:
+            return t("forecast.mlReasonEvidence", "The local model comparison cannot be read. The engine is used to avoid an unverified model.")
         }
     }
 

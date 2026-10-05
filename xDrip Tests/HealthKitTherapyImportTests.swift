@@ -9,6 +9,52 @@ final class HealthKitTherapyImportTests: XCTestCase {
     private let sourceA = HealthTherapyImportSource(bundleIdentifier: "org.example.therapy.a", name: "Pump A")
     private let sourceB = HealthTherapyImportSource(bundleIdentifier: "org.example.therapy.b", name: "Pump B")
 
+    func testConsistentLocalCutoverHidesOnlyOngoingImportsAndEnglishFooter() throws {
+        let suite = "HealthCutoverPresentation-" + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.isMaster = true
+        defaults.therapyDataSourceType = .none
+        let cutoff = Date(timeIntervalSince1970: 1_800_000_000)
+        let boundary = TreatmentSourceCutover(cutoff: cutoff,
+            insulinSourceBundleID: sourceA.bundleIdentifier,
+            carbohydrateSourceBundleID: sourceB.bundleIdentifier)
+        XCTAssertTrue(TreatmentSourceCutover.persist(boundary, defaults: defaults))
+        let model = SettingsViewHealthKitSettingsViewModel(defaults: defaults)
+        XCTAssertEqual(model.settingsRows(sectionID: 1).map(\.id), [
+            "healthKit.enabledHealthKit", "healthKit.localTreatmentCutover"
+        ])
+        XCTAssertNil(model.sectionFooter())
+        XCTAssertTrue(HealthKitLocalCutoverPresentation.isActive(
+            policy: defaults.dataFlowPolicy, cutover: boundary, defaults: defaults))
+        XCTAssertEqual(HealthKitLocalCutoverPresentation.priorSourceName(sourceA,
+            expectedBundleID: boundary.insulinSourceBundleID), "Pump A")
+        XCTAssertEqual(HealthKitLocalCutoverPresentation.priorSourceName(sourceA,
+            expectedBundleID: boundary.carbohydrateSourceBundleID), sourceB.bundleIdentifier)
+        XCTAssertFalse(HealthKitLocalCutoverPresentation.cutoffDescription(cutoff).isEmpty)
+
+        defaults.set(true, forKey: TreatmentSourceCutover.restoreRequiresSourceSetupKey)
+        XCTAssertEqual(model.settingsRows(sectionID: 1).count, 8)
+        XCTAssertNotNil(model.sectionFooter())
+        defaults.removeObject(forKey: TreatmentSourceCutover.restoreRequiresSourceSetupKey)
+        defaults.therapyDataSourceType = .nightscout
+        defaults.nightscoutEnabled = true
+        XCTAssertEqual(model.settingsRows(sectionID: 1).count, 8)
+        XCTAssertNotNil(model.sectionFooter())
+    }
+
+    func testDamagedLocalCutoverLeavesHealthImportControlsVisible() throws {
+        let suite = "InvalidHealthCutoverPresentation-" + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.isMaster = true
+        defaults.therapyDataSourceType = .none
+        defaults.set(Data("corrupted".utf8), forKey: TreatmentSourceCutover.defaultsKey)
+        let model = SettingsViewHealthKitSettingsViewModel(defaults: defaults)
+        XCTAssertEqual(model.settingsRows(sectionID: 1).count, 8)
+        XCTAssertNotNil(model.sectionFooter())
+    }
+
     private func anchor(_ text: String) -> Data { Data(text.utf8) }
 
     private func sample(_ kind: HealthTherapyImportKind, source: HealthTherapyImportSource,
@@ -604,13 +650,14 @@ final class HealthKitTherapyImportTests: XCTestCase {
         firstQuery.setPage(page([dose], next: "saved"), for: .insulin, after: nil)
         let firstCore = try CoreDataManager(testModelName: ConstantsCoreData.modelName,
                                             persistentStoreURL: storeURL)
-        let firstManager = HealthKitTherapyImportManager(query: firstQuery, defaults: defaults)
-        firstManager.configure(coreDataManager: firstCore)
+        var firstManager: HealthKitTherapyImportManager? = HealthKitTherapyImportManager(
+            query: firstQuery, defaults: defaults)
+        firstManager?.configure(coreDataManager: firstCore)
         defaults.set(sourceA.bundleIdentifier,
                      forKey: "healthTherapyImport.v1.insulin.sourceBundleID")
         defaults.set(sourceA.name, forKey: "healthTherapyImport.v1.insulin.sourceName")
         let authorized = expectation(description: "read request returned")
-        firstManager.setEnabled(true, kind: .insulin) { error in
+        firstManager?.setEnabled(true, kind: .insulin) { error in
             XCTAssertNil(error)
             authorized.fulfill()
         }
@@ -619,7 +666,20 @@ final class HealthKitTherapyImportTests: XCTestCase {
             defaults.data(forKey: "healthTherapyImport.v1.insulin.anchor") == self.anchor("saved")
         }
         XCTAssertEqual(treatments(in: firstCore).count, 1)
+        let stopped = expectation(description: "first import disabled before restart")
+        firstManager?.setEnabled(false, kind: .insulin) { error in
+            XCTAssertNil(error)
+            stopped.fulfill()
+        }
+        wait(for: [stopped], timeout: 3)
+        weak var oldManager = firstManager
+        firstManager = nil
+        waitUntil("first import manager released") { oldManager == nil }
+        guard oldManager == nil else { return }
         try firstCore.disconnectPersistentStoresForTesting()
+
+        // A new process reads the persisted enabled choice with no old manager alive.
+        defaults.set(true, forKey: "healthTherapyImport.v1.insulin.enabled")
 
         let secondQuery = FakeQuery()
         // Replayed UUID after a process restart must not create a second dose.
@@ -627,15 +687,26 @@ final class HealthKitTherapyImportTests: XCTestCase {
                             after: anchor("saved"))
         let secondCore = try CoreDataManager(testModelName: ConstantsCoreData.modelName,
                                              persistentStoreURL: storeURL)
-        defer { try? secondCore.disconnectPersistentStoresForTesting() }
-        let secondManager = HealthKitTherapyImportManager(query: secondQuery, defaults: defaults)
-        secondManager.configure(coreDataManager: secondCore)
+        var secondManager: HealthKitTherapyImportManager? = HealthKitTherapyImportManager(
+            query: secondQuery, defaults: defaults)
+        secondManager?.configure(coreDataManager: secondCore)
         waitUntil("restart query resumed") {
             defaults.data(forKey: "healthTherapyImport.v1.insulin.anchor") == self.anchor("resumed")
         }
         XCTAssertEqual(Array(secondQuery.anchors(for: .insulin).prefix(1)), [anchor("saved")])
         XCTAssertEqual(ledger(in: secondCore).count, 1)
         XCTAssertEqual(treatments(in: secondCore).count, 1)
+        let restartedStopped = expectation(description: "restarted import disabled before store removal")
+        secondManager?.setEnabled(false, kind: .insulin) { error in
+            XCTAssertNil(error)
+            restartedStopped.fulfill()
+        }
+        wait(for: [restartedStopped], timeout: 3)
+        weak var restartedManager = secondManager
+        secondManager = nil
+        waitUntil("restarted import manager released") { restartedManager == nil }
+        guard restartedManager == nil else { return }
+        try secondCore.disconnectPersistentStoresForTesting()
     }
 
     func testSourceFilterAndExactOriginIDPrecedencePreserveRealRepeatAndManualEntries() {
@@ -808,10 +879,13 @@ final class HealthKitTherapyImportTests: XCTestCase {
                               for: .carbohydrates, after: nil)
         enable(.insulin, source: mySugr, fixture: fixture)
         enable(.carbohydrates, source: mySugr, fixture: fixture)
-        waitUntil("initial mySugr import complete") {
-            !fixture.manager.status(.insulin).isIncomplete &&
-                !fixture.manager.status(.carbohydrates).isIncomplete
+        waitUntil("initial mySugr imports durably checkpointed") {
+            fixture.anchor(for: .insulin) == self.anchor("i0") &&
+                fixture.anchor(for: .carbohydrates) == self.anchor("c0") &&
+                fixture.manager.status(.insulin).lastSync != nil &&
+                fixture.manager.status(.carbohydrates).lastSync != nil
         }
+        XCTAssertEqual(treatments(in: fixture.core).count, 2)
         fixture.query.setError(ReadFailure.locked, for: .insulin)
         let failed = expectation(description: "final read failed")
         fixture.manager.switchToLocalLogging { error in
@@ -1176,6 +1250,11 @@ final class HealthKitTherapyImportTests: XCTestCase {
                      onChange: @escaping (@escaping () -> Void) -> Void) {
             lock.lock(); defer { lock.unlock() }
             observed[kind] = onChange
+        }
+
+        func stopObserving(_ kind: HealthTherapyImportKind) {
+            lock.lock(); defer { lock.unlock() }
+            observed.removeValue(forKey: kind)
         }
     }
 }

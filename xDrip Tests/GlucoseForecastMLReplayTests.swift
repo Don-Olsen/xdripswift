@@ -3,6 +3,11 @@ import XCTest
 @testable import xdrip
 
 final class GlucoseForecastMLReplayTests: XCTestCase {
+    func testHistoricalTrainingRequestsAllThreeReadOnlyHealthTypes() {
+        XCTAssertEqual(Set(GlucoseForecastMLTrainingCoordinator.historicalReadIdentifiers),
+            Set([.bloodGlucose, .insulinDelivery, .dietaryCarbohydrates]))
+    }
+
     func testEditedLocalRevisionInvalidatesPastAnchorInsteadOfPretendingZero() {
         let treatmentDate = reference.addingTimeInterval(-10 * 60)
         let created = reference.addingTimeInterval(-20 * 60)
@@ -564,7 +569,8 @@ final class GlucoseForecastMLReplayTests: XCTestCase {
                     healthSample($0, bundle: "com.xdrip.glucose")
                 })
             let loader = GlucoseForecastMLHistoryLoader(coreDataManager: core,
-                therapyManager: manager, healthImporter: importer, healthQuery: query)
+                therapyManager: manager, healthImporter: importer, healthQuery: query,
+                defaults: defaults)
             let policy = DataFlowPolicy(isMaster: true, followerDataSource: .careLink,
                 therapyDataSourceSelection: .none, nightscoutEnabled: false,
                 masterUploadsGlucoseToNightscout: false,
@@ -646,9 +652,416 @@ final class GlucoseForecastMLReplayTests: XCTestCase {
         XCTAssertEqual(loaded.coverage.healthCarbohydrateRead.count, 63)
         XCTAssertEqual(loaded.coverage.acceptedHealthInsulinCount, 63)
         XCTAssertEqual(loaded.coverage.acceptedHealthCarbohydrateCount, 63)
+        XCTAssertEqual(loaded.coverage.cutoverState.rawValue, "valid")
+        XCTAssertEqual(loaded.coverage.cutoverDate, finalDay)
+        XCTAssertEqual(loaded.coverage.cutoverInsulinSourceBundleID, therapyBundle)
+        XCTAssertEqual(loaded.coverage.cutoverCarbohydrateSourceBundleID, therapyBundle)
+        XCTAssertFalse(loaded.coverage.insulinQuery.effectiveImportEnabled)
+        XCTAssertFalse(loaded.coverage.carbohydrateQuery.effectiveImportEnabled)
+        XCTAssertEqual(loaded.coverage.insulinQuery.executedQueries, 64)
+        XCTAssertEqual(loaded.coverage.carbohydrateQuery.executedQueries, 64)
+        XCTAssertEqual(loaded.coverage.insulinQuery.returnedCount, 63)
+        XCTAssertEqual(loaded.coverage.carbohydrateQuery.returnedCount, 63)
+        XCTAssertEqual(loaded.coverage.insulinQuery.sourceMatchedCount, 63)
+        XCTAssertEqual(loaded.coverage.carbohydrateQuery.sourceMatchedCount, 63)
+        XCTAssertEqual(loaded.coverage.insulinQuery.acceptedCount, 63)
+        XCTAssertEqual(loaded.coverage.carbohydrateQuery.acceptedCount, 63)
+        XCTAssertEqual(query.requestCount(for: .insulin), 64)
+        XCTAssertEqual(query.requestCount(for: .carbohydrates), 64)
         XCTAssertGreaterThanOrEqual(loaded.coverage.healthKitDays, 60)
         XCTAssertGreaterThanOrEqual(loaded.coverage.usableDays, 60)
         XCTAssertEqual(loaded.coverage.localFallbackDays, 0)
+    }
+
+    @MainActor func testLoaderKeepsHistoricalSelectedTreatmentsAndUsesOnlyLocalAfterCutover() async throws {
+        let suite = "MLHistoryBoundary.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let finalDay = utcCalendar.startOfDay(for: reference)
+        let selected = "com.mysugr.companion.mySugr"
+        let other = "com.GFZ896KN66.xdripswift"
+        XCTAssertTrue(TreatmentSourceCutover.persist(.init(cutoff: finalDay,
+            insulinSourceBundleID: selected, carbohydrateSourceBundleID: selected),
+            defaults: defaults))
+        let importer = HealthKitTherapyImportManager(query: NoopTherapyQuery(), defaults: defaults)
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let localDate = finalDay.addingTimeInterval(8 * 3600)
+        for (kind, amount) in [(TreatmentType.Insulin, 3.0), (TreatmentType.Carbs, 30.0)] {
+            for (eventDate, dose) in [(finalDay, amount / 10), (localDate, amount)] {
+                let entry = TreatmentEntry(date: eventDate, value: dose, treatmentType: kind,
+                    nightscoutEventType: nil, enteredBy: "xDrip4iOS",
+                    nsManagedObjectContext: core.mainManagedObjectContext)
+                entry.localTreatmentUUID = UUID().uuidString
+                entry.createdAt = eventDate
+                entry.modifiedAt = eventDate
+            }
+        }
+        let unconfirmed = TreatmentEntry(date: localDate, value: 90,
+            treatmentType: .Carbs, nightscoutEventType: nil, enteredBy: "xDrip4iOS",
+            nsManagedObjectContext: core.mainManagedObjectContext)
+        unconfirmed.localTreatmentUUID = UUID().uuidString
+        unconfirmed.createdAt = localDate
+        unconfirmed.plannedMealStateRaw = TreatmentMealState.planned.rawValue
+        XCTAssertTrue(core.saveChangesSynchronously())
+        var glucose = [GlucoseForecastMLHealthSample]()
+        var insulin = [GlucoseForecastMLHealthSample]()
+        var carbohydrates = [GlucoseForecastMLHealthSample]()
+        for offset in -64...0 {
+            let day = try XCTUnwrap(utcCalendar.date(byAdding: .day, value: offset, to: finalDay))
+            let anchor = day.addingTimeInterval(12 * 3600)
+            for minute in stride(from: -40, through: 130, by: 5) {
+                let date = anchor.addingTimeInterval(Double(minute) * 60)
+                glucose.append(.init(uuid: UUID(), sourceBundleIdentifier: "com.xdrip.glucose",
+                    startDate: date, endDate: date, value: 120, insulinReason: nil,
+                    hasUndeterminedDuration: false, sampleCount: 1))
+            }
+            let therapyDate = day.addingTimeInterval(8 * 3600)
+            insulin.append(.init(uuid: UUID(), sourceBundleIdentifier: selected,
+                startDate: therapyDate, endDate: therapyDate, value: 1,
+                insulinReason: HKInsulinDeliveryReason.bolus.rawValue,
+                hasUndeterminedDuration: false, sampleCount: 1))
+            carbohydrates.append(.init(uuid: UUID(), sourceBundleIdentifier: selected,
+                startDate: therapyDate, endDate: therapyDate, value: 10,
+                insulinReason: nil, hasUndeterminedDuration: false, sampleCount: 1))
+        }
+        // A selected-source row exactly at cutoff, a copy of the later local
+        // row in HealthKit, and a different source must all be rejected.
+        insulin.append(.init(uuid: UUID(), sourceBundleIdentifier: selected,
+            startDate: finalDay, endDate: finalDay, value: 1,
+            insulinReason: HKInsulinDeliveryReason.bolus.rawValue,
+            hasUndeterminedDuration: false, sampleCount: 1))
+        carbohydrates.append(.init(uuid: UUID(), sourceBundleIdentifier: selected,
+            startDate: finalDay, endDate: finalDay, value: 10,
+            insulinReason: nil, hasUndeterminedDuration: false, sampleCount: 1))
+        // Copies of the local entries in HealthKit, plus a different source,
+        // must be visible to diagnostics but never become replay treatments.
+        insulin.append(.init(uuid: UUID(), sourceBundleIdentifier: other,
+            startDate: finalDay.addingTimeInterval(-12 * 3600),
+            endDate: finalDay.addingTimeInterval(-12 * 3600), value: 25,
+            insulinReason: HKInsulinDeliveryReason.bolus.rawValue,
+            hasUndeterminedDuration: false, sampleCount: 1))
+        insulin.append(.init(uuid: UUID(), sourceBundleIdentifier: other,
+            startDate: localDate, endDate: localDate, value: 3,
+            insulinReason: HKInsulinDeliveryReason.bolus.rawValue,
+            hasUndeterminedDuration: false, sampleCount: 1))
+        carbohydrates.append(.init(uuid: UUID(), sourceBundleIdentifier: other,
+            startDate: localDate, endDate: localDate, value: 30,
+            insulinReason: nil, hasUndeterminedDuration: false, sampleCount: 1))
+        let manager = TherapyMetricsManager()
+        manager.configure(coreDataManager: core, externalStatus: { nil })
+        let query = FakeHistoryHealthQuery(glucoseSamples: glucose, insulinSamples: insulin,
+            carbohydrateSamples: carbohydrates)
+        let loader = GlucoseForecastMLHistoryLoader(coreDataManager: core,
+            therapyManager: manager, healthImporter: importer,
+            healthQuery: query, defaults: defaults)
+        let result = await loader.load(days: 65, at: finalDay.addingTimeInterval(20 * 3600),
+            policy: historyPolicy, settings: settings, sensitivityMgdlPerUnit: 40,
+            carbohydrateRatioGramsPerUnit: 10, calendar: utcCalendar)
+        let loaded = try XCTUnwrap(result)
+        XCTAssertGreaterThanOrEqual(loaded.coverage.usableDays, 60)
+        XCTAssertEqual(loaded.coverage.insulinQuery.acceptedCount, 64)
+        XCTAssertEqual(loaded.coverage.carbohydrateQuery.acceptedCount, 64)
+        XCTAssertEqual(loaded.coverage.insulinQuery.cutoffExcludedCount, 2)
+        XCTAssertEqual(loaded.coverage.carbohydrateQuery.cutoffExcludedCount, 2)
+        XCTAssertEqual(loaded.coverage.localInsulinRead.count, 2)
+        XCTAssertEqual(loaded.coverage.localCarbohydrateRead.count, 2)
+        XCTAssertEqual(loaded.coverage.insulinQuery.sourceExcludedCount, 2)
+        XCTAssertEqual(loaded.coverage.carbohydrateQuery.sourceExcludedCount, 1)
+        XCTAssertEqual(loaded.coverage.insulinQuery.returnedSourceCounts[other], 2)
+        XCTAssertEqual(loaded.coverage.insulinQuery.returnedSourceCounts[selected], 66)
+        XCTAssertTrue(loaded.coverage.discoveredInsulinSources.contains {
+            $0.bundleIdentifier == selected
+        })
+        let afterCutover = loaded.examples.filter {
+            $0.row.referenceDate >= finalDay && $0.row.horizonMinutes == 30
+        }
+        XCTAssertFalse(afterCutover.isEmpty)
+        XCTAssertTrue(afterCutover.allSatisfy {
+            $0.bolusUnitsInWindow == 3 && $0.carbohydrateGramsInWindow == 30
+        }, "Only app-origin treatments may enter replay after the exact boundary")
+        XCTAssertEqual(query.requestCount(for: .insulin), 65)
+        XCTAssertEqual(query.requestCount(for: .carbohydrates), 65)
+    }
+
+    @MainActor func testCutoverDayRequiresBothSourcesForEachCrossingTreatmentWindow() async throws {
+        let suite = "MLHistorySameDayCutover.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let day = utcCalendar.startOfDay(for: reference)
+        let cutoff = day.addingTimeInterval(10 * 3600)
+        let selected = "com.mysugr.companion.mySugr"
+        XCTAssertTrue(TreatmentSourceCutover.persist(.init(cutoff: cutoff,
+            insulinSourceBundleID: selected, carbohydrateSourceBundleID: selected),
+            defaults: defaults))
+        let importer = HealthKitTherapyImportManager(query: NoopTherapyQuery(), defaults: defaults)
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let manager = TherapyMetricsManager()
+        manager.configure(coreDataManager: core, externalStatus: { nil })
+        let before = day.addingTimeInterval(8 * 3600)
+        let after = day.addingTimeInterval(10.25 * 3600)
+        let glucose = stride(from: -40, through: 130, by: 5).map { minute in
+            let date = day.addingTimeInterval(12 * 3600 + Double(minute) * 60)
+            return GlucoseForecastMLHealthSample(uuid: UUID(),
+                sourceBundleIdentifier: "com.xdrip.glucose", startDate: date, endDate: date,
+                value: 120, insulinReason: nil, hasUndeterminedDuration: false, sampleCount: 1)
+        }
+        let healthInsulin = GlucoseForecastMLHealthSample(uuid: UUID(),
+            sourceBundleIdentifier: selected, startDate: before, endDate: before,
+            value: 1, insulinReason: HKInsulinDeliveryReason.bolus.rawValue,
+            hasUndeterminedDuration: false, sampleCount: 1)
+        let healthCarbs = GlucoseForecastMLHealthSample(uuid: UUID(),
+            sourceBundleIdentifier: selected, startDate: before, endDate: before,
+            value: 10, insulinReason: nil, hasUndeterminedDuration: false, sampleCount: 1)
+        func load(insulin: [GlucoseForecastMLHealthSample],
+                  carbs: [GlucoseForecastMLHealthSample]) async -> GlucoseForecastMLHistoryLoadResult? {
+            let query = FakeHistoryHealthQuery(glucoseSamples: glucose,
+                insulinSamples: insulin, carbohydrateSamples: carbs)
+            let loader = GlucoseForecastMLHistoryLoader(coreDataManager: core,
+                therapyManager: manager, healthImporter: importer,
+                healthQuery: query, defaults: defaults)
+            return await loader.load(days: 1, at: day.addingTimeInterval(14.5 * 3600),
+                policy: historyPolicy, settings: settings, sensitivityMgdlPerUnit: 40,
+                carbohydrateRatioGramsPerUnit: 10, calendar: utcCalendar)
+        }
+        func addLocal(_ kind: TreatmentType, amount: Double) {
+            let entry = TreatmentEntry(date: after, value: amount, treatmentType: kind,
+                nightscoutEventType: nil, enteredBy: "xDrip4iOS",
+                nsManagedObjectContext: core.mainManagedObjectContext)
+            entry.localTreatmentUUID = UUID().uuidString
+            entry.createdAt = after
+            entry.modifiedAt = after
+            XCTAssertTrue(core.saveChangesSynchronously())
+        }
+        let noPostResult = await load(insulin: [healthInsulin], carbs: [healthCarbs])
+        let noPost = try XCTUnwrap(noPostResult)
+        XCTAssertTrue(noPost.examples.isEmpty,
+            "Pre-cutover Health rows on the same day cannot certify post-cutover zero treatment")
+        XCTAssertEqual(noPost.coverage.unknownInsulinDays, 1)
+        XCTAssertEqual(noPost.coverage.unknownCarbohydrateDays, 1)
+
+        addLocal(.Insulin, amount: 3)
+        let insulinOnlyResult = await load(insulin: [healthInsulin], carbs: [healthCarbs])
+        let insulinOnly = try XCTUnwrap(insulinOnlyResult)
+        XCTAssertTrue(insulinOnly.examples.isEmpty,
+            "Insulin evidence cannot certify missing post-cutover carbohydrate evidence")
+        XCTAssertEqual(insulinOnly.coverage.unknownCarbohydrateDays, 1)
+
+        addLocal(.Carbs, amount: 30)
+        let bothResult = await load(insulin: [healthInsulin], carbs: [healthCarbs])
+        let both = try XCTUnwrap(bothResult)
+        let postRows = both.examples.filter { $0.row.referenceDate >= cutoff }
+        XCTAssertFalse(postRows.isEmpty)
+        XCTAssertTrue(postRows.allSatisfy {
+            $0.bolusUnitsInWindow == 4 && $0.carbohydrateGramsInWindow == 40
+        })
+        XCTAssertEqual(both.coverage.unknownInsulinDays, 0)
+        XCTAssertEqual(both.coverage.unknownCarbohydrateDays, 0)
+
+        let noPreResult = await load(insulin: [], carbs: [])
+        let noPre = try XCTUnwrap(noPreResult)
+        XCTAssertTrue(noPre.examples.isEmpty,
+            "Post-cutover local rows cannot certify the pre-cutover portion of a crossing window")
+        XCTAssertEqual(noPre.coverage.unknownInsulinDays, 1)
+        XCTAssertEqual(noPre.coverage.unknownCarbohydrateDays, 1)
+    }
+
+    @MainActor func testCompletedSourceSwitchKeepsPreCutoverHistoryAvailableToLoader() async throws {
+        let suite = "MLHistoryRealSwitch.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let source = HealthTherapyImportSource(bundleIdentifier: "com.mysugr.companion.mySugr",
+            name: "mySugr")
+        for kind in HealthTherapyImportKind.allCases {
+            let prefix = "healthTherapyImport.v1.\(kind.rawValue)."
+            defaults.set(true, forKey: prefix + "enabled")
+            defaults.set(source.bundleIdentifier, forKey: prefix + "sourceBundleID")
+            defaults.set(source.name, forKey: prefix + "sourceName")
+        }
+        let eventDate = Date().addingTimeInterval(-2 * 3600)
+        let importingQuery = CompletingTherapyQuery(source: source, eventDate: eventDate)
+        let importer = HealthKitTherapyImportManager(query: importingQuery, defaults: defaults)
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        importer.configure(coreDataManager: core)
+        let switched = expectation(description: "final mySugr import and local source switch")
+        importer.switchToLocalLogging { error in
+            XCTAssertNil(error)
+            switched.fulfill()
+        }
+        await fulfillment(of: [switched], timeout: 10)
+        let cutover = try XCTUnwrap(TreatmentSourceCutover.current(defaults: defaults))
+        XCTAssertGreaterThan(cutover.cutoff, eventDate)
+        XCTAssertFalse(importer.isEnabled(.insulin))
+        XCTAssertFalse(importer.isEnabled(.carbohydrates))
+        let insulin = GlucoseForecastMLHealthSample(uuid: importingQuery.insulinUUID,
+            sourceBundleIdentifier: source.bundleIdentifier, startDate: eventDate,
+            endDate: eventDate, value: 2,
+            insulinReason: HKInsulinDeliveryReason.bolus.rawValue,
+            hasUndeterminedDuration: false, sampleCount: 1)
+        let carbohydrates = GlucoseForecastMLHealthSample(uuid: importingQuery.carbohydrateUUID,
+            sourceBundleIdentifier: source.bundleIdentifier, startDate: eventDate,
+            endDate: eventDate, value: 20, insulinReason: nil,
+            hasUndeterminedDuration: false, sampleCount: 1)
+        let historyQuery = FakeHistoryHealthQuery(glucoseSamples: [],
+            insulinSamples: [insulin], carbohydrateSamples: [carbohydrates])
+        let manager = TherapyMetricsManager()
+        manager.configure(coreDataManager: core, externalStatus: { nil })
+        let loader = GlucoseForecastMLHistoryLoader(coreDataManager: core,
+            therapyManager: manager, healthImporter: importer,
+            healthQuery: historyQuery, defaults: defaults)
+        let result = await loader.load(days: 2, at: Date(), policy: historyPolicy,
+            settings: settings, sensitivityMgdlPerUnit: 40,
+            carbohydrateRatioGramsPerUnit: 10, calendar: utcCalendar)
+        let coverage = try XCTUnwrap(result?.coverage)
+        XCTAssertEqual(coverage.cutoverState.rawValue, "valid")
+        XCTAssertFalse(coverage.insulinQuery.effectiveImportEnabled)
+        XCTAssertFalse(coverage.carbohydrateQuery.effectiveImportEnabled)
+        XCTAssertEqual(coverage.insulinQuery.executedQueries, 2)
+        XCTAssertEqual(coverage.carbohydrateQuery.executedQueries, 2)
+        XCTAssertEqual(coverage.insulinQuery.acceptedCount, 1)
+        XCTAssertEqual(coverage.carbohydrateQuery.acceptedCount, 1)
+        XCTAssertEqual(historyQuery.requestCount(for: .insulin), 2)
+        XCTAssertEqual(historyQuery.requestCount(for: .carbohydrates), 2)
+    }
+
+    @MainActor func testMissingCutoverWithDisabledImportSkipsHistoricalTherapyQueries() async throws {
+        let suite = "MLHistoryNoCutover.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let selected = "com.example.selected.therapy"
+        for kind in HealthTherapyImportKind.allCases {
+            let prefix = "healthTherapyImport.v1.\(kind.rawValue)."
+            defaults.set(false, forKey: prefix + "enabled")
+            defaults.set(selected, forKey: prefix + "sourceBundleID")
+            defaults.set("Selected source", forKey: prefix + "sourceName")
+        }
+        let importer = HealthKitTherapyImportManager(query: NoopTherapyQuery(), defaults: defaults)
+        let query = FakeHistoryHealthQuery(glucoseSamples: [],
+            insulinSamples: [healthSample(0, value: 2, bundle: selected,
+                insulinReason: HKInsulinDeliveryReason.bolus.rawValue)],
+            carbohydrateSamples: [healthSample(0, value: 20, bundle: selected)])
+        let loader = makeHistoryLoader(importer: importer, query: query, defaults: defaults)
+        let result = await loader.load(days: 1, at: reference.addingTimeInterval(3600),
+            policy: historyPolicy, settings: settings, sensitivityMgdlPerUnit: 40,
+            carbohydrateRatioGramsPerUnit: 10, calendar: utcCalendar)
+        let coverage = try XCTUnwrap(result?.coverage)
+        XCTAssertEqual(coverage.cutoverState.rawValue, "missing")
+        XCTAssertEqual(coverage.insulinSourceBundleID, selected)
+        XCTAssertEqual(coverage.carbohydrateSourceBundleID, selected)
+        for evidence in [coverage.insulinQuery, coverage.carbohydrateQuery] {
+            XCTAssertFalse(evidence.effectiveImportEnabled)
+            XCTAssertEqual(evidence.executedQueries, 0)
+            XCTAssertEqual(evidence.skippedQueries, 1)
+            XCTAssertEqual(evidence.skipReason?.rawValue, "importDisabledWithoutCutover")
+            XCTAssertEqual(evidence.returnedCount, 0)
+            XCTAssertEqual(evidence.acceptedCount, 0)
+        }
+        XCTAssertEqual(query.requestCount(for: .insulin), 0)
+        XCTAssertEqual(query.requestCount(for: .carbohydrates), 0)
+        XCTAssertEqual(coverage.usableDays, 0,
+            "Skipped history must not be interpreted as a day with zero treatment")
+    }
+
+    @MainActor func testHistoricalQueryCountsRawSourceMismatchAndEmptyResults() async throws {
+        let suite = "MLHistorySourceMismatch.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let selected = "com.example.selected.therapy"
+        let cutover = TreatmentSourceCutover(cutoff: reference.addingTimeInterval(20 * 60),
+            insulinSourceBundleID: selected, carbohydrateSourceBundleID: selected)
+        XCTAssertTrue(TreatmentSourceCutover.persist(cutover, defaults: defaults))
+        let importer = HealthKitTherapyImportManager(query: NoopTherapyQuery(), defaults: defaults)
+        let wrongSource = healthSample(0, value: 2, bundle: "com.example.other.therapy",
+            insulinReason: HKInsulinDeliveryReason.bolus.rawValue)
+        let query = FakeHistoryHealthQuery(glucoseSamples: [], insulinSamples: [wrongSource])
+        let loader = makeHistoryLoader(importer: importer, query: query, defaults: defaults)
+        let result = await loader.load(days: 1, at: reference.addingTimeInterval(3600),
+            policy: historyPolicy, settings: settings, sensitivityMgdlPerUnit: 40,
+            carbohydrateRatioGramsPerUnit: 10, calendar: utcCalendar)
+        let coverage = try XCTUnwrap(result?.coverage)
+        XCTAssertEqual(coverage.cutoverState.rawValue, "valid")
+        XCTAssertEqual(coverage.cutoverDate, cutover.cutoff)
+        XCTAssertEqual(coverage.insulinSourceBundleID, selected)
+        XCTAssertEqual(coverage.insulinQuery.executedQueries, 1)
+        XCTAssertEqual(coverage.insulinQuery.returnedCount, 1)
+        XCTAssertEqual(coverage.insulinQuery.sourceMatchedCount, 0)
+        XCTAssertEqual(coverage.insulinQuery.acceptedCount, 0)
+        XCTAssertEqual(coverage.carbohydrateQuery.executedQueries, 1)
+        XCTAssertEqual(coverage.carbohydrateQuery.returnedCount, 0,
+            "An empty HealthKit response must remain distinguishable from a skipped query")
+        XCTAssertEqual(coverage.carbohydrateQuery.sourceMatchedCount, 0)
+        XCTAssertEqual(query.requestCount(for: .insulin), 1)
+        XCTAssertEqual(query.requestCount(for: .carbohydrates), 1)
+    }
+
+    @MainActor func testHistoryLoaderCountsInvalidAndDuplicateTherapyWithoutAcceptingThem() async throws {
+        let suite = "MLHistoryRejectedRows.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let selected = "com.example.selected.therapy"
+        XCTAssertTrue(TreatmentSourceCutover.persist(.init(cutoff: reference.addingTimeInterval(1800),
+            insulinSourceBundleID: selected, carbohydrateSourceBundleID: selected),
+            defaults: defaults))
+        let date = reference
+        let accepted = GlucoseForecastMLHealthSample(uuid: UUID(),
+            sourceBundleIdentifier: selected, startDate: date, endDate: date, value: 2,
+            insulinReason: HKInsulinDeliveryReason.bolus.rawValue,
+            hasUndeterminedDuration: false, sampleCount: 1)
+        let basal = GlucoseForecastMLHealthSample(uuid: UUID(),
+            sourceBundleIdentifier: selected, startDate: date, endDate: date, value: 12,
+            insulinReason: HKInsulinDeliveryReason.basal.rawValue,
+            hasUndeterminedDuration: false, sampleCount: 1)
+        let query = FakeHistoryHealthQuery(glucoseSamples: [],
+            insulinSamples: [accepted, accepted, basal])
+        let importer = HealthKitTherapyImportManager(query: NoopTherapyQuery(), defaults: defaults)
+        let loader = makeHistoryLoader(importer: importer, query: query, defaults: defaults)
+        let result = await loader.load(days: 1, at: reference.addingTimeInterval(3600),
+            policy: historyPolicy, settings: settings, sensitivityMgdlPerUnit: 40,
+            carbohydrateRatioGramsPerUnit: 10, calendar: utcCalendar)
+        let evidence = try XCTUnwrap(result?.coverage.insulinQuery)
+        XCTAssertEqual(evidence.returnedCount, 3)
+        XCTAssertEqual(evidence.duplicateExcludedCount, 1)
+        XCTAssertEqual(evidence.invalidExcludedCount, 1)
+        XCTAssertEqual(evidence.acceptedCount, 1)
+    }
+
+    @MainActor func testInvalidCutoverStopsActualHistoryLoaderBeforeQuerying() async throws {
+        let suite = "MLHistoryInvalidCutover.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set(Data("invalid cutover".utf8), forKey: TreatmentSourceCutover.defaultsKey)
+        let importer = HealthKitTherapyImportManager(query: NoopTherapyQuery(), defaults: defaults)
+        let query = FakeHistoryHealthQuery(glucoseSamples: [], insulinSamples: [healthSample(0,
+            value: 2, insulinReason: HKInsulinDeliveryReason.bolus.rawValue)])
+        let loader = makeHistoryLoader(importer: importer, query: query, defaults: defaults)
+        XCTAssertTrue(TreatmentSourceCutover.hasInvalidStoredValue(defaults: defaults))
+        XCTAssertFalse(GlucoseForecastDataAdapter.sourceAllowsForecast(historyPolicy,
+            defaults: defaults))
+        let result = await loader.load(days: 1, at: reference.addingTimeInterval(3600),
+            policy: historyPolicy, settings: settings, sensitivityMgdlPerUnit: 40,
+            carbohydrateRatioGramsPerUnit: 10, calendar: utcCalendar)
+        XCTAssertNil(result, "A damaged cutover must not be treated as missing and read another source")
+        XCTAssertEqual(query.requestCount(for: .glucose), 0)
+        XCTAssertEqual(query.requestCount(for: .insulin), 0)
+        XCTAssertEqual(query.requestCount(for: .carbohydrates), 0)
+    }
+
+    private var historyPolicy: DataFlowPolicy {
+        DataFlowPolicy(isMaster: true, followerDataSource: .careLink,
+            therapyDataSourceSelection: .none, nightscoutEnabled: false,
+            masterUploadsGlucoseToNightscout: false,
+            followerUploadsGlucoseToNightscout: false, nightscoutFollowType: .none)
+    }
+
+    private func makeHistoryLoader(importer: HealthKitTherapyImportManager,
+                                   query: FakeHistoryHealthQuery, defaults: UserDefaults,
+                                   queryTimeout: TimeInterval = 45)
+        -> GlucoseForecastMLHistoryLoader {
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let manager = TherapyMetricsManager()
+        manager.configure(coreDataManager: core, externalStatus: { nil })
+        return GlucoseForecastMLHistoryLoader(coreDataManager: core, therapyManager: manager,
+            healthImporter: importer, healthQuery: query, defaults: defaults,
+            queryTimeout: queryTimeout)
     }
 
     @MainActor func testFailedHealthReadNeverLooksLikeSuccessfulInsufficientHistory() async throws {
@@ -674,10 +1087,14 @@ final class GlucoseForecastMLReplayTests: XCTestCase {
             followerUploadsGlucoseToNightscout: false, nightscoutFollowType: .none)
         let failures: [GlucoseForecastMLHealthKind?] = [nil, .glucose, .insulin, .carbohydrates]
         for failedKind in failures {
-            let query = FakeHistoryHealthQuery(glucoseSamples: [],
+            // Source discovery must expose xDrip before a glucose sample-query
+            // failure can be exercised; an empty source list skips that query.
+            let query = FakeHistoryHealthQuery(glucoseSamples: [healthSample(0,
+                bundle: "com.xdrip.glucose")],
                 failSources: failedKind == nil, failKind: failedKind)
             let loader = GlucoseForecastMLHistoryLoader(coreDataManager: core,
-                therapyManager: manager, healthImporter: importer, healthQuery: query)
+                therapyManager: manager, healthImporter: importer, healthQuery: query,
+                defaults: defaults)
             let cancellation = GlucoseForecastMLHistoryCancellation()
             let result = await loader.load(days: 2, at: reference.addingTimeInterval(2 * 3600),
                 policy: policy, settings: settings, sensitivityMgdlPerUnit: 40,
@@ -688,6 +1105,54 @@ final class GlucoseForecastMLReplayTests: XCTestCase {
         }
     }
 
+    @MainActor func testTimedOutHealthTherapyReadIsNotACompletedEmptyHistory() async throws {
+        let suite = "MLHistoryTimeout.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let selected = "com.example.selected.therapy"
+        XCTAssertTrue(TreatmentSourceCutover.persist(.init(cutoff: reference.addingTimeInterval(1800),
+            insulinSourceBundleID: selected, carbohydrateSourceBundleID: selected),
+            defaults: defaults))
+        let importer = HealthKitTherapyImportManager(query: NoopTherapyQuery(), defaults: defaults)
+        let query = FakeHistoryHealthQuery(glucoseSamples: [], hangKind: .insulin)
+        let loader = makeHistoryLoader(importer: importer, query: query, defaults: defaults,
+            queryTimeout: 0.05)
+        let cancellation = GlucoseForecastMLHistoryCancellation()
+        let result = await loader.load(days: 1, at: reference.addingTimeInterval(3600),
+            policy: historyPolicy, settings: settings, sensitivityMgdlPerUnit: 40,
+            carbohydrateRatioGramsPerUnit: 10, calendar: utcCalendar,
+            cancellation: cancellation)
+        XCTAssertNil(result)
+        XCTAssertEqual(query.requestCount(for: .insulin), 1)
+        XCTAssertTrue(cancellation.readFailure?.contains("timeout") == true)
+        XCTAssertNotNil(cancellation.readDiagnostic,
+            "Partial read counts must survive a failed training attempt")
+    }
+
+    @MainActor func testCancelledHistoryLoadIsDistinctFromEmptyAndReadError() async throws {
+        let suite = "MLHistoryCancel.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let selected = "com.example.selected.therapy"
+        XCTAssertTrue(TreatmentSourceCutover.persist(.init(cutoff: reference.addingTimeInterval(1800),
+            insulinSourceBundleID: selected, carbohydrateSourceBundleID: selected),
+            defaults: defaults))
+        let importer = HealthKitTherapyImportManager(query: NoopTherapyQuery(), defaults: defaults)
+        let query = FakeHistoryHealthQuery(glucoseSamples: [])
+        let loader = makeHistoryLoader(importer: importer, query: query, defaults: defaults)
+        let cancellation = GlucoseForecastMLHistoryCancellation()
+        let result = await loader.load(days: 2, at: reference.addingTimeInterval(3600),
+            policy: historyPolicy, settings: settings, sensitivityMgdlPerUnit: 40,
+            carbohydrateRatioGramsPerUnit: 10, calendar: utcCalendar,
+            cancellation: cancellation, progress: { completed, _ in
+                if completed == 1 { cancellation.cancel() }
+            })
+        XCTAssertNil(result)
+        XCTAssertTrue(cancellation.isCancelled)
+        XCTAssertNil(cancellation.readFailure)
+        XCTAssertNotNil(cancellation.readDiagnostic)
+    }
+
     private enum FakeReadError: Error { case unavailable }
 
     private final class FakeHistoryHealthQuery: GlucoseForecastMLHealthQuerying {
@@ -696,16 +1161,33 @@ final class GlucoseForecastMLReplayTests: XCTestCase {
         let carbohydrateSamples: [GlucoseForecastMLHealthSample]
         let failSources: Bool
         let failKind: GlucoseForecastMLHealthKind?
+        let hangKind: GlucoseForecastMLHealthKind?
+        private let requestLock = NSLock()
+        private var glucoseRequests = 0
+        private var insulinRequests = 0
+        private var carbohydrateRequests = 0
+
+        func requestCount(for kind: GlucoseForecastMLHealthKind) -> Int {
+            requestLock.lock()
+            defer { requestLock.unlock() }
+            switch kind {
+            case .glucose: return glucoseRequests
+            case .insulin: return insulinRequests
+            case .carbohydrates: return carbohydrateRequests
+            }
+        }
 
         init(glucoseSamples: [GlucoseForecastMLHealthSample],
              insulinSamples: [GlucoseForecastMLHealthSample] = [],
              carbohydrateSamples: [GlucoseForecastMLHealthSample] = [],
-             failSources: Bool = false, failKind: GlucoseForecastMLHealthKind? = nil) {
+             failSources: Bool = false, failKind: GlucoseForecastMLHealthKind? = nil,
+             hangKind: GlucoseForecastMLHealthKind? = nil) {
             self.glucoseSamples = glucoseSamples
             self.insulinSamples = insulinSamples
             self.carbohydrateSamples = carbohydrateSamples
             self.failSources = failSources
             self.failKind = failKind
+            self.hangKind = hangKind
         }
 
         func sources(for kind: GlucoseForecastMLHealthKind,
@@ -714,32 +1196,87 @@ final class GlucoseForecastMLReplayTests: XCTestCase {
             if failSources {
                 completion(.failure(FakeReadError.unavailable))
             } else {
-                completion(.success([GlucoseForecastMLHealthSource(
-                    bundleIdentifier: "com.xdrip.glucose", name: "xDrip4iOS")]))
+                let samples: [GlucoseForecastMLHealthSample]
+                switch kind {
+                case .glucose: samples = glucoseSamples
+                case .insulin: samples = insulinSamples
+                case .carbohydrates: samples = carbohydrateSamples
+                }
+                let sources = Dictionary(grouping: samples, by: \.sourceBundleIdentifier)
+                    .keys.sorted().map {
+                        GlucoseForecastMLHealthSource(bundleIdentifier: $0,
+                            name: kind == .glucose ? "xDrip4iOS" : "Therapy source")
+                    }
+                completion(.success(sources))
             }
             return GlucoseForecastMLHealthQueryTicket()
         }
 
         func samples(for kind: GlucoseForecastMLHealthKind, from start: Date, to end: Date,
                      sourceBundleIdentifier: String,
-                     completion: @escaping (Result<[GlucoseForecastMLHealthSample], Error>) -> Void)
+                     completion: @escaping (Result<GlucoseForecastMLHealthSampleBatch, Error>) -> Void)
             -> GlucoseForecastMLHealthQueryTicket {
+            requestLock.lock()
+            switch kind {
+            case .glucose: glucoseRequests += 1
+            case .insulin: insulinRequests += 1
+            case .carbohydrates: carbohydrateRequests += 1
+            }
+            requestLock.unlock()
             if failKind == kind {
                 completion(.failure(FakeReadError.unavailable))
                 return GlucoseForecastMLHealthQueryTicket()
             }
+            if hangKind == kind { return GlucoseForecastMLHealthQueryTicket() }
             let values: [GlucoseForecastMLHealthSample]
             switch kind {
             case .glucose: values = glucoseSamples
             case .insulin: values = insulinSamples
             case .carbohydrates: values = carbohydrateSamples
             }
-            completion(.success(values.filter {
+            // Mirror the live adapter: glucose is source-filtered, while therapy
+            // returns raw same-day rows for the loader to count and filter.
+            let sameDay = values.filter {
                 $0.startDate >= start && $0.startDate < end &&
-                    $0.sourceBundleIdentifier == sourceBundleIdentifier
-            }))
+                    (kind != .glucose || $0.sourceBundleIdentifier == sourceBundleIdentifier)
+            }
+            completion(.success(GlucoseForecastMLHealthSampleBatch(samples: sameDay)))
             return GlucoseForecastMLHealthQueryTicket()
         }
+    }
+
+    /// Completes the real importer's final anchored sync with stable mySugr rows.
+    private final class CompletingTherapyQuery: HealthTherapyQuerying {
+        let source: HealthTherapyImportSource
+        let eventDate: Date
+        let insulinUUID = UUID()
+        let carbohydrateUUID = UUID()
+
+        init(source: HealthTherapyImportSource, eventDate: Date) {
+            self.source = source
+            self.eventDate = eventDate
+        }
+
+        func requestReadAuthorization(for kind: HealthTherapyImportKind,
+                                      completion: @escaping (Error?) -> Void) { completion(nil) }
+        func discoverSources(for kind: HealthTherapyImportKind,
+                             completion: @escaping ([HealthTherapyImportSource], Error?) -> Void) {
+            completion([source], nil)
+        }
+        func page(for kind: HealthTherapyImportKind, since: Date, anchor: Data?, limit: Int,
+                  completion: @escaping (Result<HealthTherapyImportPage, Error>) -> Void) {
+            let sample = HealthTherapyIncomingSample(
+                uuid: kind == .insulin ? insulinUUID : carbohydrateUUID,
+                kind: kind, source: source, startDate: eventDate, endDate: eventDate,
+                quantity: kind == .insulin ? 2 : 20,
+                insulinReason: kind == .insulin ? HKInsulinDeliveryReason.bolus.rawValue : nil,
+                hasUndeterminedDuration: false, sampleCount: 1,
+                externalUUID: nil, syncIdentifier: nil)
+            completion(.success(HealthTherapyImportPage(samples: [sample], deletedUUIDs: [],
+                nextAnchor: Data("complete".utf8), hasMore: false)))
+        }
+        func observe(_ kind: HealthTherapyImportKind,
+                     onChange: @escaping (@escaping () -> Void) -> Void) {}
     }
 
     private final class NoopTherapyQuery: HealthTherapyQuerying {
