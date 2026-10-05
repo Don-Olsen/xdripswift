@@ -37,6 +37,86 @@ final class RootHomeInteractionTests: XCTestCase {
         XCTAssertNil(root.penCalculatorQuickActionRequest)
     }
 
+    @MainActor func testIconCalculatorWarmStartPresentsSynchronouslyAndConsumesRequest() {
+        let request = UUID()
+        var presentations = 0
+        var consumed: [UUID] = []
+
+        RootHomeCalculatorQuickActionPresentation.open(
+            request: request, isReady: true, isAlreadyPresented: false,
+            present: { presentations += 1 }, consume: { consumed.append($0) })
+
+        // These effects must already have happened when open returns; a timer
+        // or an unrelated Home refresh must not be required to open the sheet.
+        XCTAssertEqual(presentations, 1)
+        XCTAssertEqual(consumed, [request])
+    }
+
+    @MainActor func testIconCalculatorColdStartKeepsRequestUntilHomeBecomesReady() throws {
+        let root = RootTabStateModel()
+        root.requestPenCalculatorQuickAction()
+        let request = try XCTUnwrap(root.penCalculatorQuickActionRequest)
+        var presentations = 0
+
+        RootHomeCalculatorQuickActionPresentation.open(
+            request: root.penCalculatorQuickActionRequest, isReady: false,
+            isAlreadyPresented: false, present: { presentations += 1 },
+            consume: { root.consumePenCalculatorQuickAction($0) })
+        XCTAssertEqual(root.penCalculatorQuickActionRequest, request)
+        XCTAssertEqual(presentations, 0)
+
+        RootHomeCalculatorQuickActionPresentation.open(
+            request: root.penCalculatorQuickActionRequest, isReady: true,
+            isAlreadyPresented: false, present: { presentations += 1 },
+            consume: { root.consumePenCalculatorQuickAction($0) })
+        XCTAssertEqual(presentations, 1)
+        XCTAssertNil(root.penCalculatorQuickActionRequest)
+    }
+
+    @MainActor func testIconCalculatorRepeatedTapsPresentOneSheet() throws {
+        let root = RootTabStateModel()
+        root.requestPenCalculatorQuickAction()
+        let request = try XCTUnwrap(root.penCalculatorQuickActionRequest)
+        root.requestPenCalculatorQuickAction()
+        XCTAssertEqual(root.penCalculatorQuickActionRequest, request)
+        var presentations = 0
+
+        RootHomeCalculatorQuickActionPresentation.open(
+            request: root.penCalculatorQuickActionRequest, isReady: true,
+            isAlreadyPresented: false, present: { presentations += 1 },
+            consume: { root.consumePenCalculatorQuickAction($0) })
+        RootHomeCalculatorQuickActionPresentation.open(
+            request: root.penCalculatorQuickActionRequest, isReady: true,
+            isAlreadyPresented: false, present: { presentations += 1 },
+            consume: { root.consumePenCalculatorQuickAction($0) })
+        XCTAssertEqual(presentations, 1)
+    }
+
+    @MainActor func testIconCalculatorAlreadyOpenConsumesRequestWithoutPresentingAgain() {
+        let request = UUID()
+        var presentations = 0
+        var consumed: [UUID] = []
+
+        RootHomeCalculatorQuickActionPresentation.open(
+            request: request, isReady: true, isAlreadyPresented: true,
+            present: { presentations += 1 }, consume: { consumed.append($0) })
+
+        XCTAssertEqual(presentations, 0)
+        XCTAssertEqual(consumed, [request])
+    }
+
+    @MainActor func testIconCalculatorWithoutRequestDoesNotPresent() {
+        var presentations = 0
+        var consumptions = 0
+
+        RootHomeCalculatorQuickActionPresentation.open(
+            request: nil, isReady: true, isAlreadyPresented: false,
+            present: { presentations += 1 }, consume: { _ in consumptions += 1 })
+
+        XCTAssertEqual(presentations, 0)
+        XCTAssertEqual(consumptions, 0)
+    }
+
     @MainActor func testIconActionDefaultsNotificationDoesNotWaitForMainThread() {
         _ = QuickActionsManager.shared
         let posted = DispatchSemaphore(value: 0)

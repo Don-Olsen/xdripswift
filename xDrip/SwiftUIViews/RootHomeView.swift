@@ -362,7 +362,8 @@ struct RootHomeView: View {
         .onChange(of: penCalculatorQuickActionRequest) { _ in
             openPendingCalculatorQuickAction()
         }
-        .onChange(of: allowsCalculatorQuickAction) { _ in
+        .onChange(of: calculatorQuickActionIsReady) { isReady in
+            guard isReady else { return }
             openPendingCalculatorQuickAction()
         }
         .onChange(of: showsExpandedIPadChart) { _ in
@@ -379,7 +380,6 @@ struct RootHomeView: View {
             forecastFreshnessCheckTime = now
             refreshCurrentTimeRangeIfNeeded(showsLoading: false)
             requestMiniChartState(forceReset: false)
-            if penCalculatorQuickActionRequest != nil { openPendingCalculatorQuickAction() }
         }
         .onReceive(NotificationCenter.default.publisher(for: HealthKitTherapyImportManager.statusDidChange)) { _ in
             if penCalculatorQuickActionRequest != nil { openPendingCalculatorQuickAction() }
@@ -559,7 +559,12 @@ struct RootHomeView: View {
             guard newPhase == .active else { return }
 
             forecastFreshnessCheckTime = Date()
-            resetChartsToNow()
+            // Opening the calculator already resets Home to now. Avoid doing that twice
+            // when a shortcut arrives during the foreground transition.
+            if penCalculatorQuickActionRequest == nil || !calculatorQuickActionIsReady {
+                resetChartsToNow()
+            }
+            openPendingCalculatorQuickAction()
         }
         .fullScreenCover(isPresented: $showsExpandedIPadChart) {
             expandedIPadChart
@@ -1322,21 +1327,21 @@ struct RootHomeView: View {
                 && !HealthKitTherapyImportManager.shared.localInputIsIncomplete(.carbohydrates))
     }
 
+    private var calculatorQuickActionIsReady: Bool {
+        allowsCalculatorQuickAction && !showsExpandedIPadChart && scenePhase == .active
+            && !state.usesScreenLockNightLayout && showsCalculatorShortcut(state.loop)
+    }
+
     private func openPendingCalculatorQuickAction() {
-        guard let request = penCalculatorQuickActionRequest,
-              allowsCalculatorQuickAction,
-              !showsExpandedIPadChart,
-              scenePhase == .active else { return }
-        if showsPenCalculator {
-            // Repeated icon taps leave the open calculator and its entered values intact.
-            consumeCalculatorQuickAction(request)
-            return
-        }
-        guard !state.usesScreenLockNightLayout,
-              showsCalculatorShortcut(state.loop) else { return }
-        resetChartsToNow()
-        showsPenCalculator = true
-        consumeCalculatorQuickAction(request)
+        RootHomeCalculatorQuickActionPresentation.open(
+            request: penCalculatorQuickActionRequest,
+            isReady: calculatorQuickActionIsReady,
+            isAlreadyPresented: showsPenCalculator,
+            present: {
+                resetChartsToNow()
+                showsPenCalculator = true
+            },
+            consume: consumeCalculatorQuickAction)
     }
 
     private func showsTherapyRow(_ loop: RootHomeLoopState) -> Bool {

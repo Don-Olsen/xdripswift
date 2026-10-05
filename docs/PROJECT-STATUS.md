@@ -1,3 +1,21 @@
+## Kandidat efter 4299: hurtigere bolusgenvej fra app-ikonet
+
+En fysisk iPhone viste cirka 16,5 sekunders ventetid fra tryk på app-ikonets
+“Bolusberegner” til arket blev vist. Når genvejen kom før Home var klar, blev
+anmodningen bevaret, men den kunne ende med først at blive forsøgt igen ved
+Homes 15-sekunders opdateringstimer. Home reagerer nu på sin publicerede
+klar-tilstand og forgrundsskift og præsenterer samme beregner, straks det er
+muligt. Den ventende anmodning forbruges kun én gang; gentagne tryk og et
+allerede åbent ark opretter ikke flere ark. Ingen dosis- eller logningsregler
+er ændret.
+
+Lokal målrettet validering før release: 630/630 XCTest-tests bestod, inklusive
+regressionstest for varm/kold start, ændret klar-tilstand, gentagne tryk og
+allerede åbent ark. Xcodes ekstra simulatordiagnostik timeoutede efter testene,
+mens selve kørslen sluttede med `TEST SUCCEEDED` og resultatkontrollen bestod.
+Det er endnu ikke målt på fysisk iPhone, hvor hurtigt den nye kode åbner arket.
+Den præcise release-test og Apple-status registreres særskilt af releaseforløbet.
+
 <!-- testflight-7.1.1-4299:start -->
 ### TestFlight 7.1.1 (4299)
 

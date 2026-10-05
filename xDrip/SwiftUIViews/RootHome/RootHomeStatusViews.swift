@@ -57,6 +57,17 @@ enum RootHomeCalculatorShortcutPolicy {
     }
 }
 
+/// Resolves a pending icon action synchronously when Home can present its existing sheet.
+/// RootTabStateModel keeps the request until `consume` runs, including across cold starts.
+enum RootHomeCalculatorQuickActionPresentation {
+    static func open(request: UUID?, isReady: Bool, isAlreadyPresented: Bool,
+                     present: () -> Void, consume: (UUID) -> Void) {
+        guard let request, isReady else { return }
+        if !isAlreadyPresented { present() }
+        consume(request)
+    }
+}
+
 /// Loop status row displayed below the pump and glucose values.
 struct RootHomeLoopView: View {
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
