@@ -1,3 +1,15 @@
+<!-- testflight-7.1.1-4300:start -->
+### TestFlight 7.1.1 (4300)
+
+- Kildecommit og tag: `5f5a1164fbca2af9c3ec771b34cef8e4be1d4782` / `testflight-7.1.1-4300`.
+- Tests: 1396/1396 bestået; 0 fejlet; 0 skipped. iPhone- og Watch-simulatorbuilds bestod.
+- Apple-status (2026-10-05T12:10:33.644617+00:00): [Internal / Testing](https://appstoreconnect.apple.com/apps/6795645396/testflight/ios/bf44c7bd-acde-4789-b3fe-067cefd7d547).
+- Eksisterende intern gruppe: Ole Internal er bekræftet tilknyttet.
+- Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
+<!-- testflight-7.1.1-4300:end -->
+
+De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
+
 ## Kandidat efter 4299: hurtigere bolusgenvej fra app-ikonet
 
 En fysisk iPhone viste cirka 16,5 sekunders ventetid fra tryk på app-ikonets
