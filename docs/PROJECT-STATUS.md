@@ -10,6 +10,26 @@
 
 De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
 
+## Kandidat efter 4301: Watch-bolus uden for sidekarrusellen
+
+Watch-beregneren er fjernet fra `RootView`'s carousel. Main, AGP og Big Number
+viser den samme lille + i urets øverste navigationslinje og åbner den eksisterende
+`WatchManualTreatmentsView` som fuldskærmsvisning. X lukker uden at registrere
+noget. Et gemt sidevalg fra 4301's tidligere treatments-side (værdi 4) falder
+tilbage til Main. Direkte Libre-overtagelse kan fortsat vælge Big Number som
+underliggende side; beregnerens fuldskærmsvisning og indtastninger bliver
+stående. Beregning, sikkerhed, Watch-kø og telefonens behandlingssti er uændrede.
+
+Projektets lokale Python-kontroller, iPhone- og Watch-simulatorbygning samt en
+usigneret iPhoneOS/arm64-build bestod. På Watch-simulatoren blev plusikonet vist på
+Main, AGP og Big Number, og en gemt sideværdi 4 blev ved
+genstart ændret til Main (0). Skærmbillederne ligger uden for Git under
+`/private/tmp/xdrip-watch-nav-20261006-screens/`. Denne Mac har ingen styrbar
+Simulator-brugerflade, så et skærmbillede af den åbne beregner og direkte
+afprøvning af Crown, lukning samt Libre-overtagelse under indtastning mangler.
+Intet er installeret lokalt på brugerens iPhone eller ur. Det præcise
+Apple-nummererede release-checkpoint får egne XCTest-, Python- og buildresultater.
+
 <!-- testflight-7.1.1-4300:start -->
 ### TestFlight 7.1.1 (4300)
 

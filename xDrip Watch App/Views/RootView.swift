@@ -15,6 +15,7 @@ struct RootView: View {
 
     // save the last selected tab on the Watch so re-opening the app returns to the same page
     @AppStorage("watchAppSelectedPage") private var selectedPage = WatchAppPage.main.rawValue
+    @State private var showingBolusCalculator = false
 
     // keep both main pages on the same chart range so swiping between them only changes whether
     // the AGP background is visible. The chart content should not jump between pages.
@@ -34,23 +35,29 @@ struct RootView: View {
             BigNumberView(libreDirectCollector: libreDirectCollector)
                 .tag(WatchAppPage.bigNumber.rawValue)
 
-            // One swipe from the large glucose display. Entries are saved on the
-            // Watch before delivery and do not depend on current sensor ownership.
-            WatchManualTreatmentsView()
-                .tag(WatchAppPage.treatments.rawValue)
-
             // Explicit persistent hand-off between iPhone and direct Watch reception.
             LibreDirectView(collector: libreDirectCollector)
                 .tag(WatchAppPage.libreDirect.rawValue)
         }
         .modifier(RootViewTabViewStyleModifier())
         .environmentObject(watchState)
+        .toolbar {
+            if selectedPage == WatchAppPage.main.rawValue ||
+                selectedPage == WatchAppPage.agp.rawValue ||
+                selectedPage == WatchAppPage.bigNumber.rawValue {
+                ToolbarItem(placement: .topBarTrailing) { calculatorButton }
+            }
+        }
+        .fullScreenCover(isPresented: $showingBolusCalculator) {
+            WatchManualTreatmentsView()
+                .environmentObject(watchState)
+        }
         .onAppear {
-            if watchState.libreWatchOwnership == .watch {
-                selectedPage = WatchAppPage.bigNumber.rawValue
-            } else if WatchAppPage(rawValue: selectedPage) == nil {
-                // if a saved tab value from an older build is invalid, fall back to the normal main page
+            if WatchAppPage(rawValue: selectedPage) == nil {
+                // The former treatments page (4) and other unknown saved values return to Main.
                 selectedPage = WatchAppPage.main.rawValue
+            } else if watchState.libreWatchOwnership == .watch {
+                selectedPage = WatchAppPage.bigNumber.rawValue
             }
             libreDirectCollector.applicationActivityDidChange(scenePhase.libreWatchApplicationState)
             updatePhoneRefreshVisibility()
@@ -61,8 +68,7 @@ struct RootView: View {
                 watchState.refreshLocalAlarmPermission()
                 watchState.retryPendingManualTreatments()
             }
-            if newPhase == .active, watchState.libreWatchOwnership == .watch,
-               selectedPage != WatchAppPage.treatments.rawValue {
+            if newPhase == .active, watchState.libreWatchOwnership == .watch {
                 selectedPage = WatchAppPage.bigNumber.rawValue
             }
             updatePhoneRefreshVisibility()
@@ -85,6 +91,18 @@ struct RootView: View {
             showsAGP: selectedPage == WatchAppPage.agp.rawValue,
             hours: ConstantsAppleWatch.hoursToShow[hoursToShowIndex])
     }
+
+    private var calculatorButton: some View {
+        Button {
+            showingBolusCalculator = true
+        } label: {
+            Image(systemName: "plus.circle.fill")
+                .font(.system(size: 24))
+                .frame(width: 32, height: 32)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Bolusberegner")
+    }
 }
 
 private extension ScenePhase {
@@ -103,11 +121,11 @@ private enum WatchAppPage: Int {
     case agp = 1
     case bigNumber = 2
     case libreDirect = 3
-    case treatments = 4
 }
 
 private struct WatchManualTreatmentsView: View {
     @EnvironmentObject private var watchState: WatchStateModel
+    @Environment(\.dismiss) private var dismiss
     @State private var carbohydrateGrams = 0.0
     @State private var insulinUnits = 0.0
     @State private var mealKindRaw = "normal"
@@ -160,8 +178,17 @@ private struct WatchManualTreatmentsView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 8) {
-                Text("Bolusberegner")
-                    .font(.headline)
+                HStack {
+                    Text("Bolusberegner")
+                        .font(.headline)
+                    Spacer()
+                    Button { dismiss() } label: {
+                        Image(systemName: "xmark")
+                            .frame(width: 32, height: 32)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Luk bolusberegner")
+                }
                 if !watchState.phoneIsReachable {
                     Text("Ikke forbundet med iPhone – logger uden beregning")
                         .font(.footnote).foregroundStyle(.orange)
@@ -228,6 +255,7 @@ private struct WatchManualTreatmentsView: View {
             .padding(.horizontal, 8)
         }
         .onAppear {
+            focusedInput = .carbohydrates
             watchState.retryPendingManualTreatments()
             if !watchState.phoneIsReachable { watchState.requestWatchStateUpdate() }
         }
