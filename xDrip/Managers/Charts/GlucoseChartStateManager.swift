@@ -39,6 +39,11 @@ final class GlucoseChartStateManager: ObservableObject, @unchecked Sendable {
     @MainActor private var cacheRevision = UUID()
     private let log = OSLog(subsystem: ConstantsLog.subSystem, category: ConstantsLog.categoryGlucoseChartManager)
 
+    /// Cache invalidations from viewport requests skipped during coalescing. Access only on
+    /// operationQueue, including its cleanup barrier, so the newest request inherits them.
+    private var skippedForceReset = false
+    private var skippedRefreshCachedData = false
+
     // MARK: - Cached Data
 
     /// Raw Core Data snapshots kept outside the visible range.
@@ -140,6 +145,8 @@ final class GlucoseChartStateManager: ObservableObject, @unchecked Sendable {
             guard let self = self else { return }
 
             guard self.operationQueue.operations.count <= 1 else {
+                self.skippedForceReset = self.skippedForceReset || forceReset
+                self.skippedRefreshCachedData = self.skippedRefreshCachedData || refreshCachedData
                 DispatchQueue.main.async {
                     // Coalesced requests belong to the same lifecycle as fully processed requests.
                     guard self.cacheRevision == revision else { return }
@@ -149,14 +156,19 @@ final class GlucoseChartStateManager: ObservableObject, @unchecked Sendable {
                 return
             }
 
-            if forceReset {
+            let shouldForceReset = forceReset || self.skippedForceReset
+            let shouldRefreshCachedData = refreshCachedData || self.skippedRefreshCachedData
+            self.skippedForceReset = false
+            self.skippedRefreshCachedData = false
+
+            if shouldForceReset {
                 self.resetCache()
             }
 
             let hadCachedData = self.cacheStartDate != nil
             self.loadMissingData(startDate: startDateToUse, endDate: endDate)
 
-            if refreshCachedData && hadCachedData {
+            if shouldRefreshCachedData && hadCachedData {
                 self.reloadRecentData(endDate: endDate)
             }
 
@@ -181,6 +193,8 @@ final class GlucoseChartStateManager: ObservableObject, @unchecked Sendable {
         // Cancellation does not stop an already running operation. A barrier keeps reset on the
         // cache queue and ensures loads submitted after cleanup cannot overtake it.
         operationQueue.addBarrierBlock { [weak self] in
+            self?.skippedForceReset = false
+            self?.skippedRefreshCachedData = false
             self?.resetCache()
         }
     }

@@ -8,6 +8,20 @@
 - Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
 <!-- testflight-7.1.1-4302:end -->
 
+## Kandidat efter 4302: grafens sammenlagte genindlæsning
+
+Grafkøen springer fortsat mellemliggende visningspositioner over ved hurtig
+scrolling, men viderefører nu deres krav om cache-reset og opdatering af
+eksisterende data til den nyeste forespørgsel. Ved lukning af grafen ryddes
+disse krav sammen med cachen. Det ændrer kun grafens indlæsning; Libre,
+Watch, alarmer og behandlingernes lagring er uændrede.
+
+To regressionstests ændrer en behandling i databasen mellem cacheindlæsning
+og to køsatte grafopdateringer. De bekræfter, at den sidste visning afspejler
+ændringen ved både reset og refresh. Den målrettede graf-suite bestod med
+22/22 tests på iPhone-simulator. Den fulde releasekontrol og fysisk
+afprøvning på iPhone er endnu ikke gennemført for denne kandidat.
+
 De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
 
 <!-- testflight-7.1.1-4301:start -->

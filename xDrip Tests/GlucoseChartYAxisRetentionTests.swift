@@ -333,6 +333,73 @@ final class GlucoseChartYAxisRetentionTests: XCTestCase {
         XCTAssertTrue(reopened.treatmentPoints.boluses.isEmpty)
     }
 
+    /// A newer viewport request must not drop a reset requested by a coalesced update.
+    @MainActor
+    func testCoalescedChartUpdateKeepsForceReset() async {
+        let coreDataManager = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let date = Date().addingTimeInterval(-60)
+        let treatment = TreatmentEntry(date: date, value: 3, treatmentType: .Insulin,
+                                       nightscoutEventType: nil, enteredBy: "Test",
+                                       nsManagedObjectContext: coreDataManager.mainManagedObjectContext)
+        XCTAssertTrue(coreDataManager.saveChanges())
+        let syncManager = NightscoutSyncManager(coreDataManager: coreDataManager, messageHandler: nil)
+        let queue = OperationQueue()
+        let chart = GlucoseChartStateManager(coreDataManager: coreDataManager,
+                                             nightscoutSyncManager: syncManager, operationQueue: queue)
+        let endDate = Date()
+        let startDate = date.addingTimeInterval(-3600)
+        let first: GlucoseChartState = await withCheckedContinuation { continuation in
+            chart.updateState(endDate: endDate, startDate: startDate, showTreatments: true) {
+                continuation.resume(returning: $0)
+            }
+        }
+        XCTAssertEqual(first.treatmentPoints.boluses.count, 1)
+
+        coreDataManager.mainManagedObjectContext.delete(treatment)
+        XCTAssertTrue(coreDataManager.saveChanges())
+        queue.isSuspended = true
+        chart.updateState(endDate: endDate, startDate: startDate, forceReset: true, showTreatments: true)
+        let latest: GlucoseChartState = await withCheckedContinuation { continuation in
+            chart.updateState(endDate: endDate, startDate: startDate, showTreatments: true) {
+                continuation.resume(returning: $0)
+            }
+            queue.isSuspended = false
+        }
+        XCTAssertTrue(latest.treatmentPoints.boluses.isEmpty)
+    }
+
+    /// A coalesced refresh must still bring recent treatment changes into the cached range.
+    @MainActor
+    func testCoalescedChartUpdateKeepsRefreshCachedData() async {
+        let coreDataManager = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let syncManager = NightscoutSyncManager(coreDataManager: coreDataManager, messageHandler: nil)
+        let queue = OperationQueue()
+        let chart = GlucoseChartStateManager(coreDataManager: coreDataManager,
+                                             nightscoutSyncManager: syncManager, operationQueue: queue)
+        let endDate = Date()
+        let startDate = endDate.addingTimeInterval(-3600)
+        let first: GlucoseChartState = await withCheckedContinuation { continuation in
+            chart.updateState(endDate: endDate, startDate: startDate, showTreatments: true) {
+                continuation.resume(returning: $0)
+            }
+        }
+        XCTAssertTrue(first.treatmentPoints.boluses.isEmpty)
+
+        _ = TreatmentEntry(date: endDate.addingTimeInterval(-60), value: 3,
+                           treatmentType: .Insulin, nightscoutEventType: nil, enteredBy: "Test",
+                           nsManagedObjectContext: coreDataManager.mainManagedObjectContext)
+        XCTAssertTrue(coreDataManager.saveChanges())
+        queue.isSuspended = true
+        chart.updateState(endDate: endDate, startDate: startDate, refreshCachedData: true, showTreatments: true)
+        let latest: GlucoseChartState = await withCheckedContinuation { continuation in
+            chart.updateState(endDate: endDate, startDate: startDate, showTreatments: true) {
+                continuation.resume(returning: $0)
+            }
+            queue.isSuspended = false
+        }
+        XCTAssertEqual(latest.treatmentPoints.boluses.count, 1)
+    }
+
     /// Repeated chart updates must not retain the owner through queued closures or old work items.
     @MainActor
     func testDelayedStateReleasesAfterHeavyRescheduling() {
