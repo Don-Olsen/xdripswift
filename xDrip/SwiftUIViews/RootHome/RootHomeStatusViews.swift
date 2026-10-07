@@ -57,8 +57,8 @@ enum RootHomeCalculatorShortcutPolicy {
     }
 }
 
-/// Resolves a pending icon action synchronously when Home can present its existing sheet.
-/// RootTabStateModel keeps the request until `consume` runs, including across cold starts.
+/// Requests Home's existing calculator sheet. The shortcut stays pending until the sheet
+/// actually appears; SwiftUI may defer presentation during a foreground or modal transition.
 enum RootHomeCalculatorQuickActionPresentation {
     /// Presenting the calculator only needs a local treatment owner and an available sheet.
     /// Home's metric visibility can lag behind a foreground refresh; the calculator separately
@@ -72,10 +72,14 @@ enum RootHomeCalculatorQuickActionPresentation {
     }
 
     static func open(request: UUID?, isReady: Bool, isAlreadyPresented: Bool,
+                     isVisible: Bool,
                      present: () -> Void, consume: (UUID) -> Void) {
-        guard let request, isReady else { return }
-        if !isAlreadyPresented { present() }
-        consume(request)
+        guard let request else { return }
+        if isAlreadyPresented && isVisible {
+            consume(request)
+        } else if isReady && !isAlreadyPresented && !isVisible {
+            present()
+        }
     }
 }
 

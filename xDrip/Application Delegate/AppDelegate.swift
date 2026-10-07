@@ -39,11 +39,17 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
 /// Receives shortcuts while SwiftUI continues to own the scene's window and content.
 @MainActor final class QuickActionsSceneDelegate: NSObject, UIWindowSceneDelegate {
     private let quickActionsManager = QuickActionsManager.shared
+    private let quickActionLog = OSLog(subsystem: ConstantsLog.subSystem,
+        category: ConstantsLog.categoryAppDelegate)
 
     func scene(_ scene: UIScene, willConnectTo session: UISceneSession, options connectionOptions: UIScene.ConnectionOptions) {
         // A shortcut that launches the app arrives with the scene connection.
         if let shortcutItem = connectionOptions.shortcutItem,
            let quickActionType = QuickActionType(rawValue: shortcutItem.type) {
+            if quickActionType == .penCalculator {
+                trace("calculator shortcut received at scene connection", log: quickActionLog,
+                    category: ConstantsLog.categoryAppDelegate, type: .info)
+            }
             quickActionsManager.handleQuickAction(quickActionType)
         }
     }
@@ -51,6 +57,10 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
     func windowScene(_ windowScene: UIWindowScene, performActionFor shortcutItem: UIApplicationShortcutItem, completionHandler: @escaping (Bool) -> Void) {
         // An existing scene receives the action directly when the app resumes.
         if let quickActionType = QuickActionType(rawValue: shortcutItem.type) {
+            if quickActionType == .penCalculator {
+                trace("calculator shortcut received in existing scene", log: quickActionLog,
+                    category: ConstantsLog.categoryAppDelegate, type: .info)
+            }
             completionHandler(quickActionsManager.handleQuickAction(quickActionType))
         } else {
             completionHandler(false)

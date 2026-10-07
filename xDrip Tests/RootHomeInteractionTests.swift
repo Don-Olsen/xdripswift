@@ -75,26 +75,42 @@ final class RootHomeInteractionTests: XCTestCase {
                 policy: defaults.dataFlowPolicy, cutover: TreatmentSourceCutover.current(),
                 sceneIsActive: true, allowsPresentation: true,
                 showsExpandedChart: false, usesNightLayout: false),
-            isAlreadyPresented: false, present: { presentations += 1 },
+            isAlreadyPresented: false, isVisible: false, present: { presentations += 1 },
+            consume: { root.consumePenCalculatorQuickAction($0) })
+        XCTAssertEqual(presentations, 1)
+        XCTAssertEqual(root.penCalculatorQuickActionRequest, request)
+        RootHomeCalculatorQuickActionPresentation.open(request: root.penCalculatorQuickActionRequest,
+            isReady: true, isAlreadyPresented: true, isVisible: true,
+            present: { presentations += 1 },
             consume: { root.consumePenCalculatorQuickAction($0) })
         XCTAssertEqual(presentations, 1)
         XCTAssertNil(root.penCalculatorQuickActionRequest)
         XCTAssertNil(root.dependencies, "Opening the shortcut must not start treatment services")
     }
 
-    @MainActor func testIconCalculatorWarmStartPresentsSynchronouslyAndConsumesRequest() {
-        let request = UUID()
+    @MainActor func testIconCalculatorWarmStartPresentsSynchronouslyThenConsumesWhenVisible() throws {
+        let root = RootTabStateModel()
+        root.requestPenCalculatorQuickAction()
+        let request = try XCTUnwrap(root.penCalculatorQuickActionRequest)
         var presentations = 0
-        var consumed: [UUID] = []
 
         RootHomeCalculatorQuickActionPresentation.open(
-            request: request, isReady: true, isAlreadyPresented: false,
-            present: { presentations += 1 }, consume: { consumed.append($0) })
+            request: root.penCalculatorQuickActionRequest, isReady: true,
+            isAlreadyPresented: false, isVisible: false,
+            present: { presentations += 1 },
+            consume: { root.consumePenCalculatorQuickAction($0) })
 
-        // These effects must already have happened when open returns; a timer
-        // or an unrelated Home refresh must not be required to open the sheet.
+        // Request the sheet immediately, but retain the action until SwiftUI shows it.
         XCTAssertEqual(presentations, 1)
-        XCTAssertEqual(consumed, [request])
+        XCTAssertEqual(root.penCalculatorQuickActionRequest, request)
+
+        RootHomeCalculatorQuickActionPresentation.open(
+            request: root.penCalculatorQuickActionRequest, isReady: true,
+            isAlreadyPresented: true, isVisible: true,
+            present: { presentations += 1 },
+            consume: { root.consumePenCalculatorQuickAction($0) })
+        XCTAssertEqual(presentations, 1)
+        XCTAssertNil(root.penCalculatorQuickActionRequest)
     }
 
     @MainActor func testIconCalculatorColdStartKeepsRequestUntilHomeBecomesReady() throws {
@@ -105,14 +121,24 @@ final class RootHomeInteractionTests: XCTestCase {
 
         RootHomeCalculatorQuickActionPresentation.open(
             request: root.penCalculatorQuickActionRequest, isReady: false,
-            isAlreadyPresented: false, present: { presentations += 1 },
+            isAlreadyPresented: false, isVisible: false,
+            present: { presentations += 1 },
             consume: { root.consumePenCalculatorQuickAction($0) })
         XCTAssertEqual(root.penCalculatorQuickActionRequest, request)
         XCTAssertEqual(presentations, 0)
 
         RootHomeCalculatorQuickActionPresentation.open(
             request: root.penCalculatorQuickActionRequest, isReady: true,
-            isAlreadyPresented: false, present: { presentations += 1 },
+            isAlreadyPresented: false, isVisible: false,
+            present: { presentations += 1 },
+            consume: { root.consumePenCalculatorQuickAction($0) })
+        XCTAssertEqual(presentations, 1)
+        XCTAssertEqual(root.penCalculatorQuickActionRequest, request)
+
+        RootHomeCalculatorQuickActionPresentation.open(
+            request: root.penCalculatorQuickActionRequest, isReady: true,
+            isAlreadyPresented: true, isVisible: true,
+            present: { presentations += 1 },
             consume: { root.consumePenCalculatorQuickAction($0) })
         XCTAssertEqual(presentations, 1)
         XCTAssertNil(root.penCalculatorQuickActionRequest)
@@ -128,13 +154,44 @@ final class RootHomeInteractionTests: XCTestCase {
 
         RootHomeCalculatorQuickActionPresentation.open(
             request: root.penCalculatorQuickActionRequest, isReady: true,
-            isAlreadyPresented: false, present: { presentations += 1 },
+            isAlreadyPresented: false, isVisible: false,
+            present: { presentations += 1 },
             consume: { root.consumePenCalculatorQuickAction($0) })
+        root.requestPenCalculatorQuickAction()
+        XCTAssertEqual(root.penCalculatorQuickActionRequest, request)
         RootHomeCalculatorQuickActionPresentation.open(
             request: root.penCalculatorQuickActionRequest, isReady: true,
-            isAlreadyPresented: false, present: { presentations += 1 },
+            isAlreadyPresented: true, isVisible: false,
+            present: { presentations += 1 },
             consume: { root.consumePenCalculatorQuickAction($0) })
         XCTAssertEqual(presentations, 1)
+        XCTAssertEqual(root.penCalculatorQuickActionRequest, request)
+
+        RootHomeCalculatorQuickActionPresentation.open(
+            request: root.penCalculatorQuickActionRequest, isReady: true,
+            isAlreadyPresented: true, isVisible: true,
+            present: { presentations += 1 },
+            consume: { root.consumePenCalculatorQuickAction($0) })
+        XCTAssertEqual(presentations, 1)
+        XCTAssertNil(root.penCalculatorQuickActionRequest)
+    }
+
+    @MainActor func testIconCalculatorRequestedSheetRemainsPendingUntilVisible() {
+        let request = UUID()
+        var presentations = 0
+        var consumed: [UUID] = []
+
+        RootHomeCalculatorQuickActionPresentation.open(
+            request: request, isReady: true, isAlreadyPresented: true, isVisible: false,
+            present: { presentations += 1 }, consume: { consumed.append($0) })
+        XCTAssertEqual(presentations, 0)
+        XCTAssertTrue(consumed.isEmpty)
+
+        RootHomeCalculatorQuickActionPresentation.open(
+            request: request, isReady: true, isAlreadyPresented: true, isVisible: true,
+            present: { presentations += 1 }, consume: { consumed.append($0) })
+        XCTAssertEqual(presentations, 0)
+        XCTAssertEqual(consumed, [request])
     }
 
     @MainActor func testIconCalculatorAlreadyOpenConsumesRequestWithoutPresentingAgain() {
@@ -143,11 +200,29 @@ final class RootHomeInteractionTests: XCTestCase {
         var consumed: [UUID] = []
 
         RootHomeCalculatorQuickActionPresentation.open(
-            request: request, isReady: true, isAlreadyPresented: true,
+            request: request, isReady: false, isAlreadyPresented: true, isVisible: true,
             present: { presentations += 1 }, consume: { consumed.append($0) })
 
         XCTAssertEqual(presentations, 0)
         XCTAssertEqual(consumed, [request])
+    }
+
+    @MainActor func testIconCalculatorDuringSheetDismissalWaitsForActualDismissal() {
+        let request = UUID()
+        var presentations = 0
+        var consumed: [UUID] = []
+
+        RootHomeCalculatorQuickActionPresentation.open(
+            request: request, isReady: true, isAlreadyPresented: false, isVisible: true,
+            present: { presentations += 1 }, consume: { consumed.append($0) })
+        XCTAssertEqual(presentations, 0)
+        XCTAssertTrue(consumed.isEmpty)
+
+        RootHomeCalculatorQuickActionPresentation.open(
+            request: request, isReady: true, isAlreadyPresented: false, isVisible: false,
+            present: { presentations += 1 }, consume: { consumed.append($0) })
+        XCTAssertEqual(presentations, 1)
+        XCTAssertTrue(consumed.isEmpty)
     }
 
     @MainActor func testIconCalculatorWithoutRequestDoesNotPresent() {
@@ -155,7 +230,7 @@ final class RootHomeInteractionTests: XCTestCase {
         var consumptions = 0
 
         RootHomeCalculatorQuickActionPresentation.open(
-            request: nil, isReady: true, isAlreadyPresented: false,
+            request: nil, isReady: true, isAlreadyPresented: false, isVisible: false,
             present: { presentations += 1 }, consume: { _ in consumptions += 1 })
 
         XCTAssertEqual(presentations, 0)
@@ -795,15 +870,19 @@ final class RootHomeInteractionTests: XCTestCase {
         root.requestPenCalculatorQuickAction()
         var presentations = 0
         RootHomeCalculatorQuickActionPresentation.open(request: root.penCalculatorQuickActionRequest,
-            isReady: ready, isAlreadyPresented: false,
+            isReady: ready, isAlreadyPresented: false, isVisible: false,
             present: { presentations += 1 }, consume: { root.consumePenCalculatorQuickAction($0) })
         XCTAssertEqual(presentations, 1)
+        XCTAssertNotNil(root.penCalculatorQuickActionRequest)
+        RootHomeCalculatorQuickActionPresentation.open(request: root.penCalculatorQuickActionRequest,
+            isReady: ready, isAlreadyPresented: true, isVisible: true,
+            present: { presentations += 1 }, consume: { root.consumePenCalculatorQuickAction($0) })
         XCTAssertNil(root.penCalculatorQuickActionRequest)
 
         // A repeated icon tap must leave the existing sheet and its inputs alone.
         root.requestPenCalculatorQuickAction()
         RootHomeCalculatorQuickActionPresentation.open(request: root.penCalculatorQuickActionRequest,
-            isReady: ready, isAlreadyPresented: true,
+            isReady: ready, isAlreadyPresented: true, isVisible: true,
             present: { presentations += 1 }, consume: { root.consumePenCalculatorQuickAction($0) })
         XCTAssertEqual(presentations, 1)
         XCTAssertNil(root.penCalculatorQuickActionRequest)
@@ -844,11 +923,16 @@ final class RootHomeInteractionTests: XCTestCase {
         let request = try XCTUnwrap(root.penCalculatorQuickActionRequest)
         var presentations = 0
         RootHomeCalculatorQuickActionPresentation.open(request: request,
-            isReady: ready(active: false), isAlreadyPresented: false,
+            isReady: ready(active: false), isAlreadyPresented: false, isVisible: false,
             present: { presentations += 1 }, consume: { root.consumePenCalculatorQuickAction($0) })
         XCTAssertEqual(root.penCalculatorQuickActionRequest, request)
         RootHomeCalculatorQuickActionPresentation.open(request: root.penCalculatorQuickActionRequest,
-            isReady: ready(), isAlreadyPresented: false,
+            isReady: ready(), isAlreadyPresented: false, isVisible: false,
+            present: { presentations += 1 }, consume: { root.consumePenCalculatorQuickAction($0) })
+        XCTAssertEqual(presentations, 1)
+        XCTAssertEqual(root.penCalculatorQuickActionRequest, request)
+        RootHomeCalculatorQuickActionPresentation.open(request: root.penCalculatorQuickActionRequest,
+            isReady: ready(), isAlreadyPresented: true, isVisible: true,
             present: { presentations += 1 }, consume: { root.consumePenCalculatorQuickAction($0) })
         XCTAssertEqual(presentations, 1)
         XCTAssertNil(root.penCalculatorQuickActionRequest)

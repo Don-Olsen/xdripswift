@@ -8,6 +8,10 @@
 
 import Combine
 import SwiftUI
+import OSLog
+
+private let homeCalculatorShortcutLog = OSLog(subsystem: ConstantsLog.subSystem,
+    category: ConstantsLog.categoryRootView)
 
 /// Inputs that must still match before a completed forecast can remain on screen.
 struct RootHomeForecastContext: Equatable {
@@ -226,6 +230,7 @@ struct RootHomeView: View {
     @State private var chartYAxisResetRevision = 0
     @State private var showsExpandedIPadChart = false
     @State private var showsPenCalculator = false
+    @State private var penCalculatorSheetVisible = false
     @State private var healthTherapySelectionSignature = ""
     @State private var forecastPresentation = RootHomeForecastPresentationState()
     @State private var forecastDataRevision = 0
@@ -360,7 +365,22 @@ struct RootHomeView: View {
             }
         }
         .onChange(of: penCalculatorQuickActionRequest) { _ in
+            if penCalculatorQuickActionRequest != nil {
+                trace("calculator shortcut reached Home scene=%{public}d app=%{public}d allow=%{public}d chart=%{public}d night=%{public}d source=%{public}d",
+                    log: homeCalculatorShortcutLog, category: ConstantsLog.categoryRootView,
+                    type: .info, scenePhase == .active ? 1 : 0,
+                    UIApplication.shared.applicationState == .active ? 1 : 0,
+                    allowsCalculatorQuickAction ? 1 : 0, showsExpandedIPadChart ? 1 : 0,
+                    state.usesScreenLockNightLayout ? 1 : 0,
+                    TherapyMetricsManager.doseSourceIsReady(UserDefaults.standard.dataFlowPolicy,
+                        cutover: TreatmentSourceCutover.current()) ? 1 : 0)
+            }
             openPendingCalculatorQuickAction()
+        }
+        .onChange(of: showsPenCalculator) { isRequested in
+            if !isRequested && penCalculatorQuickActionRequest != nil && !penCalculatorSheetVisible {
+                openPendingCalculatorQuickAction()
+            }
         }
         .onChange(of: calculatorQuickActionIsReady) { isReady in
             guard isReady else { return }
@@ -566,6 +586,17 @@ struct RootHomeView: View {
             }
             openPendingCalculatorQuickAction()
         }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
+            if penCalculatorQuickActionRequest != nil && showsPenCalculator && !penCalculatorSheetVisible {
+                // SwiftUI can drop a sheet request made during foreground transition.
+                // Clear the stale binding; its change event requests the same sheet again.
+                trace("calculator shortcut retry after activation", log: homeCalculatorShortcutLog,
+                    category: ConstantsLog.categoryRootView, type: .info)
+                showsPenCalculator = false
+            } else {
+                openPendingCalculatorQuickAction()
+            }
+        }
         .fullScreenCover(isPresented: $showsExpandedIPadChart) {
             expandedIPadChart
         }
@@ -577,6 +608,23 @@ struct RootHomeView: View {
                     actions.refreshPumpAndLoopStatus()
                 },
                 onCancel: { showsPenCalculator = false })
+                .onAppear {
+                    penCalculatorSheetVisible = true
+                    if let request = penCalculatorQuickActionRequest {
+                        trace("calculator shortcut sheet appeared", log: homeCalculatorShortcutLog,
+                            category: ConstantsLog.categoryRootView, type: .info)
+                        consumeCalculatorQuickAction(request)
+                    }
+                }
+                .onDisappear {
+                    penCalculatorSheetVisible = false
+                    if penCalculatorQuickActionRequest != nil {
+                        Task { @MainActor in
+                            await Task.yield()
+                            openPendingCalculatorQuickAction()
+                        }
+                    }
+                }
         }
     }
 
@@ -1331,7 +1379,7 @@ struct RootHomeView: View {
         RootHomeCalculatorQuickActionPresentation.isReady(
             policy: UserDefaults.standard.dataFlowPolicy,
             cutover: TreatmentSourceCutover.current(),
-            sceneIsActive: scenePhase == .active,
+            sceneIsActive: scenePhase == .active && UIApplication.shared.applicationState == .active,
             allowsPresentation: allowsCalculatorQuickAction,
             showsExpandedChart: showsExpandedIPadChart,
             usesNightLayout: state.usesScreenLockNightLayout)
@@ -1342,7 +1390,10 @@ struct RootHomeView: View {
             request: penCalculatorQuickActionRequest,
             isReady: calculatorQuickActionIsReady,
             isAlreadyPresented: showsPenCalculator,
+            isVisible: penCalculatorSheetVisible,
             present: {
+                trace("calculator shortcut sheet requested", log: homeCalculatorShortcutLog,
+                    category: ConstantsLog.categoryRootView, type: .info)
                 resetChartsToNow()
                 showsPenCalculator = true
             },

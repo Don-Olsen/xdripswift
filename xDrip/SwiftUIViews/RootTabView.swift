@@ -539,7 +539,8 @@ struct RootTabView: View {
                         snoozeDismissalRequest: stateModel.snoozeDismissalRequest,
                         isLandscape: isLandscape,
                         penCalculatorQuickActionRequest: stateModel.penCalculatorQuickActionRequest,
-                        allowsCalculatorQuickAction: stateModel.alertRequest == nil
+                        allowsCalculatorQuickAction: selectedTab == .home
+                            && stateModel.alertRequest == nil
                             && stateModel.pickerData == nil
                             && stateModel.textInputRequest == nil
                             && !stateModel.isPreparingIncomingBackup,
@@ -646,6 +647,9 @@ struct RootTabView: View {
         if stateModel.dependencies != nil &&
             !TherapyMetricsManager.doseSourceIsReady(UserDefaults.standard.dataFlowPolicy,
                 cutover: TreatmentSourceCutover.current()) {
+            trace("calculator shortcut rejected by root: local source unavailable",
+                log: OSLog(subsystem: ConstantsLog.subSystem, category: ConstantsLog.categoryRootView),
+                category: ConstantsLog.categoryRootView, type: .info)
             stateModel.consumePenCalculatorQuickAction(request)
             QuickActionsManager.shared.updateAvailableQuickActions()
             return

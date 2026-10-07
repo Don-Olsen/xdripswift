@@ -8,6 +8,38 @@
 - Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
 <!-- testflight-7.1.1-4304:end -->
 
+## Kandidat efter 4304: app-ikonets bolusgenvej
+
+På den tilsluttede iPhone 17 Pro Max med den faktisk installerede 4304 viste en
+skærmbilledserie genvejsmenuen kl. 14.37.11 og Home kl. 14.37.12. Beregnerarket
+var stadig ikke vist kl. 14.37.58. Home-sidens blå + åbnede derefter samme
+beregner straks. Den installerede app var responsiv; dette var ikke en målt
+16-sekunders beregningstid. Den eksisterende app-journal viste forgrundsskiftet,
+men 4304 loggede ikke genvejsforløbets enkelte trin. Den præcise afvisnings-
+eller præsentationshændelse på telefonen er derfor endnu ikke dokumenteret.
+
+Kodegennemgangen fandt en konkret tabt-anmodningsvej: Home kvitterede
+genvejsanmodningen, når det bad SwiftUI om at vise arket, før arket faktisk
+var fremme. En præsentation under scene- eller modalovergang kunne dermed
+mislykkes uden mulighed for genforsøg. Home kunne også modtage anmodningen,
+mens en anden fane var valgt. Kandidaten holder anmodningen indtil arkets
+`onAppear`, begrænser præsentationen til den valgte Home-fane og venter på,
+at både app og scene er aktive. En anmodning, som ikke gav et synligt ark
+under forgrundsskiftet, kan forsøges igen, når aktiveringen er fuldført.
+Dataløse logmarkører
+skelner næste gang mellem scene-callback, kildeafvisning, ark-anmodning og
+faktisk visning. Beregnerens dosis- og registreringsregler er uændrede.
+
+De målrettede simulator-suiter bestod med 634/634 tests. Efter den sidste
+kodegennemgang bestod den fulde lokale kontrol med 1.423/1.423 XCTest-tests,
+projektets Python-kontroller og både iPhone- og Watch-simulatorbuilds. To
+SwiftUI-runtimeadvarsler opstod i Nightscout-tests og fandtes også i den
+tidligere målrettede kørsel; de er ikke knyttet til genvejsændringen.
+Dette er endnu ikke en Apple-nummereret release-kvittering. Den fysiske effekt
+af den nye rettelse er **ikke** verificeret. Ingen udviklingsapp blev
+installeret direkte på telefonen under undersøgelsen. Release-status
+registreres særskilt øverst i dette dokument.
+
 De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
 
 <!-- testflight-7.1.1-4303:start -->

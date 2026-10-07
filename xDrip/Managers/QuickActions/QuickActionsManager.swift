@@ -8,6 +8,10 @@
 
 import UIKit
 import Combine
+import OSLog
+
+private let calculatorShortcutLog = OSLog(subsystem: ConstantsLog.subSystem,
+    category: ConstantsLog.categoryAppDelegate)
 
 /// This enum defines actions that can be available at app icon's quick actions on iOS home screen
 enum QuickActionType: String, Equatable {
@@ -129,6 +133,8 @@ enum QuickActionType: String, Equatable {
                 // A stale icon item cannot bypass source ownership. During a cold start the
                 // dependencies may not exist yet; Home rechecks source ownership before presenting.
                 guard calculatorSourceIsValid() else {
+                    trace("calculator shortcut rejected: local source unavailable",
+                        log: calculatorShortcutLog, category: ConstantsLog.categoryAppDelegate, type: .info)
                     updateAvailableQuickActions()
                     return false
                 }
@@ -137,6 +143,8 @@ enum QuickActionType: String, Equatable {
                 } else {
                     pendingCalculatorBeforeRoot = true
                 }
+                trace("calculator shortcut queued", log: calculatorShortcutLog,
+                    category: ConstantsLog.categoryAppDelegate, type: .info)
             case .speakReadings:
                 UserDefaults.standard.speakReadings = true
             case .stopSpeakingReadings:
