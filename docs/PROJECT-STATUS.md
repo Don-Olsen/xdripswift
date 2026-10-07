@@ -8,6 +8,58 @@
 - Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
 <!-- testflight-7.1.1-4306:end -->
 
+## Efter 4306: reproduceret gammel skærmtilstand i bolusgenvejen
+
+4306 løste ikke den fysiske forsinkelse. Den tilsluttede iPhones installerede
+app blev kontrolleret som `com.GFZ896KN66.xdripswift`, 7.1.1 (4306). Den
+7. oktober modtog scenen genvejen kl. 17.13.48,381. Root havde Home og sine
+afhængigheder klar; Home loggede alligevel `ready=0`. Arket blev først
+anmodet kl. 17.14.15,804 og vist kl. 17.14.15,871. Tiden fra tryk til ark
+var dermed cirka 27,5 sekunder. De tidligere angivne korte tider mellem
+ark-anmodning og `onAppear` var **ikke** genvejens samlede svartid.
+
+Den konkrete fejl er reproduceret i den rigtige `RootHomeView`:
+de gamle enkeltarguments-`onChange`-callbacks ignorerede den nye anmodning
+eller genberegnede readiness fra den tidligere views værdier.
+[Apple beskriver eksplicit denne capture-adfærd](https://developer.apple.com/documentation/swiftui/view/onchange(of:perform:)).
+Det forklarer også, at den gamle log først skrev »reached Home« efter arkets
+visning: forbruget af anmodningen kaldte en closure, der stadig så den gamle
+UUID. Eksisterende helper-tests med manuelt angivet `isReady` fangede ikke
+fejlen.
+
+Rettelsen observerer ét samlet value-snapshot af anmodning, leveringsrevision,
+readiness og arkets tilstand og bruger callbackens **nye** snapshot direkte.
+Appens aktive tilstand publiceres fra de eksisterende UIKit-notifikationer,
+så UIKit/SwiftUI-aktiveringernes rækkefølge ikke kræver en senere Home-refresh.
+Der er ingen ny timer eller ventetid. Kilde-, modal-, scene-, natvisnings- og
+grafkontroller er bevaret. Beregner, dosisregler, behandlinger, HealthKit,
+prognose, Watch/Libre og alarmer er uændrede.
+
+Fire nye hosted SwiftUI-tests bruger den rigtige Home-visning, quick-action-
+handler og `PenDoseCalculatorScreen` i et simulatorvindue med in-memory-data.
+Alle fire fejlede mod 4306 (14 assertions); efter rettelsen bestod hele suiten
+med 1.429/1.429 tests. De dækker varm anmodning, sceneaktivering, frigivelse af
+præsentationsblokering samt gentagne tryk og genbrug af et åbent ark, uden at
+vente på grafens 15-sekunders timer. To supplerende hosted tests dækker en
+anmodning før Home monteres samt lukning uden genåbning eller gemte
+behandlinger, efterfulgt af en ny genvejsanmodning. Den endelige `test-all`
+bestod med **1.431/1.431 tests, 0 fejl**. Begge simulatorbuilds (iPhone og
+Watch) bestod også. Testsuitens tomme chart-fixtures gav SwiftUI-advarslen
+`Invalid frame dimension`; det er ikke undersøgt som en fysisk layoutfejl
+i denne afgrænsede rettelse. Ingen tests er fjernet eller svækket.
+
+Kontrollen er en lokal kodeverifikation, ikke en releasekvittering.
+Python-releasekontroller, nyt Apple-buildnummer, signering og IPA-kontrol
+er ikke kørt for denne unummererede rettelse. Ved en ny udgivelse skal den
+fulde releaseprocedure køre på det præcise release-checkpoint.
+
+Ved den lokale kontrol var den rettede kode ikke uploadet eller fysisk verificeret. Ingen
+lokal installation eller afbrydelse af CGM er udført. Telefonens konkrete
+svartid skal måles igen fra ikontryk til synligt ark; simulatorresultatet er
+ikke en garanti for en bestemt fysisk svartid. 4306's statuscommit er nu
+også pushet efter en midlertidig GitHub-serverfejl; Apple-uploaden var allerede
+bekræftet som Internal / Testing.
+
 De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
 
 <!-- testflight-7.1.1-4305:start -->

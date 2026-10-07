@@ -14,6 +14,152 @@ import XCTest
 
 final class RootHomeInteractionTests: XCTestCase {
 
+
+    @MainActor
+    func testHostedIconRequestBeforeHomeMountPresentsTheRealCalculator() async throws {
+        let harness = try HostedHomeCalculatorHarness()
+        defer { harness.finish() }
+        let appeared = expectation(description: "Cold pending request shows the real calculator")
+        harness.onConsumption = { _ in appeared.fulfill() }
+        let request = try harness.requestFromIcon()
+        XCTAssertNil(harness.host)
+        XCTAssertEqual(harness.root.penCalculatorQuickActionRequest, request)
+
+        await harness.mount(in: self)
+        await fulfillment(of: [appeared], timeout: 2)
+        XCTAssertNotNil(harness.host?.presentedViewController)
+        XCTAssertEqual(harness.consumedRequests, [request])
+        XCTAssertNil(harness.root.penCalculatorQuickActionRequest)
+    }
+
+    @MainActor
+    func testHostedCalculatorDismissalDoesNotReopenOrCreateTreatment() async throws {
+        let harness = try HostedHomeCalculatorHarness()
+        defer { harness.finish() }
+        await harness.mount(in: self)
+        let appeared = expectation(description: "Calculator appears before dismissal")
+        harness.onConsumption = { _ in appeared.fulfill() }
+        let request = try harness.requestFromIcon()
+        await fulfillment(of: [appeared], timeout: 2)
+        let sheet = try XCTUnwrap(harness.host?.presentedViewController)
+        XCTAssertNil(harness.root.penCalculatorQuickActionRequest)
+
+        let dismissed = expectation(description: "Actual calculator presentation finishes dismissing")
+        sheet.dismiss(animated: false) { dismissed.fulfill() }
+        await fulfillment(of: [dismissed], timeout: 2)
+        await harness.renderPendingChanges()
+        XCTAssertNil(harness.host?.presentedViewController)
+        XCTAssertNil(harness.root.penCalculatorQuickActionRequest)
+        XCTAssertEqual(harness.consumedRequests, [request])
+        XCTAssertTrue(try harness.core.mainManagedObjectContext.fetch(TreatmentEntry.fetchRequest()).isEmpty)
+        XCTAssertFalse(harness.core.mainManagedObjectContext.hasChanges)
+
+        // A later icon tap must open a new sheet. This also proves dismissal reset
+        // Home's presentation binding instead of leaving an invisible requested sheet.
+        let reopened = expectation(description: "A separate later icon tap opens a new calculator")
+        harness.onConsumption = { _ in reopened.fulfill() }
+        let nextRequest = try harness.requestFromIcon()
+        XCTAssertNotEqual(nextRequest, request)
+        await fulfillment(of: [reopened], timeout: 2)
+        XCTAssertNotNil(harness.host?.presentedViewController)
+        XCTAssertFalse(harness.host?.presentedViewController === sheet)
+        XCTAssertEqual(harness.consumedRequests, [request, nextRequest])
+        XCTAssertNil(harness.root.penCalculatorQuickActionRequest)
+        XCTAssertTrue(try harness.core.mainManagedObjectContext.fetch(TreatmentEntry.fetchRequest()).isEmpty)
+        XCTAssertFalse(harness.core.mainManagedObjectContext.hasChanges)
+    }
+
+    @MainActor
+    func testHostedIconRequestPresentsRealCalculatorAfterHomeIsMounted() async throws {
+        let harness = try HostedHomeCalculatorHarness()
+        defer { harness.finish() }
+        await harness.mount(in: self)
+        XCTAssertNil(harness.host?.presentedViewController)
+
+        let appeared = expectation(description: "Home's real calculator sheet appeared")
+        harness.onConsumption = { _ in appeared.fulfill() }
+        let request = try harness.requestFromIcon()
+        XCTAssertEqual(harness.root.penCalculatorQuickActionRequest, request)
+
+        // This must be the mounted Home's SwiftUI change handler, without a second tap,
+        // a therapy notification, or the 15-second chart refresh rescuing the request.
+        await fulfillment(of: [appeared], timeout: 2)
+        XCTAssertNotNil(harness.host?.presentedViewController)
+        XCTAssertEqual(harness.consumedRequests, [request])
+        XCTAssertNil(harness.root.penCalculatorQuickActionRequest)
+    }
+
+    @MainActor
+    func testHostedIconRequestPresentsWhenSceneBecomesActive() async throws {
+        let harness = try HostedHomeCalculatorHarness(scenePhase: .inactive)
+        defer { harness.finish() }
+        await harness.mount(in: self)
+        let request = try harness.requestFromIcon()
+        await harness.renderPendingChanges()
+        XCTAssertNil(harness.host?.presentedViewController)
+        XCTAssertEqual(harness.root.penCalculatorQuickActionRequest, request)
+
+        let appeared = expectation(description: "Pending calculator appeared after scene activation")
+        harness.onConsumption = { _ in appeared.fulfill() }
+        // The scene delegate may publish the delivery before SwiftUI's environment has
+        // changed. Readiness must use the later active snapshot, not the old closure.
+        harness.quickActions.reactivatePendingCalculatorQuickAction()
+        await harness.renderPendingChanges()
+        XCTAssertNil(harness.host?.presentedViewController)
+        harness.inputs.scenePhase = .active
+
+        await fulfillment(of: [appeared], timeout: 2)
+        XCTAssertNotNil(harness.host?.presentedViewController)
+        XCTAssertEqual(harness.consumedRequests, [request])
+        XCTAssertNil(harness.root.penCalculatorQuickActionRequest)
+    }
+
+    @MainActor
+    func testHostedIconRequestPresentsWhenHomePresentationBecomesAllowed() async throws {
+        let harness = try HostedHomeCalculatorHarness(allowsPresentation: false)
+        defer { harness.finish() }
+        await harness.mount(in: self)
+        let request = try harness.requestFromIcon()
+        await harness.renderPendingChanges()
+        XCTAssertNil(harness.host?.presentedViewController)
+        XCTAssertEqual(harness.root.penCalculatorQuickActionRequest, request)
+
+        let appeared = expectation(description: "Pending calculator appeared after presentation gate opened")
+        harness.onConsumption = { _ in appeared.fulfill() }
+        harness.inputs.allowsPresentation = true
+
+        await fulfillment(of: [appeared], timeout: 2)
+        XCTAssertNotNil(harness.host?.presentedViewController)
+        XCTAssertEqual(harness.consumedRequests, [request])
+        XCTAssertNil(harness.root.penCalculatorQuickActionRequest)
+    }
+
+    @MainActor
+    func testHostedRepeatedIconRequestsReuseTheActualVisibleCalculator() async throws {
+        let harness = try HostedHomeCalculatorHarness()
+        defer { harness.finish() }
+        await harness.mount(in: self)
+        let appeared = expectation(description: "Repeated icon taps show one calculator")
+        harness.onConsumption = { _ in appeared.fulfill() }
+        let firstRequest = try harness.requestFromIcon()
+        XCTAssertEqual(try harness.requestFromIcon(), firstRequest)
+        XCTAssertEqual(try harness.requestFromIcon(), firstRequest)
+        await fulfillment(of: [appeared], timeout: 2)
+        let sheet = try XCTUnwrap(harness.host?.presentedViewController)
+        XCTAssertEqual(harness.consumedRequests, [firstRequest])
+        XCTAssertNil(harness.root.penCalculatorQuickActionRequest)
+
+        let reused = expectation(description: "New icon request consumes against the already visible sheet")
+        harness.onConsumption = { _ in reused.fulfill() }
+        let nextRequest = try harness.requestFromIcon()
+        XCTAssertNotEqual(nextRequest, firstRequest)
+        await fulfillment(of: [reused], timeout: 2)
+        XCTAssertTrue(harness.host?.presentedViewController === sheet)
+        XCTAssertNil(sheet.presentedViewController, "The icon must not stack a second sheet")
+        XCTAssertEqual(harness.consumedRequests, [firstRequest, nextRequest])
+        XCTAssertNil(harness.root.penCalculatorQuickActionRequest)
+    }
+
     @MainActor func testIconCalculatorActionIsFirstAndSpeakingActionStillSwitches() {
         XCTAssertEqual(QuickActionsManager.availableActions(calculatorVisible: true,
             speakReadings: false), [.penCalculator, .speakReadings])
@@ -1290,6 +1436,154 @@ final class RootHomeInteractionTests: XCTestCase {
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             DispatchQueue.main.async { continuation.resume() }
         }
+    }
+}
+
+/// Drives the actual Home view and its real PenDoseCalculatorScreen sheet through SwiftUI.
+/// Only source data, scene environment, and the enclosing navigation gate are controlled.
+@MainActor
+private final class HostedHomeCalculatorHarness {
+    let root = RootTabStateModel()
+    let quickActions = QuickActionsManager()
+    let inputs: HostedHomeCalculatorInputs
+    let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+    let homeState = RootHomeStateModel()
+    let sensorHealth: SensorHealthIssueManager
+    let nightscout: NightscoutSyncManager
+    private(set) var consumedRequests: [UUID] = []
+    var onConsumption: ((UUID) -> Void)?
+    private(set) var host: UIViewController?
+    private var window: UIWindow?
+    private weak var previousKeyWindow: UIWindow?
+    private let savedDefaults: [(String, Any?)]
+    private let sensorDefaults: UserDefaults
+    private let sensorSuite = "HostedHomeCalculator.\(UUID().uuidString)"
+
+    init(scenePhase: ScenePhase = .active, allowsPresentation: Bool = true) throws {
+        inputs = HostedHomeCalculatorInputs(scenePhase: scenePhase,
+                                            allowsPresentation: allowsPresentation)
+        let defaults = UserDefaults.standard
+        let keys = [UserDefaults.Key.isMaster.rawValue,
+                    UserDefaults.Key.therapyDataSourceType.rawValue,
+                    UserDefaults.Key.nightscoutEnabled.rawValue,
+                    UserDefaults.Key.glucoseForecastHorizonMinutes.rawValue,
+                    TreatmentSourceCutover.defaultsKey,
+                    TreatmentSourceCutover.restoreRequiresSourceSetupKey]
+        savedDefaults = keys.map { ($0, defaults.object(forKey: $0)) }
+        sensorDefaults = UserDefaults(suiteName: sensorSuite)!
+        sensorHealth = SensorHealthIssueManager(userDefaults: sensorDefaults)
+        nightscout = NightscoutSyncManager(coreDataManager: core, messageHandler: nil,
+                                           observesSettings: false)
+        // The real test-host app also observes standard defaults. Disable its remote
+        // source before changing ownership, then restore that switch last at teardown.
+        defaults.nightscoutEnabled = false
+        defaults.isMaster = true
+        defaults.therapyDataSourceType = .none
+        defaults.set(0, forKey: UserDefaults.Key.glucoseForecastHorizonMinutes.rawValue)
+        defaults.set(false, forKey: TreatmentSourceCutover.restoreRequiresSourceSetupKey)
+        let boundary = TreatmentSourceCutover(cutoff: Date(),
+            insulinSourceBundleID: "hosted.test.insulin", carbohydrateSourceBundleID: "hosted.test.carbs")
+        defaults.set(try JSONEncoder().encode(boundary), forKey: TreatmentSourceCutover.defaultsKey)
+        quickActions.attachRoot(root)
+    }
+
+    func mount(in test: XCTestCase) async {
+        let appeared = XCTestExpectation(description: "Actual Home is mounted in its host window")
+        let content = HostedHomeCalculatorContent(harness: self, onAppear: { appeared.fulfill() })
+        let controller = UIHostingController(rootView: content)
+        host = controller
+        if let scene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene })
+            .first(where: { $0.activationState == .foregroundActive }) {
+            previousKeyWindow = scene.windows.first(where: \.isKeyWindow)
+            window = UIWindow(windowScene: scene)
+        } else {
+            XCTFail("Hosted presentation regression requires the XCTest app's active UIWindowScene")
+            return
+        }
+        window?.rootViewController = controller
+        window?.makeKeyAndVisible()
+        await test.fulfillment(of: [appeared], timeout: 2)
+        await renderPendingChanges()
+        XCTAssertEqual(UIApplication.shared.applicationState, .active)
+    }
+
+    func renderPendingChanges() async {
+        // Yield across a display pass; do not call a presentation helper or post a
+        // notification. In particular, drain Home's initial onAppear task before a tap.
+        try? await Task.sleep(nanoseconds: 150_000_000)
+    }
+
+    func requestFromIcon() throws -> UUID {
+        XCTAssertTrue(quickActions.handleQuickAction(.penCalculator))
+        return try XCTUnwrap(root.penCalculatorQuickActionRequest)
+    }
+
+    func consume(_ request: UUID) {
+        consumedRequests.append(request)
+        root.consumePenCalculatorQuickAction(request)
+        onConsumption?(request)
+    }
+
+    func finish() {
+        onConsumption = nil
+        if let request = root.penCalculatorQuickActionRequest {
+            root.consumePenCalculatorQuickAction(request)
+        }
+        host?.dismiss(animated: false)
+        window?.isHidden = true
+        window?.rootViewController = nil
+        host = nil
+        window = nil
+        previousKeyWindow?.makeKey()
+        let nightscoutKey = UserDefaults.Key.nightscoutEnabled.rawValue
+        let restoreOrder = savedDefaults.filter { $0.0 != nightscoutKey }
+            + savedDefaults.filter { $0.0 == nightscoutKey }
+        for (key, value) in restoreOrder {
+            if let value { UserDefaults.standard.set(value, forKey: key) }
+            else { UserDefaults.standard.removeObject(forKey: key) }
+        }
+        sensorDefaults.removePersistentDomain(forName: sensorSuite)
+        QuickActionsManager.shared.updateAvailableQuickActions()
+    }
+}
+
+@MainActor
+private final class HostedHomeCalculatorInputs: ObservableObject {
+    @Published var scenePhase: ScenePhase
+    @Published var allowsPresentation: Bool
+
+    init(scenePhase: ScenePhase, allowsPresentation: Bool) {
+        self.scenePhase = scenePhase
+        self.allowsPresentation = allowsPresentation
+    }
+}
+
+@MainActor
+private struct HostedHomeCalculatorContent: View {
+    let harness: HostedHomeCalculatorHarness
+    @ObservedObject private var root: RootTabStateModel
+    @ObservedObject private var inputs: HostedHomeCalculatorInputs
+    let onAppear: () -> Void
+
+    init(harness: HostedHomeCalculatorHarness, onAppear: @escaping () -> Void) {
+        self.harness = harness
+        self.root = harness.root
+        self.inputs = harness.inputs
+        self.onAppear = onAppear
+    }
+
+    var body: some View {
+        RootHomeView(stateModel: harness.homeState,
+            sensorHealthIssueManager: harness.sensorHealth,
+            coreDataManager: harness.core,
+            nightscoutSyncManager: harness.nightscout,
+            actions: RootHomeActions(),
+            penCalculatorQuickActionRequest: root.penCalculatorQuickActionRequest,
+            penCalculatorQuickActionDeliveryRevision: root.penCalculatorQuickActionDeliveryRevision,
+            allowsCalculatorQuickAction: inputs.allowsPresentation,
+            consumeCalculatorQuickAction: harness.consume)
+            .environment(\.scenePhase, inputs.scenePhase)
+            .onAppear(perform: onAppear)
     }
 }
 

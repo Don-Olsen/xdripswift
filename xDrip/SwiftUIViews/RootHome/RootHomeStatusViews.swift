@@ -60,6 +60,16 @@ enum RootHomeCalculatorShortcutPolicy {
 /// Requests Home's existing calculator sheet. The shortcut stays pending until the sheet
 /// actually appears; SwiftUI may defer presentation during a foreground or modal transition.
 enum RootHomeCalculatorQuickActionPresentation {
+    /// Legacy onChange closures capture the previous view. Pass the complete new value
+    /// into the handler instead of rereading the old request or presentation gates.
+    struct Delivery: Equatable {
+        let request: UUID?
+        let revision: Int
+        let isReady: Bool
+        let isAlreadyPresented: Bool
+        let isVisible: Bool
+    }
+
     /// Presenting the calculator only needs a local treatment owner and an available sheet.
     /// Home's metric visibility can lag behind a foreground refresh; the calculator separately
     /// validates the current glucose and treatment snapshot before offering a dose.

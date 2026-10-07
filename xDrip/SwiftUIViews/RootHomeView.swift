@@ -232,6 +232,7 @@ struct RootHomeView: View {
     @State private var showsExpandedIPadChart = false
     @State private var showsPenCalculator = false
     @State private var penCalculatorSheetVisible = false
+    @State private var calculatorApplicationIsActive = UIApplication.shared.applicationState == .active
     @State private var healthTherapySelectionSignature = ""
     @State private var forecastPresentation = RootHomeForecastPresentationState()
     @State private var forecastDataRevision = 0
@@ -352,6 +353,7 @@ struct RootHomeView: View {
         }
         .colorScheme(.dark)
         .onAppear {
+            calculatorApplicationIsActive = UIApplication.shared.applicationState == .active
             forecastFreshnessCheckTime = Date()
             healthTherapySelectionSignature = currentHealthTherapySelectionSignature
             scrollCoordinator.resetToNow()
@@ -362,43 +364,15 @@ struct RootHomeView: View {
             }
             requestChartState(forceReset: true)
             requestMiniChartState(forceReset: true)
-            Task { @MainActor in
-                await Task.yield()
-                openPendingCalculatorQuickAction()
-            }
+            openPendingCalculatorQuickAction(calculatorQuickActionDelivery)
         }
-        .onChange(of: penCalculatorQuickActionRequest) { _ in
-            if penCalculatorQuickActionRequest != nil {
-                trace("calculator shortcut reached Home scene=%{public}d app=%{public}d allow=%{public}d chart=%{public}d night=%{public}d source=%{public}d",
-                    log: homeCalculatorShortcutLog, category: ConstantsLog.categoryRootView,
-                    type: .info, scenePhase == .active ? 1 : 0,
-                    UIApplication.shared.applicationState == .active ? 1 : 0,
-                    allowsCalculatorQuickAction ? 1 : 0, showsExpandedIPadChart ? 1 : 0,
-                    state.usesScreenLockNightLayout ? 1 : 0,
-                    TherapyMetricsManager.doseSourceIsReady(UserDefaults.standard.dataFlowPolicy,
-                        cutover: TreatmentSourceCutover.current()) ? 1 : 0)
-            }
-            openPendingCalculatorQuickAction()
-        }
-        .onChange(of: penCalculatorQuickActionDeliveryRevision) { _ in
-            guard penCalculatorQuickActionRequest != nil else { return }
+        .onChange(of: calculatorQuickActionDelivery) { delivery in
+            guard delivery.request != nil else { return }
             trace("calculator shortcut Home delivery ready=%{public}d requested=%{public}d visible=%{public}d",
                 log: homeCalculatorShortcutLog, category: ConstantsLog.categoryRootView,
-                type: .info, calculatorQuickActionIsReady ? 1 : 0,
-                showsPenCalculator ? 1 : 0, penCalculatorSheetVisible ? 1 : 0)
-            openPendingCalculatorQuickAction()
-        }
-        .onChange(of: showsPenCalculator) { isRequested in
-            if !isRequested && penCalculatorQuickActionRequest != nil && !penCalculatorSheetVisible {
-                openPendingCalculatorQuickAction()
-            }
-        }
-        .onChange(of: calculatorQuickActionIsReady) { isReady in
-            guard isReady else { return }
-            openPendingCalculatorQuickAction()
-        }
-        .onChange(of: showsExpandedIPadChart) { _ in
-            openPendingCalculatorQuickAction()
+                type: .info, delivery.isReady ? 1 : 0,
+                delivery.isAlreadyPresented ? 1 : 0, delivery.isVisible ? 1 : 0)
+            openPendingCalculatorQuickAction(delivery)
         }
         .onDisappear {
             scrollCoordinator.stopDeceleration()
@@ -413,7 +387,6 @@ struct RootHomeView: View {
             requestMiniChartState(forceReset: false)
         }
         .onReceive(NotificationCenter.default.publisher(for: HealthKitTherapyImportManager.statusDidChange)) { _ in
-            if penCalculatorQuickActionRequest != nil { openPendingCalculatorQuickAction() }
             forecastFreshnessCheckTime = Date()
             let signature = currentHealthTherapySelectionSignature
             if signature != healthTherapySelectionSignature {
@@ -427,7 +400,6 @@ struct RootHomeView: View {
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: TherapyMetricsManager.changed)) { _ in
-            if penCalculatorQuickActionRequest != nil { openPendingCalculatorQuickAction() }
             let routine = HealthKitTherapyImportManager.shared.routineRefreshState()
             if routine?.allEnabledKindsCommitted != false
                 && TherapyMetricsManager.shared.pendingHomeTreatmentCommitState() == nil {
@@ -595,18 +567,21 @@ struct RootHomeView: View {
             if penCalculatorQuickActionRequest == nil || !calculatorQuickActionIsReady {
                 resetChartsToNow()
             }
-            openPendingCalculatorQuickAction()
         }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
+            // UIApplication's getter is not observable. Publish the activation so either
+            // UIKit/SwiftUI event order produces a new, current delivery snapshot.
+            calculatorApplicationIsActive = true
             if penCalculatorQuickActionRequest != nil && showsPenCalculator && !penCalculatorSheetVisible {
                 // SwiftUI can drop a sheet request made during foreground transition.
                 // Clear the stale binding; its change event requests the same sheet again.
                 trace("calculator shortcut retry after activation", log: homeCalculatorShortcutLog,
                     category: ConstantsLog.categoryRootView, type: .info)
                 showsPenCalculator = false
-            } else {
-                openPendingCalculatorQuickAction()
             }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in
+            calculatorApplicationIsActive = false
         }
         .fullScreenCover(isPresented: $showsExpandedIPadChart) {
             expandedIPadChart
@@ -629,12 +604,6 @@ struct RootHomeView: View {
                 }
                 .onDisappear {
                     penCalculatorSheetVisible = false
-                    if penCalculatorQuickActionRequest != nil {
-                        Task { @MainActor in
-                            await Task.yield()
-                            openPendingCalculatorQuickAction()
-                        }
-                    }
                 }
         }
     }
@@ -1390,18 +1359,26 @@ struct RootHomeView: View {
         RootHomeCalculatorQuickActionPresentation.isReady(
             policy: UserDefaults.standard.dataFlowPolicy,
             cutover: TreatmentSourceCutover.current(),
-            sceneIsActive: scenePhase == .active && UIApplication.shared.applicationState == .active,
+            sceneIsActive: scenePhase == .active && calculatorApplicationIsActive,
             allowsPresentation: allowsCalculatorQuickAction,
             showsExpandedChart: showsExpandedIPadChart,
             usesNightLayout: state.usesScreenLockNightLayout)
     }
 
-    private func openPendingCalculatorQuickAction() {
+    private var calculatorQuickActionDelivery: RootHomeCalculatorQuickActionPresentation.Delivery {
+        .init(request: penCalculatorQuickActionRequest,
+              revision: penCalculatorQuickActionDeliveryRevision,
+              isReady: calculatorQuickActionIsReady,
+              isAlreadyPresented: showsPenCalculator,
+              isVisible: penCalculatorSheetVisible)
+    }
+
+    private func openPendingCalculatorQuickAction(_ delivery: RootHomeCalculatorQuickActionPresentation.Delivery) {
         RootHomeCalculatorQuickActionPresentation.open(
-            request: penCalculatorQuickActionRequest,
-            isReady: calculatorQuickActionIsReady,
-            isAlreadyPresented: showsPenCalculator,
-            isVisible: penCalculatorSheetVisible,
+            request: delivery.request,
+            isReady: delivery.isReady,
+            isAlreadyPresented: delivery.isAlreadyPresented,
+            isVisible: delivery.isVisible,
             present: {
                 trace("calculator shortcut sheet requested", log: homeCalculatorShortcutLog,
                     category: ConstantsLog.categoryRootView, type: .info)
