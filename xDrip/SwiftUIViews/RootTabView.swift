@@ -119,6 +119,7 @@ struct RootTabDependencies {
     @Published private(set) var alertRequest: RootAlertRequest?
     @Published private(set) var sensorHealthHomeRequest = 0
     @Published private(set) var penCalculatorQuickActionRequest: UUID?
+    @Published private(set) var penCalculatorQuickActionDeliveryRevision = 0
     @Published var textInputRequest: RootTextInputRequest?
     @Published var textInput = ""
     @Published var pickerData: SnoozePickerData?
@@ -221,6 +222,15 @@ struct RootTabDependencies {
         if penCalculatorQuickActionRequest == nil {
             penCalculatorQuickActionRequest = UUID()
         }
+        // A previous presentation can remain pending after a foreground transition.
+        // Every icon tap must still publish an event, while all taps share one sheet.
+        penCalculatorQuickActionDeliveryRevision &+= 1
+    }
+
+    func reactivatePenCalculatorQuickAction() {
+        guard penCalculatorQuickActionRequest != nil else { return }
+        // A scene can become active after SwiftUI has already observed the pending UUID.
+        penCalculatorQuickActionDeliveryRevision &+= 1
     }
 
     func consumePenCalculatorQuickAction(_ id: UUID) {
@@ -431,7 +441,16 @@ struct RootTabView: View {
         .onChange(of: stateModel.penCalculatorQuickActionRequest) { request in
             if request != nil { selectHomeForCalculatorQuickAction() }
         }
-        .task(id: stateModel.penCalculatorQuickActionRequest) {
+        .onChange(of: stateModel.penCalculatorQuickActionDeliveryRevision) { _ in
+            trace("calculator shortcut root delivery home=%{public}d ready=%{public}d rootModal=%{public}d",
+                log: OSLog(subsystem: ConstantsLog.subSystem, category: ConstantsLog.categoryRootView),
+                category: ConstantsLog.categoryRootView, type: .info,
+                selectedTab == .home ? 1 : 0, stateModel.dependencies != nil ? 1 : 0,
+                stateModel.alertRequest != nil || stateModel.pickerData != nil
+                    || stateModel.textInputRequest != nil ? 1 : 0)
+            selectHomeForCalculatorQuickAction()
+        }
+        .task(id: stateModel.penCalculatorQuickActionDeliveryRevision) {
             // A shortcut tapped while another tab has a modal waits for that modal to close;
             // switching tabs immediately could discard text already entered there.
             while stateModel.penCalculatorQuickActionRequest != nil && selectedTab != .home {
@@ -539,6 +558,7 @@ struct RootTabView: View {
                         snoozeDismissalRequest: stateModel.snoozeDismissalRequest,
                         isLandscape: isLandscape,
                         penCalculatorQuickActionRequest: stateModel.penCalculatorQuickActionRequest,
+                        penCalculatorQuickActionDeliveryRevision: stateModel.penCalculatorQuickActionDeliveryRevision,
                         allowsCalculatorQuickAction: selectedTab == .home
                             && stateModel.alertRequest == nil
                             && stateModel.pickerData == nil
@@ -643,7 +663,12 @@ struct RootTabView: View {
     private func selectHomeForCalculatorQuickAction() {
         guard let request = stateModel.penCalculatorQuickActionRequest else { return }
         guard !stateModel.isPreparingIncomingBackup,
-              stateModel.incomingBackupRequest == nil else { return }
+              stateModel.incomingBackupRequest == nil else {
+            trace("calculator shortcut Home selection blocked: backup",
+                log: OSLog(subsystem: ConstantsLog.subSystem, category: ConstantsLog.categoryRootView),
+                category: ConstantsLog.categoryRootView, type: .info)
+            return
+        }
         if stateModel.dependencies != nil &&
             !TherapyMetricsManager.doseSourceIsReady(UserDefaults.standard.dataFlowPolicy,
                 cutover: TreatmentSourceCutover.current()) {
@@ -658,6 +683,9 @@ struct RootTabView: View {
            UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene })
             .first(where: { $0.activationState == .foregroundActive })?
             .keyWindow?.rootViewController?.presentedViewController != nil {
+            trace("calculator shortcut Home selection blocked: presented controller",
+                log: OSLog(subsystem: ConstantsLog.subSystem, category: ConstantsLog.categoryRootView),
+                category: ConstantsLog.categoryRootView, type: .info)
             return
         }
         // The shortcut requests the existing Home calculator; it never creates a treatment.
@@ -746,6 +774,7 @@ private struct RootHomeTabView: View {
     let snoozeDismissalRequest: Int
     let isLandscape: Bool
     let penCalculatorQuickActionRequest: UUID?
+    let penCalculatorQuickActionDeliveryRevision: Int
     let allowsCalculatorQuickAction: Bool
     let consumeCalculatorQuickAction: (UUID) -> Void
     let showBluetooth: () -> Void
@@ -769,6 +798,7 @@ private struct RootHomeTabView: View {
                         nightscoutSyncManager: dependencies.nightscoutSyncManager,
                         actions: rootHomeActions(from: dependencies),
                         penCalculatorQuickActionRequest: penCalculatorQuickActionRequest,
+                        penCalculatorQuickActionDeliveryRevision: penCalculatorQuickActionDeliveryRevision,
                         allowsCalculatorQuickAction: allowsCalculatorQuickAction && presentedView == nil,
                         consumeCalculatorQuickAction: consumeCalculatorQuickAction
                     )

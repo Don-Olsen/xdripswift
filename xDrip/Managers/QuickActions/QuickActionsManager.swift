@@ -94,6 +94,16 @@ enum QuickActionType: String, Equatable {
         updateAvailableQuickActions()
     }
 
+    /// Scene activation can follow the shortcut callback after SwiftUI's first
+    /// render. Republish the pending delivery without creating a second request.
+    func reactivatePendingCalculatorQuickAction() {
+        guard let rootStateModel,
+              rootStateModel.penCalculatorQuickActionRequest != nil else { return }
+        rootStateModel.reactivatePenCalculatorQuickAction()
+        trace("calculator shortcut reactivated with scene", log: calculatorShortcutLog,
+            category: ConstantsLog.categoryAppDelegate, type: .info)
+    }
+
     static func availableActions(calculatorVisible: Bool, speakReadings: Bool) -> [QuickActionType] {
         (calculatorVisible ? [.penCalculator] : [])
             + [speakReadings ? .stopSpeakingReadings : .speakReadings]

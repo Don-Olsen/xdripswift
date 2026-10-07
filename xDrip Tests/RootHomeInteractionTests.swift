@@ -6,6 +6,7 @@
 //  Copyright © 2026 Johan Degraeve. All rights reserved.
 //
 
+import Combine
 import CoreData
 import SwiftUI
 import XCTest
@@ -35,6 +36,47 @@ final class RootHomeInteractionTests: XCTestCase {
         XCTAssertEqual(root.penCalculatorQuickActionRequest, first)
         root.consumePenCalculatorQuickAction(first!)
         XCTAssertNil(root.penCalculatorQuickActionRequest)
+    }
+
+    @MainActor func testRepeatedIconTapPublishesDeliveryEvenWithSamePendingRequest() throws {
+        let root = RootTabStateModel()
+        var observedRevisions: [Int] = []
+        let observation = root.$penCalculatorQuickActionDeliveryRevision
+            .sink { observedRevisions.append($0) }
+        defer { observation.cancel() }
+
+        root.requestPenCalculatorQuickAction()
+        let first = try XCTUnwrap(root.penCalculatorQuickActionRequest)
+        root.requestPenCalculatorQuickAction()
+        root.requestPenCalculatorQuickAction()
+
+        XCTAssertEqual(root.penCalculatorQuickActionRequest, first,
+            "Repeated icon taps must not stack distinct calculator sheets")
+        XCTAssertEqual(observedRevisions, [0, 1, 2, 3],
+            "A second tap must wake navigation even while the pending UUID is unchanged")
+
+        root.consumePenCalculatorQuickAction(UUID())
+        XCTAssertEqual(root.penCalculatorQuickActionRequest, first)
+        root.consumePenCalculatorQuickAction(first)
+        XCTAssertNil(root.penCalculatorQuickActionRequest)
+        root.reactivatePenCalculatorQuickAction()
+        XCTAssertEqual(observedRevisions, [0, 1, 2, 3],
+            "There is nothing to reactivate after the visible sheet consumes the request")
+    }
+
+    @MainActor func testSceneReactivationRetriesPendingIconRequestWithoutReplacingIt() throws {
+        let root = RootTabStateModel()
+        let manager = QuickActionsManager()
+        manager.attachRoot(root)
+        root.requestPenCalculatorQuickAction()
+        let request = try XCTUnwrap(root.penCalculatorQuickActionRequest)
+        let firstRevision = root.penCalculatorQuickActionDeliveryRevision
+
+        manager.reactivatePendingCalculatorQuickAction()
+
+        XCTAssertEqual(root.penCalculatorQuickActionRequest, request)
+        XCTAssertGreaterThan(root.penCalculatorQuickActionDeliveryRevision, firstRevision,
+            "Scene activation must retry a request whose sheet has not appeared")
     }
 
     @MainActor func testIconActionHandlerRoutesRepeatedTapsToOneExistingCalculatorSheet() throws {

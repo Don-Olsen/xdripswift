@@ -221,6 +221,7 @@ struct RootHomeView: View {
     private let nightscoutSyncManager: NightscoutSyncManager
     private let forecastDataAdapter: GlucoseForecastDataAdapter
     private let penCalculatorQuickActionRequest: UUID?
+    private let penCalculatorQuickActionDeliveryRevision: Int
     private let allowsCalculatorQuickAction: Bool
     private let consumeCalculatorQuickAction: (UUID) -> Void
     @State private var selectedRange: RootHomeChartRange
@@ -314,6 +315,7 @@ struct RootHomeView: View {
         nightscoutSyncManager: NightscoutSyncManager,
         actions: RootHomeActions,
         penCalculatorQuickActionRequest: UUID? = nil,
+        penCalculatorQuickActionDeliveryRevision: Int = 0,
         allowsCalculatorQuickAction: Bool = true,
         consumeCalculatorQuickAction: @escaping (UUID) -> Void = { _ in }
     ) {
@@ -325,6 +327,7 @@ struct RootHomeView: View {
         self.coreDataManager = coreDataManager
         self.nightscoutSyncManager = nightscoutSyncManager
         self.penCalculatorQuickActionRequest = penCalculatorQuickActionRequest
+        self.penCalculatorQuickActionDeliveryRevision = penCalculatorQuickActionDeliveryRevision
         self.allowsCalculatorQuickAction = allowsCalculatorQuickAction
         self.consumeCalculatorQuickAction = consumeCalculatorQuickAction
         self.forecastDataAdapter = GlucoseForecastDataAdapter(coreDataManager: coreDataManager)
@@ -375,6 +378,14 @@ struct RootHomeView: View {
                     TherapyMetricsManager.doseSourceIsReady(UserDefaults.standard.dataFlowPolicy,
                         cutover: TreatmentSourceCutover.current()) ? 1 : 0)
             }
+            openPendingCalculatorQuickAction()
+        }
+        .onChange(of: penCalculatorQuickActionDeliveryRevision) { _ in
+            guard penCalculatorQuickActionRequest != nil else { return }
+            trace("calculator shortcut Home delivery ready=%{public}d requested=%{public}d visible=%{public}d",
+                log: homeCalculatorShortcutLog, category: ConstantsLog.categoryRootView,
+                type: .info, calculatorQuickActionIsReady ? 1 : 0,
+                showsPenCalculator ? 1 : 0, penCalculatorSheetVisible ? 1 : 0)
             openPendingCalculatorQuickAction()
         }
         .onChange(of: showsPenCalculator) { isRequested in

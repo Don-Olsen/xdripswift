@@ -8,6 +8,31 @@
 - Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
 <!-- testflight-7.1.1-4305:end -->
 
+## Kandidat efter 4305: forsinket bolusgenvej fra app-ikonet
+
+Den fysisk installerede 4305 modtog og kølagde genvejen kl. 16.07.53 den
+7. oktober, men Home bad først om beregnerarket kl. 16.08.22: 29,5 sekunder
+efter trykket. Arket blev vist 0,05 sekunder efter Homes anmodning. Flere
+tidligere tryk havde samme mønster: scene-callback og kølægning, men ingen
+øjeblikkelig Home-håndtering. Loggen dokumenterer dermed forsinkelsen mellem
+kølagt anmodning og Home, ikke en langsom dosisberegning. 4305-loggen viser
+ikke, hvilken af Homes tavse ventetilstande der udløste det første tabte skift.
+
+Kandidaten beholder én ventende anmodningsidentitet, men publicerer en ny
+leveringshændelse ved hvert app-ikontryk og ved sceneaktivering. Root og Home
+reagerer på hændelsen, også når den ventende identitet er uændret. Kun dataløse
+markører for leverings- og præsentationstilstand er tilføjet.
+Kildekontrol, Home-knap, beregner, dosisregler og behandlingslagring er uændrede.
+
+Regressionstests dækker gentagne tryk og genaktivering. Eksisterende tests
+dækker, at anmodningen først forbruges, når arket faktisk vises.
+Lokal `release-test` den 7. oktober bestod med 1.425/1.425 XCTest-tests,
+alle Python-kontroller og iPhone-/Watch-simulatorbuilds. Dette er kontrol af
+den unummererede kandidat; releaseforløbet skal teste igen efter Apples
+buildnummer er valgt.
+Den fysiske svartid for denne kandidat er endnu ikke verificeret; der er ikke
+lavet direkte installation på telefonen eller en ny TestFlight-udgivelse.
+
 De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
 
 <!-- testflight-7.1.1-4304:start -->

@@ -42,6 +42,10 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
     private let quickActionLog = OSLog(subsystem: ConstantsLog.subSystem,
         category: ConstantsLog.categoryAppDelegate)
 
+    func sceneDidBecomeActive(_ scene: UIScene) {
+        quickActionsManager.reactivatePendingCalculatorQuickAction()
+    }
+
     func scene(_ scene: UIScene, willConnectTo session: UISceneSession, options connectionOptions: UIScene.ConnectionOptions) {
         // A shortcut that launches the app arrives with the scene connection.
         if let shortcutItem = connectionOptions.shortcutItem,
