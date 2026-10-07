@@ -127,7 +127,7 @@ enum QuickActionType: String, Equatable {
         switch actionType {
             case .penCalculator:
                 // A stale icon item cannot bypass source ownership. During a cold start the
-                // dependencies may not exist yet; Home rechecks the exact button policy.
+                // dependencies may not exist yet; Home rechecks source ownership before presenting.
                 guard calculatorSourceIsValid() else {
                     updateAvailableQuickActions()
                     return false

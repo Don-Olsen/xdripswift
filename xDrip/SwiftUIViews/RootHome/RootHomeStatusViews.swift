@@ -60,6 +60,17 @@ enum RootHomeCalculatorShortcutPolicy {
 /// Resolves a pending icon action synchronously when Home can present its existing sheet.
 /// RootTabStateModel keeps the request until `consume` runs, including across cold starts.
 enum RootHomeCalculatorQuickActionPresentation {
+    /// Presenting the calculator only needs a local treatment owner and an available sheet.
+    /// Home's metric visibility can lag behind a foreground refresh; the calculator separately
+    /// validates the current glucose and treatment snapshot before offering a dose.
+    static func isReady(policy: DataFlowPolicy, cutover: TreatmentSourceCutover?,
+                        sceneIsActive: Bool, allowsPresentation: Bool,
+                        showsExpandedChart: Bool, usesNightLayout: Bool,
+                        defaults: UserDefaults = .standard) -> Bool {
+        sceneIsActive && allowsPresentation && !showsExpandedChart && !usesNightLayout
+            && TherapyMetricsManager.doseSourceIsReady(policy, cutover: cutover, defaults: defaults)
+    }
+
     static func open(request: UUID?, isReady: Bool, isAlreadyPresented: Bool,
                      present: () -> Void, consume: (UUID) -> Void) {
         guard let request, isReady else { return }

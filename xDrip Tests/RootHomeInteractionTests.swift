@@ -37,6 +37,51 @@ final class RootHomeInteractionTests: XCTestCase {
         XCTAssertNil(root.penCalculatorQuickActionRequest)
     }
 
+    @MainActor func testIconActionHandlerRoutesRepeatedTapsToOneExistingCalculatorSheet() throws {
+        let defaults = UserDefaults.standard
+        let keys = [UserDefaults.Key.isMaster.rawValue,
+                    UserDefaults.Key.therapyDataSourceType.rawValue,
+                    UserDefaults.Key.nightscoutEnabled.rawValue,
+                    TreatmentSourceCutover.defaultsKey,
+                    TreatmentSourceCutover.restoreRequiresSourceSetupKey]
+        let original = keys.map { ($0, defaults.object(forKey: $0)) }
+        defer {
+            for (key, value) in original {
+                if let value { defaults.set(value, forKey: key) }
+                else { defaults.removeObject(forKey: key) }
+            }
+            QuickActionsManager.shared.updateAvailableQuickActions()
+        }
+        defaults.isMaster = true
+        defaults.therapyDataSourceType = .none
+        defaults.nightscoutEnabled = false
+        defaults.set(false, forKey: TreatmentSourceCutover.restoreRequiresSourceSetupKey)
+        let boundary = TreatmentSourceCutover(cutoff: Date(),
+            insulinSourceBundleID: "insulin.source", carbohydrateSourceBundleID: "carb.source")
+        defaults.set(try JSONEncoder().encode(boundary), forKey: TreatmentSourceCutover.defaultsKey)
+
+        let root = RootTabStateModel()
+        let manager = QuickActionsManager()
+        manager.attachRoot(root)
+        XCTAssertNil(root.dependencies)
+        XCTAssertTrue(manager.handleQuickAction(.penCalculator))
+        let request = try XCTUnwrap(root.penCalculatorQuickActionRequest)
+        XCTAssertTrue(manager.handleQuickAction(.penCalculator))
+        XCTAssertEqual(root.penCalculatorQuickActionRequest, request)
+
+        var presentations = 0
+        RootHomeCalculatorQuickActionPresentation.open(request: root.penCalculatorQuickActionRequest,
+            isReady: RootHomeCalculatorQuickActionPresentation.isReady(
+                policy: defaults.dataFlowPolicy, cutover: TreatmentSourceCutover.current(),
+                sceneIsActive: true, allowsPresentation: true,
+                showsExpandedChart: false, usesNightLayout: false),
+            isAlreadyPresented: false, present: { presentations += 1 },
+            consume: { root.consumePenCalculatorQuickAction($0) })
+        XCTAssertEqual(presentations, 1)
+        XCTAssertNil(root.penCalculatorQuickActionRequest)
+        XCTAssertNil(root.dependencies, "Opening the shortcut must not start treatment services")
+    }
+
     @MainActor func testIconCalculatorWarmStartPresentsSynchronouslyAndConsumesRequest() {
         let request = UUID()
         var presentations = 0
@@ -721,6 +766,92 @@ final class RootHomeInteractionTests: XCTestCase {
         defaults.removeObject(forKey: TreatmentSourceCutover.restoreRequiresSourceSetupKey)
         defaults.set(Data("corrupted".utf8), forKey: TreatmentSourceCutover.defaultsKey)
         XCTAssertFalse(visible(local))
+    }
+
+    @MainActor
+    func testIconCalculatorOpensWithoutWaitingForHomeMetricVisibility() throws {
+        let suite = "IconCalculatorReadiness-" + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let local = DataFlowPolicy(isMaster: true, followerDataSource: .careLink,
+            therapyDataSourceSelection: .none, nightscoutEnabled: true,
+            masterUploadsGlucoseToNightscout: false,
+            followerUploadsGlucoseToNightscout: false, nightscoutFollowType: .none)
+        let boundary = TreatmentSourceCutover(cutoff: Date(),
+            insulinSourceBundleID: "insulin.source", carbohydrateSourceBundleID: "carb.source")
+
+        // A foreground refresh can temporarily hide Home's button while its metric inputs
+        // are incomplete. The calculator's own dose snapshot still rejects incomplete data.
+        XCTAssertFalse(RootHomeCalculatorShortcutPolicy.isVisible(policy: local,
+            cutover: boundary, iobSource: nil, cobSource: nil,
+            isHistorical: false, localInputsComplete: false, defaults: defaults))
+        let ready = RootHomeCalculatorQuickActionPresentation.isReady(policy: local,
+            cutover: boundary, sceneIsActive: true, allowsPresentation: true,
+            showsExpandedChart: false, usesNightLayout: false, defaults: defaults)
+        XCTAssertTrue(ready)
+
+        let root = RootTabStateModel()
+        root.requestPenCalculatorQuickAction()
+        root.requestPenCalculatorQuickAction()
+        var presentations = 0
+        RootHomeCalculatorQuickActionPresentation.open(request: root.penCalculatorQuickActionRequest,
+            isReady: ready, isAlreadyPresented: false,
+            present: { presentations += 1 }, consume: { root.consumePenCalculatorQuickAction($0) })
+        XCTAssertEqual(presentations, 1)
+        XCTAssertNil(root.penCalculatorQuickActionRequest)
+
+        // A repeated icon tap must leave the existing sheet and its inputs alone.
+        root.requestPenCalculatorQuickAction()
+        RootHomeCalculatorQuickActionPresentation.open(request: root.penCalculatorQuickActionRequest,
+            isReady: ready, isAlreadyPresented: true,
+            present: { presentations += 1 }, consume: { root.consumePenCalculatorQuickAction($0) })
+        XCTAssertEqual(presentations, 1)
+        XCTAssertNil(root.penCalculatorQuickActionRequest)
+    }
+
+    @MainActor
+    func testIconCalculatorWaitsOnlyForSourceAndPresentationReadiness() throws {
+        let suite = "IconCalculatorGates-" + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let local = DataFlowPolicy(isMaster: true, followerDataSource: .careLink,
+            therapyDataSourceSelection: .none, nightscoutEnabled: true,
+            masterUploadsGlucoseToNightscout: false,
+            followerUploadsGlucoseToNightscout: false, nightscoutFollowType: .none)
+        let remote = DataFlowPolicy(isMaster: true, followerDataSource: .careLink,
+            therapyDataSourceSelection: .nightscout, nightscoutEnabled: true,
+            masterUploadsGlucoseToNightscout: false,
+            followerUploadsGlucoseToNightscout: false, nightscoutFollowType: .none)
+        let boundary = TreatmentSourceCutover(cutoff: Date(),
+            insulinSourceBundleID: "insulin.source", carbohydrateSourceBundleID: "carb.source")
+        func ready(_ policy: DataFlowPolicy = local, cutover: TreatmentSourceCutover? = boundary,
+                   active: Bool = true, allows: Bool = true, expanded: Bool = false,
+                   night: Bool = false) -> Bool {
+            RootHomeCalculatorQuickActionPresentation.isReady(policy: policy, cutover: cutover,
+                sceneIsActive: active, allowsPresentation: allows,
+                showsExpandedChart: expanded, usesNightLayout: night, defaults: defaults)
+        }
+        XCTAssertFalse(ready(remote))
+        XCTAssertFalse(ready(cutover: nil))
+        XCTAssertFalse(ready(active: false))
+        XCTAssertFalse(ready(allows: false))
+        XCTAssertFalse(ready(expanded: true))
+        XCTAssertFalse(ready(night: true))
+
+        // A cold-start request remains pending until the scene is active and can present.
+        let root = RootTabStateModel()
+        root.requestPenCalculatorQuickAction()
+        let request = try XCTUnwrap(root.penCalculatorQuickActionRequest)
+        var presentations = 0
+        RootHomeCalculatorQuickActionPresentation.open(request: request,
+            isReady: ready(active: false), isAlreadyPresented: false,
+            present: { presentations += 1 }, consume: { root.consumePenCalculatorQuickAction($0) })
+        XCTAssertEqual(root.penCalculatorQuickActionRequest, request)
+        RootHomeCalculatorQuickActionPresentation.open(request: root.penCalculatorQuickActionRequest,
+            isReady: ready(), isAlreadyPresented: false,
+            present: { presentations += 1 }, consume: { root.consumePenCalculatorQuickAction($0) })
+        XCTAssertEqual(presentations, 1)
+        XCTAssertNil(root.penCalculatorQuickActionRequest)
     }
 
     @MainActor

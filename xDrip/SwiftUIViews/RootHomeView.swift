@@ -1328,8 +1328,13 @@ struct RootHomeView: View {
     }
 
     private var calculatorQuickActionIsReady: Bool {
-        allowsCalculatorQuickAction && !showsExpandedIPadChart && scenePhase == .active
-            && !state.usesScreenLockNightLayout && showsCalculatorShortcut(state.loop)
+        RootHomeCalculatorQuickActionPresentation.isReady(
+            policy: UserDefaults.standard.dataFlowPolicy,
+            cutover: TreatmentSourceCutover.current(),
+            sceneIsActive: scenePhase == .active,
+            allowsPresentation: allowsCalculatorQuickAction,
+            showsExpandedChart: showsExpandedIPadChart,
+            usesNightLayout: state.usesScreenLockNightLayout)
     }
 
     private func openPendingCalculatorQuickAction() {
