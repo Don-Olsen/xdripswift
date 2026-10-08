@@ -8,6 +8,31 @@
 - Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
 <!-- testflight-7.1.1-4307:end -->
 
+## Optimeringer efter 4307 — lokal validering
+
+8. oktober 2026: arbejdet fortsætter fra `8152d265` med `6564788` / 4307 som
+reference; de tre relevante kildefiler var uændrede mellem disse commits.
+Klokken sammenligner sin formaterede tekst på hovedtråden og publicerer kun
+ved ændring. Skjulte minigrafer starter ingen nye indlæsninger; genvisning
+bruger den nye synlighedsværdi og eksisterende `forceReset` til at genlæse
+hele den relevante historik. Beregnerens `start()` bruger samme annullerbare
+task og generation uden inputforsinkelsen; øvrige kald beholder 400 ms.
+
+Den fulde lokale XCTest-kørsel bestod med **1.439/1.439**, 0 fejl og 0 skipped.
+Otte nye tests dækker klokke/minutskift og hovedtråd, skjult minigraf og friske
+historiske rettelser/sletninger efter genvisning, samt åbning/genåbning,
+hurtige input og afvisning af sene svar efter annullering. Alle Python-kontroller,
+resultatkontrollen af de otte krævede suiter og begge simulatorbuilds bestod.
+De eksisterende genvejs- og prognoseudløbstests er bevaret og bestod.
+Glukosealderens separate 15-sekunders opdatering og prognosens tidskontrol er
+kodegennemgået og uændrede; ingen ny fysisk timer-/UI-test er udført.
+
+Dosisregler, lagring, HealthKit, alarmer, Watch/Libre og genvejsrettelsen fra
+4307 er uændrede. Der er ingen måling af fysisk svartid eller batteriforbrug.
+Ved den lokale validering var version/build, commits og tags uændrede;
+intet var pushet eller uploadet. En release kræver ny validering efter nummerallokering.
+Test- og buildartefakter ligger i de lokale `DeveloperBuildData`-kørselsmapper.
+
 De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
 
 <!-- testflight-7.1.1-4306:start -->

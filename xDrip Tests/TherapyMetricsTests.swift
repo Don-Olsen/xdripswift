@@ -7,6 +7,7 @@
 //
 
 import XCTest
+import Combine
 import SwiftUI
 import CoreData
 @testable import xdrip
@@ -1907,41 +1908,64 @@ private actor PenDoseSnapshotFeed {
     private var samples: [GlucoseForecastSample]
     private let treatments: [TherapyTreatment]
     private let historicalGlucose: [GlucoseForecastSample]?
+    private let requestExpectations: [XCTestExpectation]
+    private var calls = 0
 
     init(samples: [GlucoseForecastSample], treatments: [TherapyTreatment] = [],
-         historicalGlucose: [GlucoseForecastSample]? = nil) {
+         historicalGlucose: [GlucoseForecastSample]? = nil,
+         requestExpectations: [XCTestExpectation] = []) {
         self.samples = samples
         self.treatments = treatments
         self.historicalGlucose = historicalGlucose
+        self.requestExpectations = requestExpectations
     }
 
     func replace(with samples: [GlucoseForecastSample]) { self.samples = samples }
 
     func snapshot(at date: Date) -> Result<PenDoseInputSnapshot, PenDoseUnavailableReason> {
-        PenDoseInputSnapshot.make(capturedAt: date, glucose: samples,
+        if calls < requestExpectations.count { requestExpectations[calls].fulfill() }
+        calls += 1
+        return PenDoseInputSnapshot.make(capturedAt: date, glucose: samples,
             treatments: treatments, therapySettings: TherapyModelSettings(),
             treatmentRevision: 1, historicalGlucose: historicalGlucose)
     }
 }
 
 private actor DelayedPenDoseSnapshotFeed {
-    private let samples: [GlucoseForecastSample]
-    private var calls = 0
+    private var samples: [GlucoseForecastSample]
+    private(set) var calls = 0
+    private(set) var firstRequestWasCancelled = false
+    private let requestExpectations: [XCTestExpectation]
+    private let firstRequestReturned: XCTestExpectation?
     private var firstRequest: CheckedContinuation<Void, Never>?
     private var enteredWaiter: CheckedContinuation<Void, Never>?
 
-    init(samples: [GlucoseForecastSample]) { self.samples = samples }
+    init(samples: [GlucoseForecastSample], requestExpectations: [XCTestExpectation] = [],
+         firstRequestReturned: XCTestExpectation? = nil) {
+        self.samples = samples
+        self.requestExpectations = requestExpectations
+        self.firstRequestReturned = firstRequestReturned
+    }
+
+    func replace(with samples: [GlucoseForecastSample]) { self.samples = samples }
 
     func snapshot(at date: Date) async -> Result<PenDoseInputSnapshot, PenDoseUnavailableReason> {
+        let capturedSamples = samples
         calls += 1
-        if calls == 1 {
+        let request = calls
+        if request == 1 {
             await withCheckedContinuation { continuation in
                 firstRequest = continuation
+                requestExpectations.first?.fulfill()
                 enteredWaiter?.resume()
                 enteredWaiter = nil
             }
+            firstRequestWasCancelled = Task.isCancelled
+            firstRequestReturned?.fulfill()
+        } else if request <= requestExpectations.count {
+            requestExpectations[request - 1].fulfill()
         }
-        return PenDoseInputSnapshot.make(capturedAt: date, glucose: samples, treatments: [],
+        return PenDoseInputSnapshot.make(capturedAt: date, glucose: capturedSamples, treatments: [],
             therapySettings: TherapyModelSettings(), treatmentRevision: 1)
     }
 
@@ -2069,6 +2093,175 @@ private actor DelayedPenDoseSnapshotFeed {
         XCTAssertFalse(viewModel.isReviewCurrent,
             "reopening must not leave the previous copyable dose on screen")
         viewModel.stop()
+    }
+
+    private func waitForCalculation(_ viewModel: PenDoseCalculatorViewModel) async {
+        guard viewModel.isCalculating else { return }
+        let finished = expectation(description: "The current calculation finished")
+        let observation = viewModel.$isCalculating.dropFirst().filter { !$0 }.sink { _ in
+            finished.fulfill()
+        }
+        defer { observation.cancel() }
+        await fulfillment(of: [finished], timeout: 2)
+        XCTAssertFalse(viewModel.isCalculating)
+    }
+
+    func testOpeningAndReopeningStartsWithoutInputDebounceAndPreservesEnteredFields() async throws {
+        let now = Date()
+        let opened = expectation(description: "Opening requests its snapshot without input debounce")
+        let reopened = expectation(description: "Reopening requests a fresh snapshot without input debounce")
+        let readings = [21.0, 16, 11, 6, 1].map { sample($0, value: 140 - $0, at: now) }
+        let feed = PenDoseSnapshotFeed(samples: readings, requestExpectations: [opened, reopened])
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let profile = confirmedProfile()
+        let viewModel = PenDoseCalculatorViewModel(coreDataManager: core,
+            profileProvider: { profile }, sourceReadyOverride: { true },
+            snapshotProvider: { date, _ in await feed.snapshot(at: date) })
+        defer { viewModel.stop() }
+        let plannedDate = now.addingTimeInterval(20 * 60)
+        let manualDate = now.addingTimeInterval(-3 * 60)
+        viewModel.carbohydratesText = "23,5"
+        viewModel.mealKind = .slow
+        viewModel.isPlannedMeal = true
+        viewModel.plannedDate = plannedDate
+        viewModel.manualGlucoseText = "6,4"
+        viewModel.manualGlucoseDate = manualDate
+        viewModel.insulinToLogText = "2,75"
+        for request in [opened, reopened] {
+            viewModel.start()
+            XCTAssertTrue(viewModel.isCalculating)
+            XCTAssertFalse(viewModel.isReviewCurrent,
+                "Opening must invalidate the previous copyable suggestion synchronously")
+            await fulfillment(of: [request], timeout: 0.3)
+            await waitForCalculation(viewModel)
+            XCTAssertTrue(viewModel.isReviewCurrent)
+            XCTAssertEqual(viewModel.calculationDetails?.newCarbsGrams, 23.5)
+            XCTAssertEqual(viewModel.carbohydratesText, "23,5")
+            XCTAssertEqual(viewModel.mealKind, .slow)
+            XCTAssertTrue(viewModel.isPlannedMeal)
+            XCTAssertEqual(viewModel.plannedDate, plannedDate)
+            XCTAssertEqual(viewModel.manualGlucoseText, "6,4")
+            XCTAssertEqual(viewModel.manualGlucoseDate, manualDate)
+            XCTAssertEqual(viewModel.insulinToLogText, "2,75", "Calculating must never copy a dose automatically")
+            viewModel.stop()
+        }
+        XCTAssertTrue(TreatmentEntryAccessor(coreDataManager: core).getLatestTreatments(howOld: nil).isEmpty)
+    }
+
+    func testRestartCancelsStartupAndOlderSnapshotCannotOverwriteSameDraft() async throws {
+        let now = Date()
+        let opened = expectation(description: "The first startup snapshot is held")
+        let restarted = expectation(description: "Restart requests a new snapshot immediately")
+        let returned = expectation(description: "The cancelled startup snapshot returned")
+        let feed = DelayedPenDoseSnapshotFeed(
+            samples: [21.0, 16, 11, 6, 1].map { sample($0, value: 140 - $0, at: now) },
+            requestExpectations: [opened, restarted], firstRequestReturned: returned)
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let profile = confirmedProfile()
+        let viewModel = PenDoseCalculatorViewModel(coreDataManager: core,
+            profileProvider: { profile }, sourceReadyOverride: { true },
+            snapshotProvider: { date, _ in await feed.snapshot(at: date) })
+        defer { viewModel.stop(); Task { await feed.releaseFirstRequest() } }
+        viewModel.carbohydratesText = "10"
+        viewModel.start()
+        await fulfillment(of: [opened], timeout: 0.3)
+        await feed.replace(with: [21.0, 16, 11, 6, 1].map { sample($0, value: 180, at: now) })
+        viewModel.start()
+        XCTAssertTrue(viewModel.isCalculating)
+        XCTAssertFalse(viewModel.isReviewCurrent)
+        await fulfillment(of: [restarted], timeout: 0.3)
+        await waitForCalculation(viewModel)
+        XCTAssertEqual(viewModel.calculation?.glucoseMgdl, 180)
+        let stalePublication = expectation(description: "An old generation must never publish after restart")
+        stalePublication.isInverted = true
+        let observation = viewModel.$calculation.dropFirst().sink { _ in stalePublication.fulfill() }
+        defer { observation.cancel() }
+        await feed.releaseFirstRequest()
+        await fulfillment(of: [returned], timeout: 2)
+        await fulfillment(of: [stalePublication], timeout: 0.3)
+        let cancelled = await feed.firstRequestWasCancelled
+        XCTAssertTrue(cancelled, "Restart must cancel the same task that owns the startup calculation")
+        XCTAssertEqual(viewModel.calculation?.glucoseMgdl, 180)
+        XCTAssertTrue(viewModel.isReviewCurrent)
+    }
+
+    func testQuickInputCancelsStartupAndOnlyCalculatesLatestDebouncedDraft() async throws {
+        let now = Date()
+        let opened = expectation(description: "The startup snapshot is held")
+        let edited = expectation(description: "The final input draft requests one snapshot")
+        let returned = expectation(description: "The cancelled startup snapshot returned")
+        let feed = DelayedPenDoseSnapshotFeed(
+            samples: [21.0, 16, 11, 6, 1].map { sample($0, value: 140 - $0, at: now) },
+            requestExpectations: [opened, edited], firstRequestReturned: returned)
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let profile = confirmedProfile()
+        let viewModel = PenDoseCalculatorViewModel(coreDataManager: core,
+            profileProvider: { profile }, sourceReadyOverride: { true },
+            snapshotProvider: { date, _ in await feed.snapshot(at: date) })
+        defer { viewModel.stop(); Task { await feed.releaseFirstRequest() } }
+        viewModel.carbohydratesText = "10"
+        viewModel.insulinToLogText = "2,75"
+        viewModel.start()
+        await fulfillment(of: [opened], timeout: 0.3)
+        viewModel.carbohydratesText = "20"
+        try await Task.sleep(for: .milliseconds(100))
+        let changedAt = Date()
+        viewModel.carbohydratesText = "30"
+        XCTAssertFalse(viewModel.isReviewCurrent)
+        XCTAssertTrue(viewModel.isCalculating)
+        await fulfillment(of: [edited], timeout: 2)
+        await waitForCalculation(viewModel)
+        let calculatedAt = try XCTUnwrap(viewModel.calculationDetails?.calculatedAt)
+        XCTAssertGreaterThanOrEqual(calculatedAt.timeIntervalSince(changedAt), 0.4)
+        XCTAssertEqual(viewModel.calculationDetails?.newCarbsGrams, 30)
+        let stalePublication = expectation(description: "The cancelled startup must not replace the latest draft")
+        stalePublication.isInverted = true
+        let observation = viewModel.$calculation.dropFirst().sink { _ in stalePublication.fulfill() }
+        defer { observation.cancel() }
+        await feed.releaseFirstRequest()
+        await fulfillment(of: [returned], timeout: 2)
+        await fulfillment(of: [stalePublication], timeout: 0.3)
+        let calls = await feed.calls
+        let cancelled = await feed.firstRequestWasCancelled
+        XCTAssertEqual(calls, 2, "Intermediate edits must not request snapshots")
+        XCTAssertTrue(cancelled)
+        XCTAssertEqual(viewModel.calculationDetails?.newCarbsGrams, 30)
+        XCTAssertEqual(viewModel.insulinToLogText, "2,75")
+        XCTAssertFalse(viewModel.isCalculating)
+    }
+
+    func testClosingCancelsStartupAndPreventsLateSnapshotPublication() async throws {
+        let now = Date()
+        let opened = expectation(description: "The startup snapshot is held")
+        let returned = expectation(description: "The cancelled startup snapshot returned")
+        let feed = DelayedPenDoseSnapshotFeed(
+            samples: [21.0, 16, 11, 6, 1].map { sample($0, value: 140 - $0, at: now) },
+            requestExpectations: [opened], firstRequestReturned: returned)
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let profile = confirmedProfile()
+        let viewModel = PenDoseCalculatorViewModel(coreDataManager: core,
+            profileProvider: { profile }, sourceReadyOverride: { true },
+            snapshotProvider: { date, _ in await feed.snapshot(at: date) })
+        defer { viewModel.stop(); Task { await feed.releaseFirstRequest() } }
+        viewModel.start()
+        await fulfillment(of: [opened], timeout: 0.3)
+        viewModel.stop()
+        XCTAssertFalse(viewModel.isCalculating)
+        XCTAssertFalse(viewModel.isReviewCurrent)
+        let stalePublication = expectation(description: "Closing must reject the late startup result")
+        stalePublication.isInverted = true
+        let observation = viewModel.$calculation.dropFirst().sink { _ in stalePublication.fulfill() }
+        defer { observation.cancel() }
+        await feed.releaseFirstRequest()
+        await fulfillment(of: [returned], timeout: 2)
+        await fulfillment(of: [stalePublication], timeout: 0.3)
+        let cancelled = await feed.firstRequestWasCancelled
+        XCTAssertTrue(cancelled)
+        XCTAssertNil(viewModel.calculation)
+        XCTAssertNil(viewModel.latestGlucoseDate)
+        XCTAssertNil(viewModel.latestGlucoseValueMgdl)
+        XCTAssertFalse(viewModel.isCalculating)
+        XCTAssertTrue(TreatmentEntryAccessor(coreDataManager: core).getLatestTreatments(howOld: nil).isEmpty)
     }
 
     func testWatchProjectionUsesSamePhoneCalculationSnapshotIncludingPizzaAndCOB() async throws {

@@ -667,9 +667,15 @@ final class RootHomeStateModel: ObservableObject {
         }
     }
 
-    func updateClock() {
+    func updateClock(now: Date? = nil) {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { self.updateClock(now: now) }
+            return
+        }
+        let clockText = (now ?? .now).formatted(date: .omitted, time: .shortened)
+        guard state.controls.clockText != clockText else { return }
         updateState { state in
-            state.controls.clockText = Date.now.formatted(date: .omitted, time: .shortened)
+            state.controls.clockText = clockText
         }
     }
 

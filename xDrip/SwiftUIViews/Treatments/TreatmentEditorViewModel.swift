@@ -1013,7 +1013,7 @@ struct PenDoseCalculationDetails {
 
     func start() {
         isOpen = true
-        scheduleCalculation()
+        scheduleCalculation(debounce: false)
     }
 
     func stop() {
@@ -1043,9 +1043,9 @@ struct PenDoseCalculationDetails {
         }
     }
 
-    /// Debounced input changes invalidate the copyable suggestion immediately. A slow older
-    /// calculation may finish, but only the newest generation can publish it.
-    func scheduleCalculation() {
+    /// Opening skips the input debounce but still invalidates the copyable suggestion immediately.
+    /// A slow older calculation may finish, but only the newest generation can publish it.
+    func scheduleCalculation(debounce: Bool = true) {
         guard isOpen else { return }
         calculationGeneration &+= 1
         let generation = calculationGeneration
@@ -1053,7 +1053,9 @@ struct PenDoseCalculationDetails {
         isCalculating = true
         debounceTask?.cancel()
         debounceTask = Task { [weak self] in
-            try? await Task.sleep(for: .milliseconds(400))
+            if debounce {
+                try? await Task.sleep(for: .milliseconds(400))
+            }
             guard !Task.isCancelled else { return }
             await self?.calculateForGeneration(generation)
         }

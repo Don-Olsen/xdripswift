@@ -318,7 +318,8 @@ struct RootHomeView: View {
         penCalculatorQuickActionRequest: UUID? = nil,
         penCalculatorQuickActionDeliveryRevision: Int = 0,
         allowsCalculatorQuickAction: Bool = true,
-        consumeCalculatorQuickAction: @escaping (UUID) -> Void = { _ in }
+        consumeCalculatorQuickAction: @escaping (UUID) -> Void = { _ in },
+        miniChartStateManager: GlucoseChartStateManager? = nil
     ) {
         let initialRange = RootHomeChartRange.closest(to: UserDefaults.standard.chartWidthInHours)
 
@@ -335,7 +336,7 @@ struct RootHomeView: View {
         // only the main chart can show sensor noise background bands. The mini-chart keeps the
         // same clean overview behaviour and does not need the extra Core Data fetch.
         _glucoseChartStateManager = StateObject(wrappedValue: GlucoseChartStateManager(coreDataManager: coreDataManager, nightscoutSyncManager: nightscoutSyncManager, showsSensorNoiseBands: true))
-        _miniChartStateManager = StateObject(wrappedValue: GlucoseChartStateManager(coreDataManager: coreDataManager, nightscoutSyncManager: nightscoutSyncManager))
+        _miniChartStateManager = StateObject(wrappedValue: miniChartStateManager ?? GlucoseChartStateManager(coreDataManager: coreDataManager, nightscoutSyncManager: nightscoutSyncManager))
         _scrollCoordinator = StateObject(wrappedValue: GlucoseChartScrollCoordinator(visibleTimeInterval: initialRange.timeInterval))
         _historicalDataCache = StateObject(wrappedValue: RootHomeHistoricalDataCache(coreDataManager: coreDataManager))
         _selectedRange = State(initialValue: initialRange)
@@ -545,6 +546,11 @@ struct RootHomeView: View {
         }
         .onChange(of: state.usesScreenLockNightLayout) { isEnabled in
             applyClockModeState(isEnabled: isEnabled)
+        }
+        .onChange(of: state.visibility.showsMiniChart) { showsMiniChart in
+            // Legacy onChange captures the previous view. Use the callback's new visibility
+            // when showing the overview, and discard history that may have changed while hidden.
+            requestMiniChartState(forceReset: true, showsMiniChart: showsMiniChart)
         }
         .onChange(of: miniChartHoursToShow) { _ in
             requestMiniChartState(forceReset: true)
@@ -1604,7 +1610,9 @@ struct RootHomeView: View {
         }
     }
 
-    private func requestMiniChartState(forceReset: Bool, refreshCachedData: Bool = false) {
+    private func requestMiniChartState(forceReset: Bool, refreshCachedData: Bool = false,
+                                       showsMiniChart: Bool? = nil) {
+        guard showsMiniChart ?? state.visibility.showsMiniChart else { return }
         let endDate = Date()
         let startDate = endDate.addingTimeInterval(.hours(-miniChartHoursToShowForChart))
 

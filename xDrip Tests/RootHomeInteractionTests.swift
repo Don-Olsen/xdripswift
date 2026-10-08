@@ -14,6 +14,162 @@ import XCTest
 
 final class RootHomeInteractionTests: XCTestCase {
 
+    @MainActor
+    func testClockPublishesOnlyWhenItsDisplayedMinuteChanges() throws {
+        let model = RootHomeStateModel()
+        let minute = try XCTUnwrap(Calendar.current.dateInterval(of: .minute,
+            for: Date(timeIntervalSince1970: 1_800_000_000))?.start)
+        var publications: [String] = []
+        let observation = model.$state.dropFirst().sink { state in
+            XCTAssertTrue(Thread.isMainThread)
+            publications.append(state.controls.clockText)
+        }
+        defer { observation.cancel() }
+
+        model.updateClock(now: minute)
+        for second in 1..<60 {
+            model.updateClock(now: minute.addingTimeInterval(Double(second)))
+        }
+        XCTAssertEqual(publications, [minute.formatted(date: .omitted, time: .shortened)],
+            "Second ticks within the displayed minute must not republish all Home state")
+
+        let nextMinute = minute.addingTimeInterval(60)
+        model.updateClock(now: nextMinute)
+        model.updateClock(now: nextMinute.addingTimeInterval(1))
+        XCTAssertEqual(publications, [minute, nextMinute].map {
+            $0.formatted(date: .omitted, time: .shortened)
+        })
+        XCTAssertEqual(model.state.controls.clockText, publications.last)
+    }
+
+    @MainActor
+    func testBackgroundClockCallsCompareOnMainWithoutDuplicatePublications() async throws {
+        let model = RootHomeStateModel()
+        let minute = try XCTUnwrap(Calendar.current.dateInterval(of: .minute,
+            for: Date(timeIntervalSince1970: 1_800_000_000))?.start)
+        var publications: [String] = []
+        let observation = model.$state.dropFirst().sink { state in
+            XCTAssertTrue(Thread.isMainThread, "The comparison and publication belong on main")
+            publications.append(state.controls.clockText)
+        }
+        defer { observation.cancel() }
+
+        for date in [minute, minute.addingTimeInterval(60)] {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                DispatchQueue.global(qos: .userInitiated).async {
+                    for second in 0..<5 {
+                        model.updateClock(now: date.addingTimeInterval(Double(second)))
+                    }
+                    // FIFO barrier after all production main-queue updates, without a sleep.
+                    DispatchQueue.main.async { continuation.resume() }
+                }
+            }
+        }
+        XCTAssertEqual(publications, [minute, minute.addingTimeInterval(60)].map {
+            $0.formatted(date: .omitted, time: .shortened)
+        }, "Queued background calls for the same displayed text must publish once")
+    }
+
+    @MainActor
+    func testHostedHiddenMiniChartDoesNotQueueHomeRefreshRequests() async throws {
+        let harness = try HostedHomeCalculatorHarness(controlsMiniChart: true)
+        defer { harness.finish() }
+        let queue = try XCTUnwrap(harness.miniChartQueue)
+        XCTAssertTrue(queue.isSuspended)
+        await harness.mount(in: self)
+        XCTAssertFalse(harness.homeState.state.visibility.showsMiniChart)
+        XCTAssertEqual(queue.operationCount, 0, "Hidden Home must skip its initial overview load")
+
+        harness.homeState.invalidateCharts()
+        harness.homeState.resetChartsToNow()
+        UserDefaults.standard.miniChartHoursToShow = ConstantsGlucoseChart.miniChartHoursToShow2
+        NotificationCenter.default.post(name: .nightscoutFollowerGapFillDidMergeHistory, object: nil)
+        await harness.renderPendingChanges()
+        harness.inputs.scenePhase = .inactive
+        await harness.renderPendingChanges()
+        harness.inputs.scenePhase = .active
+        await harness.renderPendingChanges()
+        XCTAssertEqual(queue.operationCount, 0,
+            "Data, range, historical merge and foreground callbacks must not load a hidden overview")
+    }
+
+    @MainActor
+    func testHostedMiniChartReappearanceReloadsEditedAndDeletedHistoricalGlucose() async throws {
+        let harness = try HostedHomeCalculatorHarness(controlsMiniChart: true)
+        defer { harness.finish() }
+        let queue = try XCTUnwrap(harness.miniChartQueue)
+        let chart = try XCTUnwrap(harness.miniChart)
+        let historicalDate = Date().addingTimeInterval(-.hours(12))
+        let deletedDate = historicalDate.addingTimeInterval(-3600)
+        let reading = BgReading(timeStamp: historicalDate, sensor: nil, calibration: nil,
+            rawData: 110, deviceName: "Home overview test",
+            nsManagedObjectContext: harness.core.mainManagedObjectContext)
+        reading.calculatedValue = 110
+        let deletedReading = BgReading(timeStamp: deletedDate, sensor: nil, calibration: nil,
+            rawData: 95, deviceName: "Home overview test",
+            nsManagedObjectContext: harness.core.mainManagedObjectContext)
+        deletedReading.calculatedValue = 95
+        XCTAssertTrue(harness.core.saveChangesSynchronously())
+        harness.setMiniChartVisibility(true)
+        let loaded = expectation(description: "Visible Home loads its real overview cache")
+        let initialObservation = chart.$state.first { state in
+            zip(state.bgReadingDates, state.bgReadingValues).contains {
+                $0.0 == historicalDate && $0.1 == 110
+            }
+        }.sink { _ in loaded.fulfill() }
+        defer { initialObservation.cancel() }
+        queue.isSuspended = false
+        await harness.mount(in: self)
+        await fulfillment(of: [loaded], timeout: 2)
+        await harness.renderPendingChanges()
+        XCTAssertTrue(chart.state.bgReadingDates.contains(deletedDate))
+
+        // Both hiding mechanisms must reopen immediately. The point is older than the
+        // manager's six-hour refresh tail, so a normal recent-data refresh cannot fix it.
+        for (index, hideWithClockMode) in [false, true].enumerated() {
+            queue.isSuspended = true
+            harness.setMiniChartVisibility(hideWithClockMode, clockMode: hideWithClockMode)
+            await harness.renderPendingChanges()
+            XCTAssertFalse(harness.homeState.state.visibility.showsMiniChart)
+            XCTAssertEqual(queue.operationCount, 0)
+
+            let editedValue = Double(190 + index * 50)
+            reading.calculatedValue = editedValue
+            if hideWithClockMode {
+                harness.core.mainManagedObjectContext.delete(deletedReading)
+            }
+            XCTAssertTrue(harness.core.saveChangesSynchronously())
+            UserDefaults.standard.miniChartHoursToShow = hideWithClockMode
+                ? ConstantsGlucoseChart.miniChartHoursToShow1 : ConstantsGlucoseChart.miniChartHoursToShow2
+            harness.homeState.invalidateCharts()
+            NotificationCenter.default.post(name: .nightscoutFollowerGapFillDidMergeHistory, object: nil)
+            await harness.renderPendingChanges()
+            XCTAssertEqual(queue.operationCount, 0, "Hidden invalidations must not enqueue cache work")
+            let oldIndex = try XCTUnwrap(chart.state.bgReadingDates.firstIndex(of: historicalDate))
+            XCTAssertNotEqual(chart.state.bgReadingValues[oldIndex], editedValue)
+
+            let refreshed = expectation(description: "Reappearing overview reloads persistent history")
+            let observation = chart.$state.first { state in
+                zip(state.bgReadingDates, state.bgReadingValues).contains {
+                    $0.0 == historicalDate && $0.1 == editedValue
+                } && (!hideWithClockMode || !state.bgReadingDates.contains(deletedDate))
+            }.sink { _ in refreshed.fulfill() }
+            defer { observation.cancel() }
+            harness.setMiniChartVisibility(true)
+            await harness.renderPendingChanges()
+            XCTAssertTrue(harness.homeState.state.visibility.showsMiniChart)
+            XCTAssertGreaterThan(queue.operationCount, 0,
+                "The visibility callback must use its new value and load without the 15-second timer")
+            queue.isSuspended = false
+            await fulfillment(of: [refreshed], timeout: 2)
+            let expectedHours = UserDefaults.standard.miniChartHoursToShow
+            XCTAssertEqual(chart.state.endDate.timeIntervalSince(chart.state.startDate),
+                .hours(expectedHours), accuracy: 0.01)
+            if hideWithClockMode { XCTAssertFalse(chart.state.bgReadingDates.contains(deletedDate)) }
+            await harness.renderPendingChanges()
+        }
+    }
+
 
     @MainActor
     func testHostedIconRequestBeforeHomeMountPresentsTheRealCalculator() async throws {
@@ -1450,6 +1606,8 @@ private final class HostedHomeCalculatorHarness {
     let homeState = RootHomeStateModel()
     let sensorHealth: SensorHealthIssueManager
     let nightscout: NightscoutSyncManager
+    let miniChartQueue: OperationQueue?
+    let miniChart: GlucoseChartStateManager?
     private(set) var consumedRequests: [UUID] = []
     var onConsumption: ((UUID) -> Void)?
     private(set) var host: UIViewController?
@@ -1459,7 +1617,8 @@ private final class HostedHomeCalculatorHarness {
     private let sensorDefaults: UserDefaults
     private let sensorSuite = "HostedHomeCalculator.\(UUID().uuidString)"
 
-    init(scenePhase: ScenePhase = .active, allowsPresentation: Bool = true) throws {
+    init(scenePhase: ScenePhase = .active, allowsPresentation: Bool = true,
+         controlsMiniChart: Bool = false) throws {
         inputs = HostedHomeCalculatorInputs(scenePhase: scenePhase,
                                             allowsPresentation: allowsPresentation)
         let defaults = UserDefaults.standard
@@ -1467,6 +1626,8 @@ private final class HostedHomeCalculatorHarness {
                     UserDefaults.Key.therapyDataSourceType.rawValue,
                     UserDefaults.Key.nightscoutEnabled.rawValue,
                     UserDefaults.Key.glucoseForecastHorizonMinutes.rawValue,
+                    UserDefaults.Key.showMiniChart.rawValue,
+                    UserDefaults.Key.miniChartHoursToShow.rawValue,
                     TreatmentSourceCutover.defaultsKey,
                     TreatmentSourceCutover.restoreRequiresSourceSetupKey]
         savedDefaults = keys.map { ($0, defaults.object(forKey: $0)) }
@@ -1474,6 +1635,16 @@ private final class HostedHomeCalculatorHarness {
         sensorHealth = SensorHealthIssueManager(userDefaults: sensorDefaults)
         nightscout = NightscoutSyncManager(coreDataManager: core, messageHandler: nil,
                                            observesSettings: false)
+        if controlsMiniChart {
+            let queue = OperationQueue()
+            queue.isSuspended = true
+            miniChartQueue = queue
+            miniChart = GlucoseChartStateManager(coreDataManager: core,
+                nightscoutSyncManager: nightscout, operationQueue: queue)
+        } else {
+            miniChartQueue = nil
+            miniChart = nil
+        }
         // The real test-host app also observes standard defaults. Disable its remote
         // source before changing ownership, then restore that switch last at teardown.
         defaults.nightscoutEnabled = false
@@ -1485,6 +1656,16 @@ private final class HostedHomeCalculatorHarness {
             insulinSourceBundleID: "hosted.test.insulin", carbohydrateSourceBundleID: "hosted.test.carbs")
         defaults.set(try JSONEncoder().encode(boundary), forKey: TreatmentSourceCutover.defaultsKey)
         quickActions.attachRoot(root)
+        if controlsMiniChart {
+            defaults.miniChartHoursToShow = ConstantsGlucoseChart.miniChartHoursToShow1
+            setMiniChartVisibility(false)
+        }
+    }
+
+    func setMiniChartVisibility(_ visible: Bool, clockMode: Bool = false) {
+        UserDefaults.standard.showMiniChart = visible
+        homeState.refresh(activeSensor: nil, isScreenLocked: clockMode,
+            usesScreenLockNightLayout: clockMode)
     }
 
     func mount(in test: XCTestCase) async {
@@ -1525,6 +1706,7 @@ private final class HostedHomeCalculatorHarness {
     }
 
     func finish() {
+        miniChartQueue?.isSuspended = false
         onConsumption = nil
         if let request = root.penCalculatorQuickActionRequest {
             root.consumePenCalculatorQuickAction(request)
@@ -1581,7 +1763,8 @@ private struct HostedHomeCalculatorContent: View {
             penCalculatorQuickActionRequest: root.penCalculatorQuickActionRequest,
             penCalculatorQuickActionDeliveryRevision: root.penCalculatorQuickActionDeliveryRevision,
             allowsCalculatorQuickAction: inputs.allowsPresentation,
-            consumeCalculatorQuickAction: harness.consume)
+            consumeCalculatorQuickAction: harness.consume,
+            miniChartStateManager: harness.miniChart)
             .environment(\.scenePhase, inputs.scenePhase)
             .onAppear(perform: onAppear)
     }
