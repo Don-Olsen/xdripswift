@@ -14,21 +14,17 @@ struct MainViewHeaderView: View {
     
     let isSmallScreen = ConstantsAppleWatch.isSmallScreen()
     
-    let originalTextScaleValue = 1.0
-    let animatedTextScaleValue = 1.1
-    @State private var textScaleValue = 1.0
-    
     var body: some View {
         HStack(alignment: .lastTextBaseline) {
             Text("\(watchState.bgValueStringInUserChosenUnit())\(watchState.trendArrow())")
-                .font(.system(size: isSmallScreen ? 40 : 50)).fontWeight(.semibold)
+                .font(.system(size: isSmallScreen ? 40 : 50, weight: .semibold))
+                .monospacedDigit()
                 .foregroundStyle(watchState.bgTextColor())
                 // let large BG values and double trend arrows shrink before they truncate
                 .minimumScaleFactor(0.5)
                 .allowsTightening(true)
                 .lineLimit(1)
                 .layoutPriority(1)
-                .scaleEffect(textScaleValue)
             
             Spacer(minLength: 2)
             
@@ -36,7 +32,8 @@ struct MainViewHeaderView: View {
                 Spacer()
                 
                 Text(watchState.deltaChangeStringInUserChosenUnit())
-                    .font(.system(size: isSmallScreen ? 24 : 28)).fontWeight(.semibold)
+                    .font(.system(size: isSmallScreen ? 18 : 20, weight: .medium))
+                    .monospacedDigit()
                     .lineLimit(1)
                     // the delta is less important than the BG value but should still stay readable
                     .minimumScaleFactor(0.65)
@@ -45,27 +42,13 @@ struct MainViewHeaderView: View {
                 
                 Text(watchState.bgUnitString())
                     .font(.system(size: isSmallScreen ? 12 : 14))
-                    .foregroundStyle(.gray)
+                    .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .minimumScaleFactor(0.5)
                     .allowsTightening(true)
             }
         }
         .padding(.trailing, 10)
-        .animation(.easeOut(duration: 0.3), value: textScaleValue)
-        .onChange(of: watchState.bgValueStringInUserChosenUnit()) { oldState, newState in
-            animateTextScale()
-        }
-        .onChange(of: watchState.updateMainViewDate) { oldState, newState in
-            animateTextScale()
-        }
-    }
-    
-    func animateTextScale(){
-        textScaleValue = animatedTextScaleValue
-        DispatchQueue.main.asyncAfter(deadline: DispatchTime.now() + 0.3){
-            textScaleValue = originalTextScaleValue
-        }
     }
 }
 

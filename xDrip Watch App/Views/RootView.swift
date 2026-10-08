@@ -98,7 +98,8 @@ struct RootView: View {
         } label: {
             Image(systemName: "plus.circle.fill")
                 .font(.system(size: 24))
-                .frame(width: 32, height: 32)
+                .frame(width: 44, height: 44)
+                .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .accessibilityLabel("Bolusberegner")
@@ -125,7 +126,6 @@ private enum WatchAppPage: Int {
 
 private struct WatchManualTreatmentsView: View {
     @EnvironmentObject private var watchState: WatchStateModel
-    @Environment(\.dismiss) private var dismiss
     @State private var carbohydrateGrams = 0.0
     @State private var insulinUnits = 0.0
     @State private var mealKindRaw = "normal"
@@ -177,82 +177,80 @@ private struct WatchManualTreatmentsView: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 8) {
-                HStack {
-                    Text("Bolusberegner")
-                        .font(.headline)
-                    Spacer()
-                    Button { dismiss() } label: {
-                        Image(systemName: "xmark")
-                            .frame(width: 32, height: 32)
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("Luk bolusberegner")
-                }
+            VStack(alignment: .leading, spacing: 12) {
+                // fullScreenCover already supplies watchOS' close button above this content.
+                Text("Bolusberegner")
+                    .font(.headline)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .fixedSize(horizontal: false, vertical: true)
                 if !watchState.phoneIsReachable {
                     Text("Ikke forbundet med iPhone – logger uden beregning")
                         .font(.footnote).foregroundStyle(.orange)
                 }
-                Text("Kulhydrater · \(carbohydrateGrams.formatted()) g")
-                    .font(.body.weight(.semibold))
-                    .frame(maxWidth: .infinity, minHeight: 42, alignment: .leading)
-                    .contentShape(Rectangle())
-                    .focusable(true)
-                    .focused($focusedInput, equals: .carbohydrates)
-                    .digitalCrownRotation($carbohydrateGrams, from: 0, through: 500, by: 1,
-                        sensitivity: .medium, isContinuous: false, isHapticFeedbackEnabled: true)
-                    .onTapGesture { focusedInput = .carbohydrates }
-                    .accessibilityHint("Drej Digital Crown for at vælge gram")
-                mealKindPicker
-                if let profile = watchState.watchPenProfileSettings, profile.isValid {
-                    Text("Dosis · \(insulinUnits.formatted()) E")
-                        .font(.body.weight(.semibold))
-                        .frame(maxWidth: .infinity, minHeight: 42, alignment: .leading)
+                VStack(alignment: .leading, spacing: 8) {
+                    crownInputCard("Kulhydrater", value: carbohydrateGrams, unit: "g", input: .carbohydrates)
                         .contentShape(Rectangle())
                         .focusable(true)
-                        .focused($focusedInput, equals: .insulin)
-                        .digitalCrownRotation($insulinUnits, from: 0,
-                            through: profile.maximumUnits, by: profile.penStepUnits,
+                        .focused($focusedInput, equals: .carbohydrates)
+                        .digitalCrownRotation($carbohydrateGrams, from: 0, through: 500, by: 1,
                             sensitivity: .medium, isContinuous: false, isHapticFeedbackEnabled: true)
-                        .onTapGesture { focusedInput = .insulin }
-                        .accessibilityHint("Drej Digital Crown i \(profile.penStepUnits.formatted()) E-trin")
-                    Text("\(profile.penStepUnits.formatted()) E-trin · maks. \(profile.maximumUnits.formatted()) E")
-                        .font(.footnote).foregroundStyle(.secondary)
-                } else {
-                    Text("Pen-trin og maksimum afventer iPhone. Kulhydrater kan stadig logges.")
-                        .font(.footnote).foregroundStyle(.orange)
-                    if insulinUnits > 0 {
-                        Button("Ryd dosis") { insulinUnits = 0 }
+                        .onTapGesture { focusedInput = .carbohydrates }
+                        .accessibilityHint("Drej Digital Crown for at vælge gram")
+                    mealKindPicker
+                    if let profile = watchState.watchPenProfileSettings, profile.isValid {
+                        crownInputCard("Dosis", value: insulinUnits, unit: "E", input: .insulin)
+                            .contentShape(Rectangle())
+                            .focusable(true)
+                            .focused($focusedInput, equals: .insulin)
+                            .digitalCrownRotation($insulinUnits, from: 0,
+                                through: profile.maximumUnits, by: profile.penStepUnits,
+                                sensitivity: .medium, isContinuous: false, isHapticFeedbackEnabled: true)
+                            .onTapGesture { focusedInput = .insulin }
+                            .accessibilityHint("Drej Digital Crown i \(profile.penStepUnits.formatted()) E-trin")
+                        Text("\(profile.penStepUnits.formatted()) E-trin · maks. \(profile.maximumUnits.formatted()) E")
+                            .font(.footnote).foregroundStyle(.secondary)
+                    } else {
+                        Text("Pen-trin og maksimum afventer iPhone. Kulhydrater kan stadig logges.")
+                            .font(.footnote).foregroundStyle(.orange)
+                        if insulinUnits > 0 {
+                            Button("Ryd dosis") { insulinUnits = 0 }
+                        }
+                    }
+                    if insulinUnits > 0 && watchState.watchPenProfileSettings?.accepts(insulinUnits) != true {
+                        Text("Dosis passer ikke til den synkroniserede penprofil.")
+                            .font(.footnote).foregroundStyle(.orange)
                     }
                 }
-                if insulinUnits > 0 && watchState.watchPenProfileSettings?.accepts(insulinUnits) != true {
-                    Text("Dosis passer ikke til den synkroniserede penprofil.")
-                        .font(.footnote).foregroundStyle(.orange)
-                }
-                Button("Beregn") {
-                    watchState.calculateWatchPenDose(carbohydrateGrams: carbohydrateGrams,
-                        mealKindRaw: mealKindRaw)
-                }
-                .disabled(watchState.watchPenIsCalculating)
-                if watchState.watchPenIsCalculating { ProgressView("Beregner på iPhone…") }
-                calculationResult
-                Button("Brug forslag") {
-                    guard let suggestion = currentSuggestion else { return }
-                    if insulinUnits != suggestion {
-                        copyingSuggestion = true
-                        insulinUnits = suggestion
+                VStack(alignment: .leading, spacing: 10) {
+                    Button("Beregn") {
+                        watchState.calculateWatchPenDose(carbohydrateGrams: carbohydrateGrams,
+                            mealKindRaw: mealKindRaw)
                     }
+                    .disabled(watchState.watchPenIsCalculating)
+                    if watchState.watchPenIsCalculating { ProgressView("Beregner på iPhone…") }
+                    calculationResult
+                    Button("Brug forslag") {
+                        guard let suggestion = currentSuggestion else { return }
+                        if insulinUnits != suggestion {
+                            copyingSuggestion = true
+                            insulinUnits = suggestion
+                        }
+                    }
+                    .disabled(currentSuggestion == nil)
                 }
-                .disabled(currentSuggestion == nil)
-                Button("Log") { prepareConfirmation() }
-                    .disabled(!canLog)
-                    .buttonStyle(.borderedProminent)
-                deliveryStatus
-                    .font(.footnote)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .padding(.top, 4)
+                .padding(.top, 4)
+                Divider()
+                VStack(alignment: .leading, spacing: 8) {
+                    Button("Log") { prepareConfirmation() }
+                        .disabled(!canLog)
+                        .buttonStyle(.borderedProminent)
+                    deliveryStatus
+                        .font(.footnote)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
             .padding(.horizontal, 8)
+            .padding(.vertical, 4)
         }
         .onAppear {
             focusedInput = .carbohydrates
@@ -284,6 +282,34 @@ private struct WatchManualTreatmentsView: View {
         }
     }
 
+    private func crownInputCard(_ title: String, value: Double, unit: String, input: CrownInput) -> some View {
+        let isFocused = focusedInput == input
+        return VStack(alignment: .leading, spacing: 2) {
+            Text(title)
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(isFocused ? Color.accentColor : .secondary)
+            HStack(alignment: .firstTextBaseline, spacing: 4) {
+                Text(value.formatted())
+                    .font(.system(size: 30, weight: .semibold, design: .rounded))
+                    .monospacedDigit()
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.65)
+                Text(unit)
+                    .font(.body.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .frame(maxWidth: .infinity, minHeight: 52, alignment: .leading)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(RoundedRectangle(cornerRadius: 12)
+            .fill(isFocused ? Color.accentColor.opacity(0.16) : Color.white.opacity(0.07)))
+        .overlay(RoundedRectangle(cornerRadius: 12)
+            .strokeBorder(isFocused ? Color.accentColor : Color.white.opacity(0.12),
+                lineWidth: isFocused ? 2 : 1))
+        .accessibilityElement(children: .combine)
+    }
+
     private var mealKindPicker: some View {
         HStack(spacing: 4) {
             mealButton("🍭", kind: "fast")
@@ -300,14 +326,26 @@ private struct WatchManualTreatmentsView: View {
     }
 
     private var calculationResult: some View {
-        VStack(alignment: .leading, spacing: 3) {
+        VStack(alignment: .leading, spacing: 6) {
             if let issue = watchState.watchPenCalculationIssue {
                 Text(issue).font(.footnote).foregroundStyle(.orange)
             }
             if let result = watchState.watchPenCalculation {
                 if let suggestion = currentSuggestion {
-                    Text("Anbefalet \(suggestion.formatted()) E")
-                        .font(.headline).foregroundStyle(.green)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Anbefalet")
+                            .font(.caption2.weight(.semibold))
+                        HStack(alignment: .firstTextBaseline, spacing: 4) {
+                            Text(suggestion.formatted())
+                                .font(.system(size: 28, weight: .semibold, design: .rounded))
+                                .monospacedDigit()
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.65)
+                            Text("E").font(.body.weight(.semibold))
+                        }
+                    }
+                    .foregroundStyle(.green)
+                    .accessibilityElement(children: .combine)
                 }
                 // A blocked low-glucose calculation still has a real snapshot.
                 // Other unavailable results carry placeholder 0 values for IOB/COB.

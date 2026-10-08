@@ -51,7 +51,7 @@ struct MainViewDataSourceView: View {
                                 .foregroundStyle(watchState.getFollowerBackgroundKeepAliveColor())
                             
                             Text(watchState.followerDataSourceType.shortDescription)
-                                .font(.system(size: textSize)).fontWeight(.semibold)
+                                .font(.system(size: textSize, weight: .medium))
                                 .minimumScaleFactor(0.2)
                                 .allowsTightening(true)
                                 .lineLimit(1)
@@ -71,7 +71,7 @@ struct MainViewDataSourceView: View {
                             }
 
                             Text(watchState.activeSensorDescription)
-                                .font(.system(size: textSize)).fontWeight(.semibold)
+                                .font(.system(size: textSize, weight: .medium))
                                 .minimumScaleFactor(0.2)
                                 .allowsTightening(true)
                                 .lineLimit(1)
@@ -84,6 +84,7 @@ struct MainViewDataSourceView: View {
                     if watchState.sensorAgeInMinutes > 0 {
                         Text(watchState.activeSensorLifetimeText())
                             .font(.system(size: textSize))
+                            .monospacedDigit()
                             .foregroundStyle(watchState.activeSensorProgress().textColor)
                     }
                 }

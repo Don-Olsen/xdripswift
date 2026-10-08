@@ -42,10 +42,11 @@ struct MainViewAIDStatusView: View {
             }
         }
         .font(.system(size: textSize))
-        .fontWeight(.semibold)
+        .fontWeight(.medium)
+        .monospacedDigit()
         .foregroundStyle(.colorPrimary)
         .padding(EdgeInsets(top: 2, leading: 6, bottom: 2, trailing: 6))
-        .background(.white.opacity(0.2)).clipShape(RoundedRectangle(cornerRadius: 5))
+        .background(.white.opacity(0.12)).clipShape(RoundedRectangle(cornerRadius: 5))
         
     }
 }

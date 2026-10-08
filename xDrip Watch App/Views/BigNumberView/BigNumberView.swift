@@ -32,18 +32,10 @@ struct BigNumberView: View {
         #endif
     }()
     
-    let originalTextScaleValue = 1.0
-    let animatedTextScaleValue = 1.4
-    @State private var textScaleValue = 1.0
-    
     let originalGaugeOpacityValue = 0.8
     let animatedGaugeOpacityValue = 1.0
     @State private var gaugeOpacityValue = 0.8
     
-    let originalMinsAgoTextColor = Color.colorSecondary
-    let animatedMinsAgoTextColor = Color.white
-    @State private var minsAgoTextColor = Color.colorSecondary
-
     private var directPresentation: LibreWatchConnectionPresentation {
         watchState.directLibrePresentation(stage: libreDirectCollector.state.stage, at: displayDate)
     }
@@ -62,21 +54,14 @@ struct BigNumberView: View {
             }
 
             Text(awaitsFirstDirectReading ? (watchState.isMgDl ? "---" : "-.-") : watchState.bgValueStringInUserChosenUnit())
-                .scaleEffect(textScaleValue)
                 .font(.system(size: directReadingIsStale ? (isSmallScreen ? 72 : 84) : (isSmallScreen ? 100 : 120)))
                 .fontWeight(.semibold)
+                .monospacedDigit()
                 .foregroundStyle(directReadingIsStale ? Color.secondary : watchState.bgTextColor())
                 .padding(.top, directReadingIsStale ? 0 : (isSmallScreen ? -15 : -20))
                 .padding(.trailing, 10)
                 .lineLimit(1)
                 .minimumScaleFactor(0.5)
-                .animation(.easeOut(duration: 0.3), value: textScaleValue)
-                .onChange(of: watchState.bgValueStringInUserChosenUnit()) { oldState, newState in
-                    animateTextScale()
-                }
-                .onChange(of: watchState.updateBigNumberViewDate) { oldState, newState in
-                    animateTextScale()
-                }
                 .onTapGesture(count: 2) {
                     watchState.updateBigNumberViewDate = Date()
                     watchState.requestWatchStateUpdate()
@@ -96,17 +81,18 @@ struct BigNumberView: View {
                 HStack(alignment: .center, spacing: 10) {
                     HStack(alignment: .firstTextBaseline, spacing: 3) {
                         Text(watchState.deltaChangeStringInUserChosenUnit())
-                            .font(.system(size: isSmallScreen ? 22 : 24)).fontWeight(.semibold)
+                            .font(.system(size: isSmallScreen ? 20 : 22, weight: .medium))
+                            .monospacedDigit()
                             .lineLimit(1)
 
                         Text(watchState.bgUnitString())
-                            .font(.system(size: isSmallScreen ? 22 : 24))
-                            .foregroundStyle(.gray)
+                            .font(.system(size: isSmallScreen ? 13 : 15))
+                            .foregroundStyle(.secondary)
                             .lineLimit(1)
                     }
 
                     Text("\(watchState.trendArrow())")
-                        .font(.system(size: isSmallScreen ? 34 : 38)).fontWeight(.bold)
+                        .font(.system(size: isSmallScreen ? 34 : 38)).fontWeight(.semibold)
                         .foregroundStyle(.colorPrimary)
                         .minimumScaleFactor(0.5)
                 }
@@ -159,12 +145,9 @@ struct BigNumberView: View {
                         .padding(.trailing, 2)
 
                     Text(watchState.lastUpdatedMinsAgoString(at: displayDate))
-                        .font(.system(size: isSmallScreen ? 20 : 22))
-                        .foregroundStyle(minsAgoTextColor)
-                        .animation(.easeOut(duration: 0.3), value: minsAgoTextColor)
-                        .onChange(of: watchState.lastUpdatedMinsAgoString()) { oldState, newState in
-                            animateTextColor()
-                        }
+                        .font(.system(size: isSmallScreen ? 16 : 18))
+                        .monospacedDigit()
+                        .foregroundStyle(watchState.lastUpdatedTimeColor())
                 }
                 .padding(.top, 15)
                 .padding(.bottom, -20)
@@ -195,24 +178,6 @@ struct BigNumberView: View {
         .onReceive(displayTimer) {
             displayDate = $0
             watchState.refreshDirectLibreReadingFreshness(at: $0)
-        }
-    }
-    
-    func animateTextScale(){
-        guard watchState.libreWatchOwnership != .watch || directPresentation.reading != .stale else {
-            textScaleValue = originalTextScaleValue
-            return
-        }
-        textScaleValue = animatedTextScaleValue
-        DispatchQueue.main.asyncAfter(deadline: DispatchTime.now() + 0.3){
-            textScaleValue = originalTextScaleValue
-        }
-    }
-    
-    func animateTextColor(){
-        minsAgoTextColor = animatedMinsAgoTextColor
-        DispatchQueue.main.asyncAfter(deadline: DispatchTime.now() + 0.3){
-            minsAgoTextColor = watchState.lastUpdatedTimeColor()
         }
     }
     

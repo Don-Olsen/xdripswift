@@ -8,6 +8,52 @@
 - Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
 <!-- testflight-7.1.1-4310:end -->
 
+## Watch — visuel opstramning efter 4310
+
+8. oktober 2026: afgrænset visningsændring fra `d3a483fe` i det eksisterende
+checkout. Watch-beregnerens gram og dosis har større, monospacerede tal,
+og det aktive Crown-felt markeres med ramme og baggrund. Indtastninger,
+beregning/forslag og Log er samlet i tydeligere grupper; + har 44 × 44
+points trykflade. watchOS' eksisterende fuldskærms-X bevares, mens den
+dobbelte luk-knap inde i indholdet er fjernet, så overskriften ikke klemmes
+på små ure. De eksisterende feltbindinger,
+pen-trin/maksimum, forslagets gyldighed, bekræftelse og kølagring er uændrede.
+Beregneren bruger fortsat den eksisterende fuldskærmsvisning uden for carousel.
+
+Main/AGP og Stort tal bruger roligere sekundærtypografi og stabile talbredder.
+Glukosetallets skalapuls og målingsalderens hvide farveblink er fjernet.
+Headeren genskabes ikke længere gennem en skiftende `.id`; den eksisterende
+synlige timer publicerer fortsat `timerControlDate` og opdaterer friskhed.
+Aktuelle status-/advarselsfarver, direkte Libre, genopkobling, grafens data og
+interval, IOB/COB, alarmer og komplikationer er bevaret. Gauge-indikationen
+beholder sin eksisterende funktion. Ingen dosis-, model-, protokol-,
+behandlings-, HealthKit-, runtime- eller telefonændring.
+
+Forberedende `scripts/local-build.sh build` bestod for iPhone og Watch;
+kvittering `~/DeveloperBuildData/xDrip/local-runs/xdripswift/20261008T165752Z-43289/`.
+`git diff --check` og Swift-syntakskontrol af de ændrede visninger bestod.
+Den nummererede release gentester hele XCTest-suiten, Python-kontrollerne og
+begge simulatorbuilds på det præcise release-tree; dens faktiske resultat
+og Apple-status registreres særskilt ovenfor.
+
+Simulatorbilleder ligger uden for Git i
+`~/DeveloperBuildData/xDrip/diagnostics/watch-visual-polish-20261008/`.
+Den faktiske startskærm uden glukose og beregnerens øverste indtastningsdel
+på Ultra 49 mm og SE 40 mm er kontrolleret. Beregnerbillederne bruger tydeligt
+syntetiske værdier og en midlertidig simulatorfixture, der er fjernet
+byte-for-byte før staging/release. Ingen fixture, screenshot eller
+helbredsdata er med i Git. Simulatorens GUI-styring kunne ikke starte med
+opgavens gamle symlinkede sandbox-rødder; simctl kunne bygge, starte og
+fotografere visningen. Crown-input, scrolling, resultat-/Log-delen og det
+fulde online/offline-flow er ikke nyverificeret interaktivt eller på fysisk
+ur. Eksisterende automatiske behandlings-/Watch-tests bevares.
+
+Den parrede iPhone blev læst som 7.1.1 (4310); fysisk Watch var tilgængeligt,
+men dets installerede build blev ikke aflæst i denne opgave. Ingen lokal
+installation eller CGM-afbrydelse. Opdatér via TestFlight, bekræft urets
+faktiske build og kontrollér skift mellem Crown-felter, forslag, annullering
+og manuel/offline bekræftelse. Ingen hastigheds- eller batterigevinst er målt.
+
 De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
 
 <!-- testflight-7.1.1-4309:start -->

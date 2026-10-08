@@ -22,9 +22,6 @@ struct MainView: View {
 
     @Binding var hoursToShowIndex: Int
 
-    // store a boolean flag. We'll toggle this to refresh as needed
-    @State private var refreshView = false
-
     // keep the chart range stable during each render pass so glucose and AGP use the same x-axis
     @State private var chartRangeEndDate = Date()
 
@@ -77,7 +74,6 @@ struct MainView: View {
                     // keep the header at its natural height and let the chart take any extra space
                     .fixedSize(horizontal: false, vertical: true)
                     .measureFixedRow(.header)
-                    .id(refreshView)
                     .onTapGesture(count: 2) {
                         watchState.updateMainViewDate = Date()
                         watchState.requestWatchStateUpdate()
@@ -131,15 +127,13 @@ struct MainView: View {
                 if date.timeIntervalSince(chartRangeEndDate) >= 60 { chartRangeEndDate = date }
                 watchState.timerControlDate = date
                 watchState.refreshDirectLibreReadingFreshness(at: date)
-                refreshView.toggle()
             }
             .onAppear {
                 guard isVisible else { return }
                 chartRangeEndDate = Date()
-                refreshView.toggle()
             }
             .onChange(of: isVisible) { visible in
-                if visible { chartRangeEndDate = Date(); refreshView.toggle() }
+                if visible { chartRangeEndDate = Date() }
             }
             .onChange(of: watchState.bgReadingDates.first) { _ in
                 if isVisible { chartRangeEndDate = Date() }

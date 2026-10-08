@@ -14,10 +14,6 @@ struct MainViewInfoView: View {
     
     let isSmallScreen = ConstantsAppleWatch.isSmallScreen()
     
-    let originalMinsAgoTextColor = Color.colorSecondary
-    let animatedMinsAgoTextColor = Color.white
-    @State private var minsAgoTextColor = Color.colorSecondary
-    
     var body: some View {
         let textSize: CGFloat = isSmallScreen ? 14 : 16
         
@@ -30,18 +26,8 @@ struct MainViewInfoView: View {
             
             Text(watchState.lastUpdatedMinsAgoString())
                 .font(.system(size: textSize))
-                .foregroundStyle(minsAgoTextColor)
-                .animation(.easeOut(duration: 0.3), value: minsAgoTextColor)
-                .onChange(of: watchState.lastUpdatedMinsAgoString()) { _, _ in
-                    animateTextColor()
-                }
-        }
-    }
-    
-    func animateTextColor() {
-        minsAgoTextColor = animatedMinsAgoTextColor
-        DispatchQueue.main.asyncAfter(deadline: DispatchTime.now() + 0.3) {
-            minsAgoTextColor = watchState.lastUpdatedTimeColor()
+                .monospacedDigit()
+                .foregroundStyle(watchState.lastUpdatedTimeColor())
         }
     }
 }
