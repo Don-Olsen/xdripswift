@@ -1095,7 +1095,7 @@ struct GlucoseChartView: View {
                              yEnd: .value("Interval upper", clipped.upperBound),
                              series: .value("Series", "glucose-forecast-ml-band"))
                         .interpolationMethod(.linear)
-                        .foregroundStyle(Color.cyan.opacity(0.18))
+                        .foregroundStyle(Color.cyan.opacity(usesMainChartYAxisContext ? 0.12 : 0.18))
                         .accessibilityHidden(true)
                 }
             }
@@ -1119,7 +1119,7 @@ struct GlucoseChartView: View {
                     .lineStyle(forecastIsML ? StrokeStyle(lineWidth: 2.5)
                                              : StrokeStyle(lineWidth: 2.5, dash: [5, 4]))
                     .foregroundStyle(Color.cyan)
-                    .accessibilityLabel(forecastIsML ? "ML estimate" : Bundle.main.localizedString(forKey: "forecast.estimate", value: "Estimate", table: "SettingsViews"))
+                    .accessibilityLabel(Bundle.main.localizedString(forKey: forecastIsML ? "forecast.mlEstimate" : "forecast.estimate", value: forecastIsML ? "ML estimate" : "Estimate", table: "SettingsViews"))
                     .accessibilityValue(point.glucoseMgdl.mgDlToMmolAndToString(mgDl: isMgDl))
             }
 
@@ -1555,7 +1555,9 @@ struct GlucoseChartView: View {
         Text(" \(label) ")
             .font(.system(size: fontSize, weight: .bold))
             .foregroundStyle(color)
-            .background(GlucoseChartTreatmentStyle.treatmentLabelBackgroundColor)
+            .background(usesMainChartYAxisContext
+                ? Color.black.opacity(0.65) : GlucoseChartTreatmentStyle.treatmentLabelBackgroundColor,
+                in: RoundedRectangle(cornerRadius: 3))
     }
 }
 

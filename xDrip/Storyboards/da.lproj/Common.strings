@@ -1,4 +1,5 @@
 "common_Ok" = "OK";
+"common_dismiss" = "Luk";
 "common_cancel" = "Cancel";
 "common_mgdl" = "mg/dL";
 "common_mmol" = "mmol/L";
@@ -10,18 +11,18 @@
 "common_low" = "LOW";
 "common_hour" = "hour";
 "common_hours" = "hours";
-"common_minutes" = "mins";
+"common_minutes" = "min";
 "common_minute" = "min";
-"common_day" = "day";
-"common_days" = "days";
+"common_day" = "dag";
+"common_days" = "dage";
 "common_landscape_showAGPChartData" = "Vis data i AGP-grafen:";
 "common_landscape_comparisonDays" = "%d dage";
 "common_landscape_comparisonNone" = "Ingen";
-"common_today" = "Today";
+"common_today" = "I dag";
 "common_week" = "week";
 "common_hourshort" = "h";
 "common_dayshort" = "d";
-"common_todayshort" = "Today";
+"common_todayshort" = "I dag";
 "warning" ="Warning!";
 "update" = "Edit";
 "add" = "Add";
@@ -41,10 +42,10 @@
 "unknown" = "Unknown";
 "sensorStatus" = "Sensor Status";
 "invalidAccountOrPassword" = "Invalid account or password";
-"common_statistics_low" = "Low";
-"common_statistics_inRange" = "In Range";
-"common_statistics_high" = "High";
-"common_statistics_average" = "Average";
+"common_statistics_low" = "Lavt";
+"common_statistics_inRange" = "I målområdet";
+"common_statistics_high" = "Højt";
+"common_statistics_average" = "Gennemsnit";
 "common_statistics_gmiTrend" = "GMI-tendens";
 "common_statistics_threeDay" = "Hver 3. dag";
 "common_statistics_weekly" = "Ugentligt";
@@ -58,10 +59,10 @@
 /////////////////////////////////////////////////////////////////////////////////////////////
 
 /// the words in tight range
-"common_statistics_inTightRange" = "Tight Range";
+"common_statistics_inTightRange" = "I snævert målområde";
 
 /// the words in user range
-"common_statistics_userRange" = "User Range";
+"common_statistics_userRange" = "I eget målområde";
 
 // Local therapy accessibility
 "therapy.estimatedIOB" = "Anslået aktivt insulin";

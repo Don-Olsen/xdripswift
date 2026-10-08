@@ -201,7 +201,7 @@ final class CareLinkTests: XCTestCase {
         XCTAssertFalse(aidStatus.supportsCOB)
 
         let state = RootHomeStateModel().careLinkLoopState(snapshot: snapshot, referenceDate: now)
-        XCTAssertEqual(state.iob.value, "- U")
+        XCTAssertEqual(state.iob.value, "- \(Texts_HomeView.insulinUnit)")
         XCTAssertEqual(state.cob.value, "- g")
         XCTAssertFalse(state.showsCOB)
     }

@@ -4,6 +4,11 @@ import Foundation
 enum Texts_HomeView {
     static private let filename = "HomeView"
 
+    static let insulinUnit = NSLocalizedString("home_insulinUnit", tableName: filename, bundle: .main,
+        value: "U", comment: "Home insulin amount unit")
+    static let insulinRateUnit = NSLocalizedString("home_insulinRateUnit", tableName: filename, bundle: .main,
+        value: "U/hr", comment: "Home pump basal insulin rate unit")
+
     static let lastReadingAgeFormat = NSLocalizedString(
         "home_lastReadingAgeFormat", tableName: filename, bundle: .main,
         value: "Last reading: %d min", comment: "Age of a glucose reading that is no longer current"

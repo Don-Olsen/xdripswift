@@ -601,3 +601,11 @@
 "forecast.mlMAE" = "MAE";
 "forecast.mlCoverage" = "Observed band coverage";
 "forecast.mlRetrospective" = "Historical treatment import times and past settings are not always known. The self-check is retrospective, not a guarantee of future accuracy. The band targets 80% coverage at each horizon, not for the entire curve.";
+
+"forecast.detailsTitle" = "About the forecast";
+"forecast.detailsAction" = "Show forecast information";
+"forecast.noNewTreatments" = "The estimate assumes no new meals or treatments.";
+"forecast.pointwise80Explanation" = "The band targets 80% coverage at +30, +60 and +120 min. This applies at each time, not to the whole curve, and does not guarantee protection from low glucose.";
+"forecast.plannedConditional" = "If eaten · conditional engine estimate";
+"forecast.futureValues" = "Estimated values";
+"forecast.parametersLabel" = "Calculation inputs";

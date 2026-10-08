@@ -11,6 +11,30 @@ import SwiftUI
 
 // MARK: - Presentation State
 
+/// Home-only formatting. Shared readings and therapy payloads keep their existing representation.
+enum RootHomeNumberFormatting {
+    static func glucose(_ valueMgdl: Double, isMgDl: Bool, locale: Locale = .current) -> String {
+        GlucoseReportFormatting.number(valueMgdl.mgDlToMmol(mgDl: isMgDl),
+            decimalPlaces: isMgDl ? 0 : 1, locale: locale)
+    }
+
+    /// Localize an already calculated display value without changing HIGH/LOW or error markers.
+    static func glucoseText(_ text: String, isMgDl: Bool, locale: Locale = .current) -> String {
+        guard let value = Double(text), value.isFinite else { return text }
+        let number = GlucoseReportFormatting.number(value, decimalPlaces: isMgDl ? 0 : 1, locale: locale)
+        return text.hasPrefix("+") ? "+" + number : number
+    }
+
+    static func number(_ value: Double, maximumFractionDigits: Int, locale: Locale = .current) -> String {
+        value.formatted(.number.locale(locale).precision(.fractionLength(0...maximumFractionDigits))
+            .grouping(.never))
+    }
+
+    static func therapyMetric(_ metric: TherapyMetricState, isIOB: Bool, at date: Date) -> String {
+        "\(metric.number(isIOB: isIOB, at: date)) \(isIOB ? Texts_HomeView.insulinUnit : "g")"
+    }
+}
+
 /// Complete presentation state for the SwiftUI home screen.
 ///
 /// The values are independent of any individual view and can be shared by portrait and landscape.
@@ -57,7 +81,7 @@ struct RootHomePumpState {
 
 /// Loop status and optional uploader-battery presentation.
 struct RootHomeLoopState {
-    var iob = RootHomeMetricState(title: "IOB", value: "- U")
+    var iob = RootHomeMetricState(title: "IOB", value: "- \(Texts_HomeView.insulinUnit)")
     var cob = RootHomeMetricState(title: "COB", value: "- g")
     var showsCOB = true
     var showsIOB = true
@@ -255,7 +279,7 @@ struct RootHomeLocalMetricPresentation {
     mutating func display(_ current: TherapyMetricState, in metric: RootHomeMetricState,
                           sourceSignature: String, isIOB: Bool, at date: Date) -> RootHomeMetricState {
         var result = metric
-        result.value = current.formatted(isIOB: isIOB, at: date)
+        result.value = RootHomeNumberFormatting.therapyMetric(current, isIOB: isIOB, at: date)
         result.valueColor = ConstantsAppColors.primaryText
         result.lastCalculatedAt = nil
 
@@ -273,7 +297,7 @@ struct RootHomeLocalMetricPresentation {
            let confirmed,
            (0..<Self.maximumRetainedAge).contains(date.timeIntervalSince(confirmed.referenceDate)),
            confirmed.value(at: date) != nil {
-            result.value = confirmed.formatted(isIOB: isIOB, at: confirmed.referenceDate)
+            result.value = RootHomeNumberFormatting.therapyMetric(confirmed, isIOB: isIOB, at: confirmed.referenceDate)
             result.valueColor = ConstantsAppColors.secondaryText
             result.lastCalculatedAt = confirmed.referenceDate
             return result
@@ -339,8 +363,8 @@ struct RootHomeTherapyRefreshPresentation {
                 date: date, settings: confirmed.settings, currentDate: date, recentEntries: []) : nil
         var iob = confirmed.iob
         var cob = confirmed.cob
-        if let iobState { iob.value = iobState.formatted(isIOB: true, at: date) }
-        if let cobState { cob.value = cobState.formatted(isIOB: false, at: date) }
+        if let iobState { iob.value = RootHomeNumberFormatting.therapyMetric(iobState, isIOB: true, at: date) }
+        if let cobState { cob.value = RootHomeNumberFormatting.therapyMetric(cobState, isIOB: false, at: date) }
         return Confirmed(iob: iob, cob: cob,
             showsIOB: iobState?.isVisible(at: date) ?? confirmed.showsIOB,
             showsCOB: cobState?.isVisible(at: date) ?? confirmed.showsCOB,
@@ -530,8 +554,8 @@ final class RootHomeStateModel: ObservableObject {
         loop.showsCOB = metrics.cob.isVisible(at: date)
         loop.showsAIDStatus = UserDefaults.standard.dataFlowPolicy.showsTherapyStatus
         if historical {
-            loop.iob.value = metrics.iob.formatted(isIOB: true, at: date)
-            loop.cob.value = metrics.cob.formatted(isIOB: false, at: date)
+            loop.iob.value = RootHomeNumberFormatting.therapyMetric(metrics.iob, isIOB: true, at: date)
+            loop.cob.value = RootHomeNumberFormatting.therapyMetric(metrics.cob, isIOB: false, at: date)
             loop.iob.lastCalculatedAt = nil
             loop.cob.lastCalculatedAt = nil
         } else {
@@ -627,7 +651,7 @@ final class RootHomeStateModel: ObservableObject {
         let hasData = statistics.averageStatisticValue.value > 0
         let glucoseUnit = isMgDl ? Texts_Common.mgdl : Texts_Common.mmol
         let averageValue = hasData
-            ? statistics.averageStatisticValue.bgValueToString(mgDl: isMgDl) + " " + glucoseUnit
+            ? GlucoseReportFormatting.number(statistics.averageStatisticValue, decimalPlaces: isMgDl ? 0 : 1) + " " + glucoseUnit
             : "-"
         let gmiValue = GlucoseReportFormatting.gmi(statistics.gmiPercentage,
             usesIFCC: UserDefaults.standard.useIFCCA1C, compactUnit: true)
@@ -738,7 +762,7 @@ final class RootHomeStateModel: ObservableObject {
 
         let isMgDl = UserDefaults.standard.bloodGlucoseUnitIsMgDl
         let isStale = latestReading.timeStamp < Date(timeIntervalSinceNow: -60 * 11)
-        var valueText = latestReading.unitizedString(unitIsMgDl: isMgDl)
+        var valueText = RootHomeNumberFormatting.glucoseText(latestReading.unitizedString(unitIsMgDl: isMgDl), isMgDl: isMgDl)
 
         if !isStale && !latestReading.hideSlope {
             valueText += " \(latestReading.slopeArrow())"
@@ -771,7 +795,7 @@ final class RootHomeStateModel: ObservableObject {
             minutesText: isStale ? String(format: Texts_HomeView.lastReadingAgeFormat, minutesAgo) : String(minutesAgo),
             minutesAgoText: isStale ? "" : "\(ageUnit) \(Texts_HomeView.ago)",
             minutesColor: ConstantsAppColors.primaryText,
-            deltaText: isStale ? "" : latestReading.unitizedDeltaString(previousBgReading: previousReading, showUnit: false, highGranularity: true, mgDl: isMgDl),
+            deltaText: isStale ? "" : RootHomeNumberFormatting.glucoseText(latestReading.unitizedDeltaString(previousBgReading: previousReading, showUnit: false, highGranularity: true, mgDl: isMgDl), isMgDl: isMgDl),
             deltaUnitText: isStale ? "" : (isMgDl ? Texts_Common.mgdl : Texts_Common.mmol),
             deltaColor: ConstantsAppColors.primaryText
         )
@@ -793,17 +817,17 @@ final class RootHomeStateModel: ObservableObject {
         let reservoirText: String
 
         if hasRecentData, deviceStatus?.pumpReservoir == ConstantsNightscout.omniPodReservoirFlagNumber {
-            reservoirText = "50+ U"
+            reservoirText = "50+ \(Texts_HomeView.insulinUnit)"
         } else if hasRecentData, let reservoir = deviceStatus?.pumpReservoir {
-            reservoirText = "\(reservoir.round(toDecimalPlaces: reservoir < ConstantsHomeView.pumpReservoirUrgent ? 1 : 0).stringWithoutTrailingZeroes) U"
+            reservoirText = "\(RootHomeNumberFormatting.number(reservoir.round(toDecimalPlaces: reservoir < ConstantsHomeView.pumpReservoirUrgent ? 1 : 0), maximumFractionDigits: 1)) \(Texts_HomeView.insulinUnit)"
         } else {
-            reservoirText = "- U"
+            reservoirText = "- \(Texts_HomeView.insulinUnit)"
         }
 
         let batteryText = hasRecentData ? deviceStatus?.pumpBatteryPercent.map { "\($0) %" } ?? "- %" : "- %"
 
         return RootHomePumpState(
-            basal: RootHomeMetricState(title: "Basal", value: basal.map { "\($0) U/hr" } ?? "? U/hr", valueColor: defaultTextColor),
+            basal: RootHomeMetricState(title: "Basal", value: basal.map { "\(GlucoseReportFormatting.number($0, decimalPlaces: 1)) \(Texts_HomeView.insulinRateUnit)" } ?? "? \(Texts_HomeView.insulinRateUnit)", valueColor: defaultTextColor),
             reservoir: RootHomeMetricState(title: Texts_HomeView.pumpReservoir, value: reservoirText, valueColor: hasRecentData ? deviceStatus?.pumpReservoirColor() ?? defaultTextColor : defaultTextColor),
             battery: RootHomeMetricState(title: Texts_HomeView.pumpBattery, value: batteryText, valueColor: hasRecentData ? deviceStatus?.pumpBatteryPercentColor() ?? defaultTextColor : defaultTextColor),
             cage: latestSiteChangeDate.map { siteChangeDate in
@@ -889,12 +913,12 @@ final class RootHomeStateModel: ObservableObject {
         return RootHomeLoopState(
             iob: RootHomeMetricState(
                 title: "IOB",
-                value: presentation.hasFreshData ? aidStatus.iob.map { "\($0.round(toDecimalPlaces: 2)) U" } ?? "- U" : "- U",
+                value: presentation.hasFreshData ? aidStatus.iob.map { "\(RootHomeNumberFormatting.number($0.round(toDecimalPlaces: 2), maximumFractionDigits: 2)) \(Texts_HomeView.insulinUnit)" } ?? "- \(Texts_HomeView.insulinUnit)" : "- \(Texts_HomeView.insulinUnit)",
                 valueColor: defaultTextColor
             ),
             cob: RootHomeMetricState(
                 title: "COB",
-                value: presentation.hasFreshData ? "\(aidStatus.cob?.round(toDecimalPlaces: 0).stringWithoutTrailingZeroes ?? "-") g" : "- g",
+                value: presentation.hasFreshData ? "\(aidStatus.cob.map { RootHomeNumberFormatting.number($0.round(toDecimalPlaces: 0), maximumFractionDigits: 0) } ?? "-") g" : "- g",
                 valueColor: defaultTextColor
             ),
             // CareLink exposes entered meal grams, not a decaying active-carb value. Keep the
@@ -1315,7 +1339,7 @@ final class RootHomeStateModel: ObservableObject {
     }
 
     private func formattedLimit(_ value: Double, isMgDl: Bool) -> String {
-        value.bgValueToString(mgDl: isMgDl)
+        GlucoseReportFormatting.number(value, decimalPlaces: isMgDl ? 0 : 1)
     }
 
 }

@@ -8,6 +8,43 @@
 - Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
 <!-- testflight-7.1.1-4309:end -->
 
+## Home — visuel opstramning efter 4309
+
+8. oktober 2026, lokalt arbejde fra `89503294` på den eksisterende integrationsbranch.
+Prognoseboksen er kortere: +30/+60 og +120 ved valgt totimershorisont.
+ⓘ åbner måletidspunkt, beregningskilde og forklaring af ML-båndets punktvise
+måldækning. Oplysningerne fastholdes som ét visningssnapshot ved åbning;
+nye målinger blandes ikke ind i et åbent ark. Under opdatering vises status
+uden numeriske prognoseværdier, også i arket. Stor tekst ombrydes, og boksen
+har mindst 44 points trykhøjde.
+
+Home bruger telefonens talformat, danske alder-/statistiktekster og E/E/t
+ved dansk sprog. Delte behandlinger/payloads beholder eksisterende enheder.
+ML-båndets opacitet er reduceret alene på Home; behandlingsetiketter får
+mere baggrundskontrast. Prognosepunkter, rå båndværdier, motor/ML,
+friskheds-/inputkontroller, grafens opdatering og gestus, dosisregler,
+lagring/journal, HealthKit, alarmer og Watch/Libre er bevaret.
+
+Endelig `scripts/local-build.sh release-test` bestod med **1.453/1.453
+XCTest-tests**, 0 fejl og 0 skipped; **166 Python-tests**, begge syntetiske
+Watch-kontroller og iPhone-/Watch-simulatorbuilds bestod. Kvittering:
+`~/DeveloperBuildData/xDrip/local-runs/xdripswift/20261008T162127Z-23872/`.
+Fem nye tests dækker locale/enhedsformat, ukendt kontra nul, danske ressourcer,
+ombrydning/trykhøjde og syntetiske visninger. Eksisterende Home-tests blev
+opdateret alene for lokaliseret E frem for U; delte metric-/Watch-forventninger
+og alle eksisterende sikkerhedstests er bevaret. `git diff --check` og
+`plutil -lint` af de fem ændrede sprogfiler bestod.
+
+Syntetiske simulatorbilleder og testoutput ligger uden for Git i
+`~/DeveloperBuildData/xDrip/diagnostics/home-visual-polish-20261008/`.
+Normal tekst, accessibility3 og mg/dL er visuelt kontrolleret. Infoarkets
+NavigationStack gengives i en aktiv simulator-scene, fordi ImageRenderer
+ikke kan gengive den indlejrede UIKit-navigation. Den nye brugerflade er
+ikke installeret eller verificeret på fysisk iPhone. Ingen hastigheds-,
+batteri- eller præcisionsgevinst er målt. Denne lokale validering skete før
+versionsændring, commit, push og upload. Den nummererede release og Apples
+faktiske status registreres særskilt af releaseproceduren.
+
 De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
 
 <!-- testflight-7.1.1-4308:start -->

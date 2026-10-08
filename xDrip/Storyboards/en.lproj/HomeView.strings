@@ -251,3 +251,6 @@
 "noSensorCode" = "No code (0000)";
 "dexcomG7SelectSensorCodeMessage" = "Enter the four-digit pairing code manually, scan the current applicator, or choose a photo. Check the selected code, then tap Continue.";
 "noSensorCodeSelectedTitle" = "Continue Without a Sensor Code?";
+
+"home_insulinUnit" = "U";
+"home_insulinRateUnit" = "U/hr";

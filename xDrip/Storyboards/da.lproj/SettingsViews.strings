@@ -631,3 +631,11 @@
 "forecast.mlMAE" = "MAE";
 "forecast.mlCoverage" = "Observeret bånddækning";
 "forecast.mlRetrospective" = "Tidspunkter for historisk import af behandlinger og tidligere indstillinger kendes ikke altid. Selvtjekket er retrospektivt og garanterer ikke fremtidig præcision. Båndet sigter mod 80 % dækning ved +30/+60/+120 minutter; bredden imellem er interpoleret.";
+
+"forecast.detailsTitle" = "Om prognosen";
+"forecast.detailsAction" = "Vis oplysninger om prognosen";
+"forecast.noNewTreatments" = "Estimatet forudsætter ingen nye måltider eller behandlinger.";
+"forecast.pointwise80Explanation" = "Båndet har 80 % måldækning ved +30, +60 og +120 min. Det gælder hvert tidspunkt, ikke hele kurven, og er ingen garanti mod lavt blodsukker.";
+"forecast.plannedConditional" = "Hvis spist · betinget motorprognose";
+"forecast.futureValues" = "Forventede værdier";
+"forecast.parametersLabel" = "Beregningsgrundlag";

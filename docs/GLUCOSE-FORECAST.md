@@ -4,6 +4,25 @@ The iPhone Home chart can show a separate, dotted estimate for the next 60 minut
 
 Forecast points are never saved as BG readings or sent to Nightscout, Apple Health or Watch. From the post-4294 local-treatment change, the existing engine can also supply a separate bolus safety check and the new optional “Low soon” warning. Neither use writes forecast points as measurements, and ML never supplies the safety check or warning. Watch sensor ownership, Bluetooth recovery and workout runtime are unchanged. These checks use new glucose events, without polling or a keepalive timer.
 
+## Home visual follow-up after 4309
+
+The compact badge shows +30/+60 and, when selected, +120. Its ⓘ button opens
+reference time, parameter source and the explanation of the ML band's coverage
+at each horizon. The sheet freezes one presentation snapshot at opening;
+subsequent readings do not mix newer values into that explanation. An updating
+state hides numeric summaries in both the badge and the sheet, as before.
+Large text wraps instead of shrinking, and the button has a minimum 44-point
+height. Numbers follow the phone's locale; Danish Home labels and insulin
+units use Danish text and E/E/t without changing shared therapy payloads.
+
+Only Home's ML band is less prominent, with stronger treatment-label background
+contrast. Forecast points, raw band values, validation, freshness, chart
+publication and calculation behavior are unchanged. Synthetic simulator
+fixtures cover normal text, accessibility3, mmol/L, mg/dL and the information
+view. The new UI is not installed or physically verified on iPhone; no speed,
+battery or accuracy improvement has been measured. Local validation is recorded
+in PROJECT-STATUS.md; release remains a separate task.
+
 ## Home presentation during reloads
 
 The live Home graph reserves the selected 60/120-minute future span independently

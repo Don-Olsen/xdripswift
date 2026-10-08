@@ -249,8 +249,9 @@ final class TherapyMetricsTests: XCTestCase {
         let advanced = at.addingTimeInterval(20)
         let held = try XCTUnwrap(presentation.retained(refresh: refresh, metricsReady: false,
             pendingCommit: nil, sourceSignature: "same-source", nonHealthRevision: 4, at: advanced))
-        XCTAssertEqual(held.iob.value, TherapyMetricsManager.localMetric(entries: inputs, isIOB: true,
-            date: advanced, settings: settings).formatted(isIOB: true, at: advanced))
+        let expectedIOB = TherapyMetricsManager.localMetric(entries: inputs, isIOB: true,
+            date: advanced, settings: settings)
+        XCTAssertEqual(held.iob.value, "\(expectedIOB.number(isIOB: true, at: advanced)) \(Texts_HomeView.insulinUnit)")
         XCTAssertEqual(held.cob.value, TherapyMetricsManager.localMetric(entries: inputs, isIOB: false,
             date: advanced, settings: settings).formatted(isIOB: false, at: advanced))
         XCTAssertNotEqual(held.cob.value, startingCOB, "normal time decay continues from frozen complete inputs")
@@ -546,25 +547,25 @@ final class TherapyMetricsTests: XCTestCase {
     func testHomeShowsRecentConfirmedLocalValueAsLastCalculatedDuringShortRefresh() {
         var presentation = RootHomeLocalMetricPresentation()
         let confirmed = metric([entry(2)])
-        let input = RootHomeMetricState(title: "IOB", value: "- U")
+        let input = RootHomeMetricState(title: "IOB", value: "- \(Texts_HomeView.insulinUnit)")
         let initial = presentation.display(confirmed, in: input, sourceSignature: "local-a",
             isIOB: true, at: now)
-        XCTAssertEqual(initial.value, "2 U")
+        XCTAssertEqual(initial.value, "2 \(Texts_HomeView.insulinUnit)")
         XCTAssertNil(initial.lastCalculatedAt)
 
         let firstRefresh = presentation.display(metric(nil), in: input, sourceSignature: "local-a",
             isIOB: true, at: now.addingTimeInterval(10))
-        XCTAssertEqual(firstRefresh.value, "2 U")
+        XCTAssertEqual(firstRefresh.value, "2 \(Texts_HomeView.insulinUnit)")
         XCTAssertEqual(firstRefresh.lastCalculatedAt, now)
         // Repeated foreground publications must not lose the last confirmed Home value.
         let repeatedRefresh = presentation.display(metric(nil), in: input, sourceSignature: "local-a",
             isIOB: true, at: now.addingTimeInterval(30))
-        XCTAssertEqual(repeatedRefresh.value, "2 U")
+        XCTAssertEqual(repeatedRefresh.value, "2 \(Texts_HomeView.insulinUnit)")
         XCTAssertEqual(repeatedRefresh.lastCalculatedAt, now)
 
         let completed = presentation.display(metric([entry(1)]), in: input,
             sourceSignature: "local-a", isIOB: true, at: now.addingTimeInterval(31))
-        XCTAssertNotEqual(completed.value, "- U")
+        XCTAssertNotEqual(completed.value, "- \(Texts_HomeView.insulinUnit)")
         XCTAssertNil(completed.lastCalculatedAt)
         XCTAssertEqual(completed.valueColor, ConstantsAppColors.primaryText)
         XCTAssertNil(metric(nil).value(at: now), "The underlying clinical metric must remain unavailable")
@@ -576,7 +577,7 @@ final class TherapyMetricsTests: XCTestCase {
         let shared = TherapyMetricsManager.shared
         var iobPresentation = RootHomeLocalMetricPresentation()
         var cobPresentation = RootHomeLocalMetricPresentation()
-        let iobInput = RootHomeMetricState(title: "IOB", value: "- U")
+        let iobInput = RootHomeMetricState(title: "IOB", value: "- \(Texts_HomeView.insulinUnit)")
         let cobInput = RootHomeMetricState(title: "COB", value: "- g")
         _ = iobPresentation.display(metric([entry(2)]), in: iobInput,
             sourceSignature: initialSignature, isIOB: true, at: now)
@@ -588,7 +589,7 @@ final class TherapyMetricsTests: XCTestCase {
             "A status-only refresh must not discard confirmed treatment amounts")
         let waitingIOB = iobPresentation.display(metric(nil), in: iobInput,
             sourceSignature: initialSignature, isIOB: true, at: now.addingTimeInterval(5))
-        XCTAssertEqual(waitingIOB.value, "2 U")
+        XCTAssertEqual(waitingIOB.value, "2 \(Texts_HomeView.insulinUnit)")
         XCTAssertEqual(waitingIOB.lastCalculatedAt, now)
 
         shared.invalidate()
@@ -598,7 +599,7 @@ final class TherapyMetricsTests: XCTestCase {
             sourceSignature: changedSignature, isIOB: true, at: now.addingTimeInterval(10))
         let staleCOB = cobPresentation.display(metric(nil, isIOB: false), in: cobInput,
             sourceSignature: changedSignature, isIOB: false, at: now.addingTimeInterval(10))
-        XCTAssertEqual(staleIOB.value, "- U")
+        XCTAssertEqual(staleIOB.value, "- \(Texts_HomeView.insulinUnit)")
         XCTAssertEqual(staleCOB.value, "- g")
         XCTAssertNil(staleIOB.lastCalculatedAt)
         XCTAssertNil(staleCOB.lastCalculatedAt)

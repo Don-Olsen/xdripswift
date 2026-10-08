@@ -15,6 +15,113 @@ import XCTest
 final class RootHomeInteractionTests: XCTestCase {
 
     @MainActor
+    func testForecastBadgeWrapsValuesAndRetainsTouchHeightAtLargeText() {
+        let info = forecastVisualInformation()
+        let regular = UIHostingController(rootView: RootHomeForecastBadge(
+            information: info, showInformation: {}).frame(maxWidth: 265)
+            .environment(\.dynamicTypeSize, .large))
+        let accessible = UIHostingController(rootView: RootHomeForecastBadge(
+            information: info, showInformation: {}).frame(maxWidth: 265)
+            .environment(\.dynamicTypeSize, .accessibility3))
+        let regularSize = regular.sizeThatFits(in: CGSize(width: 265, height: 600))
+        let accessibleSize = accessible.sizeThatFits(in: CGSize(width: 265, height: 600))
+        XCTAssertGreaterThanOrEqual(regularSize.height, 44)
+        XCTAssertLessThanOrEqual(regularSize.width, 265)
+        XCTAssertLessThanOrEqual(accessibleSize.width, 265)
+        XCTAssertGreaterThan(accessibleSize.height, regularSize.height,
+            "Large text must wrap rather than shrink or cut off the forecast values")
+    }
+
+    /// Synthetic presentation fixtures only; no user measurements or model are loaded.
+    @MainActor
+    func testRenderCompactForecastAtNormalAndAccessibleTextSizes() async throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let start = now.addingTimeInterval(-3 * 3600)
+        for (width, textSize, isMgDl) in [(320.0, DynamicTypeSize.large, false),
+                                        (320.0, .accessibility3, false),
+                                        (430.0, .large, true)] {
+            var state = GlucoseChartState.empty(startDate: start, endDate: now)
+            state.bgReadingDates = (0...180).map { start.addingTimeInterval(Double($0) * 60) }
+            state.bgReadingValues = (0...180).map { 118 + 10 * sin(Double($0) / 30) }
+            state.treatmentPoints.carbs = [.init(date: now.addingTimeInterval(-3600),
+                yValue: 145, treatmentValue: 30, label: "30", notes: nil, idPrefix: "synthetic-carbs")]
+            state.treatmentPoints.boluses = [.init(date: now.addingTimeInterval(-3300),
+                yValue: 90, treatmentValue: 2.5, label: "2,5", notes: nil, idPrefix: "synthetic-bolus")]
+            let points = (0...24).map { index in
+                GlucoseChartForecastPoint(date: now.addingTimeInterval(Double(index) * 300),
+                    glucoseMgdl: 115 + Double(index) * 0.7)
+            }
+            let band = points.enumerated().map { index, point in
+                GlucoseChartForecastBandPoint(date: point.date,
+                    lowerMgdl: point.glucoseMgdl - Double(index) * 2,
+                    upperMgdl: point.glucoseMgdl + Double(index) * 2)
+            }
+            let chart = GlucoseChartView(glucoseChartType: .widgetSystemLarge,
+                bgReadingValues: nil, bgReadingDates: nil, isMgDl: isMgDl,
+                urgentLowLimitInMgDl: 55, lowLimitInMgDl: 70, highLimitInMgDl: 180,
+                urgentHighLimitInMgDl: 230, liveActivityType: nil,
+                hoursToShowScalingHours: 3, glucoseCircleDiameterScalingHours: 3,
+                showsTreatments: true, overrideChartHeight: 360, overrideChartWidth: width,
+                highContrast: nil, chartState: state)
+                .mainChartYAxisContext(resetRevision: 0, renderBasalDownwards: true, isLiveViewport: true)
+                .forecastPlot(points, bandPoints: band, isML: true, from: now, horizonMinutes: 120)
+            let information = forecastVisualInformation(isMgDl: isMgDl)
+            let content = ZStack(alignment: .topLeading) {
+                chart
+                RootHomeForecastBadge(information: information, showInformation: {})
+                    .frame(maxWidth: width - 55, alignment: .leading).padding(7)
+            }
+            .frame(width: width, height: 360).background(Color.black)
+            .environment(\.colorScheme, .dark).environment(\.dynamicTypeSize, textSize)
+            let renderer = ImageRenderer(content: content)
+            renderer.scale = 2
+            let attachment = XCTAttachment(image: try XCTUnwrap(renderer.uiImage))
+            attachment.name = "Synthetic Home forecast \(Int(width))pt \(textSize) \(isMgDl ? "mgdl" : "mmol")"
+            attachment.lifetime = .keepAlways
+            add(attachment)
+        }
+        // NavigationStack contains UIKit views that ImageRenderer cannot capture.
+        // Mount the real information view in an active simulator scene instead.
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .first { $0.activationState == .foregroundActive })
+        let previousWindow = scene.windows.first { $0.isKeyWindow }
+        let window = UIWindow(windowScene: scene)
+        window.frame = CGRect(x: 0, y: 0, width: 320, height: 680)
+        let appeared = expectation(description: "Forecast information appears in simulator")
+        let information = RootHomeForecastInformationView(information: forecastVisualInformation())
+            .environment(\.colorScheme, .dark)
+            .onAppear { appeared.fulfill() }
+        let controller = UIHostingController(rootView: information)
+        controller.overrideUserInterfaceStyle = .dark
+        window.rootViewController = controller
+        window.makeKeyAndVisible()
+        defer {
+            window.isHidden = true
+            window.rootViewController = nil
+            previousWindow?.makeKey()
+        }
+        await fulfillment(of: [appeared], timeout: 2)
+        try await Task.sleep(nanoseconds: 150_000_000)
+        controller.view.layoutIfNeeded()
+        let image = UIGraphicsImageRenderer(bounds: controller.view.bounds).image { _ in
+            XCTAssertTrue(controller.view.drawHierarchy(in: controller.view.bounds,
+                afterScreenUpdates: true))
+        }
+        let attachment = XCTAttachment(image: image)
+        attachment.name = "Synthetic forecast information"
+        attachment.lifetime = .keepAlways
+        add(attachment)
+    }
+
+    private func forecastVisualInformation(isMgDl: Bool = false) -> RootHomeForecastInformation {
+        RootHomeForecastInformation(kind: "ML-estimat", unit: isMgDl ? "mg/dL" : "mmol/L",
+            reference: "Fra måling kl. 14.00", source: "Manuelt angivet ISF og kulhydratfaktor",
+            values: isMgDl ? ["+30 125", "+60 129", "+120 138"] : ["+30 6,9", "+60 7,2", "+120 7,7"],
+            status: nil, isML: true, hasPlannedMeal: false, isLongHorizon: true)
+    }
+
+    @MainActor
     func testClockPublishesOnlyWhenItsDisplayedMinuteChanges() throws {
         let model = RootHomeStateModel()
         let minute = try XCTUnwrap(Calendar.current.dateInterval(of: .minute,
@@ -1933,5 +2040,55 @@ final class RootHomeStatisticsEasterEggTests: XCTestCase {
         XCTAssertNotEqual(original, context(now: now, calendar: utc))
         XCTAssertEqual(context(days: 7, now: now, calendar: calendar),
                        context(days: 7, now: date(9, 11), calendar: calendar))
+    }
+}
+
+
+final class RootHomeNumberFormattingTests: XCTestCase {
+    func testHomeGlucoseAndDeltaKeepUnitPrecisionAndLocale() {
+        let danish = Locale(identifier: "da_DK")
+        let english = Locale(identifier: "en_US")
+        let glucose = 7.2.mmolToMgdl()
+        XCTAssertEqual(RootHomeNumberFormatting.glucose(glucose, isMgDl: false, locale: danish), "7,2")
+        XCTAssertEqual(RootHomeNumberFormatting.glucose(glucose, isMgDl: false, locale: english), "7.2")
+        XCTAssertEqual(RootHomeNumberFormatting.glucose(130.2, isMgDl: true, locale: danish), "130")
+        XCTAssertEqual(RootHomeNumberFormatting.glucoseText("+0.1", isMgDl: false, locale: danish), "+0,1")
+        XCTAssertEqual(RootHomeNumberFormatting.glucoseText("+0.0", isMgDl: false, locale: danish), "+0,0")
+        XCTAssertEqual(RootHomeNumberFormatting.glucoseText("+2", isMgDl: true, locale: danish), "+2")
+        XCTAssertEqual(RootHomeNumberFormatting.number(2.75, maximumFractionDigits: 2, locale: danish), "2,75")
+        XCTAssertEqual(RootHomeNumberFormatting.number(2, maximumFractionDigits: 2, locale: english), "2")
+    }
+
+    func testHomeFormattingPreservesClinicalAndUnavailableMarkers() {
+        for text in ["HIGH", "LOW", "ERR", "???", "?SN", "?RF", "??0", "NaN", "inf"] {
+            XCTAssertEqual(RootHomeNumberFormatting.glucoseText(text, isMgDl: false,
+                locale: Locale(identifier: "da_DK")), text)
+        }
+        let date = Date(timeIntervalSince1970: 1_800_000_000)
+        var metric = TherapyMetricState(amount: 0, source: .local, referenceDate: date,
+            expiresAt: date.addingTimeInterval(60), visibilityDeadline: date.addingTimeInterval(600))
+        XCTAssertEqual(RootHomeNumberFormatting.therapyMetric(metric, isIOB: true, at: date),
+            "0 \(Texts_HomeView.insulinUnit)")
+        metric.reason = .readFailed
+        XCTAssertEqual(RootHomeNumberFormatting.therapyMetric(metric, isIOB: true, at: date),
+            "- \(Texts_HomeView.insulinUnit)", "Unknown must remain distinct from a valid zero")
+        XCTAssertEqual(metric.formatted(isIOB: true, at: date), "- U",
+            "Home formatting must not alter the shared therapy payload representation")
+    }
+
+    func testDanishHomeResourcesProvideConsistentAgeStatisticsAndInsulinUnits() throws {
+        let path = try XCTUnwrap(Bundle.main.path(forResource: "da", ofType: "lproj"))
+        let bundle = try XCTUnwrap(Bundle(path: path))
+        func text(_ key: String, table: String) -> String {
+            bundle.localizedString(forKey: key, value: nil, table: table)
+        }
+        XCTAssertEqual(text("ago", table: "HomeView"), "siden")
+        XCTAssertEqual(text("common_minutes", table: "Common"), "min")
+        XCTAssertEqual(text("common_dismiss", table: "Common"), "Luk")
+        XCTAssertEqual(text("common_statistics_low", table: "Common"), "Lavt")
+        XCTAssertEqual(text("common_statistics_high", table: "Common"), "Højt")
+        XCTAssertEqual(text("common_statistics_inRange", table: "Common"), "I målområdet")
+        XCTAssertEqual(text("common_statistics_average", table: "Common"), "Gennemsnit")
+        XCTAssertEqual(text("home_insulinUnit", table: "HomeView"), "E")
     }
 }

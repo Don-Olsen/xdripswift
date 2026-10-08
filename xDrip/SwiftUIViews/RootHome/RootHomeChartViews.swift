@@ -18,6 +18,139 @@ enum RootHomeTherapyChartPublication {
     }
 }
 
+/// Display strings are frozen when the information sheet opens. A new reading cannot
+/// mix newer values into the explanation of the estimate the user selected.
+struct RootHomeForecastInformation: Identifiable {
+    let id = UUID()
+    let kind: String
+    let unit: String
+    let reference: String
+    let source: String
+    let values: [String]
+    let status: String?
+    let isML: Bool
+    let hasPlannedMeal: Bool
+    let isLongHorizon: Bool
+}
+
+/// Only this compact control intercepts taps; the surrounding chart keeps its pan gesture.
+struct RootHomeForecastBadge: View {
+    let information: RootHomeForecastInformation
+    let showInformation: () -> Void
+
+    var body: some View {
+        Button(action: showInformation) {
+            HStack(spacing: 8) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("\(information.kind) · \(information.unit)")
+                        .fontWeight(.semibold)
+                    if let status = information.status {
+                        Text(status).foregroundStyle(ConstantsAppColors.secondaryText)
+                    } else {
+                        ViewThatFits(in: .horizontal) {
+                            HStack(spacing: 8) { forecastValues }
+                            VStack(alignment: .leading, spacing: 2) { forecastValues }
+                        }
+                        .monospacedDigit()
+                    }
+                    if information.hasPlannedMeal {
+                        Text("🍽 " + GlucoseForecastTexts.text("forecast.plannedConditional",
+                            fallback: "If eaten · conditional engine estimate"))
+                            .foregroundStyle(.orange)
+                    }
+                }
+                Image(systemName: "info.circle")
+                    .font(.body)
+                    .accessibilityHidden(true)
+            }
+            .font(.caption2)
+            .multilineTextAlignment(.leading)
+            .foregroundStyle(Color.cyan)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .frame(minHeight: 44, alignment: .leading)
+            .background(ConstantsAppColors.homePanelBackground.opacity(0.92),
+                in: RoundedRectangle(cornerRadius: 8))
+            .contentShape(RoundedRectangle(cornerRadius: 8))
+        }
+        .buttonStyle(.plain)
+        .accessibilityElement(children: .combine)
+        .accessibilityHint(GlucoseForecastTexts.text("forecast.detailsAction",
+            fallback: "Show forecast information"))
+        .accessibilityValue(information.reference)
+    }
+
+    private var forecastValues: some View {
+        ForEach(information.values, id: \.self) { Text($0).fixedSize() }
+    }
+}
+
+struct RootHomeForecastInformationView: View {
+    let information: RootHomeForecastInformation
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(information.kind).font(.headline).foregroundStyle(.cyan)
+                        if !information.reference.isEmpty {
+                            Text(information.reference).foregroundStyle(.secondary)
+                        }
+                    }
+                    if let status = information.status {
+                        Text(status)
+                    }
+                    if !information.values.isEmpty {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text(GlucoseForecastTexts.text("forecast.futureValues",
+                                fallback: "Estimated values")).font(.headline)
+                            ForEach(information.values, id: \.self) {
+                                Text("\($0) \(information.unit)").monospacedDigit()
+                            }
+                        }
+                    }
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(GlucoseForecastTexts.text("forecast.parametersLabel",
+                            fallback: "Calculation inputs")).font(.headline)
+                        Text(information.source)
+                        Text(GlucoseForecastTexts.text("forecast.noNewTreatments",
+                            fallback: "The estimate assumes no new meals or treatments."))
+                    }
+                    if information.isML {
+                        Text(GlucoseForecastTexts.text("forecast.pointwise80Explanation",
+                            fallback: "The band targets 80% coverage at +30, +60 and +120 min. This applies at each time, not to the whole curve, and does not guarantee protection from low glucose."))
+                        Text(GlucoseForecastTexts.text("forecast.pointwise80Target",
+                            fallback: "80% target at +30/+60/+120 min; intermediate widths are interpolated"))
+                            .font(.footnote).foregroundStyle(.secondary)
+                    }
+                    if information.isLongHorizon {
+                        Text("+120 min · " + GlucoseForecastTexts.uncertain)
+                            .foregroundStyle(.secondary)
+                    }
+                    if information.hasPlannedMeal {
+                        Text("🍽 " + GlucoseForecastTexts.text("forecast.plannedConditional",
+                            fallback: "If eaten · conditional engine estimate"))
+                            .foregroundStyle(.orange)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding()
+            }
+            .navigationTitle(GlucoseForecastTexts.text("forecast.detailsTitle",
+                fallback: "About the forecast"))
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(Texts_Common.dismiss) { dismiss() }
+                }
+            }
+        }
+        .presentationDetents([.medium, .large])
+    }
+}
+
 /// Main interactive chart with loading state and the reading shown at the panned end date.
 struct RootHomeMainChartView: View {
     @AppStorage(UserDefaults.Key.targetMarkValue.rawValue) private var targetValueInMgDl = 0.0
@@ -57,6 +190,7 @@ struct RootHomeMainChartView: View {
     @State private var stagedTherapySeries: TherapyChartSeries?
     @State private var stagedForecastRevision: Int?
     @State private var stagedTreatmentRevision: Int?
+    @State private var forecastInformation: RootHomeForecastInformation?
     // Hide curves immediately and cancel pending chart work when Treatments is off.
     private var displayedTherapySeries: TherapyChartSeries {
         guard completeTherapySourceSignature == therapySourceSignature,
@@ -183,10 +317,10 @@ struct RootHomeMainChartView: View {
 
                 if forecastHorizonMinutes != 0 {
                     forecastBadge
+                        .frame(maxWidth: max(0, geometry.size.width - 55), alignment: .leading)
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                         .padding(.leading, 7)
                         .padding(.top, 5)
-                        .allowsHitTesting(false)
                 }
 
                 if rangeOverlay.value {
@@ -324,54 +458,37 @@ struct RootHomeMainChartView: View {
         .onDisappear {
             rangeOverlay.cancel()
         }
+        .sheet(item: $forecastInformation) { information in
+            RootHomeForecastInformationView(information: information)
+        }
     }
 
     private var forecastBadge: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            if let forecastResult, forecastResult.reason == nil {
-                Text("\(forecastKind) · \(forecastSource(forecastResult.parameterSource)) · \(forecastUnit)" +
-                     (forecastHorizonMinutes == 120 ? " · \(GlucoseForecastTexts.uncertain)" : ""))
-                    .fontWeight(.semibold)
-                HStack(spacing: 6) {
-                    if let referenceDate = forecastResult.referenceDate {
-                        Text(GlucoseForecastTexts.basedOnShort(referenceDate))
-                    }
-                    if forecastIsUpdating {
-                        Text(GlucoseForecastTexts.text("forecast.updating", fallback: "Updating…"))
-                    } else {
-                        Text("+30 \(forecastValue(at: 30, from: forecastResult))")
-                        Text("+60 \(forecastValue(at: 60, from: forecastResult))")
-                        if forecastHorizonMinutes == 120 {
-                            Text("+120 \(forecastValue(at: 120, from: forecastResult))")
-                        }
-                    }
-                }
-                if isMLForecast {
-                    Text(GlucoseForecastTexts.text("forecast.pointwise80Target",
-                                                   fallback: "80% target at +30/+60/+120 min; intermediate widths are interpolated"))
-                        .foregroundStyle(ConstantsAppColors.secondaryText)
-                }
-                if conditionalPlannedForecastPoints?.isEmpty == false {
-                    Text("🍽 Hvis spist · betinget motorprognose")
-                        .foregroundStyle(.orange)
-                }
-            } else {
-                Text(GlucoseForecastTexts.estimate)
-                    .fontWeight(.semibold)
-                Text(forecastResult?.reason.map(GlucoseForecastTexts.unavailable) ?? GlucoseForecastTexts.calculating)
-                    .foregroundStyle(ConstantsAppColors.secondaryText)
-            }
+        let information = currentForecastInformation
+        return RootHomeForecastBadge(information: information) {
+            forecastInformation = information
         }
-        .font(.system(size: 11))
-        .lineLimit(1)
-        .minimumScaleFactor(0.9)
-        .foregroundStyle(Color.cyan)
-        .padding(.horizontal, 7)
-        .padding(.vertical, 5)
-        .background(ConstantsAppColors.homePanelBackground.opacity(0.92),
-                    in: RoundedRectangle(cornerRadius: 7))
-        .accessibilityElement(children: .combine)
-        .accessibilityValue(forecastResult?.referenceDate.map(GlucoseForecastTexts.basedOnReading) ?? "")
+    }
+
+    private var currentForecastInformation: RootHomeForecastInformation {
+        let result = forecastResult
+        let available = result?.reason == nil && result != nil
+        let status: String? = !available
+            ? result?.reason.map(GlucoseForecastTexts.unavailable) ?? GlucoseForecastTexts.calculating
+            : forecastIsUpdating
+                ? GlucoseForecastTexts.text("forecast.updating", fallback: "Updating…") : nil
+        let horizons = forecastHorizonMinutes == 120 ? [30, 60, 120] : [30, 60]
+        return RootHomeForecastInformation(
+            kind: available ? forecastKind : GlucoseForecastTexts.estimate,
+            unit: forecastUnit,
+            reference: result?.referenceDate.map(GlucoseForecastTexts.basedOnReading) ?? "",
+            source: forecastSource(result?.parameterSource),
+            values: available && !forecastIsUpdating ? result.map { result in
+                horizons.map { "+\($0) \(forecastValue(at: $0, from: result))" }
+            } ?? [] : [],
+            status: status, isML: isMLForecast,
+            hasPlannedMeal: conditionalPlannedForecastPoints?.isEmpty == false,
+            isLongHorizon: forecastHorizonMinutes == 120)
     }
 
     private var forecastKind: String {
@@ -387,7 +504,7 @@ struct RootHomeMainChartView: View {
     private func forecastValue(at minutes: Int, from result: GlucoseForecastResult) -> String {
         guard let value = GlucoseForecastMLPresentation.value(atMinutes: minutes, in: result),
               value.isFinite else { return "–" }
-        return value.mgDlToMmolAndToString(mgDl: UserDefaults.standard.bloodGlucoseUnitIsMgDl)
+        return RootHomeNumberFormatting.glucose(value, isMgDl: UserDefaults.standard.bloodGlucoseUnitIsMgDl)
     }
 
     private func forecastSource(_ source: GlucoseForecastParameterSource?) -> String {

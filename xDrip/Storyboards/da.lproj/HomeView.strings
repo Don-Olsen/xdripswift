@@ -21,7 +21,7 @@
 "notknown" = "Not Known";
 "lastconnection" = "Last Connection";
 "transmitterbatterylevel" = "Transmitter Battery Level";
-"ago" = "ago";
+"ago" = "siden";
 "home_lastReadingAgeFormat" = "Sidst målt: %d min";
 "licenseinfo" = "This program is free software distributed under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or any later version.\r\n\nThis program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY.\r\n\nSee http://www.gnu.org/licenses/gpl.txt for more details.\r\n\r\nInfo: ";
 "info" = "Please Read";
@@ -183,3 +183,6 @@
 "noSensorCodeSelectedMessage" = "Hvis en sensorsession allerede kører på senderen, bruger appen den session med dens eksisterende kalibreringskrav.\n\nEn ny session uden kode kræver kalibreringer efter opvarmning og derefter med jævne mellemrum. Disse krav forsvinder ikke, når appens kalibreringspåmindelse slås fra.";
 "showHideGlucoseChartTitle" = "Graf";
 "showHideAdditionalItemsTitle" = "Alarmer og tale";
+
+"home_insulinUnit" = "E";
+"home_insulinRateUnit" = "E/t";
