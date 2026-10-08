@@ -82,6 +82,18 @@ struct MealPlanMetadata: Codable, Equatable {
     func replace(_ metadata: MealPlanMetadata) throws {
         let url = try fileURL(for: metadata.mealUUID)
         do {
+            // Reconciliation often yields the same saved values. Keep the existing durable
+            // file only when its protection is also complete; a partial write must be repaired.
+            if let saved = try? self.metadata(for: metadata.mealUUID), saved == metadata,
+               let directoryAttributes = try? fileManager.attributesOfItem(atPath: directory.path),
+               directoryAttributes[.protectionKey] as? FileProtectionType ==
+                    .completeUntilFirstUserAuthentication,
+               let fileAttributes = try? fileManager.attributesOfItem(atPath: url.path),
+               fileAttributes[.protectionKey] as? FileProtectionType ==
+                    .completeUntilFirstUserAuthentication {
+                return
+            }
+
             try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
             try fileManager.setAttributes([.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
                                           ofItemAtPath: directory.path)

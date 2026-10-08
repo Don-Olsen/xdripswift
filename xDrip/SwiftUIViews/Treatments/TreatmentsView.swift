@@ -237,6 +237,11 @@ struct TreatmentsListView: View {
             ) { _ in
                 viewModel.handleUserDefaultsDidChange()
             }
+            .onReceive(
+                NotificationCenter.default.publisher(for: TherapyMetricsManager.changed).receive(on: RunLoop.main)
+            ) { _ in
+                viewModel.handleTherapyMetricsChanged()
+            }
         }
     }
 

@@ -36,7 +36,9 @@ class CleanupTests(unittest.TestCase):
         self.previous = self.make_release("100")
         self.current = self.make_release("101")
         self.write(self.root / "build/release-automation/active.json", {"version":"7.1.1", "build":"101"})
-        self.patches = [mock.patch.object(c, "idle"), mock.patch.object(c, "ensure_unopened"),
+        # Keep storage inventory in the synthetic fixture, not the host's build area.
+        self.patches = [mock.patch.object(c.Path, "home", return_value=self.root / "synthetic-home"),
+                        mock.patch.object(c, "idle"), mock.patch.object(c, "ensure_unopened"),
                         mock.patch.object(c, "build_lock", contextlib.nullcontext)]
         for patch in self.patches:
             patch.start(); self.addCleanup(patch.stop)
@@ -78,6 +80,21 @@ class CleanupTests(unittest.TestCase):
 
     def manifest(self, r):
         return {str(p.relative_to(r)):p.read_bytes() for p in r.rglob("*") if p.is_file()}
+
+    def external_signing(self, release=None):
+        release = release or self.old
+        temporary = tempfile.TemporaryDirectory(dir=self.root.parent)
+        self.addCleanup(temporary.cleanup)
+        external = Path(temporary.name) / "signing"
+        (release / "build").rename(external)
+        (release / "build").symlink_to(external, target_is_directory=True)
+        (external / "verification").mkdir()
+        (release / "verify").symlink_to(external / "verification", target_is_directory=True)
+        state_path = release / "release-state.json"
+        state = json.loads(state_path.read_text())
+        state["signingOutputRoot"] = str(external)
+        self.write(state_path, state)
+        return external
 
     def test_apply_removes_only_cache_and_preserves_current_and_evidence(self):
         current=self.manifest(self.current); before=self.manifest(self.old)
@@ -122,6 +139,178 @@ class CleanupTests(unittest.TestCase):
         self.assertEqual(c.cleanup(self.root, self.client, True)["deletedFiles"], 0)
         self.assertTrue(all("reason" in json.loads(line) for line in
                             (Path(result["reportPath"]).parent / "deleted.jsonl").read_text().splitlines()))
+
+    def test_approved_external_verify_link_reclaims_cache_and_exact_ipa_copy(self):
+        external = self.external_signing()
+        ipa = self.old / "build/export/xdrip.ipa"
+        with zipfile.ZipFile(ipa, "w") as package:
+            package.writestr("Payload/xdrip.app/xdrip", b"signed binary")
+        state_path = self.old / "release-state.json"
+        state = json.loads(state_path.read_text())
+        state["ipaSha256"] = c.hash_file(ipa)
+        self.write(state_path, state)
+        copy = external / "verification/ipa-fixture/Payload/xdrip.app/xdrip"
+        copy.parent.mkdir(parents=True)
+        copy.write_bytes(b"signed binary")
+        previous = self.manifest(self.previous)
+        current = self.manifest(self.current)
+        dry = c.cleanup(self.root, self.client)
+        self.assertEqual(dry["status"], "dry-run")
+        self.assertTrue(self.cache().exists())
+        self.assertTrue(copy.exists())
+        self.assertTrue(any(row["build"] == "99" for row in dry["candidates"]))
+        result = c.cleanup(self.root, self.client, True)
+        self.assertEqual(result["deletedFiles"], 5)
+        self.assertFalse(self.cache().exists())
+        self.assertFalse(copy.exists())
+        self.assertTrue((self.old / "verify").is_symlink())
+        self.assertTrue(ipa.is_file())
+        self.assertTrue((self.old / "build/archive/xdrip.xcarchive/dSYMs").is_dir())
+        self.assertTrue((self.old / "test/results/AllTests.xcresult").is_dir())
+        self.assertEqual(self.manifest(self.previous), previous)
+        self.assertEqual(self.manifest(self.current), current)
+        self.assertEqual(result["gitBefore"], result["gitAfter"])
+        self.assertEqual(c.cleanup(self.root, self.client, True)["deletedFiles"], 0)
+
+    def test_external_verify_link_rejects_other_target_and_extra_redirect(self):
+        external = self.external_signing()
+        verify = self.old / "verify"
+        other = external.parent / "other-verification"
+        other.mkdir()
+        redirect = external.parent / "redirect"
+        redirect.symlink_to(external / "verification", target_is_directory=True)
+        for target in (other, redirect):
+            verify.unlink()
+            verify.symlink_to(target, target_is_directory=True)
+            result = c.cleanup(self.root, self.client, True)
+            self.assertEqual(result["deletedFiles"], 0)
+            self.assertTrue(self.cache().exists())
+            self.assertTrue(any(row["path"] == str(self.old)
+                                and row["reason"] == "Unknown verify root" for row in result["kept"]))
+
+    def test_external_verify_link_rejects_redirected_or_missing_target_directory(self):
+        external = self.external_signing()
+        verification = external / "verification"
+        verification.rmdir()
+        other = external.parent / "other-verification"
+        other.mkdir()
+        verification.symlink_to(other, target_is_directory=True)
+        self.assertEqual(c.cleanup(self.root, self.client, True)["deletedFiles"], 0)
+        self.assertTrue(self.cache().exists())
+        verification.unlink()
+        with self.assertRaisesRegex(c.CleanupBlocked, "Broken release output link"):
+            c.cleanup(self.root, self.client, True)
+        self.assertTrue(self.cache().exists())
+
+    def test_verify_link_without_approved_external_build_is_rejected(self):
+        verification = self.old / "build/verification"
+        verification.mkdir()
+        (self.old / "verify").symlink_to(verification, target_is_directory=True)
+        result = c.cleanup(self.root, self.client, True)
+        self.assertEqual(result["deletedFiles"], 0)
+        self.assertTrue(self.cache().exists())
+        self.assertTrue(any(row["path"] == str(self.old)
+                            and row["reason"] == "Unknown verify root" for row in result["kept"]))
+
+    def test_external_verify_link_does_not_enter_current_build(self):
+        external = self.external_signing(self.current)
+        old_build = self.old / "build"
+        old_build.rename(self.old / "preserved-output")
+        old_build.symlink_to(external, target_is_directory=True)
+        verify = self.old / "verify"
+        verify.symlink_to(external / "verification", target_is_directory=True)
+        state_path = self.old / "release-state.json"
+        state = json.loads(state_path.read_text())
+        state["signingOutputRoot"] = str(external)
+        self.write(state_path, state)
+        result = c.cleanup(self.root, self.client, True)
+        self.assertEqual(result["deletedFiles"], 0)
+        self.assertTrue(self.cache().exists())
+        self.assertTrue(any(row["path"] == str(self.old)
+                            and row["reason"] == "Verify root overlaps protected build"
+                            for row in result["kept"]))
+
+    def test_external_verify_link_keeps_release_on_ipa_copy_mismatch(self):
+        external = self.external_signing()
+        ipa = self.old / "build/export/xdrip.ipa"
+        with zipfile.ZipFile(ipa, "w") as package:
+            package.writestr("Payload/xdrip.app/xdrip", b"original")
+        state_path = self.old / "release-state.json"
+        state = json.loads(state_path.read_text())
+        state["ipaSha256"] = c.hash_file(ipa)
+        self.write(state_path, state)
+        copy = external / "verification/ipa-fixture/Payload/xdrip.app/xdrip"
+        copy.parent.mkdir(parents=True)
+        copy.write_bytes(b"different")
+        result = c.cleanup(self.root, self.client, True)
+        self.assertEqual(result["deletedFiles"], 0)
+        self.assertTrue(self.cache().exists())
+        self.assertEqual(copy.read_bytes(), b"different")
+
+    def test_external_signing_link_cannot_target_repo_or_ancestor(self):
+        out = self.old / "build"
+        out.rename(self.old / "preserved-output")
+        state_path = self.old / "release-state.json"
+        state = json.loads(state_path.read_text())
+        for target in (self.root, self.root.parent):
+            out.symlink_to(target, target_is_directory=True)
+            state["signingOutputRoot"] = str(target)
+            self.write(state_path, state)
+            candidates, kept = c.release_candidates(
+                self.root, json.loads((self.current / "release-state.json").read_text()))
+            self.assertFalse(any(row["build"] == "99" for row in candidates))
+            self.assertTrue(self.cache().exists())
+            self.assertTrue(any(row["path"] == str(self.old)
+                                and row["reason"] == "Unknown external signing output"
+                                for row in kept))
+            out.unlink()
+
+    def test_external_release_link_change_after_planning_blocks_first_unlink(self):
+        external = self.external_signing()
+        verify = self.old / "verify"
+        other = external.parent / "other-verification"
+        other.mkdir()
+        original = c.preservation_inventory
+        changed = False
+        def retarget_after_inventory(*args, **kwargs):
+            nonlocal changed
+            value = original(*args, **kwargs)
+            if not changed:
+                verify.unlink()
+                verify.symlink_to(other, target_is_directory=True)
+                changed = True
+            return value
+        with mock.patch.object(c, "preservation_inventory", side_effect=retarget_after_inventory):
+            with self.assertRaisesRegex(c.CleanupBlocked, "Release link changed"):
+                c.cleanup(self.root, self.client, True)
+        self.assertTrue(self.cache().exists())
+
+    def test_external_release_link_change_during_apply_stops_next_unlink(self):
+        external = self.external_signing()
+        build_link = self.old / "build"
+        other = external.parent / "other-signing"
+        other.mkdir()
+        paths = [self.old / "test/DerivedData/all-tests" / relative for relative in (
+            "ModuleCache.noindex/test.pcm", "Index.noindex/DataStore/records/index-record",
+            "Build/Intermediates.noindex/temp.o", "Build/Products/app.app/binary")]
+        original = c.safe_unlink
+        changed = False
+        def retarget_after_first_unlink(item):
+            nonlocal changed
+            original(item)
+            if not changed:
+                build_link.unlink()
+                build_link.symlink_to(other, target_is_directory=True)
+                changed = True
+        with mock.patch.object(c, "safe_unlink", side_effect=retarget_after_first_unlink):
+            with self.assertRaisesRegex(c.CleanupBlocked, "Release link changed"):
+                c.cleanup(self.root, self.client, True)
+        self.assertEqual(sum(not path.exists() for path in paths), 1)
+        reports = sorted((self.root / "build/release-automation/cleanup").glob("*/report.json"))
+        self.assertTrue(reports)
+        report = json.loads(reports[-1].read_text())
+        self.assertEqual(report["status"], "stopped")
+        self.assertEqual(report["deletedFiles"], 1)
 
     def test_mismatched_ipa_copy_preserves_entire_old_release(self):
         ipa = self.old / "build/export/xdrip.ipa"

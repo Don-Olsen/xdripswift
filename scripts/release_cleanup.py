@@ -240,6 +240,16 @@ def verified_extraction(extracted, ipa):
                           "reason": "byte-identical expanded copy of retained IPA"})
     return files
 
+def confirm_release_links(candidates):
+    """Keep approved external release links fixed until each cache unlink."""
+    for candidate in candidates:
+        for link in candidate.get("releaseLinks", ()):
+            path, target = Path(link["path"]), Path(link["target"])
+            require(path.is_symlink() and fingerprint(path) == link["fingerprint"]
+                    and Path(os.readlink(path)) == target and path.resolve() == target
+                    and target.is_dir() and not target.is_symlink(),
+                    "Release link changed during cleanup")
+
 def release_candidates(root, current):
     candidates, kept = [], []
     completed_prior = []
@@ -279,9 +289,19 @@ def release_candidates(root, current):
             require(command(["git", "rev-parse", "refs/tags/" + s["tag"] + "^{}"], root).strip()
                     == s["checkpoint"], "Source tag does not match")
             out = folder / "build"
+            external_output = None
+            release_links = []
             if out.is_symlink():
-                require(out.resolve() == Path(s.get("signingOutputRoot", ""))
-                        and root not in out.resolve().parents, "Unknown external signing output")
+                external_output = out.resolve()
+                require(external_output == Path(s.get("signingOutputRoot", ""))
+                        and external_output != root and root not in external_output.parents
+                        and external_output not in root.parents,
+                        "Unknown external signing output")
+                require(Path(os.readlink(out)) == external_output
+                        and external_output.is_dir() and not external_output.is_symlink(),
+                        "Unknown external signing output")
+                release_links.append({"path": str(out), "target": str(external_output),
+                                      "fingerprint": fingerprint(out)})
             else:
                 require(out.is_dir(), "Missing build output")
             ipa, archive = out / "export/xdrip.ipa", out / "archive/xdrip.xcarchive"
@@ -302,11 +322,23 @@ def release_candidates(root, current):
                 require(not any(real == p or p in real.parents or real in p.parents for p in protected),
                         "DerivedData overlaps a protected build")
                 local.append({"build": s["build"], "path": str(real),
-                              "files": scan_derived(real) + scan_generated_products(real)})
+                              "files": scan_derived(real) + scan_generated_products(real),
+                              "releaseLinks": release_links})
             extraction_roots = [out / "export-verification"]
             verify_root = folder / "verify"
-            if verify_root.exists():
-                require(verify_root.is_dir() and not verify_root.is_symlink(), "Unknown verify root")
+            if verify_root.exists() or verify_root.is_symlink():
+                if verify_root.is_symlink():
+                    # The release exporter may link verify to the same approved
+                    # external signing output. Accept only that direct target.
+                    expected = external_output / "verification" if external_output else None
+                    require(expected is not None and Path(os.readlink(verify_root)) == expected
+                            and expected.is_dir() and not expected.is_symlink(), "Unknown verify root")
+                    require(not any(expected == p or p in expected.parents or expected in p.parents
+                                    for p in protected), "Verify root overlaps protected build")
+                    release_links.append({"path": str(verify_root), "target": str(expected),
+                                          "fingerprint": fingerprint(verify_root)})
+                else:
+                    require(verify_root.is_dir(), "Unknown verify root")
                 extraction_roots += sorted(verify_root.glob("ipa-*"))
             for extracted in extraction_roots:
                 if not extracted.exists():
@@ -317,7 +349,8 @@ def release_candidates(root, current):
                 require(not any(real == p or p in real.parents or real in p.parents for p in protected),
                         "IPA extraction overlaps protected build")
                 local.append({"build": s["build"], "path": str(real),
-                              "files": verified_extraction(real, ipa)})
+                              "files": verified_extraction(real, ipa),
+                              "releaseLinks": release_links})
             candidates.extend(local)
         except (CleanupBlocked, OSError, ValueError, KeyError, zipfile.BadZipFile) as e:
             kept.append({"path": str(folder), "reason": str(e)})
@@ -495,6 +528,7 @@ def cleanup(root, client, apply=False):
         candidates.extend(local)
         kept.extend(local_kept)
         local_outputs = [Path(c["outputRoot"]) for c in local]
+        confirm_release_links(candidates)
         usage_before = build_area_usage(root, before, local_outputs)
         files = [f for c in candidates for f in c["files"]]
         targets = {f["path"] for f in files}
@@ -509,6 +543,7 @@ def cleanup(root, client, apply=False):
         require(git_snapshot(root) == before, "Git changed during planning")
         require(read_json(root / "build/release-automation/active.json") == active, "Active release changed")
         confirm_local_receipts(candidates)
+        confirm_release_links(candidates)
         for f in files:
             require(fingerprint(Path(f["path"])) == f["fingerprint"], "Cache changed during planning")
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
@@ -526,6 +561,7 @@ def cleanup(root, client, apply=False):
         try:
             if apply:
                 # Full planning gates finish before first unlink. Recheck between roots and batches.
+                confirm_release_links(candidates)
                 with (report_dir / "deleted.jsonl").open("x") as journal:
                     for c in candidates:
                         if not c["files"]:
@@ -533,9 +569,11 @@ def cleanup(root, client, apply=False):
                         idle()
                         ensure_unopened([c["path"]])
                         confirm_local_receipts([c])
+                        confirm_release_links([c])
                         for i, f in enumerate(c["files"]):
                             if i % 1000 == 0:
                                 idle()
+                            confirm_release_links([c])
                             safe_unlink(f)
                             journal.write(json.dumps({"path": f["path"], "allocatedBytes": f["allocatedBytes"],
                                                       "reason": f.get("reason", "rebuildable compiler cache")}) + "\n")

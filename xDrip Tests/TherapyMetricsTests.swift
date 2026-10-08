@@ -2318,3 +2318,164 @@ private actor DelayedPenDoseSnapshotFeed {
             viewModel.calculation?.safety.map(PenDoseCalculatorViewModel.safetyMessage))
     }
 }
+
+final class TreatmentListRefreshTests: XCTestCase {
+    @MainActor private func withListDefaults(_ body: () throws -> Void) rethrows {
+        let defaults = UserDefaults.standard
+        let flags = ["showSmallBolusTreatmentsInList", "showBolusTreatmentsInList",
+            "showCarbsTreatmentsInList", "showBasalTreatmentsInList", "showBgCheckTreatmentsInList",
+            "showBasalInjectionTreatmentsInList", "showNoteTreatmentsInList"]
+        let keys = flags + ["smallBolusTreatmentThreshold", "bloodGlucoseUnitIsMgDl",
+            "quickCarbohydrateGrams", TreatmentSourceCutover.defaultsKey,
+            "healthTherapyImport.v1.insulin.enabled", "healthTherapyImport.v1.insulin.sourceBundleID",
+            "healthTherapyImport.v1.carbohydrates.enabled", "healthTherapyImport.v1.carbohydrates.sourceBundleID",
+            "timeStampLatestNightscoutSyncRequest"]
+        let saved = keys.map { defaults.object(forKey: $0) }
+        defer {
+            for (key, value) in zip(keys, saved) {
+                if let value { defaults.set(value, forKey: key) }
+                else { defaults.removeObject(forKey: key) }
+            }
+        }
+        defaults.showSmallBolusTreatmentsInList = true
+        defaults.showBolusTreatmentsInList = true
+        defaults.showCarbsTreatmentsInList = true
+        defaults.showBasalTreatmentsInList = true
+        defaults.showBgCheckTreatmentsInList = true
+        defaults.showBasalInjectionTreatmentsInList = true
+        defaults.showNoteTreatmentsInList = true
+        defaults.quickCarbohydrateGrams = nil
+        defaults.removeObject(forKey: TreatmentSourceCutover.defaultsKey)
+        try body()
+    }
+
+    @MainActor func testUnrelatedDefaultsAndStatusNeverReloadOrPublishTheList() throws {
+        try withListDefaults {
+            let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+            let metrics = TherapyMetricsManager()
+            let list = TreatmentsViewModel(coreDataManager: core, therapyMetricsManager: metrics)
+            list.initializeViewIfNeeded()
+            var publications = 0
+            let subscription = list.$filteredTreatments.dropFirst().sink { _ in publications += 1 }
+            defer { subscription.cancel() }
+            for index in 0..<20 {
+                UserDefaults.standard.timeStampLatestNightscoutSyncRequest = Date(timeIntervalSince1970: Double(index))
+                list.handleUserDefaultsDidChange()
+                metrics.invalidate(treatmentsChanged: false)
+                list.handleTherapyMetricsChanged()
+            }
+            XCTAssertEqual(publications, 0, "No history fetch/reconciliation/publication for unrelated defaults or glucose/status changes")
+
+            // Returning to the tab still performs its established explicit refresh.
+            _ = TreatmentEntry(date: Date(), value: 1, treatmentType: .BasalInjection,
+                nightscoutEventType: nil, enteredBy: "Test", nsManagedObjectContext: core.mainManagedObjectContext)
+            XCTAssertTrue(core.saveChangesSynchronously())
+            list.initializeViewIfNeeded()
+            XCTAssertEqual(list.filteredTreatments.count, 1)
+            XCTAssertGreaterThan(publications, 0)
+        }
+    }
+
+    @MainActor func testRelevantFiltersUnitsAndQuickCarbsStillRefresh() throws {
+        try withListDefaults {
+            let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+            _ = TreatmentEntry(date: Date(), value: 1, treatmentType: .BasalInjection,
+                nightscoutEventType: nil, enteredBy: "Test", nsManagedObjectContext: core.mainManagedObjectContext)
+            XCTAssertTrue(core.saveChangesSynchronously())
+            let list = TreatmentsViewModel(coreDataManager: core)
+            list.reloadTreatments()
+            XCTAssertEqual(list.filteredTreatments.count, 1)
+            UserDefaults.standard.showBasalInjectionTreatmentsInList = false
+            list.handleUserDefaultsDidChange()
+            XCTAssertTrue(list.filteredTreatments.isEmpty)
+            UserDefaults.standard.showBasalInjectionTreatmentsInList = true
+            list.handleUserDefaultsDidChange()
+            XCTAssertEqual(list.filteredTreatments.count, 1)
+            var publications = 0
+            let subscription = list.$filteredTreatments.dropFirst().sink { _ in publications += 1 }
+            defer { subscription.cancel() }
+            UserDefaults.standard.bloodGlucoseUnitIsMgDl.toggle()
+            list.handleUserDefaultsDidChange()
+            XCTAssertGreaterThan(publications, 0)
+            let beforeQuickCarbs = publications
+            UserDefaults.standard.quickCarbohydrateGrams = 17
+            list.handleUserDefaultsDidChange()
+            XCTAssertGreaterThan(publications, beforeQuickCarbs)
+            let afterChanges = publications
+            list.handleUserDefaultsDidChange()
+            XCTAssertEqual(publications, afterChanges)
+        }
+    }
+
+    @MainActor func testHealthSourceSelectionAndCutoverStillChangeEligibleRows() throws {
+        try withListDefaults {
+            let defaults = UserDefaults.standard
+            defaults.set(true, forKey: "healthTherapyImport.v1.insulin.enabled")
+            defaults.set("test.source.a", forKey: "healthTherapyImport.v1.insulin.sourceBundleID")
+            let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+            let at = Date().addingTimeInterval(-30)
+            let first = TreatmentEntry(date: at, value: 1, treatmentType: .Insulin,
+                nightscoutEventType: nil, enteredBy: "Test", nsManagedObjectContext: core.mainManagedObjectContext)
+            first.healthKitSampleUUID = UUID().uuidString
+            first.healthKitSourceBundleIdentifier = "test.source.a"
+            let second = TreatmentEntry(date: at, value: 2, treatmentType: .Insulin,
+                nightscoutEventType: nil, enteredBy: "Test", nsManagedObjectContext: core.mainManagedObjectContext)
+            second.healthKitSampleUUID = UUID().uuidString
+            second.healthKitSourceBundleIdentifier = "test.source.b"
+            XCTAssertTrue(core.saveChangesSynchronously())
+            let list = TreatmentsViewModel(coreDataManager: core)
+            list.reloadTreatments()
+            XCTAssertEqual(list.filteredTreatments.map(\.rawValue), [1])
+            defaults.set("test.source.b", forKey: "healthTherapyImport.v1.insulin.sourceBundleID")
+            list.handleUserDefaultsDidChange()
+            XCTAssertEqual(list.filteredTreatments.map(\.rawValue), [2])
+            defaults.set(false, forKey: "healthTherapyImport.v1.insulin.enabled")
+            list.handleUserDefaultsDidChange()
+            XCTAssertTrue(list.filteredTreatments.isEmpty)
+            XCTAssertTrue(TreatmentSourceCutover.persist(.init(cutoff: Date(),
+                insulinSourceBundleID: "test.source.a", carbohydrateSourceBundleID: "test.carbs")))
+            list.handleUserDefaultsDidChange()
+            XCTAssertEqual(list.filteredTreatments.map(\.rawValue), [1], "Stored pre-cutover history remains visible with ongoing import off")
+        }
+    }
+
+    @MainActor func testRealTreatmentCommitsRefreshWithoutAnyDefaultsWrite() throws {
+        try withListDefaults {
+            let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+            let metrics = TherapyMetricsManager()
+            metrics.configure(coreDataManager: core, externalStatus: { nil })
+            let list = TreatmentsViewModel(coreDataManager: core, therapyMetricsManager: metrics)
+            list.reloadTreatments()
+            let notifications = NotificationCenter.default.publisher(for: TherapyMetricsManager.changed)
+                .receive(on: RunLoop.main).sink { _ in list.handleTherapyMetricsChanged() }
+            defer { notifications.cancel() }
+            let entry = TreatmentEntry(date: Date(), value: 1, treatmentType: .BasalInjection,
+                nightscoutEventType: nil, enteredBy: "Test", nsManagedObjectContext: core.mainManagedObjectContext)
+            try core.mainManagedObjectContext.save()
+            XCTAssertTrue(metrics.hasUncommittedTreatmentChanges)
+            list.handleTherapyMetricsChanged()
+            XCTAssertTrue(list.filteredTreatments.isEmpty, "An unfinished parent commit must not publish")
+            let inserted = expectation(description: "inserted treatment reaches list")
+            let insertObserver = list.$filteredTreatments.first(where: { $0.count == 1 }).sink { _ in inserted.fulfill() }
+            XCTAssertTrue(core.saveChangesSynchronously())
+            wait(for: [inserted], timeout: 3)
+            insertObserver.cancel()
+            XCTAssertFalse(metrics.hasUncommittedTreatmentChanges)
+
+            let edited = expectation(description: "edited treatment reaches list")
+            let editObserver = list.$filteredTreatments.first(where: { $0.first?.rawValue == 2 }).sink { _ in edited.fulfill() }
+            entry.value = 2
+            XCTAssertTrue(core.saveChangesSynchronously())
+            wait(for: [edited], timeout: 3)
+            editObserver.cancel()
+
+            let deleted = expectation(description: "deleted treatment leaves list")
+            let deleteObserver = list.$filteredTreatments.first(where: { $0.isEmpty }).sink { _ in deleted.fulfill() }
+            entry.treatmentdeleted = true
+            XCTAssertTrue(core.saveChangesSynchronously())
+            wait(for: [deleted], timeout: 3)
+            deleteObserver.cancel()
+            XCTAssertTrue(list.filteredTreatments.isEmpty)
+        }
+    }
+}

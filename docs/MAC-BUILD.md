@@ -184,7 +184,12 @@ XCArchive/dSYMs, XCResult og Apple-status. Fejlede, uafsluttede, ukendte og
 uregistrerede historiske lokale buildmapper samt andre worktrees og globale
 Xcode-caches ryddes ikke automatisk. Registrerede lokale testcaches behandles
 separat efter reglerne nedenfor i den samme oprydningsmekanisme. Et tidligere eksternt signeringsoutput accepteres kun,
-når build-linket matcher den registrerede sti og ikke overlapper et beskyttet build.
+når build-linket matcher den registrerede sti og ikke overlapper et beskyttet build
+eller kildekataloget. Ældre releases kan have et `verify`-link; kun et direkte
+link til `verification` under samme godkendte eksterne signeringsoutput
+accepteres. Andre mål, manglende mål, ekstra linkled og overlap afvises.
+De godkendte links kontrolleres igen før og under sletningen. Dette ændrer
+ikke kravene til IPA, arkiv, testresultater eller verificeret release-status.
 
 Der slettes kun navngivne, gendannelige filer fra **ældre afsluttede** builds,
 aldrig hele DerivedData: compiler-/SDK-moduler, indeks- og compilercache samt
@@ -194,8 +199,9 @@ JSON-, plist-, database- og releaseartefakter bevares. Udvidede kopier af en IPA
 under `build/export-verification` eller `verify/ipa-*` må kun ryddes, hvis hver
 fil er byteidentisk med en fil i den bevarede, SHA-256-verificerede IPA, og der
 ikke findes ekstra filer. Derved bevares IPA, XCArchive, dSYM, XCResult, logs,
-JSON/status, kildekode og ukendte filer. Links, hardlinks og uklare stier afviser
-den pågældende release. Det aktuelle, nyere og uafsluttede build er urørt.
+JSON/status, kildekode og ukendte filer. Andre links end de udtrykkeligt
+godkendte build-/verify-links, hardlinks og uklare stier afviser den pågældende
+release. Det aktuelle, nyere og uafsluttede build er urørt.
 Derfor forsvinder DerivedData-mappen ikke nødvendigvis.
 Filidentitet, type, størrelse og ændringstid kontrolleres før sletning;
 linkantallet kontrolleres igen ved hver fil. macOS File Provider kan ændre

@@ -8,6 +8,96 @@
 - Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
 <!-- testflight-7.1.1-4308:end -->
 
+
+## Målt hovedtrådsarbejde efter 4308 — afgrænset rettelse
+
+8. oktober 2026: Time Profiler på fysisk iPhone 17 Pro Max med installeret
+7.1.1 (4308), verificeret bundle og matchende dSYM, registrerede 111
+hovedtrådspauser på mindst 250 ms under 181 sekunders måling; medianen var
+368 ms og længste interval 2,58 sekunder ved forgrundsaktivering.
+`reloadTreatments()` forekom i 82,8 % af hovedtrådssamples. En separat
+21-sekunders kontrol uden skærmbilleder viste samme sti. Sporene dokumenterer
+arbejde fra generelle UserDefaults-notifikationer gennem behandlingslisten
+og påmindelsesafstemning til synkrone metadata-skrivninger, også mens Home
+vises. Det er ikke en måling af batteriforbrug eller præcis tryk-til-ark-tid.
+Rå spor og skærmbilleder er private og ligger uden for Git.
+
+Rettelsen ændrer kun tre appfiler i behandlingsvisningen: relevante
+liste-/kildeindstillinger sammenlignes før genindlæsning; gemte behandlinger
+opdaterer listen gennem den eksisterende behandlingsrevision efter afsluttet
+commit. Glukose-/statushændelser med uændret revision genindlæser ikke listen.
+Eksisterende genindlæsning ved åbning, gemning og sletning bevares.
+Påmindelsesmetadata genskrives ikke, hvis den faktiske gemte fil er identisk
+og både mappe og fil har korrekt beskyttelse. Ændrede, manglende, beskadigede
+eller forkert beskyttede filer bruger fortsat samme atomiske skrivning og
+filsynkronisering. Journal og påmindelsestider er uændrede.
+
+Indledende validering: **1.448/1.448 XCTest-tests**, 0 fejl; alle Python-kontroller
+(166 unittest-tests) og begge syntetiske Watch-kontroller bestod. Ni nye tests
+dækker uændrede defaults, relevante filtre/enheder/kilder/skift, reelle
+indsættelser/redigeringer/sletninger med ventende parent-commit samt uændrede
+metadata, ny lagerinstans, redigering/sletning og reparation. Første forsøg
+fandt en manglende dato i testfixtures; næste fandt inverterede testfiltre og
+simulatorens manglende filbeskyttelsesattribut. Disse fixtures blev rettet;
+ingen eksisterende test blev fjernet eller svækket. Filernes indhold,
+ændringstid og inode testes på rigtig disk, mens simulatorens beskyttelses-
+attributter leveres af en isoleret FileManager-testdouble. Fysisk iOS-
+filbeskyttelse er ikke nyverificeret af simulatoren.
+
+Endelig lokal testkvittering:
+`~/DeveloperBuildData/xDrip/local-runs/xdripswift/20261008T153321Z-96347/`.
+Python: `20261008T153149Z-93762`. Nummereret release kræver som altid egne
+friske test-/buildkvitteringer; status registreres af releaseproceduren.
+
+Dosisregler, behandlingslagring/journal, prognose/ML, HealthKit, alarmer,
+Watch/Libre og genvejsrettelsen er bevaret. Den tilsluttede telefon blev
+kontrolleret læsende som 4308; ingen lokal installation eller CGM-afbrydelse.
+Før/efter-responstid og batterigevinst kræver måling efter TestFlight-opdatering.
+Reelle filterændringer og gemte importsider kan fortsat udløse en fuld
+listegenindlæsning; dette er ikke en generel historik-/databaseomlægning.
+
+## Lokal oprydning efter 4308 — 8. oktober 2026
+
+Arbejdet er udført i `~/Developer/xdripswift` fra `9c7b7ca5` på
+`integration/upstream-7.1.1`. Seks afsluttede releases (4288, 4292, 4293,
+4296, 4298 og 4299) beholdt ellers gendannelige caches, fordi oprydningen
+afviste deres direkte `verify`-link som `Unknown verify root`. Disse links
+peger på `verification` under det allerede registrerede eksterne
+signeringsoutput. Den snævre rettelse accepterer kun dette direkte mål;
+andre mål, ekstra linkled, manglende mål og overlap med beskyttede mapper
+afvises. Build-/verify-links kontrolleres igen før og under sletningen.
+IPA-indhold, releasekvitteringer, proceskontroller og fælles lås er bevaret.
+
+Den samlede `scripts/local-build.sh python` bestod: 166 unittest-tests,
+heraf **48 oprydningstests**, samt begge eksisterende Watch-selvkontroller.
+Ni nye regressionstests dækker den tilladte alias, forkerte/brudte mål,
+beskyttet overlap, ændrede links før/under sletning, afvigende IPA-indhold
+og gentagen oprydning. En første kørsel fandt en forkert forventning i den
+nye test af brudte links: den eksisterende kontrol stopper hele oprydningen.
+Testen er rettet til at kræve dette stop og bevaret cache; ingen kontrol er
+svækket. Testenes hjemmesti er isoleret til deres midlertidige fixture, så de
+ikke optæller Mac'ens rigtige centrale buildområde ved hver test.
+Endelige logs: `~/DeveloperBuildData/xDrip/local-runs/xdripswift/20261008T141411Z-81360/`.
+XCTest og simulator-/device-builds er ikke genkørt for denne Python-/docsændring.
+
+Den virkelige tørkørsel `20261008T141609.100851Z` godkendte 26.435.133.440 byte.
+`cleanup --apply` afsluttede med **183.645 slettede filer / 26,44 GB**.
+Rapporten `build/release-automation/cleanup/20261008T141830.638010Z/report.json`
+registrerer alle planlagte filer som slettet, uændret Git før/efter og identiske
+fingerprints for alle bevarede releasefiler. Målt fri plads steg 26,46 GB;
+umiddelbart efter var cirka 45,05 GB fri. 4308 og seneste tidligere release
+4307, IPA, XCArchive/dSYM, XCResult, logs, historiske checkouts og den delte
+udviklingscache er bevaret. Buildområderne fylder stadig cirka 55,22 GB;
+15-GiB-målet kan ikke nås med de nuværende bevaringsregler. Ingen yderligere
+manuel sletning, upload, installation, versionsændring eller ændring af appkode.
+
+Kildekoden ligger uden for Documents/File Provider i den aktive Developer-mappe.
+Efter brugerens ændring den 8. oktober er Codex-projektets primære mappe
+kontrolleret via appens projektliste som `/Users/donolsen/Developer/xdripswift`.
+Git-roden og branchen `integration/upstream-7.1.1` er bekræftet dér; HEAD er
+fortsat `9c7b7ca5`, og de lokale oprydningsændringer er bevaret. Historiske
+mapper og Git-object-recovery er fortsat bevaret.
+
 De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
 
 <!-- testflight-7.1.1-4307:start -->

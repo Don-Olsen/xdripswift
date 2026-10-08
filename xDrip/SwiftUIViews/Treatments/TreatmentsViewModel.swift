@@ -38,20 +38,62 @@ import OSLog
     let coreDataManager: CoreDataManager
     private let treatmentEntryAccessor: TreatmentEntryAccessor
     private let localSaveJournal: PenDoseLogJournal
+    private let therapyMetricsManager: TherapyMetricsManager
     private let localSaveOverride: (() -> Bool)?
     private let log = OSLog(subsystem: ConstantsLog.subSystem, category: ConstantsLog.categoryApplicationDataTreatments)
 
     private var allTreatments: [TreatmentSnapshot] = []
     private var didInitializeView = false
+    private var loadedTreatmentRevision: Int?
+    private var lastSettings = ListSettings()
+
+    /// Only preferences read by this list may trigger a reload. Glucose/export timestamps and
+    /// unrelated defaults are frequent; observing them must not fetch history or reconcile files.
+    private struct ListSettings: Equatable {
+        let filters: [Bool]
+        let smallBolusThreshold: Double
+        let usesMgDl: Bool
+        let quickCarbs: Double?
+        let sourcePolicy: [Bool]
+        let insulinSource: String?
+        let carbsSource: String?
+        let importsInsulin: Bool
+        let importsCarbs: Bool
+        let cutover: TreatmentSourceCutover?
+        let invalidCutover: Bool
+
+        init() {
+            let defaults = UserDefaults.standard
+            let policy = defaults.dataFlowPolicy
+            let importer = HealthKitTherapyImportManager.shared
+            filters = [defaults.showSmallBolusTreatmentsInList, defaults.showBolusTreatmentsInList,
+                defaults.showCarbsTreatmentsInList, defaults.showBasalTreatmentsInList,
+                defaults.showBgCheckTreatmentsInList, defaults.showBasalInjectionTreatmentsInList,
+                defaults.showNoteTreatmentsInList]
+            smallBolusThreshold = defaults.smallBolusTreatmentThreshold
+            usesMgDl = defaults.bloodGlucoseUnitIsMgDl
+            quickCarbs = defaults.quickCarbohydrateGrams
+            sourcePolicy = [policy.importsTherapyFromCareLink, policy.importsTreatmentsFromNightscout,
+                            policy.showsPumpData]
+            insulinSource = importer.selectedSource(.insulin)?.bundleIdentifier
+            carbsSource = importer.selectedSource(.carbohydrates)?.bundleIdentifier
+            importsInsulin = importer.isEnabled(.insulin)
+            importsCarbs = importer.isEnabled(.carbohydrates)
+            cutover = TreatmentSourceCutover.current()
+            invalidCutover = TreatmentSourceCutover.hasInvalidStoredValue()
+        }
+    }
 
     // MARK: - initialization
 
     init(coreDataManager: CoreDataManager, localSaveJournal: PenDoseLogJournal? = nil,
-         localSaveOverride: (() -> Bool)? = nil) {
+         localSaveOverride: (() -> Bool)? = nil,
+         therapyMetricsManager: TherapyMetricsManager = .shared) {
         self.coreDataManager = coreDataManager
         self.treatmentEntryAccessor = TreatmentEntryAccessor(coreDataManager: coreDataManager)
         self.localSaveJournal = localSaveJournal ?? .shared
         self.localSaveOverride = localSaveOverride
+        self.therapyMetricsManager = therapyMetricsManager
 
         updateDayName()
     }
@@ -71,6 +113,8 @@ import OSLog
 
     /// Reloads the treatment history and reapplies the current filters.
     func reloadTreatments() {
+        lastSettings = ListSettings()
+        loadedTreatmentRevision = therapyMetricsManager.treatmentChangeRevision
         syncFilterSettingsFromUserDefaults()
 
         let fetched = treatmentEntryAccessor.getLatestTreatments(howOld: nil)
@@ -130,6 +174,16 @@ import OSLog
     }
 
     func handleUserDefaultsDidChange() {
+        guard ListSettings() != lastSettings else { return }
+        reloadTreatments()
+    }
+
+    /// Data changes must not depend on an incidental defaults write. Ignore glucose-only/status
+    /// notifications and wait for the existing durable treatment commit before refreshing rows.
+    func handleTherapyMetricsChanged() {
+        guard let loadedTreatmentRevision,
+              loadedTreatmentRevision != therapyMetricsManager.treatmentChangeRevision,
+              !therapyMetricsManager.hasUncommittedTreatmentChanges else { return }
         reloadTreatments()
     }
 

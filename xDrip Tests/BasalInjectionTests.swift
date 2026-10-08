@@ -956,6 +956,159 @@ final class LocalTreatmentPlanningTests: XCTestCase {
         }
     }
 
+    @MainActor func testMealMetadataUnchangedReplacePreservesFileAcrossStoreRecreation() throws {
+        let date = Date(timeIntervalSince1970: 1_788_804_000)
+        let files = MealMetadataProtectionFileManager()
+        let directory = files.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? files.removeItem(at: directory) }
+        let metadata = MealPlanMetadata(mealUUID: UUID().uuidString, bolusUUID: UUID().uuidString,
+            loggedAt: date, plannedAt: date.addingTimeInterval(900), grams: 35,
+            pizzaSettings: PizzaSplitSettings(isEnabled: true, percentageNow: 70, reminderMinutes: 90),
+            mealKind: .slow)
+        try MealPlanMetadataStore(directory: directory, fileManager: files).stage(metadata)
+        let url = directory.appendingPathComponent("PenDose/MealPlans/\(metadata.mealUUID).json")
+        let untouchedDate = Date(timeIntervalSince1970: 1_700_000_000)
+        try files.setAttributes([.modificationDate: untouchedDate], ofItemAtPath: url.path)
+        let before = try files.attributesOfItem(atPath: url.path)
+        let bytes = try Data(contentsOf: url)
+
+        for _ in 0..<3 {
+            try MealPlanMetadataStore(directory: directory, fileManager: files).replace(metadata)
+        }
+
+        let after = try files.attributesOfItem(atPath: url.path)
+        XCTAssertEqual(after[.modificationDate] as? Date, untouchedDate)
+        XCTAssertEqual(try XCTUnwrap(after[.systemFileNumber] as? NSNumber),
+                       try XCTUnwrap(before[.systemFileNumber] as? NSNumber))
+        XCTAssertEqual(try Data(contentsOf: url), bytes)
+        XCTAssertEqual(try MealPlanMetadataStore(directory: directory, fileManager: files).metadata(for: metadata.mealUUID), metadata)
+    }
+
+    @MainActor func testMealMetadataReplacePersistsReminderFieldsOutsideLogIdentity() throws {
+        let date = Date(timeIntervalSince1970: 1_788_804_000)
+        let files = MealMetadataProtectionFileManager()
+        let directory = files.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? files.removeItem(at: directory) }
+        let store = MealPlanMetadataStore(directory: directory, fileManager: files)
+        let original = MealPlanMetadata(mealUUID: UUID().uuidString, bolusUUID: UUID().uuidString,
+            loggedAt: date, plannedAt: nil, grams: 40,
+            pizzaSettings: PizzaSplitSettings(isEnabled: true, percentageNow: 70, reminderMinutes: 90),
+            mealKind: .slow)
+        try store.stage(original)
+        var changed = original
+        changed.pizzaReminderAt = date.addingTimeInterval(120 * 60)
+        changed.pizzaReminderEligible = false
+        XCTAssertTrue(original.matchesLogAttempt(changed),
+            "A reminder edit must still persist when the original log identity is unchanged")
+
+        try store.replace(changed)
+
+        XCTAssertEqual(try MealPlanMetadataStore(directory: directory, fileManager: files).metadata(for: original.mealUUID), changed)
+    }
+
+    @MainActor func testMealMetadataReplaceReadsPersistedStateAfterRemovalOrDamage() throws {
+        let date = Date(timeIntervalSince1970: 1_788_804_000)
+        let files = MealMetadataProtectionFileManager()
+        let directory = files.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? files.removeItem(at: directory) }
+        let store = MealPlanMetadataStore(directory: directory, fileManager: files)
+        let metadata = MealPlanMetadata(mealUUID: UUID().uuidString, bolusUUID: nil,
+            loggedAt: date, plannedAt: nil, grams: 30, pizzaSettings: nil, mealKind: .normal)
+        try store.replace(metadata)
+        let url = directory.appendingPathComponent("PenDose/MealPlans/\(metadata.mealUUID).json")
+        try files.removeItem(at: url)
+        try store.replace(metadata)
+        XCTAssertEqual(try MealPlanMetadataStore(directory: directory, fileManager: files).metadata(for: metadata.mealUUID), metadata)
+
+        try Data("damaged metadata".utf8).write(to: url, options: .atomic)
+        XCTAssertThrowsError(try store.stage(metadata), "Staging must still reject unreadable existing metadata")
+        try store.replace(metadata)
+        XCTAssertEqual(try MealPlanMetadataStore(directory: directory, fileManager: files).metadata(for: metadata.mealUUID), metadata,
+            "An explicit replacement must retain its existing ability to repair damaged data")
+    }
+
+    @MainActor func testMealMetadataUnchangedReplaceRepairsIncompleteFileProtection() throws {
+        let date = Date(timeIntervalSince1970: 1_788_804_000)
+        let files = MealMetadataProtectionFileManager()
+        let directory = files.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? files.removeItem(at: directory) }
+        let store = MealPlanMetadataStore(directory: directory, fileManager: files)
+        let metadata = MealPlanMetadata(mealUUID: UUID().uuidString, bolusUUID: nil,
+            loggedAt: date, plannedAt: nil, grams: 30, pizzaSettings: nil, mealKind: .normal)
+        try store.replace(metadata)
+        let metadataDirectory = directory.appendingPathComponent("PenDose/MealPlans")
+        let url = metadataDirectory.appendingPathComponent("\(metadata.mealUUID).json")
+
+        // Exercise each protection failure separately: an earlier write could have stopped
+        // after either the directory or the file was created, before its protection was set.
+        for path in [metadataDirectory.path, url.path] {
+            let untouchedDate = Date(timeIntervalSince1970: 1_700_000_000)
+            try files.setAttributes([.modificationDate: untouchedDate], ofItemAtPath: url.path)
+            try files.setAttributes([.protectionKey: FileProtectionType.none], ofItemAtPath: path)
+            XCTAssertEqual(try files.attributesOfItem(atPath: path)[.protectionKey] as? FileProtectionType,
+                           FileProtectionType.none)
+            try store.replace(metadata)
+            let directoryAttributes = try files.attributesOfItem(atPath: metadataDirectory.path)
+            let fileAttributes = try files.attributesOfItem(atPath: url.path)
+            XCTAssertNotEqual(fileAttributes[.modificationDate] as? Date, untouchedDate,
+                "Either incomplete protection must take the real durable replacement path")
+            XCTAssertEqual(directoryAttributes[.protectionKey] as? FileProtectionType,
+                           .completeUntilFirstUserAuthentication)
+            XCTAssertEqual(fileAttributes[.protectionKey] as? FileProtectionType,
+                           .completeUntilFirstUserAuthentication)
+            XCTAssertEqual(try MealPlanMetadataStore(directory: directory, fileManager: files).metadata(for: metadata.mealUUID), metadata)
+        }
+    }
+
+    @MainActor func testUnchangedMealReminderRefreshSkipsWritesButPersistsEditsAndDeletion() throws {
+        let date = Date(timeIntervalSince1970: 1_788_804_000)
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let files = MealMetadataProtectionFileManager()
+        let directory = files.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? files.removeItem(at: directory) }
+        let store = MealPlanMetadataStore(directory: directory, fileManager: files)
+        let uuid = UUID().uuidString
+        let meal = TreatmentEntry(date: date, value: 30, treatmentType: .Carbs,
+            nightscoutEventType: nil, enteredBy: "xDrip4iOS",
+            nsManagedObjectContext: core.mainManagedObjectContext)
+        meal.localTreatmentUUID = uuid
+        meal.mealKindRaw = TreatmentMealKind.normal.rawValue
+        XCTAssertTrue(core.saveChangesSynchronously())
+        XCTAssertNil(MealPlanReminderCoordinator.refresh(coreDataManager: core,
+            mealUUID: uuid, now: date, store: store))
+        let original = try XCTUnwrap(store.metadata(for: uuid))
+        let url = directory.appendingPathComponent("PenDose/MealPlans/\(uuid).json")
+        let untouchedDate = Date(timeIntervalSince1970: 1_700_000_000)
+        try files.setAttributes([.modificationDate: untouchedDate], ofItemAtPath: url.path)
+        let before = try files.attributesOfItem(atPath: url.path)
+
+        for _ in 0..<3 {
+            XCTAssertNil(MealPlanReminderCoordinator.refresh(coreDataManager: core,
+                mealUUID: uuid, now: date.addingTimeInterval(60), store: store))
+        }
+        let unchanged = try files.attributesOfItem(atPath: url.path)
+        XCTAssertEqual(unchanged[.modificationDate] as? Date, untouchedDate)
+        XCTAssertEqual(try XCTUnwrap(unchanged[.systemFileNumber] as? NSNumber),
+                       try XCTUnwrap(before[.systemFileNumber] as? NSNumber))
+        XCTAssertEqual(try store.metadata(for: uuid), original)
+
+        meal.value = 45
+        meal.date = date.addingTimeInterval(120)
+        XCTAssertTrue(core.saveChangesSynchronously())
+        XCTAssertNil(MealPlanReminderCoordinator.refresh(coreDataManager: core,
+            mealUUID: uuid, now: date.addingTimeInterval(180), store: store))
+        let edited = try XCTUnwrap(MealPlanMetadataStore(directory: directory, fileManager: files).metadata(for: uuid))
+        XCTAssertEqual(edited.lastStoredMealGrams, 45)
+        XCTAssertEqual(edited.lastStoredMealDate, meal.date)
+
+        meal.treatmentdeleted = true
+        XCTAssertTrue(core.saveChangesSynchronously())
+        XCTAssertNil(MealPlanReminderCoordinator.refresh(coreDataManager: core,
+            mealUUID: uuid, now: date.addingTimeInterval(240), store: store))
+        XCTAssertNil(try store.metadata(for: uuid))
+        XCTAssertFalse(files.fileExists(atPath: url.path))
+    }
+
     @MainActor func testPlannedPizzaKeepsLinkAndSettingsUntilActualMealConfirmation() throws {
         let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -1527,6 +1680,35 @@ final class LocalTreatmentPlanningTests: XCTestCase {
         guard case .failure(.storageFailed) = second else {
             return XCTFail("Uncertain deletion must block a new dose")
         }
+    }
+}
+
+/// Simulator file protection setters succeed but reads omit protectionKey. Keep only that
+/// attribute in an overlay tied to the real file identity; all disk reads/writes remain real.
+/// These tests exercise the protection guard, not physical iOS at-rest data protection.
+private final class MealMetadataProtectionFileManager: FileManager, @unchecked Sendable {
+    private let protectionLock = NSLock()
+    private var protections: [String: (fileNumber: NSNumber, value: FileProtectionType)] = [:]
+
+    override func setAttributes(_ attributes: [FileAttributeKey: Any], ofItemAtPath path: String) throws {
+        try super.setAttributes(attributes, ofItemAtPath: path)
+        if let protection = attributes[.protectionKey] as? FileProtectionType,
+           let fileNumber = try super.attributesOfItem(atPath: path)[.systemFileNumber] as? NSNumber {
+            protectionLock.lock()
+            protections[path] = (fileNumber, protection)
+            protectionLock.unlock()
+        }
+    }
+
+    override func attributesOfItem(atPath path: String) throws -> [FileAttributeKey: Any] {
+        var attributes = try super.attributesOfItem(atPath: path)
+        protectionLock.lock()
+        let protection = protections[path]
+        protectionLock.unlock()
+        if let protection, attributes[.systemFileNumber] as? NSNumber == protection.fileNumber {
+            attributes[.protectionKey] = protection.value
+        }
+        return attributes
     }
 }
 
