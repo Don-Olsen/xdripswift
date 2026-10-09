@@ -172,7 +172,7 @@ settings; its self-check cannot prove live accuracy or freedom from all
 retrospective information bias.
 
 Create ML trains separate boosted-tree correction and expected-error models at
-+30, +60 and +120 minutes, sequentially on the iPhone while the app is active.
++30, +60 and +120 minutes, sequentially on the iPhone, either during an explicit foreground run or a system-granted background processing opportunity.
 The error targets come from chronological out-of-sample complete-line
 predictions. The last 28 calendar days ending on the latest usable day
 are held apart: 14 for interval calibration and 14 for final self-check;
@@ -193,14 +193,16 @@ at **the three calibrated horizons** using deterministic nearest-rank
 calibration of positive expected error; intermediate interval widths are
 interpolated. This is neither a probability for the whole curve nor a
 hypoglycemia safety limit. Settings → Home Screen → Personal forecast model
-shows the current status, historical self-check and **Train now**. Training
-stops when the app leaves the foreground; the next foreground use can retry.
-Model packages are written in Application Support and activated through an
-atomic pointer only after all six compiled models reload and validate.
-Create ML checkpoint directories are protected and excluded from backup before
-training writes to them; interrupted sessions are removed on the next start.
-Model retention keeps the active package and one verified previous package,
-while unknown directories are preserved.
+shows the current status, historical self-check and **Train now**. An explicit
+foreground run pauses when the app leaves the foreground; automatic runs use
+only a real system-granted `BGProcessingTask` lease. Model packages are written
+in Application Support and activated through an atomic pointer only after all
+six compiled models reload and validate. Create ML checkpoint directories are
+protected and excluded from backup before training writes to them. Interrupted
+sessions can resume only with the exact same immutable training inputs,
+context, app build and training recipe, within 48 hours. Stale or incompatible
+sessions are removed; unknown directories are preserved. Model retention keeps
+the active package and one verified previous package.
 
 These checks are software safeguards, not an observed improvement for this
 person. A physical run must compare newly collected predictions with later
@@ -587,3 +589,54 @@ hashes. `docs/PROJECT-STATUS.md` records the scope and remaining physical checks
 iOS hardware file-protection behavior and real device backup/restore cannot be
 proven by CoreSimulator; the configured protection class and backup flags are
 tested. No upload or installation on a physical device was performed.
+
+
+## Automatic background ML training after 4311
+
+Ordinary unlocked foreground use prepares a complete immutable history snapshot
+through the existing HealthKit/app loader and replay. This preparation can start
+one day before a compatible model becomes seven days old. The snapshot contains
+value types, frozen settings, feature order, reference/target dates and the exact
+examples used by the existing trainer. No Core Data objects cross queues. The
+protected snapshot is stored locally in Application Support, excluded from
+backup, limited to 128 MiB and 200,000 rows, and rejected after 48 hours or when
+the latest reference is over 48 hours old. Source context, engine/features,
+app build and time zone must still match. Historical provenance limitations,
+60-day requirements, chronological splits and all approval gates are unchanged.
+
+One registered `BGProcessingTask` requests external power, requires no network,
+and supplies an earliest start time. iOS chooses whether and when it runs;
+this is an approximately weekly opportunity, not a guaranteed weekly execution.
+The background entry waits for existing model-load readiness, reads only the
+prepared protected snapshot, and never asks HealthKit for authorization or
+reads locked HealthKit history. It uses the existing sequential Create ML
+trainer, calibration, self-check and atomic model installation on its separate
+low-priority worker. Foreground forecast work, sensor collection, alarm delivery
+and Watch communication retain their existing paths. **Train now** remains an
+explicit immediate foreground action.
+
+An interrupted task cancels the training lease and retains fingerprint-bound
+Create ML sessions for a later run. Public Create ML session restore/resume is
+used; a completed-fit shortcut is accepted only if its final checkpoint reloads
+as a valid regressor. System expiration or process termination requests a retry
+no earlier than one hour; a failed attempt or unavailable prepared snapshot has
+a 24-hour retry delay. Completed training or a completed self-check rejection
+uses a seven-day cadence. The existing compatible model remains active after
+failed/interrupted/rejected training. Disabled forecasting or an invalid source
+configuration removes this task's pending request. Repeated app activations,
+duplicated callbacks and process restarts do not create parallel jobs or reset
+the durable cadence. A missing/stale snapshot needs fresh preparation during
+ordinary unlocked app use; no background mechanism fabricates missing history.
+
+Software validation and physical evidence are recorded in PROJECT-STATUS.md.
+Synthetic tests cover snapshot validation/protection, durable cadence, actual
+background-entry handoff, expiration/readiness and repeated callbacks. A local
+macOS Create ML probe produced checkpoints at iterations 5/10/15/20 and resumed
+with an identical prediction; final-checkpoint construction failed on that Mac,
+so the session-resume fallback was exercised. This is not an iPhone background
+runtime measurement. The paired phone was inspected read-only at build 4311;
+no local installation or background training was performed. Overnight locked-
+phone completion, iOS scheduling/expiration and battery/runtime effects remain
+for physical follow-up after TestFlight installation. No new prediction
+accuracy is claimed, and engine mathematics, ML features/approval criteria,
+dosing rules, HealthKit import/export, alarms and Libre/Watch are unchanged.

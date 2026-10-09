@@ -10,15 +10,17 @@ final class GlucoseForecastMLTrainerTests: XCTestCase {
                                                                       isDirectory: true)
         defer { try? files.removeItem(at: root) }
         let store = GlucoseForecastMLModelStore(directory: root)
-        let active = try store.prepareTrainingSession()
+        let active = try store.prepareTrainingSession(context: reviewMetadata().context,
+                                                      examples: [], now: Date())
         let sessionsRoot = root.appendingPathComponent("training-sessions", isDirectory: true)
         let job = active.appendingPathComponent("correction_30", isDirectory: true)
+        let manifest = active.appendingPathComponent("manifest.json")
         try GlucoseForecastMLStoragePolicy.secureDirectory(job)
-        for directory in [sessionsRoot, active, job] {
-            XCTAssertEqual(try directory.resourceValues(forKeys: [.isExcludedFromBackupKey])
+        for item in [sessionsRoot, active, job, manifest] {
+            XCTAssertEqual(try item.resourceValues(forKeys: [.isExcludedFromBackupKey])
                 .isExcludedFromBackup, true)
             #if os(iOS) && !targetEnvironment(simulator)
-            let protection = try files.attributesOfItem(atPath: directory.path)[.protectionKey]
+            let protection = try files.attributesOfItem(atPath: item.path)[.protectionKey]
             XCTAssertEqual(protection as? FileProtectionType,
                            .completeUntilFirstUserAuthentication)
             #endif
@@ -41,6 +43,91 @@ final class GlucoseForecastMLTrainerTests: XCTestCase {
         try GlucoseForecastMLModelStore(directory: root).cleanupStaleTrainingSessions()
         XCTAssertFalse(files.fileExists(atPath: interrupted.path))
         XCTAssertTrue(files.fileExists(atPath: unrelated.path))
+    }
+
+    func testInterruptedTrainingSessionResumesOnlyForExactContextAndReplaySnapshot() throws {
+        let files = FileManager.default
+        let root = files.temporaryDirectory.appendingPathComponent(UUID().uuidString,
+                                                                      isDirectory: true)
+        defer { try? files.removeItem(at: root) }
+        let context = reviewMetadata().context
+        let original = completeAnchor(at: Date().addingTimeInterval(-3 * 3600))
+        let now = Date()
+        let firstStore = GlucoseForecastMLModelStore(directory: root)
+        let first = try firstStore.prepareTrainingSession(context: context,
+            examples: original, now: now)
+        let checkpoint = first.appendingPathComponent("walk_30_0", isDirectory: true)
+        try GlucoseForecastMLStoragePolicy.secureDirectory(checkpoint)
+        try Data("checkpoint".utf8).write(to: checkpoint.appendingPathComponent("state"))
+        firstStore.finishTrainingSession(first, preserveForResume: true)
+
+        let restarted = GlucoseForecastMLModelStore(directory: root)
+        try restarted.cleanupStaleTrainingSessions()
+        XCTAssertTrue(files.fileExists(atPath: checkpoint.path))
+        let same = try restarted.prepareTrainingSession(context: context,
+            examples: original, now: now)
+        XCTAssertEqual(same, first)
+        restarted.finishTrainingSession(same, preserveForResume: true)
+
+        // The same settings with changed replay rows must not reuse any fit.
+        let changed = completeAnchor(at: Date().addingTimeInterval(-2 * 3600))
+        let fresh = try restarted.prepareTrainingSession(context: context,
+            examples: changed, now: now)
+        XCTAssertNotEqual(fresh, first)
+        XCTAssertFalse(files.fileExists(atPath: first.path))
+        restarted.finishTrainingSession(fresh, preserveForResume: true)
+
+        let differentSource = GlucoseForecastMLContext(
+            sensitivityMgdlPerUnit: 40, carbohydrateRatioGramsPerUnit: 10,
+            settings: TherapyModelSettings(), sourceSignature: "different-source")!
+        let incompatible = try restarted.prepareTrainingSession(context: differentSource,
+            examples: changed, now: now)
+        XCTAssertNotEqual(incompatible, fresh)
+        XCTAssertFalse(files.fileExists(atPath: fresh.path))
+        restarted.finishTrainingSession(incompatible)
+        XCTAssertFalse(files.fileExists(atPath: incompatible.path))
+    }
+
+    func testTrainingFingerprintBindsContextAndOrderedReplayRows() throws {
+        let rows = completeAnchor(at: Date().addingTimeInterval(-3 * 3600))
+        let context = reviewMetadata().context
+        let first = try GlucoseForecastMLTrainingFingerprint.value(context: context, examples: rows)
+        XCTAssertEqual(first, try GlucoseForecastMLTrainingFingerprint.value(
+            context: context, examples: rows))
+        XCTAssertNotEqual(first, try GlucoseForecastMLTrainingFingerprint.value(
+            context: context, examples: Array(rows.reversed())))
+        let other = GlucoseForecastMLContext(sensitivityMgdlPerUnit: 40,
+            carbohydrateRatioGramsPerUnit: 10, settings: TherapyModelSettings(),
+            sourceSignature: "different-source")!
+        XCTAssertNotEqual(first, try GlucoseForecastMLTrainingFingerprint.value(
+            context: other, examples: rows))
+    }
+
+    func testDamagedOrPreviousBuildTrainingSessionIsNotResumed() throws {
+        let files = FileManager.default
+        let root = files.temporaryDirectory.appendingPathComponent(UUID().uuidString,
+                                                                      isDirectory: true)
+        defer { try? files.removeItem(at: root) }
+        let context = reviewMetadata().context
+        let now = Date()
+        let store = GlucoseForecastMLModelStore(directory: root)
+        let first = try store.prepareTrainingSession(context: context, examples: [], now: now)
+        store.finishTrainingSession(first, preserveForResume: true)
+        let manifestURL = first.appendingPathComponent("manifest.json")
+        var fields = try XCTUnwrap(JSONSerialization.jsonObject(
+            with: Data(contentsOf: manifestURL)) as? [String: Any])
+        fields["appBuild"] = "a-different-build"
+        try JSONSerialization.data(withJSONObject: fields).write(to: manifestURL)
+        let restarted = GlucoseForecastMLModelStore(directory: root)
+        try restarted.cleanupStaleTrainingSessions()
+        XCTAssertFalse(files.fileExists(atPath: first.path))
+
+        let second = try restarted.prepareTrainingSession(context: context, examples: [], now: now)
+        restarted.finishTrainingSession(second, preserveForResume: true)
+        try Data("invalid manifest".utf8).write(
+            to: second.appendingPathComponent("manifest.json"))
+        try GlucoseForecastMLModelStore(directory: root).cleanupStaleTrainingSessions()
+        XCTAssertFalse(files.fileExists(atPath: second.path))
     }
 
     func testModelRetentionKeepsActiveLatestVerifiedPreviousAndUnknownDirectories() async throws {

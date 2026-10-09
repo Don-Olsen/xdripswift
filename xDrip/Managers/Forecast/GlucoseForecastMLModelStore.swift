@@ -216,6 +216,32 @@ enum GlucoseForecastMLStoragePolicy {
 }
 
 final class GlucoseForecastMLModelStore {
+    /// A session is usable only with the exact immutable replay snapshot. The
+    /// manifest contains a digest, never glucose or treatment values.
+    private struct TrainingSessionManifest: Codable {
+        static let schemaVersion = 1
+        static let maximumAge: TimeInterval = 48 * 60 * 60
+
+        let schemaVersion: Int
+        let context: GlucoseForecastMLContext
+        let snapshotFingerprint: String
+        let trainingDate: Date
+        let trainingRecipeSignature: String
+        let appBuild: String
+
+        var matchesCurrentGeneration: Bool {
+            schemaVersion == Self.schemaVersion
+                && context.engineVersion == GlucoseForecastEngine.engineVersion
+                && context.featureVersion == GlucoseForecastMLFeatures.featureVersion
+                && trainingRecipeSignature == GlucoseForecastMLTrainingRecipe.signature
+                && appBuild == (Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown")
+        }
+
+        func isFresh(at date: Date) -> Bool {
+            let age = date.timeIntervalSince(trainingDate)
+            return age >= 0 && age <= Self.maximumAge
+        }
+    }
     private struct ActivePointer: Codable { let modelID: String }
     private struct SavedReview: Codable {
         let modelSchemaVersion: Int
@@ -247,9 +273,8 @@ final class GlucoseForecastMLModelStore {
     }
 
     func loadActive() async -> GlucoseForecastMLLoadedBundle? {
-        // The manager finishes loading before it permits a new training run.
-        // A crash leaves checkpoints here; a future launch removes only UUID
-        // session directories, never model packages or unrelated files.
+        // Preserve one protected, compatible interrupted session so the next
+        // foreground or background opportunity can resume its exact snapshot.
         try? cleanupStaleTrainingSessions()
         guard let data = try? Data(contentsOf: pointerURL),
               let pointer = try? JSONDecoder().decode(ActivePointer.self, from: data),
@@ -264,26 +289,70 @@ final class GlucoseForecastMLModelStore {
         return bundle
     }
 
-    func prepareTrainingSession() throws -> URL {
+    func prepareTrainingSession(context: GlucoseForecastMLContext,
+                                examples: [GlucoseForecastMLReplayExample],
+                                now: Date = .now) throws -> URL {
         sessionLock.lock(); defer { sessionLock.unlock() }
         guard activeTrainingSession == nil else {
             throw GlucoseForecastMLTrainingFailure.packageInvalid
         }
+        guard context.engineVersion == GlucoseForecastEngine.engineVersion,
+              context.featureVersion == GlucoseForecastMLFeatures.featureVersion,
+              now <= Date(), Date().timeIntervalSince(now) <= TrainingSessionManifest.maximumAge else {
+            throw GlucoseForecastMLTrainingFailure.packageInvalid
+        }
+        let fingerprint = try GlucoseForecastMLTrainingFingerprint.value(
+            context: context, examples: examples)
         try prepareDirectory()
         try GlucoseForecastMLStoragePolicy.secureDirectory(trainingSessionsDirectory,
                                                           fileManager: fileManager)
-        try removeStaleTrainingSessions(excluding: nil)
+        // Only the newest matching session can be reused. All generated
+        // sessions for another source, settings, or replay snapshot are stale.
+        let contents = try fileManager.contentsOfDirectory(at: trainingSessionsDirectory,
+            includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+        for child in contents where GlucoseForecastMLStoragePolicy.isGeneratedUUID(child.lastPathComponent) {
+            guard GlucoseForecastMLStoragePolicy.isRealDirectory(child) else { continue }
+            if let manifest = trainingManifest(at: child),
+               manifest.matchesCurrentGeneration, manifest.isFresh(at: Date()),
+               manifest.context == context,
+               manifest.trainingDate == now,
+               manifest.snapshotFingerprint == fingerprint {
+                activeTrainingSession = child
+                try removeStaleTrainingSessions(keeping: child)
+                return child
+            }
+        }
+        try removeStaleTrainingSessions(keeping: nil, preserveLatestValid: false)
         let session = trainingSessionsDirectory
             .appendingPathComponent(UUID().uuidString.lowercased(), isDirectory: true)
         try GlucoseForecastMLStoragePolicy.secureDirectory(session, fileManager: fileManager)
+        let manifest = TrainingSessionManifest(schemaVersion: TrainingSessionManifest.schemaVersion,
+            context: context, snapshotFingerprint: fingerprint, trainingDate: now,
+            trainingRecipeSignature: GlucoseForecastMLTrainingRecipe.signature,
+            appBuild: Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown")
+        let manifestURL = session.appendingPathComponent("manifest.json")
+        do {
+            let data = try JSONEncoder().encode(manifest)
+            #if os(iOS)
+            try data.write(to: manifestURL,
+                options: Data.WritingOptions([.atomic,
+                    .completeFileProtectionUntilFirstUserAuthentication]))
+            #else
+            try data.write(to: manifestURL, options: .atomic)
+            #endif
+            try protect(manifestURL)
+        } catch {
+            try? fileManager.removeItem(at: session)
+            throw error
+        }
         activeTrainingSession = session
         return session
     }
 
-    func finishTrainingSession(_ session: URL) {
+    func finishTrainingSession(_ session: URL, preserveForResume: Bool = false) {
         sessionLock.lock(); defer { sessionLock.unlock() }
         guard activeTrainingSession == session else { return }
-        try? fileManager.removeItem(at: session)
+        if !preserveForResume { try? fileManager.removeItem(at: session) }
         activeTrainingSession = nil
     }
 
@@ -292,17 +361,42 @@ final class GlucoseForecastMLModelStore {
         try prepareDirectory()
         try GlucoseForecastMLStoragePolicy.secureDirectory(trainingSessionsDirectory,
                                                           fileManager: fileManager)
-        try removeStaleTrainingSessions(excluding: activeTrainingSession)
+        try removeStaleTrainingSessions(keeping: activeTrainingSession)
     }
 
-    private func removeStaleTrainingSessions(excluding active: URL?) throws {
+    private func trainingManifest(at session: URL) -> TrainingSessionManifest? {
+        let manifestURL = session.appendingPathComponent("manifest.json")
+        guard let values = try? manifestURL.resourceValues(forKeys: [
+            .isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]),
+              values.isRegularFile == true, values.isSymbolicLink != true,
+              let fileSize = values.fileSize, fileSize > 0, fileSize <= 64 * 1024,
+              let data = try? Data(contentsOf: manifestURL),
+              let manifest = try? JSONDecoder().decode(TrainingSessionManifest.self, from: data),
+              manifest.snapshotFingerprint.count == 64,
+              manifest.snapshotFingerprint.allSatisfy({ $0.isHexDigit }) else { return nil }
+        return manifest
+    }
+
+    private func removeStaleTrainingSessions(keeping active: URL?,
+                                             preserveLatestValid: Bool = true) throws {
         guard GlucoseForecastMLStoragePolicy.isRealDirectory(trainingSessionsDirectory) else {
             throw GlucoseForecastMLTrainingFailure.packageInvalid
         }
         let contents = try fileManager.contentsOfDirectory(at: trainingSessionsDirectory,
             includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+        let retained = (preserveLatestValid && active == nil ? contents : []).filter { child in
+            child != active
+                && GlucoseForecastMLStoragePolicy.isGeneratedUUID(child.lastPathComponent)
+                && GlucoseForecastMLStoragePolicy.isRealDirectory(child)
+                && trainingManifest(at: child).map {
+                    $0.matchesCurrentGeneration && $0.isFresh(at: Date())
+                } == true
+        }.max { a, b in
+            (trainingManifest(at: a)?.trainingDate ?? .distantPast)
+                < (trainingManifest(at: b)?.trainingDate ?? .distantPast)
+        }
         for url in contents {
-            guard url != active,
+            guard url != active, url != retained,
                   GlucoseForecastMLStoragePolicy.isGeneratedUUID(url.lastPathComponent),
                   GlucoseForecastMLStoragePolicy.isRealDirectory(url) else { continue }
             try fileManager.removeItem(at: url)
@@ -901,10 +995,13 @@ final class GlucoseForecastMLManager: @unchecked Sendable {
     private let transitionEvidence: GlucoseForecastMLTransitionEvidence
     private var loaded: GlucoseForecastMLLoadedBundle?
     private var loading = true
+    private var loadWaiters: [CheckedContinuation<Void, Never>] = []
     private var isTraining = false
     private var progress: GlucoseForecastMLTrainingProgress?
     private var activeAttemptID: UUID?
     private var trainingTask: Task<Void, Never>?
+    private var activeBackgroundRun: GlucoseForecastMLBackgroundRun?
+    private var trainingCompletion: (@Sendable (Bool) -> Void)?
     private var lastAttempt: Date?
     private var lastOutcome: String?
     private var lastIssue: GlucoseForecastMLTrainingIssue?
@@ -934,14 +1031,33 @@ final class GlucoseForecastMLManager: @unchecked Sendable {
             let bundle = await self.store.loadActive()
             let review = self.store.loadReview()
             let reviewCSVURL = self.store.reviewCSVURL()
-            self.lock.withLock {
+            let waiters = self.lock.withLock {
                 self.loaded = bundle
                 self.lastSelfCheck = review
                 self.lastReviewCSVURL = reviewCSVURL
                 self.loading = false
+                let waiters = self.loadWaiters
+                self.loadWaiters.removeAll()
+                return waiters
             }
+            waiters.forEach { $0.resume() }
             self.notifyStatus()
             if bundle != nil { self.notifyModel() }
+        }
+    }
+
+    /// A cold background launch waits for the same cached package load as live
+    /// inference, using its completion event rather than a readiness timer.
+    func waitUntilLoaded() async {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if loading {
+                loadWaiters.append(continuation)
+                lock.unlock()
+            } else {
+                lock.unlock()
+                continuation.resume()
+            }
         }
     }
 
@@ -1062,8 +1178,20 @@ final class GlucoseForecastMLManager: @unchecked Sendable {
             || now.timeIntervalSince(metadata.trainedAt) > GlucoseForecastMLChronology.modelAgeLimit
     }
 
+    /// Eligibility used for preparation as well as actual fitting; no timers poll it.
+    func automaticTrainingDueDate(context: GlucoseForecastMLContext, now: Date = .now) -> Date? {
+        lock.lock(); defer { lock.unlock() }
+        guard !loading, !isTraining else { return nil }
+        guard let metadata = loaded?.metadata, metadata.context == context else { return now }
+        return metadata.trainedAt.addingTimeInterval(GlucoseForecastMLChronology.modelAgeLimit + 1)
+    }
+
+    @discardableResult
     func requestTraining(examples: [GlucoseForecastMLReplayExample],
-                         context: GlucoseForecastMLContext, force: Bool = false) {
+                         context: GlucoseForecastMLContext, force: Bool = false,
+                         trainingDate: Date = .now,
+                         backgroundRun: GlucoseForecastMLBackgroundRun? = nil,
+                         completion: (@Sendable (Bool) -> Void)? = nil) -> Bool {
         #if canImport(CreateML)
         lock.lock()
         let due: Bool
@@ -1071,13 +1199,17 @@ final class GlucoseForecastMLManager: @unchecked Sendable {
             due = metadata.context != context
                 || Date().timeIntervalSince(metadata.trainedAt) > GlucoseForecastMLChronology.modelAgeLimit
         } else { due = true }
-        guard !loading, !isTraining, !appHasResignedActive, force || due else {
+        guard !loading, !isTraining,
+              !appHasResignedActive || backgroundRun?.isCancelled == false,
+              backgroundRun?.isCancelled != true, force || due else {
             lock.unlock()
-            return
+            return false
         }
         isTraining = true
         let attemptID = UUID()
         activeAttemptID = attemptID
+        activeBackgroundRun = backgroundRun
+        trainingCompletion = completion
         progress = .trainingModels(completed: 0, total: 12)
         lastAttempt = .now
         lastOutcome = nil
@@ -1086,35 +1218,41 @@ final class GlucoseForecastMLManager: @unchecked Sendable {
         lock.unlock()
         notifyStatus()
         let task = Task.detached(priority: .background) { [weak self] in
-            guard let self else { return }
+            guard let self else { completion?(false); return }
             #if canImport(UIKit)
             let foreground = await MainActor.run { UIApplication.shared.applicationState == .active }
-            if !foreground {
+            if !(foreground || backgroundRun?.isCancelled == false) {
                 self.finish(outcome: "backgroundCancelled", report: nil, attemptID: attemptID)
                 return
             }
             #endif
             let sessions: URL
             do {
-                sessions = try self.store.prepareTrainingSession()
+                sessions = try self.store.prepareTrainingSession(context: context,
+                    examples: examples, now: trainingDate)
             } catch {
                 self.finish(outcome: "trainingFailed", report: nil, attemptID: attemptID)
                 return
             }
-            defer { self.store.finishTrainingSession(sessions) }
+            var preserveSession = false
+            defer { self.store.finishTrainingSession(sessions, preserveForResume: preserveSession) }
             do {
+                try Task.checkCancellation()
+                if backgroundRun?.isCancelled == true { throw CancellationError() }
                 let candidate = try await GlucoseForecastMLTrainer.train(
                     examples: examples, context: context, active: active,
-                    sessionsDirectory: sessions, onProgress: { [weak self] progress in
+                    sessionsDirectory: sessions, now: trainingDate,
+                    onProgress: { [weak self] progress in
                         self?.recordProgress(progress, attemptID: attemptID)
                     })
                 try Task.checkCancellation()
+                if backgroundRun?.isCancelled == true { throw CancellationError() }
                 if candidate.metadata.selfCheck.promoted {
                     #if canImport(UIKit)
                     let stillCurrent = await MainActor.run {
-                        UIApplication.shared.applicationState == .active &&
-                            GlucoseForecastDataAdapter.presentationInputSignature(
-                                horizonMinutes: 120) == context.sourceSignature
+                        (UIApplication.shared.applicationState == .active || backgroundRun?.isCancelled == false)
+                            && GlucoseForecastMLTrainingCoordinator.currentContext() == context
+                            && (backgroundRun == nil || UserDefaults.standard.glucoseForecastHorizonMinutes > 0)
                     }
                     guard stillCurrent else { throw CancellationError() }
                     #endif
@@ -1127,6 +1265,8 @@ final class GlucoseForecastMLManager: @unchecked Sendable {
                         self.lastReviewCSVURL = reviewSaved ? self.store.reviewCSVURL() : nil
                     }
                     self.notifyModel()
+                    // Release the session before another scheduler callback can begin.
+                    self.store.finishTrainingSession(sessions)
                     self.finish(outcome: "activated", report: candidate.metadata.selfCheck,
                                 attemptID: attemptID)
                 } else {
@@ -1135,30 +1275,53 @@ final class GlucoseForecastMLManager: @unchecked Sendable {
                     self.lock.withLock {
                         self.lastReviewCSVURL = reviewSaved ? self.store.reviewCSVURL() : nil
                     }
+                    self.store.finishTrainingSession(sessions)
                     self.finish(outcome: "rejected", report: candidate.metadata.selfCheck,
                                 attemptID: attemptID)
                 }
             } catch is CancellationError {
+                preserveSession = true
+                self.store.finishTrainingSession(sessions, preserveForResume: true)
                 self.finish(outcome: "backgroundCancelled", report: nil, attemptID: attemptID)
-            } catch let issue as GlucoseForecastMLTrainingIssue {
-                self.finish(outcome: "trainingIssue", report: nil, attemptID: attemptID,
-                            issue: issue)
-            } catch let failure as GlucoseForecastMLTrainingFailure {
-                self.finish(outcome: failure.rawValue, report: nil, attemptID: attemptID)
             } catch {
-                self.finish(outcome: "trainingFailed", report: nil, attemptID: attemptID)
+                // Create ML can surface job.cancel() as its own error rather than
+                // CancellationError. Runtime expiry still preserves checkpoints.
+                if Task.isCancelled || backgroundRun?.isCancelled == true {
+                    preserveSession = true
+                    self.store.finishTrainingSession(sessions, preserveForResume: true)
+                    self.finish(outcome: "backgroundCancelled", report: nil, attemptID: attemptID)
+                } else {
+                    self.store.finishTrainingSession(sessions)
+                    if let issue = error as? GlucoseForecastMLTrainingIssue {
+                        self.finish(outcome: "trainingIssue", report: nil, attemptID: attemptID, issue: issue)
+                    } else if let failure = error as? GlucoseForecastMLTrainingFailure {
+                        self.finish(outcome: failure.rawValue, report: nil, attemptID: attemptID)
+                    } else {
+                        self.finish(outcome: "trainingFailed", report: nil, attemptID: attemptID)
+                    }
+                }
             }
         }
         lock.lock()
-        if isTraining { trainingTask = task } else { task.cancel() }
+        if isTraining, activeAttemptID == attemptID { trainingTask = task } else { task.cancel() }
         lock.unlock()
+        return true
         #else
         lock.lock()
         lastAttempt = .now
         lastOutcome = GlucoseForecastMLTrainingFailure.trainingUnavailable.rawValue
         lock.unlock()
         notifyStatus()
+        return false
         #endif
+    }
+
+    func cancelBackgroundTraining() {
+        lock.lock()
+        activeBackgroundRun?.cancel()
+        let task = activeBackgroundRun != nil ? trainingTask : nil
+        lock.unlock()
+        task?.cancel()
     }
 
     func infer(input: GlucoseForecastInput,
@@ -1210,7 +1373,7 @@ final class GlucoseForecastMLManager: @unchecked Sendable {
     private func cancelForBackground() {
         lock.lock()
         appHasResignedActive = true
-        let task = trainingTask
+        let task = activeBackgroundRun?.isCancelled == false ? nil : trainingTask
         lock.unlock()
         task?.cancel()
     }
@@ -1235,8 +1398,12 @@ final class GlucoseForecastMLManager: @unchecked Sendable {
         lastOutcome = outcome
         lastIssue = issue
         if let report { lastSelfCheck = report }
+        let completion = trainingCompletion
+        trainingCompletion = nil
+        activeBackgroundRun = nil
         lock.unlock()
         notifyStatus()
+        completion?(outcome == "activated" || outcome == "rejected")
     }
 
     private func notifyModel() {

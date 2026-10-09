@@ -6,7 +6,7 @@ enum GlucoseForecastMLAvailabilityProvenance: String, Codable, Sendable {
     case retrospectiveUnknown
 }
 
-struct GlucoseForecastMLReplayExample: Sendable {
+struct GlucoseForecastMLReplayExample: Codable, Sendable {
     let row: GlucoseForecastMLFeatureRow
     let targetDate: Date
     let targetGlucoseMgdl: Double

@@ -15,6 +15,7 @@ import SwiftUI
 /// do not yet have a SwiftUI equivalent, such as supported orientations and Home Screen actions.
 @main @MainActor struct XdripApp: App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+    @Environment(\.scenePhase) private var scenePhase
     @StateObject private var stateModel: RootTabStateModel
 
     private let applicationCoordinator: RootApplicationCoordinator
@@ -54,6 +55,11 @@ import SwiftUI
             }
             .background(ConstantsAppColors.background)
             .onOpenURL(perform: stateModel.receiveIncomingBackup)
+            .task(id: scenePhase == .active && stateModel.dependencies != nil) {
+                guard scenePhase == .active, let dependencies = stateModel.dependencies else { return }
+                GlucoseForecastMLTrainingCoordinator.shared.refreshAutomaticTraining(
+                    coreDataManager: dependencies.coreDataManager)
+            }
         }
     }
 }

@@ -17,6 +17,7 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
         trace("*** in didFinishLaunchingWithOptions ***", log: log, category: ConstantsLog.categoryAppDelegate, type: .info)
         trace("****************************************", log: log, category: ConstantsLog.categoryAppDelegate, type: .info)
 
+        GlucoseForecastMLBackgroundScheduler.shared.register()
         return true
     }
 

@@ -9,6 +9,24 @@ import Combine
 import TabularData
 #endif
 
+/// Session compatibility is needed on simulator builds where Create ML itself
+/// is unavailable. Keep the recipe identity independent of the fitting type.
+enum GlucoseForecastMLTrainingRecipe {
+    static let randomSeed = 42
+    static let maxDepth = 6
+    static let maxIterations = 400
+    static let minChildWeight = 50.0
+    static let stepSize = 0.05
+    static let checkpointInterval = 50
+    /// Bump when fold formation, targets, or fit semantics change without a
+    /// feature/engine version change; old Create ML sessions must not resume.
+    static let revision = 1
+    static var signature: String {
+        "\(revision)|\(maxDepth)|\(maxIterations)|\(minChildWeight)|"
+            + "\(stepSize)|\(randomSeed)|\(checkpointInterval)"
+    }
+}
+
 enum GlucoseForecastMLTrainingFailure: String, Error, Sendable {
     case insufficientHistory
     case insufficientTrainingRows
@@ -537,7 +555,18 @@ struct GlucoseForecastMLTrainedCandidate {
 
 enum GlucoseForecastMLTrainer {
     static let targetColumn = "target"
-    static let randomSeed = 42
+    private typealias Recipe = GlucoseForecastMLTrainingRecipe
+
+    /// A completed Create ML fit is only reused with the exact replay snapshot
+    /// admitted by the enclosing training-session manifest. If completion was
+    /// interrupted before this marker was written, Create ML resumes its last
+    /// checkpoint instead of substituting an unverified partial model.
+    private struct CompletedFit: Codable {
+        static let schemaVersion = 1
+        let schemaVersion: Int
+        let checkpointRelativePath: String
+        let iteration: Int
+    }
 
     static func key(_ kind: String, _ horizon: Int) -> String { "\(kind)_\(horizon)" }
 
@@ -927,31 +956,98 @@ enum GlucoseForecastMLTrainer {
                             targets: [Double],
                             sessionDirectory: URL) async throws -> MLBoostedTreeRegressor {
         try Task.checkCancellation()
-        guard examples.count == targets.count else {
+        guard examples.count == targets.count,
+              targets.allSatisfy(\.isFinite),
+              examples.allSatisfy({ $0.row.values.count == GlucoseForecastMLFeatures.featureNames.count
+                  && $0.row.values.allSatisfy(\.isFinite) }) else {
             throw GlucoseForecastMLTrainingFailure.invalidFeatureRow
         }
-        var data = DataFrame()
-        for (index, name) in GlucoseForecastMLFeatures.featureNames.enumerated() {
-            data.append(column: Column<Double>(name: name, contents: examples.map { $0.row.values[index] }))
-        }
-        guard targets.allSatisfy(\.isFinite) else { throw GlucoseForecastMLTrainingFailure.invalidFeatureRow }
-        data.append(column: Column<Double>(name: targetColumn, contents: targets))
-        let parameters = MLBoostedTreeRegressor.ModelParameters(
-            validation: .none, maxDepth: 6, maxIterations: 400,
-            minChildWeight: 50, randomSeed: randomSeed, stepSize: 0.05)
-        // Create ML writes checkpoints as soon as the job starts.
         try GlucoseForecastMLStoragePolicy.secureDirectory(sessionDirectory)
-        let session = MLTrainingSessionParameters(sessionDirectory: sessionDirectory,
-                                                   reportInterval: 25, checkpointInterval: 50,
-                                                   iterations: 400)
-        let job = try MLBoostedTreeRegressor.train(
-            trainingData: data, targetColumn: targetColumn,
-            featureColumns: GlucoseForecastMLFeatures.featureNames,
-            parameters: parameters, sessionParameters: session)
-        return try await withTaskCancellationHandler {
+        // Reconstruct only a final checkpoint that was marked after the job
+        // yielded a complete model. A bare checkpoint can still be resumed,
+        // but is never treated as a finished fit.
+        let sessionParameters = MLTrainingSessionParameters(sessionDirectory: sessionDirectory,
+            reportInterval: 25, checkpointInterval: Recipe.checkpointInterval,
+            iterations: Recipe.maxIterations)
+        let completionURL = sessionDirectory.appendingPathComponent("completed-fit.json")
+        if FileManager.default.fileExists(atPath: completionURL.path) {
+            guard let markerData = try? Data(contentsOf: completionURL),
+                  let marker = try? JSONDecoder().decode(CompletedFit.self, from: markerData),
+                  marker.schemaVersion == CompletedFit.schemaVersion,
+                  marker.iteration >= Recipe.maxIterations,
+                  !marker.checkpointRelativePath.hasPrefix("/"),
+                  !marker.checkpointRelativePath.split(separator: "/").contains(".."),
+                  let restored = try? MLBoostedTreeRegressor.restoreTrainingSession(
+                    sessionParameters: sessionParameters),
+                  let checkpoint = restored.checkpoints.first(where: {
+                    $0.iteration == marker.iteration
+                        && $0.url.standardizedFileURL.path == sessionDirectory
+                            .appendingPathComponent(marker.checkpointRelativePath)
+                            .standardizedFileURL.path
+                  }),
+                  let model = try? MLBoostedTreeRegressor(checkpoint: checkpoint),
+                  model.targetColumn == targetColumn,
+                  model.featureColumns == GlucoseForecastMLFeatures.featureNames else {
+                // A marked complete fit with unreadable state is a damaged
+                // session, not permission to quietly reuse partial weights.
+                throw GlucoseForecastMLTrainingFailure.packageInvalid
+            }
+            return model
+        }
+        // Create ML writes checkpoints as soon as the job starts.
+        let job: MLJob<MLBoostedTreeRegressor>
+        let entries = try FileManager.default.contentsOfDirectory(atPath: sessionDirectory.path)
+        if !entries.isEmpty {
+            guard let restored = try? MLBoostedTreeRegressor.restoreTrainingSession(
+                sessionParameters: sessionParameters),
+                  let resumed = try? MLBoostedTreeRegressor.resume(restored) else {
+                throw GlucoseForecastMLTrainingFailure.packageInvalid
+            }
+            job = resumed
+        } else {
+            var data = DataFrame()
+            for (index, name) in GlucoseForecastMLFeatures.featureNames.enumerated() {
+                data.append(column: Column<Double>(name: name,
+                    contents: examples.map { $0.row.values[index] }))
+            }
+            data.append(column: Column<Double>(name: targetColumn, contents: targets))
+            let parameters = MLBoostedTreeRegressor.ModelParameters(
+                validation: .none, maxDepth: Recipe.maxDepth,
+                maxIterations: Recipe.maxIterations,
+                minChildWeight: Recipe.minChildWeight,
+                randomSeed: Recipe.randomSeed, stepSize: Recipe.stepSize)
+            job = try MLBoostedTreeRegressor.train(
+                trainingData: data, targetColumn: targetColumn,
+                featureColumns: GlucoseForecastMLFeatures.featureNames,
+                parameters: parameters, sessionParameters: sessionParameters)
+        }
+        let trained = try await withTaskCancellationHandler {
             for try await trained in job.result.values { return trained }
             throw GlucoseForecastMLTrainingFailure.trainingProducedNoModel
         } onCancel: { job.cancel() }
+        // Create ML checkpoints every 50 iterations. A final checkpoint is
+        // retained for the next launch only when it can recreate this model.
+        if let restored = try? MLBoostedTreeRegressor.restoreTrainingSession(
+            sessionParameters: sessionParameters),
+           let checkpoint = restored.checkpoints.filter({ $0.iteration >= Recipe.maxIterations })
+               .max(by: { $0.iteration < $1.iteration }),
+           checkpoint.url.standardizedFileURL.path.hasPrefix(
+               sessionDirectory.standardizedFileURL.path + "/"),
+           (try? MLBoostedTreeRegressor(checkpoint: checkpoint)) != nil {
+            let relative = String(checkpoint.url.standardizedFileURL.path.dropFirst(
+                sessionDirectory.standardizedFileURL.path.count + 1))
+            let marker = CompletedFit(schemaVersion: CompletedFit.schemaVersion,
+                checkpointRelativePath: relative, iteration: checkpoint.iteration)
+            if let data = try? JSONEncoder().encode(marker),
+               (try? data.write(to: completionURL, options: .atomic)) != nil {
+                #if os(iOS)
+                try? FileManager.default.setAttributes(
+                    [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
+                    ofItemAtPath: completionURL.path)
+                #endif
+            }
+        }
+        return trained
     }
 
     static func predict(_ model: MLModel, row: GlucoseForecastMLFeatureRow) -> Double? {

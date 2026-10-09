@@ -2,7 +2,7 @@
 //  GlucoseForecastMLTrainingCoordinator.swift
 //  xdrip
 //
-//  Foreground-triggered, low-priority historical replay. Live forecast and BLE work
+//  Event-driven preparation and iOS-granted, low-priority model training. Live forecast and BLE work
 //  never wait for this loader or for Create ML training.
 //
 
@@ -17,6 +17,9 @@ final class GlucoseForecastMLTrainingCoordinator: @unchecked Sendable {
     static let statusDidChange = Notification.Name("GlucoseForecastMLTrainingPreparationDidChange")
 
     private let lock = NSLock()
+    private let preparedStore: GlucoseForecastMLPreparedHistoryStore
+    private var backgroundRun: GlucoseForecastMLBackgroundRun?
+    private var backgroundCompletion: (@Sendable (Bool) -> Void)?
     private var preparationInProgress = false
     private var preparationTask: Task<Void, Never>?
     private var preparationCancellation: GlucoseForecastMLHistoryCancellation?
@@ -24,14 +27,45 @@ final class GlucoseForecastMLTrainingCoordinator: @unchecked Sendable {
     private var preparationStatus = ""
     private var preparationCoverage = ""
     private var backgroundObservers: [NSObjectProtocol] = []
+    private weak var automaticCoreDataManager: CoreDataManager?
     private static let automaticRetryInterval: TimeInterval = 24 * 60 * 60
-    private static let stoppedStatus = "Historiklæsningen blev stoppet, da appen blev forladt."
+    private static let stoppedStatus = "Historikforberedelsen fortsætter ved næste brug. Et færdigt grundlag trænes automatisk under opladning."
     static let historicalReadIdentifiers: [HKQuantityTypeIdentifier] = [
         .bloodGlucose, .insulinDelivery, .dietaryCarbohydrates
     ]
 
-    private init() {
+    /// A small value-only seam for exercising the real BG entry without HealthKit,
+    /// Core Data or Create ML. Production always uses `live`.
+    struct BackgroundDependencies: Sendable {
+        let waitUntilReady: @Sendable () async -> Void
+        let currentContext: @Sendable () async -> GlucoseForecastMLContext?
+        let forecastEnabled: @Sendable () async -> Bool
+        let currentDueDate: @Sendable (GlucoseForecastMLContext) -> Date?
+        let train: @Sendable (GlucoseForecastMLPreparedHistory,
+                              GlucoseForecastMLBackgroundRun,
+                              @escaping @Sendable (Bool) -> Void) -> Bool
+
+        static var live: Self {
+            Self(waitUntilReady: { await GlucoseForecastMLManager.shared.waitUntilLoaded() },
+                 currentContext: { await MainActor.run { GlucoseForecastMLTrainingCoordinator.currentContext() } },
+                 forecastEnabled: { await MainActor.run {
+                     UserDefaults.standard.glucoseForecastHorizonMinutes > 0
+                 } },
+                 currentDueDate: { GlucoseForecastMLManager.shared.automaticTrainingDueDate(context: $0) },
+                 train: { snapshot, run, completion in
+                     GlucoseForecastMLManager.shared.requestTraining(
+                         examples: snapshot.examples, context: snapshot.context,
+                         trainingDate: snapshot.preparedAt, backgroundRun: run,
+                         completion: completion)
+                 })
+        }
+    }
+
+    init(preparedStore: GlucoseForecastMLPreparedHistoryStore = GlucoseForecastMLPreparedHistoryStore(),
+         observeLifecycle: Bool = true) {
+        self.preparedStore = preparedStore
         #if canImport(UIKit)
+        guard observeLifecycle else { return }
         // The first Health read authorization sheet may temporarily make the
         // app inactive without sending it to the background. Keep that user-
         // initiated training attempt alive until the app actually leaves.
@@ -39,6 +73,14 @@ final class GlucoseForecastMLTrainingCoordinator: @unchecked Sendable {
             backgroundObservers.append(NotificationCenter.default.addObserver(forName: name,
                 object: nil, queue: nil) { [weak self] _ in self?.cancelForBackground() })
         }
+        backgroundObservers.append(NotificationCenter.default.addObserver(
+            forName: GlucoseForecastMLManager.statusDidChange, object: nil, queue: .main) { [weak self] _ in
+                guard let self, UIApplication.shared.applicationState == .active,
+                      let coreData = self.lock.withLock({ self.automaticCoreDataManager }) else { return }
+                // Model loading finishes asynchronously after app dependencies. Its
+                // publication is the readiness event, without Home/polling dependency.
+                self.refreshAutomaticTraining(coreDataManager: coreData)
+            })
         #endif
     }
 
@@ -64,18 +106,51 @@ final class GlucoseForecastMLTrainingCoordinator: @unchecked Sendable {
         return preparationCoverage
     }
 
-    /// Called only from an active Home forecast or an explicit Settings button.
-    /// This work is enqueued independently of the forecast adapter's serial worker.
+    /// A foreground event prepares immutable rows; iOS grants the later fitting runtime.
+    /// Explicit Train now keeps its existing immediate foreground behavior.
+    func refreshAutomaticTraining(coreDataManager: CoreDataManager) {
+        lock.withLock { automaticCoreDataManager = coreDataManager }
+        let defaults = UserDefaults.standard
+        guard defaults.glucoseForecastHorizonMinutes > 0,
+              let context = Self.currentContext() else {
+            Task { @MainActor in GlucoseForecastMLBackgroundScheduler.shared.cancelPendingTraining() }
+            return
+        }
+        scheduleIfNeeded(coreDataManager: coreDataManager, policy: defaults.dataFlowPolicy,
+            settings: TherapyModelSettings(defaults: defaults),
+            sensitivity: context.sensitivityMgdlPerUnit,
+            ratio: context.carbohydrateRatioGramsPerUnit,
+            sourceSignature: context.sourceSignature)
+    }
+
+    func nextAutomaticTrainingDate() -> Date? {
+        guard let context = Self.currentContext(),
+              let modelDue = GlucoseForecastMLManager.shared.automaticTrainingDueDate(context: context)
+        else { return nil }
+        return max(modelDue, preparedStore.nextAutomaticAttempt(context: context, at: Date()))
+    }
+
+    static func currentContext() -> GlucoseForecastMLContext? {
+        let defaults = UserDefaults.standard
+        let policy = defaults.dataFlowPolicy
+        guard !TreatmentSourceCutover.hasInvalidStoredValue(),
+              !defaults.bool(forKey: TreatmentSourceCutover.restoreRequiresSourceSetupKey),
+              GlucoseForecastDataAdapter.sourceAllowsForecast(policy),
+              GlucoseForecastDataAdapter.treatmentSourcesAreUnambiguous(policy,
+                  healthInsulinEnabled: HealthKitTherapyImportManager.shared.isEnabled(.insulin),
+                  healthCarbsEnabled: HealthKitTherapyImportManager.shared.isEnabled(.carbohydrates)),
+              let sensitivity = defaults.glucoseForecastManualSensitivityMgdlPerUnit,
+              let ratio = defaults.glucoseForecastManualCarbRatioGramsPerUnit else { return nil }
+        return GlucoseForecastMLContext(sensitivityMgdlPerUnit: sensitivity,
+            carbohydrateRatioGramsPerUnit: ratio, settings: TherapyModelSettings(defaults: defaults),
+            sourceSignature: GlucoseForecastDataAdapter.presentationInputSignature(horizonMinutes: 120))
+    }
+
     func scheduleIfNeeded(coreDataManager: CoreDataManager, policy: DataFlowPolicy,
                           settings: TherapyModelSettings, sensitivity: Double, ratio: Double,
                           sourceSignature: String, force: Bool = false, now: Date = .now) {
         if TreatmentSourceCutover.hasInvalidStoredValue() {
-            let importer = HealthKitTherapyImportManager.shared
-            updateStatus("Historisk kildeovergang: ugyldig; dato og kilde-id'er kan ikke læses. " +
-                "Løbende import: insulin \(importer.isEnabled(.insulin) ? "til" : "fra"), " +
-                "kulhydrat \(importer.isEnabled(.carbohydrates) ? "til" : "fra"). " +
-                "Behandlingsforespørgsler: 0 udført, sprunget over pga. ugyldig overgang. " +
-                "Træning er stoppet uden at ændre behandlinger.")
+            updateStatus("Historisk kildeovergang er ugyldig. Træning afventer korrekt kildeopsætning.")
             return
         }
         guard GlucoseForecastDataAdapter.sourceAllowsForecast(policy),
@@ -92,10 +167,13 @@ final class GlucoseForecastMLTrainingCoordinator: @unchecked Sendable {
             return
         }
         let manager = GlucoseForecastMLManager.shared
-        guard force || manager.shouldTrain(context: context, now: now) else { return }
+        guard let modelDue = manager.automaticTrainingDueDate(context: context, now: now) else { return }
+        let due = max(modelDue, preparedStore.nextAutomaticAttempt(context: context, at: now))
+        guard force || due <= now.addingTimeInterval(24 * 3600) else { return }
         let cancellation = GlucoseForecastMLHistoryCancellation()
         lock.lock()
-        if preparationInProgress || (!force && previousAutomaticAttempt?.context == context &&
+        if preparationInProgress || backgroundRun != nil || (!force &&
+            previousAutomaticAttempt?.context == context &&
             now.timeIntervalSince(previousAutomaticAttempt!.date) < Self.automaticRetryInterval) {
             lock.unlock()
             return
@@ -103,31 +181,40 @@ final class GlucoseForecastMLTrainingCoordinator: @unchecked Sendable {
         preparationInProgress = true
         preparationCancellation = cancellation
         if !force { previousAutomaticAttempt = (context, now) }
-        preparationStatus = "Henter historik (0 af 365 dage)… Hold appen åben, mens den træner."
+        preparationStatus = "Forbereder automatisk træning…"
         preparationCoverage = ""
         lock.unlock()
         NotificationCenter.default.post(name: Self.statusDidChange, object: nil)
-
         let loader = GlucoseForecastMLHistoryLoader(coreDataManager: coreDataManager)
         let task = Task.detached(priority: .background) { [weak self] in
             guard let self else { return }
             guard await Self.appIsActive(), !Task.isCancelled, !cancellation.isCancelled else {
-                cancellation.cancel()
                 self.finishPreparation(Self.stoppedStatus, cancellation: cancellation)
                 return
             }
-            // A successful HealthKit authorization request does not reveal whether
-            // read access was granted. Empty results are handled as missing data;
-            // the history loader applies the same coverage rules to local fallback.
+            if !force, self.preparedStore.load(context: context, at: now) != nil {
+                self.finishPreparation("Træningsgrundlag klar. Afventer opladning og køretid fra iOS.",
+                                       cancellation: cancellation)
+                await GlucoseForecastMLBackgroundScheduler.shared.schedule(earliestBeginDate: due, context: context)
+                return
+            }
+            if !force, self.preparedStore.nextPreparationDate(context: context, at: now) > now {
+                self.finishPreparation("Automatisk træning afventer næste forsøg. Den nuværende prognose bevares.",
+                                       cancellation: cancellation)
+                return
+            }
+            // Persist the retry throttle. Background launches never present authorization.
+            if !force {
+                try? self.preparedStore.recordAttempt(context: context, at: now, completed: false)
+            }
             if let authorizationFailure = await Self.requestHistoricalReadAccessIfAvailable() {
                 cancellation.recordReadFailure(authorizationFailure)
-                self.finishPreparation("Historiklæsning stoppet: \(authorizationFailure). " +
-                    "Prognosemotoren bruges fortsat.", cancellation: cancellation)
+                self.finishPreparation("Historiklæsning stoppet: \(authorizationFailure). Den nuværende prognose bevares.",
+                                       cancellation: cancellation)
                 return
             }
             guard await Self.waitForActiveAfterAuthorization(cancellation: cancellation),
                   !Task.isCancelled, !cancellation.isCancelled else {
-                cancellation.cancel()
                 self.finishPreparation(Self.stoppedStatus, cancellation: cancellation)
                 return
             }
@@ -135,33 +222,63 @@ final class GlucoseForecastMLTrainingCoordinator: @unchecked Sendable {
                 settings: settings, sensitivityMgdlPerUnit: sensitivity,
                 carbohydrateRatioGramsPerUnit: ratio, cancellation: cancellation,
                 progress: { [weak self] completed, total in
-                    self?.updatePreparationStatus(
-                        "Henter historik (\(completed) af \(total) dage)… Hold appen åben, mens den træner.",
-                        cancellation: cancellation)
+                    self?.updatePreparationStatus("Henter historik (\(completed) af \(total) dage)…",
+                                                  cancellation: cancellation)
                 })
-            let foreground = await Self.appIsActive()
-            guard foreground, !Task.isCancelled, !cancellation.isCancelled else {
-                cancellation.cancel()
+            guard await Self.appIsActive(), !Task.isCancelled, !cancellation.isCancelled else {
                 self.finishPreparation(Self.stoppedStatus, cancellation: cancellation)
                 return
             }
-            if let result {
-                self.updateCoverage(result.coverage, cancellation: cancellation)
-                if result.coverage.usableDays < GlucoseForecastMLChronology.minimumUsableDays {
-                    self.finishPreparation(
-                        "Ikke nok brugbare data: \(result.coverage.usableDays) af 60 brugbare dage. Prognosemotoren bruges fortsat.",
-                        cancellation: cancellation)
-                } else {
-                    manager.requestTraining(examples: result.examples, context: context, force: force)
-                    self.finishPreparation(manager.statusSummary.isTraining ? "" :
-                        "Modeltræningen kunne ikke startes nu. Prognosemotoren bruges fortsat.",
-                        cancellation: cancellation)
-                }
-            } else {
+            guard let result else {
                 let reason = cancellation.readFailure.map { "Historiklæsning stoppet: \($0)." }
                     ?? "Historikken kunne ikke læses sikkert."
-                self.finishPreparation("\(reason) Prognosemotoren bruges fortsat.",
+                self.finishPreparation("\(reason) Den nuværende prognose bevares.",
                     cancellation: cancellation, diagnostic: cancellation.readDiagnostic)
+                return
+            }
+            self.updateCoverage(result.coverage, cancellation: cancellation)
+            guard result.coverage.usableDays >= GlucoseForecastMLChronology.minimumUsableDays else {
+                self.finishPreparation("Ikke nok brugbare data: \(result.coverage.usableDays) af 60 brugbare dage. Prognosemotoren bruges fortsat.",
+                                       cancellation: cancellation)
+                return
+            }
+            guard await MainActor.run(body: { Self.currentContext() == context }),
+                  !Task.isCancelled, !cancellation.isCancelled else {
+                self.finishPreparation("Indstillingerne er ændret. Træningsgrundlaget forberedes igen ved næste brug.",
+                                       cancellation: cancellation)
+                return
+            }
+            let snapshot = GlucoseForecastMLPreparedHistory(context: context, preparedAt: now,
+                                                             examples: result.examples)
+            guard snapshot.isUsable(context: context, at: Date()) else {
+                self.finishPreparation("Træningsgrundlaget er ikke aktuelt eller komplet. Afventer ny historik.",
+                                       cancellation: cancellation)
+                return
+            }
+            do {
+                try self.preparedStore.save(snapshot)
+                try Task.checkCancellation()
+                if force {
+                    // An explicit foreground run can resume under the scheduled opportunity
+                    // if the person later leaves the app.
+                    await GlucoseForecastMLBackgroundScheduler.shared.schedule(earliestBeginDate: now, context: context)
+                    manager.requestTraining(examples: snapshot.examples, context: context,
+                        force: true, trainingDate: snapshot.preparedAt) { [weak self] success in
+                            guard let self, success else { return }
+                            self.preparedStore.remove(id: snapshot.id)
+                            try? self.preparedStore.recordAttempt(context: context, at: Date(), completed: true)
+                        }
+                    self.finishPreparation(manager.statusSummary.isTraining ? "" :
+                        "Modeltræningen kunne ikke startes nu. Den nuværende prognose bevares.",
+                        cancellation: cancellation)
+                } else {
+                    self.finishPreparation("Træningsgrundlag klar. Afventer opladning og køretid fra iOS.",
+                                           cancellation: cancellation)
+                    await GlucoseForecastMLBackgroundScheduler.shared.schedule(earliestBeginDate: due, context: context)
+                }
+            } catch {
+                self.finishPreparation("Træningsgrundlaget kunne ikke gemmes sikkert. Den nuværende prognose bevares.",
+                                       cancellation: cancellation)
             }
         }
         lock.lock()
@@ -172,6 +289,86 @@ final class GlucoseForecastMLTrainingCoordinator: @unchecked Sendable {
             lock.unlock()
             task.cancel()
         }
+    }
+
+    /// Invoked only while a real BGProcessingTask owns runtime. No UI authorization,
+    /// HealthKit queries or live forecast work is started from this path.
+    func runPreparedBackgroundTraining(
+        dependencies: BackgroundDependencies = .live,
+        completion: @escaping @Sendable (Bool) -> Void) {
+        let run = GlucoseForecastMLBackgroundRun()
+        lock.lock()
+        guard backgroundRun == nil, !preparationInProgress else {
+            lock.unlock(); completion(false); return
+        }
+        backgroundRun = run
+        backgroundCompletion = completion
+        lock.unlock()
+        Task.detached(priority: .background) { [weak self] in
+            guard let self else { completion(false); return }
+            await dependencies.waitUntilReady()
+            let context = await dependencies.currentContext()
+            guard let context, !run.isCancelled,
+                  await dependencies.forecastEnabled() else {
+                self.finishBackgroundRun(run, success: false)
+                return
+            }
+            if let due = dependencies.currentDueDate(context), due > Date() {
+                self.finishBackgroundRun(run, success: true)
+                return
+            }
+            guard let snapshot = self.preparedStore.load(context: context, at: Date()) else {
+                self.updateStatus("Automatisk træning afventer et aktuelt træningsgrundlag fra almindelig brug af appen.")
+                self.finishBackgroundRun(run, success: false)
+                return
+            }
+            guard !run.isCancelled else {
+                self.finishBackgroundRun(run, success: false); return
+            }
+            let started = dependencies.train(snapshot, run) { [weak self] success in
+                    guard let self else { completion(false); return }
+                    let finished = success && !run.isCancelled
+                    self.finishBackgroundRun(run, success: finished) {
+                        if finished { self.preparedStore.remove(id: snapshot.id) }
+                        try? self.preparedStore.recordAttempt(context: context, at: Date(), completed: finished)
+                    }
+                }
+            if !started {
+                self.finishBackgroundRun(run, success: false)
+            }
+        }
+    }
+
+    func cancelBackgroundTraining() {
+        lock.lock()
+        let run = backgroundRun
+        let completion = backgroundCompletion
+        backgroundRun = nil
+        backgroundCompletion = nil
+        run?.cancel()
+        lock.unlock()
+        GlucoseForecastMLManager.shared.cancelBackgroundTraining()
+        if run != nil {
+            // BG expiration must release the lease even if cold model loading
+            // never resumes its continuation. Later callbacks fail the ID guard.
+            completion?(false)
+            NotificationCenter.default.post(name: Self.statusDidChange, object: nil)
+        }
+    }
+
+    private func finishBackgroundRun(_ run: GlucoseForecastMLBackgroundRun, success: Bool,
+                                     beforeCompletion: (() -> Void)? = nil) {
+        lock.lock()
+        guard backgroundRun === run else { lock.unlock(); return }
+        backgroundRun = nil
+        let storedCompletion = backgroundCompletion
+        backgroundCompletion = nil
+        lock.unlock()
+        // Claim this operation before any durable side effect. A delayed or
+        // duplicated trainer callback cannot turn a completed week into a retry.
+        beforeCompletion?()
+        storedCompletion?(success)
+        NotificationCenter.default.post(name: Self.statusDidChange, object: nil)
     }
 
     func trainNow(coreDataManager: CoreDataManager) {

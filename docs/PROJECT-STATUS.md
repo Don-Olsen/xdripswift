@@ -1,3 +1,49 @@
+## Automatisk baggrundstræning af ML efter 4311
+
+9. oktober 2026: eksisterende integration fra `cba02061`. Almindelig oplåst
+brug forbereder et uforanderligt, beskyttet træningsgrundlag gennem den
+nuværende loader/replay. iOS får én opladerkrævende `BGProcessingTask` uden
+netværkskrav og kan køre den eksisterende sekventielle Create ML-træning uden
+åben app. Cirka ugentlig mulighed; tidspunkt og tilstrækkelig køretid afgøres
+af iOS. Ingen garanti for en bestemt ugedag eller for færdiggørelse uden
+aktuelt grundlag fra almindelig brug. **Træn nu** bevares.
+
+Snapshot og sessions bindes til de faktiske input, kilde/indstillinger,
+motor/features, build og træningsopskrift; 48-timersfriskheden og alle
+historik-/selvtjekkrav bevares. Afbrydelse gemmer genoptagelig session og
+planlægger tidligst nyt forsøg efter én time; fejlet/manglende grundlag har
+24 timers cooldown, afsluttet træning/afvist kandidat har syv dages cadence.
+En gammel kompatibel model bevares. Deaktivering af prognosen aflyser kun
+denne baggrundsopgave. Låst baggrundskørsel læser ikke Sundhed og viser ingen
+tilladelsesdialog. Modellen aktiveres kun via eksisterende validerede atomiske
+pakke. Ingen ændring af motor/features, dosisregler, HealthKit-import/eksport,
+alarmer, Watch/Libre, Nightscout, appidentitet eller entitlements; telefonens
+Info.plist tilføjer den nødvendige `processing`-baggrundstilstand og task-id.
+
+Forberedende `scripts/local-build.sh release-test` bestod med **1.471/1.471
+XCTest-tests**, 0 fejl og 0 skipped, **166 Python-tests**, de syntetiske
+Watch-kontroller og begge simulatorbuilds. Kvittering:
+`~/DeveloperBuildData/xDrip/local-runs/xdripswift/20261009T051605Z-89563/`.
+En efterfølgende review fandt og rettede en kant ved udløb, mens
+modelindlæsningen endnu ikke er klar: lease frigives nu straks, og testen
+beviser et nyt forsøg før den gamle ventning afsluttes. Endelig unsigned
+iPhoneOS/arm64-build bestod, inklusive Create ML-stien; lokalt output
+`/private/tmp/xdrip-ml-background-iphoneos-final.log`. Den nummererede release
+gentester hele suiten på det præcise checkpoint; det forberedende resultat
+ovenfor bruges ikke som kvittering for ændret release-kode.
+
+En syntetisk macOS Create ML-probe genoptog checkpoints med identisk
+prognose. Direkte konstruktion fra slutcheckpoint fejlede på Mac'en, hvorfor
+produktionskoden beholder den offentlige restore/resume-sti som fallback.
+Probe og buildoutput ligger uden for Git. Ingen faktisk iPhone-træning,
+klinisk præcision eller batterigevinst er målt. `devicectl` bekræftede læsende
+den parrede iPhone som `com.GFZ896KN66.xdripswift`, xDrip4iO5 7.1.1 (4311).
+Ingen lokal installation eller CGM-afbrydelse. Fysisk opfølgning: installér via
+TestFlight, brug appen normalt så aktuelt grundlag kan forberedes, og lad
+iPhone oplade; kontrollér ML-status og afslutning/genoptagelse efter en nat.
+Reel iOS-planlægning, låst telefon og afslutning inden systemets køretidsgrænse
+er endnu ikke fysisk verificeret. Se GLUCOSE-FORECAST.md for grænserne.
+
 <!-- testflight-7.1.1-4311:start -->
 ### TestFlight 7.1.1 (4311)
 

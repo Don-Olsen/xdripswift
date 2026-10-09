@@ -64,7 +64,7 @@ enum GlucoseForecastMLStatusPresentation {
             }
             return localize("forecast.mlRejected", "Training finished, but the model did not pass the historical self-check. The previous forecast remains active.")
         case "backgroundCancelled":
-            return localize("forecast.mlStopped", "Training stopped when the app left the foreground. You can try again.")
+            return "Træningen er sat på pause. Færdige trin bevares; automatisk genoptagelse afventer opladning og køretid fra iOS."
         case GlucoseForecastMLTrainingFailure.insufficientHistory.rawValue,
              GlucoseForecastMLTrainingFailure.insufficientTrainingRows.rawValue,
              GlucoseForecastMLTrainingFailure.insufficientCalibrationRows.rawValue,
@@ -94,6 +94,7 @@ struct GlucoseForecastMLSettingsView: View {
         .invalid(.packageUnavailable)
     @State private var transitionStatus: GlucoseForecastMLTransitionEvidence.Status?
     @State private var selfCheckCSVURL: URL?
+    @State private var schedulingIssue: String?
 
     private func t(_ key: String, _ fallback: String) -> String {
         GlucoseForecastTexts.text(key, fallback: fallback)
@@ -145,7 +146,7 @@ struct GlucoseForecastMLSettingsView: View {
                              ? GlucoseForecastMLStatusPresentation.progress(status.progress, localize: t)
                              : preparationStatus)
                     }
-                    Text(t("forecast.mlKeepOpen", "Keep the app open until training and the self-check finish."))
+                    Text("Historik forberedes under almindelig brug. Automatisk træning kan derefter køre under opladning. Ved Træn nu: hold appen åben.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 } else if let message = GlucoseForecastMLStatusPresentation.preparationOrPreviousIssue(
@@ -162,6 +163,12 @@ struct GlucoseForecastMLSettingsView: View {
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
+                if let schedulingIssue {
+                    Text(schedulingIssue).foregroundStyle(.orange)
+                }
+                Text("Automatisk træning forsøges cirka én gang om ugen under opladning. iOS vælger tidspunktet og kan afbryde arbejdet; færdige trin gemmes til genoptagelse.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
                 Button(t("forecast.mlTrainNow", "Træn nu")) {
                     GlucoseForecastMLTrainingCoordinator.shared.trainNow(coreDataManager: coreDataManager)
                     refresh()
@@ -231,7 +238,8 @@ struct GlucoseForecastMLSettingsView: View {
             .receive(on: DispatchQueue.main)) { _ in refresh() }
     }
 
-    private func refresh() {
+    @MainActor private func refresh() {
+        schedulingIssue = GlucoseForecastMLBackgroundScheduler.shared.schedulingIssue
         status = GlucoseForecastMLManager.shared.statusSummary
         metadata = GlucoseForecastMLManager.shared.activeModelMetadata
         selfCheckCSVURL = GlucoseForecastMLManager.shared.selfCheckCSVURL

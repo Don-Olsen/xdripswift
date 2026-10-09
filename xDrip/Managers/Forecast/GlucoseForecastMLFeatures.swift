@@ -1,7 +1,7 @@
 // Fixed, value-only feature contract shared by live inference and historical replay.
 import Foundation
 
-struct GlucoseForecastMLFeatureRow: Sendable {
+struct GlucoseForecastMLFeatureRow: Codable, Sendable {
     let horizonMinutes: Int
     let referenceDate: Date
     let engineValue: Double
