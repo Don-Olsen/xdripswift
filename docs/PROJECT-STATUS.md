@@ -10,6 +10,35 @@
 
 De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
 
+## iPhone — automatisk måltidsforslag efter 4313
+
+9. oktober 2026: brugerens ønskede flow er nu kulhydrater → automatisk udfyldt
+insulin → Log. Kun et aktuelt, gyldigt forslag fra den eksisterende beregner
+udfyldes, inklusive planlagt mad og den afsluttende 🍕-deling. En manuel rettelse,
+0 eller rydning bevares ved genberegning. Mens et automatisk forslag genberegnes,
+ryddes det gamle automatiske felt, og Log venter; et hurtigt tryk kan derfor
+ikke utilsigtet registrere kun mad. Blokeret/manglende forslag udfylder ingen
+insulin. Eksisterende advarselsbekræftelse, frosne registreringer og stabile
+ID'er bevares. Tom åbning, 🍕-revurdering og Watch har ikke automatisk udfyldning.
+
+Ændringen er afgrænset til PenDoseCalculatorViewModel og iPhone-skærmen med ni
+nye regressionstests. Dosisformel, profil, CGM-COB, sikkerhedsregler, pen-
+afrunding, lagring/journal, HealthKit, ML/prognose og Watch/Libre er uændrede.
+`scripts/local-build.sh release-test` bestod: **1.480/1.480 XCTest-tests**, ingen
+fejl eller skipped, **166 Python-tests**, eksisterende syntetiske Watch-
+kontroller og både iPhone- og Watch-simulatorbuild. Kvittering:
+`~/DeveloperBuildData/xDrip/local-runs/xdripswift/20261009T055851Z-20240/`.
+`git diff --check` og Swift-syntakskontrol bestod. Ingen målt hastigheds-,
+batteri- eller klinisk gevinst. Ikke lokalt installeret eller fysisk afprøvet på
+iPhone. Brugeren autoriserede derefter byg og upload af denne rettelse. Den
+nummererede release gentester det præcise checkpoint; faktisk Apple-status
+registreres særskilt ovenfor. Læsende device-kontrol før release viste iPhone
+og Watch som utilgængelige. Gentest efter TestFlight-opdatering: indtast/ret
+gram, kontrollér auto-forslag; ret selv
+insulin og kontrollér at næste opdatering bevarer rettelsen. Eksisterende
+advarsler skal stadig kræve bekræftelse. Ingen behandling skal registreres
+alene ved indtastning eller beregning.
+
 ## Automatisk baggrundstræning af ML efter 4311
 
 9. oktober 2026: eksisterende integration fra `cba02061`. Almindelig oplåst

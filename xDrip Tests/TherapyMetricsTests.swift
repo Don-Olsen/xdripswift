@@ -2265,6 +2265,322 @@ private actor DelayedPenDoseSnapshotFeed {
         XCTAssertTrue(TreatmentEntryAccessor(coreDataManager: core).getLatestTreatments(howOld: nil).isEmpty)
     }
 
+    func testMealDoseAutofillUsesCurrentSuggestionAndFollowsCarbohydrateChanges() async throws {
+        let now = Date()
+        let feed = PenDoseSnapshotFeed(samples: [21.0, 16, 11, 6, 1].map {
+            sample($0, value: 140, at: now)
+        })
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let profile = confirmedProfile()
+        let viewModel = PenDoseCalculatorViewModel(coreDataManager: core,
+            profileProvider: { profile }, sourceReadyOverride: { true },
+            snapshotProvider: { date, _ in await feed.snapshot(at: date) },
+            automaticallyFillMealDose: true)
+        defer { viewModel.stop() }
+        viewModel.carbohydratesText = "20"
+        viewModel.start()
+        await viewModel.calculate()
+        let firstSuggestion = try XCTUnwrap(viewModel.suggestedUnits)
+        XCTAssertEqual(viewModel.insulinToLogText,
+            PenDoseDisplayFormatter.insulinInput(firstSuggestion))
+        XCTAssertTrue(viewModel.usesAutomaticMealDose)
+        XCTAssertTrue(viewModel.canLog)
+        XCTAssertTrue(TreatmentEntryAccessor(coreDataManager: core)
+            .getLatestTreatments(howOld: nil).isEmpty, "Filling a dose must never register a treatment")
+
+        viewModel.carbohydratesText = "60"
+        XCTAssertTrue(viewModel.isCalculating)
+        XCTAssertEqual(viewModel.insulinToLogText, "", "An obsolete automatic dose must not remain loggable")
+        XCTAssertFalse(viewModel.canLog)
+        await viewModel.calculate()
+        let newSuggestion = try XCTUnwrap(viewModel.suggestedUnits)
+        XCTAssertGreaterThan(newSuggestion, firstSuggestion)
+        XCTAssertEqual(viewModel.insulinToLogText,
+            PenDoseDisplayFormatter.insulinInput(newSuggestion))
+        XCTAssertEqual(viewModel.calculationDetails?.newCarbsGrams, 60)
+    }
+
+    func testPlannedPizzaAutofillCopiesTheAlreadySplitPenSuggestion() async throws {
+        let defaults = UserDefaults.standard
+        let keys = [PizzaSplitSettings.enabledKey, PizzaSplitSettings.percentageKey,
+            PizzaSplitSettings.reminderKey]
+        let saved = keys.map { defaults.object(forKey: $0) }
+        defer {
+            for (key, value) in zip(keys, saved) {
+                if let value { defaults.set(value, forKey: key) }
+                else { defaults.removeObject(forKey: key) }
+            }
+        }
+        XCTAssertTrue(PizzaSplitSettings(isEnabled: true, percentageNow: 70,
+            reminderMinutes: 90).persist())
+        let now = Date()
+        let planned = now.addingTimeInterval(15 * 60)
+        let feed = PenDoseSnapshotFeed(samples: [21.0, 16, 11, 6, 1].map {
+            sample($0, value: 140, at: now)
+        })
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let profile = confirmedProfile()
+        let viewModel = PenDoseCalculatorViewModel(coreDataManager: core,
+            profileProvider: { profile }, sourceReadyOverride: { true },
+            snapshotProvider: { date, _ in await feed.snapshot(at: date) },
+            automaticallyFillMealDose: true)
+        viewModel.carbohydratesText = "45"
+        viewModel.mealKind = .slow
+        viewModel.isPlannedMeal = true
+        viewModel.plannedDate = planned
+        await viewModel.calculate()
+        let details = try XCTUnwrap(viewModel.calculationDetails)
+        let suggestion = try XCTUnwrap(viewModel.suggestedUnits)
+        XCTAssertEqual(details.pizzaPercentageNow, 70)
+        XCTAssertEqual(details.pizzaReminderMinutes, 90)
+        XCTAssertEqual(viewModel.insulinToLogText, PenDoseDisplayFormatter.insulinInput(suggestion))
+        XCTAssertEqual(suggestion, details.suggestedNowUnits)
+        XCTAssertEqual(viewModel.plannedDate, planned)
+        XCTAssertTrue(viewModel.canLog)
+        XCTAssertTrue(viewModel.logButtonTitle.contains("planlæg"))
+        XCTAssertTrue(TreatmentEntryAccessor(coreDataManager: core).getLatestTreatments(howOld: nil).isEmpty)
+    }
+
+    func testManualDoseIncludingZeroAndClearingAlwaysWinsOverAutofill() async throws {
+        let now = Date()
+        let feed = PenDoseSnapshotFeed(samples: [21.0, 16, 11, 6, 1].map {
+            sample($0, value: 140, at: now)
+        })
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        var profile = PenDoseProfile.prefilledUnconfirmed
+        profile.settings.penStepUnits = 0.25
+        XCTAssertTrue(profile.confirm())
+        for manualText in ["2,75", "0", ""] {
+            let viewModel = PenDoseCalculatorViewModel(coreDataManager: core,
+                profileProvider: { profile }, sourceReadyOverride: { true },
+                snapshotProvider: { date, _ in await feed.snapshot(at: date) },
+                automaticallyFillMealDose: true)
+            viewModel.carbohydratesText = "45"
+            viewModel.start()
+            await viewModel.calculate()
+            XCTAssertFalse(viewModel.insulinToLogText.isEmpty)
+            viewModel.insulinToLogText = manualText
+            viewModel.carbohydratesText = "60"
+            XCTAssertEqual(viewModel.insulinToLogText, manualText)
+            XCTAssertTrue(viewModel.canLog, "An explicit manual dose or zero may be logged during calculation")
+            XCTAssertFalse(viewModel.usesAutomaticMealDose)
+            await viewModel.calculate()
+            XCTAssertEqual(viewModel.insulinToLogText, manualText)
+            viewModel.stop()
+        }
+    }
+
+    func testPendingAutofillCannotLogCarbohydratesAndLateResultCannotRestoreOldDose() async throws {
+        let now = Date()
+        let feed = DelayedPenDoseSnapshotFeed(samples: [21.0, 16, 11, 6, 1].map {
+            sample($0, value: 140, at: now)
+        })
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let profile = confirmedProfile()
+        let viewModel = PenDoseCalculatorViewModel(coreDataManager: core,
+            profileProvider: { profile }, sourceReadyOverride: { true },
+            snapshotProvider: { date, _ in await feed.snapshot(at: date) },
+            automaticallyFillMealDose: true)
+        defer { viewModel.stop(); Task { await feed.releaseFirstRequest() } }
+        viewModel.carbohydratesText = "10"
+        let old = Task { await viewModel.calculate() }
+        await feed.waitForFirstRequest()
+        XCTAssertTrue(viewModel.isCalculating)
+        XCTAssertFalse(viewModel.canLog)
+        XCTAssertFalse(viewModel.requestLog())
+        XCTAssertNil(viewModel.confirmationDraft,
+            "A fast Log tap must not freeze an accidental carbohydrate-only operation")
+        viewModel.carbohydratesText = "30"
+        await viewModel.calculate()
+        let latestSuggestion = try XCTUnwrap(viewModel.suggestedUnits)
+        let expectedText = PenDoseDisplayFormatter.insulinInput(latestSuggestion)
+        XCTAssertEqual(viewModel.insulinToLogText, expectedText)
+        await feed.releaseFirstRequest()
+        await old.value
+        XCTAssertEqual(viewModel.calculationDetails?.newCarbsGrams, 30)
+        XCTAssertEqual(viewModel.insulinToLogText, expectedText)
+        XCTAssertTrue(viewModel.isReviewCurrent)
+        XCTAssertTrue(viewModel.canLog)
+    }
+
+    func testBlockedOrFailedCalculationNeverAutofillsAValidZeroDose() async throws {
+        let now = Date()
+        let feed = PenDoseSnapshotFeed(samples: [21.0, 16, 11, 6, 1].map {
+            sample($0, value: 45, at: now)
+        })
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let profile = confirmedProfile()
+        var readFails = false
+        let viewModel = PenDoseCalculatorViewModel(coreDataManager: core,
+            profileProvider: { profile }, sourceReadyOverride: { true },
+            snapshotProvider: { date, _ in
+                if readFails { return .failure(.missingGlucose) }
+                return await feed.snapshot(at: date)
+            }, automaticallyFillMealDose: true)
+        viewModel.carbohydratesText = "45"
+        await viewModel.calculate()
+        guard case .blockedCurrentLow = viewModel.calculation?.safety else {
+            return XCTFail("Synthetic low glucose must keep the existing safety block")
+        }
+        XCTAssertNil(viewModel.suggestedUnits)
+        XCTAssertEqual(viewModel.insulinToLogText, "")
+        XCTAssertTrue(viewModel.isReviewCurrent)
+        XCTAssertTrue(viewModel.canLog, "A blocked dose must not prevent logging carbohydrate alone")
+        XCTAssertFalse(viewModel.requestLog())
+        XCTAssertEqual(viewModel.confirmationDraft?.insulinUnits, 0)
+        viewModel.cancelLogConfirmation()
+
+        readFails = true
+        await viewModel.calculate()
+        XCTAssertEqual(viewModel.insulinToLogText, "")
+        XCTAssertNil(viewModel.suggestedUnits)
+        XCTAssertFalse(viewModel.canLog, "Unknown automatic dose must require an explicit manual choice")
+        viewModel.insulinToLogText = "0"
+        XCTAssertTrue(viewModel.canLog)
+        viewModel.insulinToLogText = "2,0"
+        XCTAssertTrue(viewModel.requestLog(), "Manual insulin without calculation still requires confirmation")
+        XCTAssertEqual(viewModel.confirmationDraft?.insulinUnits, 2)
+        viewModel.cancelLogConfirmation()
+    }
+
+    func testOrangeAutofillConfirmationFreezesDoseAndFoodUntilVerifiedSave() async throws {
+        let now = Date()
+        let feed = PenDoseSnapshotFeed(samples: [21.0, 16, 11, 6, 1].map {
+            sample($0, value: 140, at: now)
+        })
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let profile = confirmedProfile()
+        let viewModel = PenDoseCalculatorViewModel(coreDataManager: core,
+            logJournal: PenDoseLogJournal(directory: directory),
+            metadataStore: MealPlanMetadataStore(directory: directory),
+            profileProvider: { profile }, sourceReadyOverride: { true },
+            snapshotProvider: { date, _ in await feed.snapshot(at: date) },
+            automaticallyFillMealDose: true)
+        viewModel.carbohydratesText = "45"
+        await viewModel.calculate()
+        guard case .forecastUnchecked = viewModel.calculation?.safety else {
+            return XCTFail("The short synthetic history must preserve the forecast warning")
+        }
+        let units = try XCTUnwrap(viewModel.suggestedUnits)
+        let doseText = viewModel.insulinToLogText
+        XCTAssertGreaterThan(units, 0)
+        XCTAssertTrue(viewModel.requestLog(), "Orange warning must still require the existing confirmation")
+        let draft = try XCTUnwrap(viewModel.confirmationDraft)
+        XCTAssertEqual(draft.insulinUnits, units)
+        XCTAssertEqual(draft.carbohydrateGrams, 45)
+        XCTAssertFalse(viewModel.canLog)
+
+        viewModel.carbohydratesText = "60"
+        await viewModel.calculate()
+        XCTAssertEqual(viewModel.insulinToLogText, doseText, "New suggestions cannot change a frozen operation")
+        XCTAssertFalse(viewModel.requestLog())
+        XCTAssertEqual(viewModel.confirmationDraft?.operation.bolusUUID, draft.operation.bolusUUID)
+        XCTAssertEqual(viewModel.confirmationDraft?.operation.mealUUID, draft.operation.mealUUID)
+        XCTAssertEqual(viewModel.confirmationDraft?.insulinUnits, units)
+        XCTAssertEqual(viewModel.confirmationDraft?.carbohydrateGrams, 45)
+        let saved = await viewModel.confirmLog()
+        XCTAssertTrue(saved)
+        let entries = TreatmentEntryAccessor(coreDataManager: core).getLatestTreatments(howOld: nil)
+        XCTAssertEqual(entries.count, 2)
+        XCTAssertEqual(entries.first { $0.treatmentType == .Insulin }?.value, units)
+        XCTAssertEqual(entries.first { $0.treatmentType == .Carbs }?.value, 45)
+        XCTAssertEqual(entries.first { $0.treatmentType == .Insulin }?.localTreatmentUUID, draft.operation.bolusUUID)
+        XCTAssertEqual(viewModel.insulinToLogText, "")
+    }
+
+    func testZeroOrInvalidCarbohydratesClearOnlyAutomaticDose() async throws {
+        let now = Date()
+        let feed = PenDoseSnapshotFeed(samples: [21.0, 16, 11, 6, 1].map {
+            sample($0, value: 140, at: now)
+        })
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let profile = confirmedProfile()
+        let viewModel = PenDoseCalculatorViewModel(coreDataManager: core,
+            profileProvider: { profile }, sourceReadyOverride: { true },
+            snapshotProvider: { date, _ in await feed.snapshot(at: date) },
+            automaticallyFillMealDose: true)
+        viewModel.start()
+        defer { viewModel.stop() }
+        viewModel.carbohydratesText = "45"
+        await viewModel.calculate()
+        XCTAssertFalse(viewModel.insulinToLogText.isEmpty)
+        viewModel.carbohydratesText = "0"
+        await viewModel.calculate()
+        XCTAssertEqual(viewModel.insulinToLogText, "", "Removing food must not leave its automatic insulin")
+        XCTAssertFalse(viewModel.canLog)
+        viewModel.carbohydratesText = "45"
+        await viewModel.calculate()
+        XCTAssertFalse(viewModel.insulinToLogText.isEmpty)
+        viewModel.carbohydratesText = "invalid"
+        await viewModel.calculate()
+        XCTAssertEqual(viewModel.insulinToLogText, "")
+        XCTAssertFalse(viewModel.canLog)
+        viewModel.insulinToLogText = "2,0"
+        viewModel.carbohydratesText = ""
+        await viewModel.calculate()
+        XCTAssertEqual(viewModel.insulinToLogText, "2,0", "No-food calculations must preserve actual manual insulin")
+        XCTAssertTrue(viewModel.canLog)
+    }
+
+    func testExplicitCopyCanResumeAutofillAfterManualOverride() async throws {
+        let now = Date()
+        let feed = PenDoseSnapshotFeed(samples: [21.0, 16, 11, 6, 1].map {
+            sample($0, value: 140, at: now)
+        })
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let profile = confirmedProfile()
+        let viewModel = PenDoseCalculatorViewModel(coreDataManager: core,
+            profileProvider: { profile }, sourceReadyOverride: { true },
+            snapshotProvider: { date, _ in await feed.snapshot(at: date) },
+            automaticallyFillMealDose: true)
+        viewModel.carbohydratesText = "20"
+        await viewModel.calculate()
+        viewModel.insulinToLogText = "2,0"
+        XCTAssertFalse(viewModel.usesAutomaticMealDose)
+        viewModel.copySuggestion()
+        XCTAssertTrue(viewModel.usesAutomaticMealDose)
+        XCTAssertEqual(viewModel.insulinToLogText,
+            PenDoseDisplayFormatter.insulinInput(try XCTUnwrap(viewModel.suggestedUnits)))
+        viewModel.carbohydratesText = "60"
+        await viewModel.calculate()
+        XCTAssertEqual(viewModel.insulinToLogText,
+            PenDoseDisplayFormatter.insulinInput(try XCTUnwrap(viewModel.suggestedUnits)))
+    }
+
+    func testDefaultWatchAndEmptyOrReassessmentPhoneDoNotAutofill() async throws {
+        let now = Date()
+        let feed = PenDoseSnapshotFeed(samples: [21.0, 16, 11, 6, 1].map {
+            sample($0, value: 180, at: now)
+        })
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let profile = confirmedProfile()
+        let watch = PenDoseCalculatorViewModel(coreDataManager: core,
+            profileProvider: { profile }, sourceReadyOverride: { true },
+            snapshotProvider: { date, _ in await feed.snapshot(at: date) })
+        watch.carbohydratesText = "45"
+        await watch.calculate()
+        XCTAssertNotNil(watch.suggestedUnits)
+        XCTAssertEqual(watch.insulinToLogText, "", "The shared Watch service keeps explicit-copy behavior")
+        let emptyPhone = PenDoseCalculatorViewModel(coreDataManager: core,
+            profileProvider: { profile }, sourceReadyOverride: { true },
+            snapshotProvider: { date, _ in await feed.snapshot(at: date) },
+            automaticallyFillMealDose: true)
+        await emptyPhone.calculate()
+        XCTAssertNotNil(emptyPhone.suggestedUnits)
+        XCTAssertEqual(emptyPhone.insulinToLogText, "", "Opening an empty calculator must not auto-copy correction insulin")
+        let reassessment = PenDoseCalculatorViewModel(coreDataManager: core,
+            reminderMealUUID: "already-recorded-meal",
+            profileProvider: { profile }, sourceReadyOverride: { true },
+            snapshotProvider: { date, _ in await feed.snapshot(at: date) },
+            automaticallyFillMealDose: true)
+        reassessment.carbohydratesText = "45"
+        await reassessment.calculate()
+        XCTAssertEqual(reassessment.calculationDetails?.newCarbsGrams, 0)
+        XCTAssertEqual(reassessment.insulinToLogText, "", "Pizza reassessment must not auto-copy or add food again")
+    }
+
     func testWatchProjectionUsesSamePhoneCalculationSnapshotIncludingPizzaAndCOB() async throws {
         let now = Date()
         let readings = [31.0, 26, 21, 16, 11, 6, 1].enumerated().map { index, minutes in

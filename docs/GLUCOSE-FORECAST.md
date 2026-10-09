@@ -477,7 +477,8 @@ the recorded ML model.
 
 The iPhone pen calculator recalculates its existing suggestion when its inputs change and
 on the existing screen clock as treatment effects and the time-based profile age. A
-suggestion is copied into the insulin field only by an explicit tap. Logging records the
+suggestion in 4296 was copied into the insulin field only by an explicit tap; the
+follow-up after 4313 below changes meal entry on iPhone. Logging records the
 user-entered insulin and carbohydrate amounts independently of whether a current
 suggestion exists; insulin under a warning or without a completed calculation needs an
 explicit confirmation. The local write-ahead journal binds each attempt's UUIDs to its
@@ -515,6 +516,25 @@ Unit tests cover model curves, timing, units, stale and gapped data, treatment s
 
 Future extensions may evaluate proven profile provenance, activity, heart rate, sleep and medication effects. The Watch workout that keeps the sensor connection alive must not be interpreted as exercise.
 
+
+### iPhone meal-dose autofill after 4313
+
+Entering new carbohydrates on iPhone now fills the insulin field from the existing
+current, valid pen suggestion, including the final planned-meal/🍕 split. It does
+not calculate a second dose or record treatment. Empty opening and 🍕 reassessment
+keep explicit-copy behavior; the shared Watch service retains its existing behavior.
+A user edit, including explicit zero or clearing, owns the insulin field. An explicit
+selection of the current suggestion resumes automatic filling for a new meal.
+
+An invalidated automatic dose is cleared until the latest calculation completes;
+Log waits during that automatic refresh. A missing calculation never supplies zero.
+Blocked suggestions fill no insulin, while carbohydrate-only registration remains
+possible after a completed block. Manual logging remains independent of calculation
+availability, with the existing warning confirmation. Frozen confirmation/save drafts
+retain their original amounts, timestamps and operation identities. Formula, profile,
+CGM-COB, rounding, safety checks and journal/storage are unchanged. Physical iPhone
+interaction has not yet been verified for this change. Software validation and the
+authorised release outcome are recorded separately in PROJECT-STATUS.md.
 
 ## Prospective evidence log and export
 

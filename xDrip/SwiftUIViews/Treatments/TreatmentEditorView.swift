@@ -436,7 +436,8 @@ struct PenDoseCalculatorScreen: View {
         self.onSave = onSave
         self.onCancel = onCancel
         _viewModel = StateObject(wrappedValue: PenDoseCalculatorViewModel(
-            coreDataManager: coreDataManager, reminderMealUUID: reminderMealUUID))
+            coreDataManager: coreDataManager, reminderMealUUID: reminderMealUUID,
+            automaticallyFillMealDose: true))
     }
 
     var body: some View {
@@ -690,7 +691,11 @@ struct PenDoseCalculatorScreen: View {
                     .font(.footnote).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            Text("Indtast det, du faktisk har taget. Appen giver aldrig insulin.")
+            if viewModel.usesAutomaticMealDose {
+                Text("Forslaget udfyldes automatisk. Du kan rette mængden før Log.")
+                    .font(.footnote).foregroundStyle(.secondary)
+            }
+            Text("Log kun insulin, du faktisk har taget. Appen giver aldrig insulin.")
                 .font(.footnote).foregroundStyle(.secondary)
         }
     }

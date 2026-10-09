@@ -860,7 +860,11 @@ struct PenDoseCalculationDetails {
     @Published var glucoseChoice: PenDoseGlucoseChoice = .currentCGM { didSet { scheduleCalculation() } }
     @Published var manualGlucoseText = "" { didSet { scheduleCalculation() } }
     @Published var manualGlucoseDate = Date() { didSet { scheduleCalculation() } }
-    @Published var insulinToLogText = ""
+    @Published var insulinToLogText = "" {
+        didSet {
+            if !isUpdatingAutomaticInsulin { hasManualInsulinEntry = true }
+        }
+    }
     @Published private(set) var calculation: PenDoseCalculation?
     @Published private(set) var calculationDetails: PenDoseCalculationDetails?
     @Published private(set) var latestGlucoseDate: Date?
@@ -892,6 +896,9 @@ struct PenDoseCalculationDetails {
     private var calculationGeneration = 0
     private var debounceTask: Task<Void, Never>?
     private var isOpen = false
+    private let automaticallyFillMealDose: Bool
+    private var hasManualInsulinEntry = false
+    private var isUpdatingAutomaticInsulin = false
 
     init(coreDataManager: CoreDataManager, reminderMealUUID: String? = nil,
          glucoseStore: ManualDoseGlucoseStore = .shared,
@@ -899,7 +906,8 @@ struct PenDoseCalculationDetails {
          metadataStore: MealPlanMetadataStore? = nil,
          profileProvider: @escaping () -> PenDoseProfile = { PenDoseProfile.load() },
          sourceReadyOverride: (() -> Bool)? = nil,
-         snapshotProvider: ((Date, Bool) async -> Result<PenDoseInputSnapshot, PenDoseUnavailableReason>)? = nil) {
+         snapshotProvider: ((Date, Bool) async -> Result<PenDoseInputSnapshot, PenDoseUnavailableReason>)? = nil,
+         automaticallyFillMealDose: Bool = false) {
         let logJournal = logJournal ?? .shared
         self.coreDataManager = coreDataManager
         self.reminderMealUUID = reminderMealUUID
@@ -909,6 +917,7 @@ struct PenDoseCalculationDetails {
         self.profileProvider = profileProvider
         self.sourceReadyOverride = sourceReadyOverride
         self.snapshotProvider = snapshotProvider
+        self.automaticallyFillMealDose = automaticallyFillMealDose
         self.storageGateState = logJournal.recoveryState(coreDataManager: coreDataManager)
         if storageGateState != .ready { statusMessage = storageGateState.message }
     }
@@ -922,6 +931,10 @@ struct PenDoseCalculationDetails {
     var suggestedUnits: Double? {
         guard isReviewCurrent else { return nil }
         return calculationDetails?.suggestedNowUnits
+    }
+    var usesAutomaticMealDose: Bool {
+        automaticallyFillMealDose && !hasManualInsulinEntry && reminderMealUUID == nil
+            && (parsedCarbs ?? 0) > 0
     }
     var latestGlucoseAgeMinutes: Int? {
         latestGlucoseDate.map { max(0, Int(currentTime.timeIntervalSince($0) / 60)) }
@@ -982,6 +995,11 @@ struct PenDoseCalculationDetails {
         }
         guard let carbs = parsedCarbs else { return "Kulhydrat skal være 0–500 g" }
         guard units > 0 || carbs > 0 else { return "Indtast kulhydrater eller insulin" }
+        // A blank automatic field during refresh is not an intentional zero dose.
+        // Explicit manual input (including zero/clearing) keeps the existing log path.
+        if usesAutomaticMealDose && !isReviewCurrent {
+            return isCalculating ? "Beregner insulinforslag…" : "Indtast insulin selv"
+        }
         if isPlannedMeal {
             guard reminderMealUUID == nil, carbs > 0 else { return "Vælg kulhydrater til planen" }
             guard plannedDate > currentTime else { return "Tidspunktet er passeret" }
@@ -1050,6 +1068,7 @@ struct PenDoseCalculationDetails {
         calculationGeneration &+= 1
         let generation = calculationGeneration
         calculatedDraftSignature = nil
+        invalidateAutomaticInsulin()
         isCalculating = true
         debounceTask?.cancel()
         debounceTask = Task { [weak self] in
@@ -1065,6 +1084,7 @@ struct PenDoseCalculationDetails {
         calculationGeneration &+= 1
         debounceTask?.cancel()
         calculatedDraftSignature = nil
+        invalidateAutomaticInsulin()
         isCalculating = true
         await calculateForGeneration(calculationGeneration)
     }
@@ -1157,12 +1177,41 @@ struct PenDoseCalculationDetails {
         }
         statusMessage = result.unavailableReason.map(Self.unavailableText)
         isCalculating = false
+        refreshAutomaticInsulin()
     }
 
-    /// Copy is explicit. Recalculation never touches the user's dose field.
+    /// A user edit owns the field until an explicit selection of the current suggestion.
     func copySuggestion() {
-        guard let units = suggestedUnits else { return }
-        insulinToLogText = PenDoseDisplayFormatter.insulinInput(units)
+        guard !isSaving, confirmationDraft == nil, let units = suggestedUnits else { return }
+        if automaticallyFillMealDose, reminderMealUUID == nil, (parsedCarbs ?? 0) > 0 {
+            hasManualInsulinEntry = false
+            setAutomaticInsulin(PenDoseDisplayFormatter.insulinInput(units))
+        } else {
+            insulinToLogText = PenDoseDisplayFormatter.insulinInput(units)
+        }
+    }
+
+    private func setAutomaticInsulin(_ text: String) {
+        isUpdatingAutomaticInsulin = true
+        insulinToLogText = text
+        isUpdatingAutomaticInsulin = false
+    }
+
+    private func invalidateAutomaticInsulin() {
+        guard automaticallyFillMealDose, !hasManualInsulinEntry,
+              !isSaving, confirmationDraft == nil else { return }
+        setAutomaticInsulin("")
+    }
+
+    private func refreshAutomaticInsulin() {
+        guard automaticallyFillMealDose, !hasManualInsulinEntry,
+              !isSaving, confirmationDraft == nil else { return }
+        guard usesAutomaticMealDose, let units = suggestedUnits,
+              units.isFinite, units >= 0 else {
+            setAutomaticInsulin("")
+            return
+        }
+        setAutomaticInsulin(PenDoseDisplayFormatter.insulinInput(units))
     }
 
     /// Capture the actual quantities once. Returns true only when the red/orange or missing
@@ -1190,6 +1239,7 @@ struct PenDoseCalculationDetails {
         confirmationDraft = nil
         requiresLogConfirmation = false
         logOperation = nil
+        refreshAutomaticInsulin()
     }
 
     /// Uses only the frozen registration; no glucose, IOB, COB or suggestion read occurs here.
@@ -1242,7 +1292,8 @@ struct PenDoseCalculationDetails {
             confirmationDraft = nil
             requiresLogConfirmation = false
             logOperation = nil
-            insulinToLogText = ""
+            hasManualInsulinEntry = false
+            setAutomaticInsulin("")
             carbohydratesText = ""
             postSaveReminderWarning = receipt.reminderWarning
             statusMessage = postSaveReminderWarning == nil
@@ -1394,6 +1445,7 @@ struct PenDoseCalculationDetails {
         calculatedDraftSignature = nil
         statusMessage = message
         isCalculating = false
+        invalidateAutomaticInsulin()
     }
     private static func safetyIdentity(_ state: PenDoseSafetyState?) -> String {
         switch state {
