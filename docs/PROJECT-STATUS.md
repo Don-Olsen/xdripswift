@@ -1,3 +1,15 @@
+<!-- testflight-7.1.1-4313:start -->
+### TestFlight 7.1.1 (4313)
+
+- Kildecommit og tag: `e687bd222ca898265d329ef496245a4e6cc94621` / `testflight-7.1.1-4313`.
+- Tests: 1471/1471 bestået; 0 fejlet; 0 skipped. iPhone- og Watch-simulatorbuilds bestod.
+- Apple-status (2026-10-09T05:42:58.047440+00:00): [Internal / Testing](https://appstoreconnect.apple.com/apps/6795645396/testflight/ios/fdd1477d-10ff-4519-8877-f51e35c8d447).
+- Eksisterende intern gruppe: Ole Internal er bekræftet tilknyttet.
+- Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
+<!-- testflight-7.1.1-4313:end -->
+
+De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
+
 ## Automatisk baggrundstræning af ML efter 4311
 
 9. oktober 2026: eksisterende integration fra `cba02061`. Almindelig oplåst
