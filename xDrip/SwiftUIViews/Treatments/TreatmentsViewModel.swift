@@ -30,7 +30,7 @@ import OSLog
     @Published private(set) var showBgCheckTreatments = UserDefaults.standard.showBgCheckTreatmentsInList
     @Published private(set) var showBasalInjectionTreatments = UserDefaults.standard.showBasalInjectionTreatmentsInList
     @Published private(set) var showNoteTreatments = UserDefaults.standard.showNoteTreatmentsInList
-    @Published private(set) var selectedDate = Date().toMidnight()
+    @Published private(set) var selectedDate: Date
     @Published var deletionFailureMessage: String?
 
     // MARK: - private properties
@@ -40,6 +40,9 @@ import OSLog
     private let localSaveJournal: PenDoseLogJournal
     private let therapyMetricsManager: TherapyMetricsManager
     private let localSaveOverride: (() -> Bool)?
+    private let clock: () -> Date
+    private let calendarProvider: () -> Calendar
+    private var followsCurrentDay = true
     private let log = OSLog(subsystem: ConstantsLog.subSystem, category: ConstantsLog.categoryApplicationDataTreatments)
 
     private var allTreatments: [TreatmentSnapshot] = []
@@ -88,12 +91,17 @@ import OSLog
 
     init(coreDataManager: CoreDataManager, localSaveJournal: PenDoseLogJournal? = nil,
          localSaveOverride: (() -> Bool)? = nil,
-         therapyMetricsManager: TherapyMetricsManager = .shared) {
+         therapyMetricsManager: TherapyMetricsManager = .shared,
+         clock: @escaping () -> Date = Date.init,
+         calendarProvider: @escaping () -> Calendar = { .current }) {
         self.coreDataManager = coreDataManager
         self.treatmentEntryAccessor = TreatmentEntryAccessor(coreDataManager: coreDataManager)
         self.localSaveJournal = localSaveJournal ?? .shared
         self.localSaveOverride = localSaveOverride
         self.therapyMetricsManager = therapyMetricsManager
+        self.clock = clock
+        self.calendarProvider = calendarProvider
+        self.selectedDate = calendarProvider().startOfDay(for: clock())
 
         updateDayName()
     }
@@ -113,6 +121,7 @@ import OSLog
 
     /// Reloads the treatment history and reapplies the current filters.
     func reloadTreatments() {
+        updateSelectedDayIfNeeded()
         lastSettings = ListSettings()
         loadedTreatmentRevision = therapyMetricsManager.treatmentChangeRevision
         syncFilterSettingsFromUserDefaults()
@@ -188,10 +197,20 @@ import OSLog
     }
 
     func selectedDateChanged(_ newDate: Date) {
-        selectedDate = min(newDate, Date()).toMidnight()
+        let now = clock()
+        let calendar = calendarProvider()
+        selectedDate = calendar.startOfDay(for: min(newDate, now))
+        followsCurrentDay = calendar.isDate(selectedDate, inSameDayAs: now)
         updateDayName()
         applyFilters()
         datePickerReset = UUID()
+    }
+
+    /// Midnight notifications may be missed while suspended; foreground/tab reloads also check.
+    /// An explicitly selected historical day remains selected until the user returns to today.
+    func handleCurrentDayChanged() {
+        guard updateSelectedDayIfNeeded() else { return }
+        reloadTreatments()
     }
 
     func toggleSmallBolusFilter() {
@@ -307,6 +326,15 @@ import OSLog
 
     // MARK: - private functions
 
+    @discardableResult private func updateSelectedDayIfNeeded() -> Bool {
+        let today = calendarProvider().startOfDay(for: clock())
+        guard followsCurrentDay, selectedDate != today else { return false }
+        selectedDate = today
+        updateDayName()
+        datePickerReset = UUID()
+        return true
+    }
+
     private func syncFilterSettingsFromUserDefaults() {
         showSmallBolusTreatments = UserDefaults.standard.showSmallBolusTreatmentsInList
         showBolusTreatments = UserDefaults.standard.showBolusTreatmentsInList
@@ -319,11 +347,12 @@ import OSLog
     }
 
     private func applyFilters() {
-        let selectedMidnight = selectedDate.toMidnight()
+        let calendar = calendarProvider()
+        let selectedDayIsToday = calendar.isDate(selectedDate, inSameDayAs: clock())
 
         filteredTreatments = allTreatments.filter { treatment in
-            Calendar.current.compare(treatment.date, to: selectedMidnight, toGranularity: .day) == .orderedSame ||
-                (treatment.isPlannedMeal && Calendar.current.isDateInToday(selectedDate))
+            calendar.isDate(treatment.date, inSameDayAs: selectedDate) ||
+                (treatment.isPlannedMeal && selectedDayIsToday)
         }
 
         if !showBolusTreatments {
@@ -358,7 +387,9 @@ import OSLog
 
     private func updateDayName() {
         let dateFormatter = DateFormatter()
-
+        let calendar = calendarProvider()
+        dateFormatter.calendar = calendar
+        dateFormatter.timeZone = calendar.timeZone
         dateFormatter.dateFormat = "EEEE"
 
         selectedDateDayName = dateFormatter.string(from: selectedDate).capitalized

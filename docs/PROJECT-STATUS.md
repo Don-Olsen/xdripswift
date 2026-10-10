@@ -8,6 +8,29 @@
 - Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
 <!-- testflight-7.1.1-4314:end -->
 
+## Treatment-fanen — automatisk dagsskift efter 4314
+
+10. oktober 2026: datoen blev kun sat ved oprettelse af `TreatmentsViewModel`;
+fanens senere genindlæsninger brugte fortsat den gamle dato. Dagens visning
+følger nu kalenderdagen ved midnat, tilbagevenden til appen/fanen og ændret
+tidszone/systemtid. En historisk dag, brugeren selv vælger, bevares; valg af
+i dag genoptager automatisk dagsskift. Gentagne tids-/forgrundshændelser samme
+dag genindlæser ikke listen. Ingen ny timer eller ændring af behandlinger,
+kildevalg, beregninger, alarmer, HealthKit eller Watch/Libre.
+
+Fem nye regressionstests dækker genåbning med korrekte dagsrækker, gentagne
+hændelser, historisk valg, begge sommertidsskift og ændret lokal tidszone.
+`scripts/local-build.sh release-test` bestod: **1.485/1.485 XCTest-tests**,
+0 fejl og 0 skipped, **166 Python-tests**, **30 + 24 syntetiske kontroller**
+samt iPhone- og Watch-simulatorbuilds. Lokal testkvittering:
+`~/DeveloperBuildData/xDrip/local-runs/xdripswift/20261010T055757Z-88518/`.
+Swift-syntakskontrol og `git diff --check` bestod. Ingen fysisk iPhone-test
+eller målt ydelses-/batterigevinst. Fysisk opfølgning: lad fanen vise i dag,
+genåbn efter midnat og kontrollér dato/rækker; en bevidst valgt historisk dato
+skal blive stående. Den lokale kontrol ændrede ikke version eller udgav noget.
+Brugeren har derefter autoriseret byg og upload af datorettelsen. Releaseproceduren
+gentester det nummererede checkpoint; faktisk Apple-status registreres særskilt.
+
 De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
 
 <!-- testflight-7.1.1-4313:start -->

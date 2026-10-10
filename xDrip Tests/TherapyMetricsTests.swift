@@ -2666,6 +2666,135 @@ final class TreatmentListRefreshTests: XCTestCase {
         try body()
     }
 
+    private func dayCalendar(_ zone: String = "Europe/Copenhagen") -> Calendar {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: zone)!
+        return calendar
+    }
+
+    private func dayDate(_ day: Int, month: Int = 9, hour: Int = 12, minute: Int = 0,
+                         calendar: Calendar) -> Date {
+        calendar.date(from: DateComponents(year: 2026, month: month, day: day,
+            hour: hour, minute: minute))!
+    }
+
+    @MainActor func testReturningToTreatmentsAfterMidnightAdvancesDateAndRows() throws {
+        try withListDefaults {
+            let calendar = dayCalendar()
+            var now = dayDate(7, hour: 23, minute: 59, calendar: calendar)
+            let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+            for (day, value) in [(7, 1.0), (8, 2.0)] {
+                _ = TreatmentEntry(date: dayDate(day, calendar: calendar), value: value,
+                    treatmentType: .BasalInjection, nightscoutEventType: nil, enteredBy: "Test",
+                    nsManagedObjectContext: core.mainManagedObjectContext)
+            }
+            XCTAssertTrue(core.saveChangesSynchronously())
+            let list = TreatmentsViewModel(coreDataManager: core, clock: { now },
+                calendarProvider: { calendar })
+            list.initializeViewIfNeeded()
+            XCTAssertEqual(list.filteredTreatments.map(\.rawValue), [1])
+            let oldName = list.selectedDateDayName
+            let oldPicker = list.datePickerReset
+
+            // The same tab model survives suspension; onAppear must catch the missed midnight.
+            now = dayDate(8, hour: 13, calendar: calendar)
+            list.initializeViewIfNeeded()
+            XCTAssertEqual(list.selectedDate, calendar.startOfDay(for: now))
+            XCTAssertEqual(list.filteredTreatments.map(\.rawValue), [2])
+            XCTAssertNotEqual(list.selectedDateDayName, oldName)
+            XCTAssertNotEqual(list.datePickerReset, oldPicker)
+            XCTAssertEqual(TreatmentEntryAccessor(coreDataManager: core)
+                .getLatestTreatments(howOld: nil).count, 2, "Only the displayed day changes")
+        }
+    }
+
+    @MainActor func testDayAndForegroundEventsAdvanceOnceWithoutSameDayReloads() throws {
+        try withListDefaults {
+            let calendar = dayCalendar()
+            var now = dayDate(7, hour: 23, minute: 59, calendar: calendar)
+            let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+            let list = TreatmentsViewModel(coreDataManager: core, clock: { now },
+                calendarProvider: { calendar })
+            list.initializeViewIfNeeded()
+            var publications = 0
+            let subscription = list.$filteredTreatments.dropFirst().sink { _ in publications += 1 }
+            defer { subscription.cancel() }
+            list.handleCurrentDayChanged()
+            XCTAssertEqual(publications, 0)
+            now = now.addingTimeInterval(120)
+            list.handleCurrentDayChanged()
+            XCTAssertEqual(list.selectedDate, calendar.startOfDay(for: now))
+            XCTAssertEqual(publications, 1)
+            let picker = list.datePickerReset
+            // A significant-time-change notification and foreground may follow the day event.
+            list.handleCurrentDayChanged()
+            list.handleCurrentDayChanged()
+            XCTAssertEqual(publications, 1)
+            XCTAssertEqual(list.datePickerReset, picker)
+        }
+    }
+
+    @MainActor func testHistoricalSelectionIsPreservedAndTodayResumesFollowing() throws {
+        try withListDefaults {
+            let calendar = dayCalendar()
+            var now = dayDate(8, calendar: calendar)
+            let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+            let list = TreatmentsViewModel(coreDataManager: core, clock: { now },
+                calendarProvider: { calendar })
+            list.initializeViewIfNeeded()
+            let historical = calendar.startOfDay(for: dayDate(7, calendar: calendar))
+            list.selectedDateChanged(historical)
+            now = dayDate(9, calendar: calendar)
+            list.handleCurrentDayChanged()
+            list.initializeViewIfNeeded()
+            XCTAssertEqual(list.selectedDate, historical)
+            list.selectedDateChanged(now)
+            now = dayDate(10, calendar: calendar)
+            list.handleCurrentDayChanged()
+            XCTAssertEqual(list.selectedDate, calendar.startOfDay(for: now))
+        }
+    }
+
+    @MainActor func testFollowingTodayUsesCalendarDaysAcrossBothDSTChanges() throws {
+        try withListDefaults {
+            let calendar = dayCalendar()
+            for (month, day, hours) in [(3, 29, 23.0), (10, 25, 25.0)] {
+                var now = dayDate(day, month: month, hour: 0, minute: 5, calendar: calendar)
+                let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+                let list = TreatmentsViewModel(coreDataManager: core, clock: { now },
+                    calendarProvider: { calendar })
+                list.initializeViewIfNeeded()
+                let previousMidnight = list.selectedDate
+                now = dayDate(day + 1, month: month, hour: 0, minute: 5, calendar: calendar)
+                list.handleCurrentDayChanged()
+                XCTAssertEqual(list.selectedDate, calendar.startOfDay(for: now))
+                XCTAssertEqual(list.selectedDate.timeIntervalSince(previousMidnight), hours * 3600,
+                    "A local day must not be assumed to be 24 hours")
+            }
+        }
+    }
+
+    @MainActor func testFollowingTodayReevaluatesLocalDateAfterTimeZoneChange() throws {
+        try withListDefaults {
+            var calendar = dayCalendar()
+            let now = dayDate(10, month: 10, hour: 2, calendar: calendar)
+            let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+            let list = TreatmentsViewModel(coreDataManager: core, clock: { now },
+                calendarProvider: { calendar })
+            list.initializeViewIfNeeded()
+            XCTAssertEqual(calendar.component(.day, from: list.selectedDate), 10)
+            calendar = dayCalendar("America/Los_Angeles")
+            list.handleCurrentDayChanged()
+            XCTAssertEqual(list.selectedDate, calendar.startOfDay(for: now))
+            XCTAssertEqual(calendar.component(.day, from: list.selectedDate), 9)
+            let formatter = DateFormatter()
+            formatter.calendar = calendar
+            formatter.timeZone = calendar.timeZone
+            formatter.dateFormat = "EEEE"
+            XCTAssertEqual(list.selectedDateDayName, formatter.string(from: now).capitalized)
+        }
+    }
+
     @MainActor func testUnrelatedDefaultsAndStatusNeverReloadOrPublishTheList() throws {
         try withListDefaults {
             let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)

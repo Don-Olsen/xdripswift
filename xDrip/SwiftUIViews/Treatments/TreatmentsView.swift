@@ -232,6 +232,14 @@ struct TreatmentsListView: View {
             .onAppear {
                 viewModel.initializeViewIfNeeded()
             }
+            .onReceive(Publishers.MergeMany([
+                UIApplication.didBecomeActiveNotification,
+                UIApplication.significantTimeChangeNotification,
+                .NSCalendarDayChanged,
+                .NSSystemTimeZoneDidChange
+            ].map { NotificationCenter.default.publisher(for: $0) }).receive(on: RunLoop.main)) { _ in
+                viewModel.handleCurrentDayChanged()
+            }
             .onReceive(
                 NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification).receive(on: RunLoop.main)
             ) { _ in
