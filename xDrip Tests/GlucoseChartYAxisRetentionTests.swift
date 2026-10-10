@@ -400,6 +400,205 @@ final class GlucoseChartYAxisRetentionTests: XCTestCase {
         XCTAssertEqual(latest.treatmentPoints.boluses.count, 1)
     }
 
+    /// Marker rows must never be fetched into the mini cache, including reset and refresh loads.
+    @MainActor
+    func testMiniChartOmitsMarkerFetchesAndRegularChartRetainsHiddenTreatments() async throws {
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let endDate = Date()
+        let startDate = endDate.addingTimeInterval(-3600)
+        let date = endDate.addingTimeInterval(-60)
+        let reading = BgReading(timeStamp: date, sensor: nil, calibration: nil, rawData: 120,
+                                deviceName: "Test", nsManagedObjectContext: core.mainManagedObjectContext)
+        reading.calculatedValue = 120
+        let sensor = Sensor(startDate: startDate, nsManagedObjectContext: core.mainManagedObjectContext)
+        let calibration = Calibration(timeStamp: date, sensor: sensor, bg: 130,
+                                      rawValue: 130, adjustedRawValue: 130, sensorConfidence: 1,
+                                      rawTimeStamp: date, slope: 1, intercept: 0,
+                                      distanceFromEstimate: 0, estimateRawAtTimeOfCalibration: 130,
+                                      slopeConfidence: 1, deviceName: "Test",
+                                      nsManagedObjectContext: core.mainManagedObjectContext)
+        let treatment = TreatmentEntry(date: date, value: 3, treatmentType: .Insulin,
+                                       nightscoutEventType: nil, enteredBy: "Test",
+                                       nsManagedObjectContext: core.mainManagedObjectContext)
+        // Child-context saves may retain temporary IDs after the parent has committed.
+        // Promote fixture IDs first so registration checks identify the actual stored rows.
+        try core.mainManagedObjectContext.obtainPermanentIDs(for: [reading, sensor, calibration, treatment])
+        XCTAssertTrue(core.saveChangesSynchronously())
+        let markerIDs = Set([calibration.objectID, treatment.objectID])
+        XCTAssertTrue(markerIDs.allSatisfy { !$0.isTemporaryID })
+        let sync = NightscoutSyncManager(coreDataManager: core, messageHandler: nil)
+        let context = core.privateManagedObjectContext
+        // Retain fetched objects so an accessor read remains observable after snapshot mapping.
+        // Reset first to remove registrations from saving the fixtures into the parent context.
+        context.performAndWait {
+            context.reset()
+            context.retainsRegisteredObjects = true
+            XCTAssertTrue(context.registeredObjects.isEmpty)
+        }
+        let mini = GlucoseChartStateManager(coreDataManager: core, nightscoutSyncManager: sync,
+                                            loadMode: .miniChart)
+        for (forceReset, refresh) in [(false, false), (false, true), (true, false)] {
+            let state: GlucoseChartState = await withCheckedContinuation { continuation in
+                mini.updateState(endDate: endDate, startDate: startDate, forceReset: forceReset,
+                                 refreshCachedData: refresh, showTreatments: true) {
+                    continuation.resume(returning: $0)
+                }
+            }
+            XCTAssertEqual(state.bgReadingValues, [120])
+            XCTAssertTrue(state.calibrationPoints.isEmpty)
+            XCTAssertTrue(state.treatmentPoints.boluses.isEmpty)
+            context.performAndWait {
+                XCTAssertTrue(context.registeredObjects.allSatisfy { !markerIDs.contains($0.objectID) },
+                              "The mini load must skip marker fetches, not only hide their output")
+            }
+        }
+
+        context.performAndWait { context.reset() }
+        let regular = GlucoseChartStateManager(coreDataManager: core, nightscoutSyncManager: sync)
+        let hidden: GlucoseChartState = await withCheckedContinuation { continuation in
+            regular.updateState(endDate: endDate, startDate: startDate, showTreatments: false) {
+                continuation.resume(returning: $0)
+            }
+        }
+        XCTAssertEqual(hidden.calibrationPoints.map(\.value), [130])
+        XCTAssertTrue(hidden.treatmentPoints.boluses.isEmpty)
+        context.performAndWait {
+            XCTAssertTrue(markerIDs.isSubset(of: Set(context.registeredObjects.map(\.objectID))))
+        }
+        // Turning treatments on must use the full chart's existing cached range without a reset.
+        let visible: GlucoseChartState = await withCheckedContinuation { continuation in
+            regular.updateState(endDate: endDate, startDate: startDate, showTreatments: true) {
+                continuation.resume(returning: $0)
+            }
+        }
+        XCTAssertEqual(visible.bgReadingValues, [120])
+        XCTAssertEqual(visible.calibrationPoints.map(\.value), [130])
+        XCTAssertEqual(visible.treatmentPoints.boluses.map(\.treatmentValue), [3])
+    }
+
+    /// Both glucose caches remain available for processed rendering, raw peek and source validity.
+    @MainActor
+    func testMiniChartPreservesOriginalSuppressedRowsAndRefreshesSensorProvenance() async {
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let endDate = Date()
+        let startDate = endDate.addingTimeInterval(-3600)
+        let sensorA = Sensor(startDate: startDate, nsManagedObjectContext: core.mainManagedObjectContext)
+        let sensorB = Sensor(startDate: startDate, nsManagedObjectContext: core.mainManagedObjectContext)
+        func add(_ secondsAgo: TimeInterval, raw: Double, processed: Double,
+                 sensor: Sensor, suppressed: Bool) {
+            let reading = BgReading(timeStamp: endDate.addingTimeInterval(-secondsAgo), sensor: sensor,
+                                    calibration: nil, rawData: raw, deviceName: "Test",
+                                    nsManagedObjectContext: core.mainManagedObjectContext)
+            reading.calculatedValue = raw
+            reading.smoothedValue = NSNumber(value: processed)
+            reading.isSuppressedByFiveMinuteCadence = suppressed
+        }
+        add(120, raw: 120, processed: 140, sensor: sensorA, suppressed: false)
+        add(60, raw: 130, processed: 150, sensor: sensorA, suppressed: true)
+        XCTAssertTrue(core.saveChangesSynchronously())
+        let sync = NightscoutSyncManager(coreDataManager: core, messageHandler: nil)
+        let mini = GlucoseChartStateManager(coreDataManager: core, nightscoutSyncManager: sync,
+                                            loadMode: .miniChart)
+        let processed: GlucoseChartState = await withCheckedContinuation { continuation in
+            mini.updateState(endDate: endDate, startDate: startDate, showTreatments: false) {
+                continuation.resume(returning: $0)
+            }
+        }
+        XCTAssertEqual(processed.bgReadingValues, [140])
+        XCTAssertEqual(processed.newestBgReadingDate, endDate.addingTimeInterval(-120))
+        XCTAssertTrue(processed.newestBgReadingIsValidForDownstream)
+        let original: GlucoseChartState = await withCheckedContinuation { continuation in
+            mini.updateState(endDate: endDate, startDate: startDate, showTreatments: false,
+                             showOriginalReadingsOnly: true) { continuation.resume(returning: $0) }
+        }
+        XCTAssertTrue(original.bgReadingValues.isEmpty)
+        XCTAssertEqual(original.additionalBgReadingDataSets.first?.bgReadingValues, [120, 130])
+        XCTAssertEqual(original.dataStartDate, processed.dataStartDate)
+
+        add(30, raw: 160, processed: 170, sensor: sensorB, suppressed: true)
+        XCTAssertTrue(core.saveChangesSynchronously())
+        let refreshed: GlucoseChartState = await withCheckedContinuation { continuation in
+            mini.updateState(endDate: endDate, startDate: startDate, refreshCachedData: true,
+                             showTreatments: false, showOriginalReadingsOnly: true) {
+                continuation.resume(returning: $0)
+            }
+        }
+        XCTAssertEqual(refreshed.additionalBgReadingDataSets.first?.bgReadingValues, [120, 130, 160])
+        XCTAssertEqual(refreshed.newestBgReadingDate, processed.newestBgReadingDate)
+        XCTAssertFalse(refreshed.newestBgReadingIsValidForDownstream)
+        XCTAssertEqual(refreshed.dataStartDate, processed.dataStartDate)
+    }
+
+    /// A coalesced reset reloads edits in older cached history, outside the recent-tail refresh.
+    @MainActor
+    func testMiniChartCoalescedForceResetReloadsHistoricalGlucose() async {
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let endDate = Date().addingTimeInterval(-48 * 3600)
+        let startDate = endDate.addingTimeInterval(-3600)
+        let reading = BgReading(timeStamp: endDate.addingTimeInterval(-60), sensor: nil,
+                                calibration: nil, rawData: 120, deviceName: "Test",
+                                nsManagedObjectContext: core.mainManagedObjectContext)
+        reading.calculatedValue = 120
+        XCTAssertTrue(core.saveChangesSynchronously())
+        let sync = NightscoutSyncManager(coreDataManager: core, messageHandler: nil)
+        let queue = OperationQueue()
+        let mini = GlucoseChartStateManager(coreDataManager: core, nightscoutSyncManager: sync,
+                                            loadMode: .miniChart, operationQueue: queue)
+        let initial: GlucoseChartState = await withCheckedContinuation { continuation in
+            mini.updateState(endDate: endDate, startDate: startDate, showTreatments: false) {
+                continuation.resume(returning: $0)
+            }
+        }
+        XCTAssertEqual(initial.bgReadingValues, [120])
+        reading.calculatedValue = 180
+        XCTAssertTrue(core.saveChangesSynchronously())
+        queue.isSuspended = true
+        mini.updateState(endDate: endDate, startDate: startDate, forceReset: true, showTreatments: false)
+        let updated: GlucoseChartState = await withCheckedContinuation { continuation in
+            mini.updateState(endDate: endDate, startDate: startDate, showTreatments: false) {
+                continuation.resume(returning: $0)
+            }
+            queue.isSuspended = false
+        }
+        XCTAssertEqual(updated.bgReadingValues, [180])
+        XCTAssertEqual(updated.startDate, startDate)
+        XCTAssertEqual(updated.endDate, endDate)
+    }
+
+    /// The newest mini viewport inherits a skipped refresh for a newly inserted cached reading.
+    @MainActor
+    func testMiniChartCoalescedRefreshReloadsRecentGlucose() async {
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let sync = NightscoutSyncManager(coreDataManager: core, messageHandler: nil)
+        let queue = OperationQueue()
+        let mini = GlucoseChartStateManager(coreDataManager: core, nightscoutSyncManager: sync,
+                                            loadMode: .miniChart, operationQueue: queue)
+        let endDate = Date()
+        let startDate = endDate.addingTimeInterval(-3600)
+        let initial: GlucoseChartState = await withCheckedContinuation { continuation in
+            mini.updateState(endDate: endDate, startDate: startDate, showTreatments: false) {
+                continuation.resume(returning: $0)
+            }
+        }
+        XCTAssertTrue(initial.bgReadingValues.isEmpty)
+        let reading = BgReading(timeStamp: endDate.addingTimeInterval(-60), sensor: nil,
+                                calibration: nil, rawData: 125, deviceName: "Test",
+                                nsManagedObjectContext: core.mainManagedObjectContext)
+        reading.calculatedValue = 125
+        XCTAssertTrue(core.saveChangesSynchronously())
+        queue.isSuspended = true
+        mini.updateState(endDate: endDate, startDate: startDate, refreshCachedData: true,
+                         showTreatments: false)
+        let updated: GlucoseChartState = await withCheckedContinuation { continuation in
+            mini.updateState(endDate: endDate, startDate: startDate, showTreatments: false) {
+                continuation.resume(returning: $0)
+            }
+            queue.isSuspended = false
+        }
+        XCTAssertEqual(updated.bgReadingValues, [125])
+        XCTAssertEqual(updated.dataStartDate, initial.dataStartDate)
+    }
+
     /// Repeated chart updates must not retain the owner through queued closures or old work items.
     @MainActor
     func testDelayedStateReleasesAfterHeavyRescheduling() {

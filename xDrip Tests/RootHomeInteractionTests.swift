@@ -15,6 +15,137 @@ import XCTest
 final class RootHomeInteractionTests: XCTestCase {
 
     @MainActor
+    func testPostProcessingEventRefreshesHomeOnceAndPreservesEveryChartReset() {
+        withHomeRefreshDefaults {
+            let model = RootHomeStateModel()
+            let coordinator = RootApplicationCoordinator(homeStateModelForTesting: model)
+            model.refresh(activeSensor: nil, isScreenLocked: false, usesScreenLockNightLayout: false)
+            var publications: [RootHomeState] = []
+            let observation = model.$state.dropFirst().sink { publications.append($0) }
+            defer { observation.cancel() }
+
+            UserDefaults.standard.enableSmoothing = true
+            coordinator.handleBgPostProcessingDidUpdateForTesting()
+            XCTAssertEqual(publications.count, 2,
+                "The existing chart reset and one full Home refresh must each publish")
+            XCTAssertEqual(publications.map(\.chartResetToNowRevision), [1, 1])
+            XCTAssertEqual(publications.map { $0.controls.postProcessingSystemImage },
+                ["dial.low", "dial.low.fill"])
+            XCTAssertTrue(model.state.controls.postProcessingEnabled)
+            XCTAssertTrue(UserDefaults.standard.nightscoutSyncRequired,
+                "The existing treatment-sync request must still run")
+            XCTAssertNotNil(UserDefaults.standard.timeStampLatestNightscoutSyncRequest)
+
+            publications.removeAll()
+            UserDefaults.standard.enableSmoothing = false
+            UserDefaults.standard.enableAdjustment = true
+            coordinator.handleBgPostProcessingDidUpdateForTesting()
+            XCTAssertEqual(publications.count, 2,
+                "A separate post-processing event must still refresh immediately")
+            XCTAssertEqual(publications.map(\.chartResetToNowRevision), [2, 2])
+            XCTAssertEqual(model.state.controls.postProcessingSystemImage, "dial.medium")
+            XCTAssertTrue(model.state.controls.postProcessingEnabled)
+            XCTAssertEqual(model.state.chartRevision, 0)
+        }
+    }
+
+    @MainActor
+    func testStandalonePostProcessingSettingChangeStillRefreshesHomeImmediately() {
+        withHomeRefreshDefaults {
+            let model = RootHomeStateModel()
+            let coordinator = RootApplicationCoordinator(homeStateModelForTesting: model)
+            model.refresh(activeSensor: nil, isScreenLocked: false, usesScreenLockNightLayout: false)
+            var publications: [RootHomeState] = []
+            let observation = model.$state.dropFirst().sink { publications.append($0) }
+            defer { observation.cancel() }
+
+            for key in [UserDefaults.Key.enableAdjustment, .enableSmoothing] {
+                UserDefaults.standard.set(true, forKey: key.rawValue)
+                coordinator.observeValue(forKeyPath: key.rawValue, of: UserDefaults.standard,
+                    change: [.newKey: true], context: nil)
+            }
+            XCTAssertEqual(publications.count, 2, "Each independent setting callback needs its own refresh")
+            XCTAssertEqual(publications.map { $0.controls.postProcessingSystemImage },
+                ["dial.medium", "dial.medium.fill"])
+            XCTAssertTrue(model.state.controls.postProcessingEnabled)
+            XCTAssertEqual(model.state.chartResetToNowRevision, 0)
+        }
+    }
+
+    @MainActor
+    func testDataSourceEventPublishesOnceAfterMetadataAndMaintainsFollowerTimer() {
+        withHomeRefreshDefaults {
+            let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+            let sensorStart = Date(timeIntervalSince1970: 1_800_000_000)
+            let sensor = Sensor(startDate: sensorStart,
+                nsManagedObjectContext: core.mainManagedObjectContext)
+            let model = RootHomeStateModel()
+            let coordinator = RootApplicationCoordinator(homeStateModelForTesting: model,
+                activeSensorForTesting: sensor)
+            var publications: [RootHomeState] = []
+            var publishedStartDates: [Date?] = []
+            let observation = model.$state.dropFirst().sink { state in
+                publications.append(state)
+                publishedStartDates.append(UserDefaults.standard.activeSensorStartDate)
+            }
+            defer { observation.cancel() }
+            // Always release the follower timer's ownership of the synthetic coordinator.
+            defer {
+                UserDefaults.standard.isMaster = true
+                coordinator.updateDataSourceInfoForTesting()
+            }
+
+            UserDefaults.standard.isMaster = false
+            XCTAssertFalse(coordinator.hasFollowerConnectionTimerForTesting)
+            coordinator.updateDataSourceInfoForTesting()
+            XCTAssertEqual(publications.count, 1,
+                "The nested connection update already publishes the complete Home state")
+            XCTAssertEqual(publishedStartDates, [sensorStart], "Metadata must be updated before publication")
+            XCTAssertFalse(model.state.controls.sensorButtonEnabled)
+            XCTAssertTrue(coordinator.hasFollowerConnectionTimerForTesting)
+
+            publications.removeAll()
+            publishedStartDates.removeAll()
+            UserDefaults.standard.isMaster = true
+            coordinator.updateDataSourceInfoForTesting()
+            XCTAssertEqual(publications.count, 1)
+            XCTAssertEqual(publishedStartDates, [sensorStart])
+            XCTAssertTrue(model.state.controls.sensorButtonEnabled)
+            XCTAssertFalse(coordinator.hasFollowerConnectionTimerForTesting)
+            XCTAssertEqual(model.state.chartResetToNowRevision, 0)
+        }
+    }
+
+    @MainActor
+    private func withHomeRefreshDefaults(_ body: () -> Void) {
+        let defaults = UserDefaults.standard
+        let keys = [UserDefaults.Key.nightscoutEnabled, .isMaster, .therapyDataSourceType,
+                    .showStatistics, .enableAdjustment, .enableSmoothing,
+                    .nightscoutSyncRequired, .timeStampLatestNightscoutSyncRequest,
+                    .activeSensorStartDate, .followerBackgroundKeepAliveType]
+        let saved = keys.map { ($0.rawValue, defaults.object(forKey: $0.rawValue)) }
+        defer {
+            let nightscoutKey = UserDefaults.Key.nightscoutEnabled.rawValue
+            for (key, value) in saved.filter({ $0.0 != nightscoutKey })
+                + saved.filter({ $0.0 == nightscoutKey }) {
+                if let value { defaults.set(value, forKey: key) }
+                else { defaults.removeObject(forKey: key) }
+            }
+        }
+        defaults.nightscoutEnabled = false
+        defaults.isMaster = true
+        defaults.therapyDataSourceType = .none
+        defaults.showStatistics = false
+        defaults.enableAdjustment = false
+        defaults.enableSmoothing = false
+        defaults.nightscoutSyncRequired = false
+        defaults.timeStampLatestNightscoutSyncRequest = nil
+        defaults.activeSensorStartDate = nil
+        defaults.followerBackgroundKeepAliveType = .disabled
+        body()
+    }
+
+    @MainActor
     func testForecastBadgeWrapsValuesAndRetainsTouchHeightAtLargeText() {
         let info = forecastVisualInformation()
         let regular = UIHostingController(rootView: RootHomeForecastBadge(
@@ -1747,7 +1878,7 @@ private final class HostedHomeCalculatorHarness {
             queue.isSuspended = true
             miniChartQueue = queue
             miniChart = GlucoseChartStateManager(coreDataManager: core,
-                nightscoutSyncManager: nightscout, operationQueue: queue)
+                nightscoutSyncManager: nightscout, loadMode: .miniChart, operationQueue: queue)
         } else {
             miniChartQueue = nil
             miniChart = nil

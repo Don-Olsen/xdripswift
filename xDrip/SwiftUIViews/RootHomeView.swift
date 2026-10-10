@@ -336,7 +336,7 @@ struct RootHomeView: View {
         // only the main chart can show sensor noise background bands. The mini-chart keeps the
         // same clean overview behaviour and does not need the extra Core Data fetch.
         _glucoseChartStateManager = StateObject(wrappedValue: GlucoseChartStateManager(coreDataManager: coreDataManager, nightscoutSyncManager: nightscoutSyncManager, showsSensorNoiseBands: true))
-        _miniChartStateManager = StateObject(wrappedValue: miniChartStateManager ?? GlucoseChartStateManager(coreDataManager: coreDataManager, nightscoutSyncManager: nightscoutSyncManager))
+        _miniChartStateManager = StateObject(wrappedValue: miniChartStateManager ?? GlucoseChartStateManager(coreDataManager: coreDataManager, nightscoutSyncManager: nightscoutSyncManager, loadMode: .miniChart))
         _scrollCoordinator = StateObject(wrappedValue: GlucoseChartScrollCoordinator(visibleTimeInterval: initialRange.timeInterval))
         _historicalDataCache = StateObject(wrappedValue: RootHomeHistoricalDataCache(coreDataManager: coreDataManager))
         _selectedRange = State(initialValue: initialRange)

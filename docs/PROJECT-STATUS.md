@@ -20,6 +20,47 @@ De følgende afsnit bevarer integrations- og testhistorikken før denne udgivels
 - Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
 <!-- testflight-7.1.1-4314:end -->
 
+## Home og minigraf — afgrænset optimering efter 4315
+
+10. oktober 2026: `handleBgPostProcessingDidUpdate` lavede en fuld
+Home-opdatering og derefter endnu en fuld opdatering via
+`updatePostProcessingStatus`. Den sidste er fjernet i netop denne hændelse;
+selvstændige indstillingsopdateringer bevares. `updateDataSourceInfo`
+publicerede også efter `setFollowerConnectionAndHeartbeatStatus`, som allerede
+publicerer den færdige tilstand. Den ydre gentagelse er fjernet. Graf-reset,
+sensormetadata, follower-timer, Watch- og widgetkald bevares.
+
+Minigrafens eksisterende manager får en fast `miniChart`-indlæsningsmode,
+som springer behandlinger, kalibreringer og afledte behandlingspunkter over.
+Home vælger denne mode kun for minigrafen. Hovedgraf og landscape beholder
+fuld indlæsning, også når behandlingsmarkører midlertidigt er skjult.
+Glukose, originale/supprimerede rækker, kilde-/sensorproveniens, friskhed,
+cachegrænser og sammenlægning af reset-/refresh-krav er uændrede.
+
+Syv nye regressionstests bruger de faktiske Home-handlere og grafmanageren
+med syntetisk Core Data. De kontrollerer publikationer og sideeffekter pr.
+hændelse, udeladte databaseopslag, normalgrafens markører, originale rækker,
+sensorfriskhed samt historiske og nyere ændringer gennem sammenlagte
+reset-/refresh-anmodninger. Fixture-id'er gøres permanente før lagring, så
+kontrollen af hentede databaseobjekter bruger de faktiske rækkeidentiteter.
+
+`scripts/local-build.sh release-test` bestod: **1.492/1.492 XCTest-tests**,
+0 fejl og 0 skipped, **166 Python-tests**, **30 + 24 syntetiske kontroller**
+samt begge simulatorbuilds. Lokal testkvittering:
+`~/DeveloperBuildData/xDrip/local-runs/xdripswift/20261010T070217Z-10720/`.
+Diff- og syntakskontrol samt særskilt review bestod. Ingen ændring af
+dosisregler, behandlingslagring, HealthKit, prognose/ML, alarmer,
+Watch-komplikationer eller Libre/Watch-forbindelser.
+
+Læsende device-kontrol viste den forventede iPhone-app `xDrip4iO5`,
+`com.GFZ896KN66.xdripswift`, 7.1.1 (4315). Rettelsen er ikke lokalt installeret
+eller fysisk ydelsesmålt; ingen hastigheds- eller batterigevinst er dokumenteret.
+Fysisk opfølgning efter TestFlight-opdatering: kontrollér Home ved nye målinger
+og efterbehandling, minigrafens navigation og friskhed samt hovedgrafens
+behandlingsmarkører. Brugeren har autoriseret byg og upload af denne ændring.
+Releaseproceduren vælger nummer hos Apple og gentester det nummererede
+checkpoint; faktisk Apple-status registreres særskilt ovenfor.
+
 ## Treatment-fanen — automatisk dagsskift efter 4314
 
 10. oktober 2026: datoen blev kun sat ved oprettelse af `TreatmentsViewModel`;

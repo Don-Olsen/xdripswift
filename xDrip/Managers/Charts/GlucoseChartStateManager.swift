@@ -22,6 +22,13 @@ import SwiftUI
 // the main queue, so the manager can be captured by the queue's Sendable closures.
 final class GlucoseChartStateManager: ObservableObject, @unchecked Sendable {
 
+    /// The overview has its own manager and never renders treatment or calibration markers.
+    /// Keep this fixed for the cache lifetime so display toggles cannot leave source ranges missing.
+    enum LoadMode {
+        case fullChart
+        case miniChart
+    }
+
     // MARK: - Published State
 
     @Published private(set) var state: GlucoseChartState
@@ -34,6 +41,7 @@ final class GlucoseChartStateManager: ObservableObject, @unchecked Sendable {
     private let treatmentEntryAccessor: TreatmentEntryAccessor
     private let nightscoutSyncManager: NightscoutSyncManager
     private let operationQueue: OperationQueue
+    private let loadMode: LoadMode
 
     /// Main-thread lifecycle token. Loads from before cleanup must not publish into a reopened chart.
     @MainActor private var cacheRevision = UUID()
@@ -102,9 +110,10 @@ final class GlucoseChartStateManager: ObservableObject, @unchecked Sendable {
 
     // MARK: - Initialisation
 
-    init(coreDataManager: CoreDataManager, nightscoutSyncManager: NightscoutSyncManager, showsSensorNoiseBands: Bool = false, operationQueue: OperationQueue = OperationQueue()) {
+    init(coreDataManager: CoreDataManager, nightscoutSyncManager: NightscoutSyncManager, showsSensorNoiseBands: Bool = false, loadMode: LoadMode = .fullChart, operationQueue: OperationQueue = OperationQueue()) {
         // Allow tests to control queue progress without changing the production loading path.
         self.operationQueue = operationQueue
+        self.loadMode = loadMode
         self.coreDataManager = coreDataManager
         self.nightscoutSyncManager = nightscoutSyncManager
         self.bgReadingsAccessor = BgReadingsAccessor(coreDataManager: coreDataManager)
@@ -266,7 +275,8 @@ final class GlucoseChartStateManager: ObservableObject, @unchecked Sendable {
 
         let managedObjectContext = coreDataManager.privateManagedObjectContext
 
-        // Load all source series for the same missing range so no series is rebuilt independently.
+        // Glucose and original/suppressed rows share the same cache range in both modes.
+        // The mini-chart omits marker sources that its overview renderer does not use.
         cachedReadings.merge(
             mapBgReadings(
                 bgReadingsAccessor.getBgReadings(from: startDate, to: endDate, on: managedObjectContext),
@@ -281,23 +291,27 @@ final class GlucoseChartStateManager: ObservableObject, @unchecked Sendable {
             )
         )
 
-        cachedCalibrations.merge(
-            mapCalibrations(
-                calibrationsAccessor.getCalibrations(from: startDate, to: endDate, on: managedObjectContext),
-                on: managedObjectContext
+        if loadMode == .fullChart {
+            cachedCalibrations.merge(
+                mapCalibrations(
+                    calibrationsAccessor.getCalibrations(from: startDate, to: endDate, on: managedObjectContext),
+                    on: managedObjectContext
+                )
             )
-        )
+        }
 
         if showsSensorNoiseBands {
             cachedNoiseSamples.merge(loadNoiseSamples(from: startDate, to: endDate, on: managedObjectContext))
         }
 
-        cachedTreatments.merge(
-            mapTreatments(
-                treatmentEntryAccessor.getTreatments(fromDate: startDate, toDate: endDate, on: managedObjectContext),
-                on: managedObjectContext
+        if loadMode == .fullChart {
+            cachedTreatments.merge(
+                mapTreatments(
+                    treatmentEntryAccessor.getTreatments(fromDate: startDate, toDate: endDate, on: managedObjectContext),
+                    on: managedObjectContext
+                )
             )
-        )
+        }
     }
 
     /// Reloads a small overlapping tail without discarding the wider scrolling cache.
@@ -372,6 +386,7 @@ final class GlucoseChartStateManager: ObservableObject, @unchecked Sendable {
     /// wider cached arrays through the state keeps the renderer stable while new leading/trailing
     /// points arrive, and lets step-based basal drawing synthesize clean visible edges.
     private func makeState(startDate: Date, endDate: Date, showTreatments: Bool, showOriginalReadingsOnly: Bool) -> GlucoseChartState {
+        let showTreatments = showTreatments && loadMode == .fullChart
         let cachedReadingsForTreatmentPositions = cachedReadings.filter { $0.finalValue > 0 }
         let cachedReadingsToRender = showOriginalReadingsOnly ? [] : cachedReadingsForTreatmentPositions
         let cachedOriginalReadingsToRender = shouldShowOriginalReadings || showOriginalReadingsOnly ? cachedOriginalReadings.filter { $0.calculatedValue > 0 } : []
@@ -416,13 +431,15 @@ final class GlucoseChartStateManager: ObservableObject, @unchecked Sendable {
         ]
 
         let minimumChartValue = minimumChartValue(startDate: startDate, endDate: endDate, showTreatments: showTreatments)
-        updateTreatmentPointCacheIfNeeded(
-            startDate: dataStartDate,
-            endDate: dataEndDate,
-            bgReadings: cachedReadingsForTreatmentPositions,
-            minimumChartValue: minimumChartValue,
-            showTreatments: showTreatments
-        )
+        if loadMode == .fullChart {
+            updateTreatmentPointCacheIfNeeded(
+                startDate: dataStartDate,
+                endDate: dataEndDate,
+                bgReadings: cachedReadingsForTreatmentPositions,
+                minimumChartValue: minimumChartValue,
+                showTreatments: showTreatments
+            )
+        }
 
         return GlucoseChartState(
             startDate: startDate,

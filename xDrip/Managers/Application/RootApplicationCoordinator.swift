@@ -244,12 +244,37 @@ struct InitialCalibrationRequestGate {
     /// Presentation state shared with the native SwiftUI home screen.
     ///
     /// The coordinator owns app services while this model calculates display values directly.
-    private let rootHomeStateModel = RootHomeStateModel()
+    private let rootHomeStateModel: RootHomeStateModel
 
     /// Publishes the services needed by the native SwiftUI tabs after startup completes.
     private weak var rootTabStateModel: RootTabStateModel?
 
     private var hasStarted = false
+
+    override init() {
+        rootHomeStateModel = RootHomeStateModel()
+        super.init()
+    }
+
+    #if DEBUG
+    /// Exercises presentation callbacks with synthetic state without starting app services.
+    init(homeStateModelForTesting: RootHomeStateModel, activeSensorForTesting: Sensor? = nil) {
+        rootHomeStateModel = homeStateModelForTesting
+        activeSensor = activeSensorForTesting
+        hasStarted = true
+        super.init()
+    }
+
+    func handleBgPostProcessingDidUpdateForTesting() {
+        handleBgPostProcessingDidUpdate()
+    }
+
+    func updateDataSourceInfoForTesting() {
+        updateDataSourceInfo()
+    }
+
+    var hasFollowerConnectionTimerForTesting: Bool { followerConnectionTimer != nil }
+    #endif
     
     // MARK: - SwiftUI Lifecycle
 
@@ -2248,8 +2273,8 @@ struct InitialCalibrationRequestGate {
     }
     
     @objc private func handleBgPostProcessingDidUpdate() {
+        // The full Home refresh already includes the post-processing status.
         updateLabelsAndChart(overrideApplicationState: true, forceReset: true)
-        updatePostProcessingStatus()
         watchManager?.updateWatchApp(forceComplicationUpdate: true)
         updateLiveActivityAndWidgets(forceRestart: false)
     }
@@ -2612,10 +2637,6 @@ struct InitialCalibrationRequestGate {
     
     /// update the data source information view and also the sensor progress view (if needed)
     private func updateDataSourceInfo() {
-        defer {
-            publishRootHomeState()
-        }
-
         // check if there is an active sensor connected via cgmTransmitter in master mode
         // if so, then use this value to override/set the coredata activeSensorStartDate
         if let startDate = activeSensor?.startDate {
@@ -2631,6 +2652,7 @@ struct InitialCalibrationRequestGate {
 
         // The state model owns all visible sensor and data-source formatting. The controller keeps
         // only the source metadata and follower timer maintenance that other app services use.
+        // This call publishes the complete Home state after those updates.
         setFollowerConnectionAndHeartbeatStatus()
         return
     }
