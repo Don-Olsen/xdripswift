@@ -170,18 +170,24 @@ struct GlucoseForecastLogSnapshot: Codable, Sendable {
 
     static func encoder() -> JSONEncoder {
         let encoder = JSONEncoder()
+        // Each codec owns its formatter; snapshot construction and log IO use different workers.
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         encoder.dateEncodingStrategy = .custom { date, encoder in
-            var container = encoder.singleValueContainer(); try container.encode(isoDate(date))
+            var container = encoder.singleValueContainer(); try container.encode(formatter.string(from: date))
         }
         return encoder
     }
 
     static func decoder() -> JSONDecoder {
         let decoder = JSONDecoder()
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         decoder.dateDecodingStrategy = .custom { decoder in
             let text = try decoder.singleValueContainer().decode(String.self)
-            guard let date = parseDate(text) else { throw GlucoseForecastLogFailure.invalidSnapshot }
+            guard let date = formatter.date(from: text) else { throw GlucoseForecastLogFailure.invalidSnapshot }
             return date
         }
         return decoder
@@ -448,17 +454,21 @@ enum GlucoseForecastCSV {
         func date(_ value: Date?) -> String { value.map(GlucoseForecastLogSnapshot.isoDate) ?? "" }
         let parameters = snapshot.parameters; let summary = snapshot.treatmentSummary
         let constants = String(decoding: try GlucoseForecastLogSnapshot.encoder().encode(snapshot.constants), as: UTF8.self)
+        // Only offset and prediction vary between a snapshot's rows. Format and escape
+        // the shared cells once, including the four UTC dates and constants JSON.
+        let prefix = [String(snapshot.schemaVersion), snapshot.recordType.rawValue, snapshot.engineVersion, snapshot.appVersion,
+            snapshot.appBuild, snapshot.sourceIdentity, snapshot.sensorIdentity ?? "", snapshot.referenceIdentity ?? "",
+            date(snapshot.referenceDate), date(snapshot.computedAt), String(snapshot.horizonMinutes),
+            number(snapshot.referenceGlucoseMgdl)].map(escape).joined(separator: ",")
+        let suffix = [snapshot.reason ?? "", number(parameters.sensitivityMgdlPerUnit),
+            number(parameters.carbohydrateRatioGramsPerUnit), parameters.insulinModel ?? "",
+            number(parameters.insulinPeakMinutes), number(parameters.insulinDurationMinutes), number(parameters.carbohydrateDurationMinutes),
+            date(summary.windowStart), date(summary.windowEnd), integer(summary.bolusCount), number(summary.bolusUnits),
+            integer(summary.carbohydrateCount), number(summary.carbohydrateGrams), snapshot.inputFingerprint ?? "", constants]
+            .map(escape).joined(separator: ",")
         let points: [GlucoseForecastLogSnapshot.Point?] = snapshot.recordType == .forecast ? snapshot.points.map { Optional($0) } : [nil]
         return points.map { point in
-            [String(snapshot.schemaVersion), snapshot.recordType.rawValue, snapshot.engineVersion, snapshot.appVersion,
-             snapshot.appBuild, snapshot.sourceIdentity, snapshot.sensorIdentity ?? "", snapshot.referenceIdentity ?? "",
-             date(snapshot.referenceDate), date(snapshot.computedAt), String(snapshot.horizonMinutes),
-             number(snapshot.referenceGlucoseMgdl), integer(point?.offsetMinutes), number(point?.glucoseMgdl), snapshot.reason ?? "",
-             number(parameters.sensitivityMgdlPerUnit), number(parameters.carbohydrateRatioGramsPerUnit), parameters.insulinModel ?? "",
-             number(parameters.insulinPeakMinutes), number(parameters.insulinDurationMinutes), number(parameters.carbohydrateDurationMinutes),
-             date(summary.windowStart), date(summary.windowEnd), integer(summary.bolusCount), number(summary.bolusUnits),
-             integer(summary.carbohydrateCount), number(summary.carbohydrateGrams), snapshot.inputFingerprint ?? "", constants]
-                .map(escape).joined(separator: ",") + "\r\n"
+            prefix + "," + escape(integer(point?.offsetMinutes)) + "," + escape(number(point?.glucoseMgdl)) + "," + suffix + "\r\n"
         }
     }
 

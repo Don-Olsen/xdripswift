@@ -2646,7 +2646,7 @@ final class TreatmentListRefreshTests: XCTestCase {
             "quickCarbohydrateGrams", TreatmentSourceCutover.defaultsKey,
             "healthTherapyImport.v1.insulin.enabled", "healthTherapyImport.v1.insulin.sourceBundleID",
             "healthTherapyImport.v1.carbohydrates.enabled", "healthTherapyImport.v1.carbohydrates.sourceBundleID",
-            "timeStampLatestNightscoutSyncRequest"]
+            "timeStampLatestNightscoutSyncRequest", "therapyDataSourceType", "nightscoutEnabled"]
         let saved = keys.map { defaults.object(forKey: $0) }
         defer {
             for (key, value) in zip(keys, saved) {
@@ -2662,6 +2662,7 @@ final class TreatmentListRefreshTests: XCTestCase {
         defaults.showBasalInjectionTreatmentsInList = true
         defaults.showNoteTreatmentsInList = true
         defaults.quickCarbohydrateGrams = nil
+        defaults.therapyDataSourceType = .none
         defaults.removeObject(forKey: TreatmentSourceCutover.defaultsKey)
         try body()
     }
@@ -2822,6 +2823,175 @@ final class TreatmentListRefreshTests: XCTestCase {
         }
     }
 
+    @MainActor func testDisplaySettingsReuseLoadedRowsAndDynamicUnitsWithoutHistoryOrReminderWork() throws {
+        try withListDefaults {
+            let defaults = UserDefaults.standard
+            defaults.bloodGlucoseUnitIsMgDl = true
+            defaults.smallBolusTreatmentThreshold = 0.5
+            let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+            let at = Date()
+            let glucose = TreatmentEntry(date: at, value: 180, treatmentType: .BgCheck,
+                nightscoutEventType: nil, enteredBy: "Test", nsManagedObjectContext: core.mainManagedObjectContext)
+            _ = TreatmentEntry(date: at.addingTimeInterval(-1), value: 0.3, treatmentType: .Insulin,
+                nightscoutEventType: nil, enteredBy: "Test", nsManagedObjectContext: core.mainManagedObjectContext)
+            _ = TreatmentEntry(date: at.addingTimeInterval(-2), value: 1, treatmentType: .BasalInjection,
+                nightscoutEventType: nil, enteredBy: "Test", nsManagedObjectContext: core.mainManagedObjectContext)
+            XCTAssertTrue(core.saveChangesSynchronously())
+            let accessor = TreatmentEntryAccessor(coreDataManager: core)
+            var loads = 0
+            var reconciliations = 0
+            let list = TreatmentsViewModel(coreDataManager: core,
+                loadTreatments: { loads += 1; return accessor.getLatestTreatments(howOld: nil) },
+                reconcileReminders: { reconciliations += 1 })
+            list.reloadTreatments()
+            let loadedRows = list.filteredTreatments
+            XCTAssertEqual(loadedRows.count, 3)
+            let originalGlucose = try XCTUnwrap(loadedRows.first { $0.treatmentType == .BgCheck })
+            XCTAssertEqual(originalGlucose.valueText, "180")
+            XCTAssertEqual(originalGlucose.unitText, Texts_Common.mgdl)
+
+            // Changes not yet committed must not enter immutable rows through a display preference.
+            glucose.value = 250
+            _ = TreatmentEntry(date: at, value: 0, treatmentType: .Note,
+                nightscoutEventType: nil, enteredBy: "Uncommitted", nsManagedObjectContext: core.mainManagedObjectContext)
+            defaults.showBgCheckTreatmentsInList = false
+            list.handleUserDefaultsDidChange()
+            XCTAssertEqual(list.filteredTreatments, loadedRows.filter { $0.treatmentType != .BgCheck })
+            defaults.showBgCheckTreatmentsInList = true
+            defaults.showSmallBolusTreatmentsInList = false
+            list.handleUserDefaultsDidChange()
+            XCTAssertEqual(list.filteredTreatments, loadedRows.filter { $0.treatmentType != .Insulin })
+            defaults.smallBolusTreatmentThreshold = 0.2
+            list.handleUserDefaultsDidChange()
+            XCTAssertEqual(list.filteredTreatments, loadedRows)
+
+            defaults.bloodGlucoseUnitIsMgDl = false
+            list.handleUserDefaultsDidChange()
+            XCTAssertEqual(list.filteredTreatments, loadedRows)
+            let displayedGlucose = try XCTUnwrap(list.filteredTreatments.first { $0.objectID == originalGlucose.objectID })
+            XCTAssertEqual(displayedGlucose.rawValue, 180)
+            XCTAssertEqual(displayedGlucose.valueText, 180.0.mgDlToMmolAndToString(mgDl: false))
+            XCTAssertEqual(displayedGlucose.unitText, Texts_Common.mmol)
+
+            var publications = 0
+            let observer = list.$filteredTreatments.dropFirst().sink { _ in publications += 1 }
+            defer { observer.cancel() }
+            defaults.quickCarbohydrateGrams = 17
+            list.handleUserDefaultsDidChange()
+            XCTAssertGreaterThan(publications, 0, "The quick-carbs control must redraw")
+            XCTAssertEqual(list.filteredTreatments, loadedRows)
+            XCTAssertEqual(loads, 1)
+            XCTAssertEqual(reconciliations, 1)
+        }
+    }
+
+    @MainActor func testDirectFilterTogglesDoNotRepeatWorkOnDefaultsNotification() throws {
+        try withListDefaults {
+            let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+            let accessor = TreatmentEntryAccessor(coreDataManager: core)
+            var loads = 0
+            var reconciliations = 0
+            let list = TreatmentsViewModel(coreDataManager: core,
+                loadTreatments: { loads += 1; return accessor.getLatestTreatments(howOld: nil) },
+                reconcileReminders: { reconciliations += 1 })
+            list.reloadTreatments()
+            var publications = 0
+            let observer = list.$filteredTreatments.dropFirst().sink { _ in publications += 1 }
+            defer { observer.cancel() }
+            let toggles = [list.toggleSmallBolusFilter, list.toggleBolusFilter, list.toggleCarbsFilter,
+                list.toggleBasalFilter, list.toggleBgCheckFilter, list.toggleBasalInjectionFilter, list.toggleNoteFilter]
+            for toggle in toggles {
+                let before = publications
+                toggle()
+                XCTAssertGreaterThan(publications, before)
+                let afterToggle = publications
+                list.handleUserDefaultsDidChange()
+                XCTAssertEqual(publications, afterToggle)
+            }
+            XCTAssertEqual(loads, 1)
+            XCTAssertEqual(reconciliations, 1)
+        }
+    }
+
+    @MainActor func testFilterToggleStillProcessesPendingHealthSourceAndSourcePolicyChanges() throws {
+        try withListDefaults {
+            let defaults = UserDefaults.standard
+            defaults.set(true, forKey: "healthTherapyImport.v1.insulin.enabled")
+            defaults.set("test.source.a", forKey: "healthTherapyImport.v1.insulin.sourceBundleID")
+            let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+            let at = Date()
+            for (source, value) in [("test.source.a", 1.0), ("test.source.b", 2.0)] {
+                let row = TreatmentEntry(date: at, value: value, treatmentType: .Insulin,
+                    nightscoutEventType: nil, enteredBy: "Test", nsManagedObjectContext: core.mainManagedObjectContext)
+                row.healthKitSampleUUID = UUID().uuidString
+                row.healthKitSourceBundleIdentifier = source
+            }
+            _ = TreatmentEntry(id: "test-remote", date: at, value: 3, treatmentType: .Insulin,
+                uploaded: true, nightscoutEventType: "Bolus", enteredBy: "Test",
+                nsManagedObjectContext: core.mainManagedObjectContext)
+            XCTAssertTrue(core.saveChangesSynchronously())
+            let accessor = TreatmentEntryAccessor(coreDataManager: core)
+            var loads = 0
+            var reconciliations = 0
+            let list = TreatmentsViewModel(coreDataManager: core,
+                loadTreatments: { loads += 1; return accessor.getLatestTreatments(howOld: nil) },
+                reconcileReminders: { reconciliations += 1 })
+            list.reloadTreatments()
+            XCTAssertEqual(list.filteredTreatments.map(\.rawValue), [1])
+            defaults.set("test.source.b", forKey: "healthTherapyImport.v1.insulin.sourceBundleID")
+            list.toggleNoteFilter()
+            list.handleUserDefaultsDidChange()
+            XCTAssertEqual(list.filteredTreatments.map(\.rawValue), [2])
+            XCTAssertEqual(loads, 2)
+            XCTAssertEqual(reconciliations, 2)
+
+            defaults.nightscoutEnabled = true
+            defaults.therapyDataSourceType = .nightscout
+            list.toggleCarbsFilter()
+            list.handleUserDefaultsDidChange()
+            XCTAssertEqual(list.filteredTreatments.map(\.rawValue).sorted(), [2, 3])
+            XCTAssertEqual(loads, 3)
+            XCTAssertEqual(reconciliations, 3)
+        }
+    }
+
+    @MainActor func testDisplayDefaultsBeforeFirstLoadAndAfterMidnightStillLoadCurrentRows() throws {
+        try withListDefaults {
+            let calendar = dayCalendar()
+            var now = dayDate(7, hour: 23, minute: 59, calendar: calendar)
+            let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+            for (day, value) in [(7, 1.0), (8, 2.0)] {
+                _ = TreatmentEntry(date: dayDate(day, calendar: calendar), value: value,
+                    treatmentType: .BasalInjection, nightscoutEventType: nil, enteredBy: "Test",
+                    nsManagedObjectContext: core.mainManagedObjectContext)
+            }
+            XCTAssertTrue(core.saveChangesSynchronously())
+            let accessor = TreatmentEntryAccessor(coreDataManager: core)
+            var loads = 0
+            var reconciliations = 0
+            let list = TreatmentsViewModel(coreDataManager: core, clock: { now },
+                calendarProvider: { calendar },
+                loadTreatments: { loads += 1; return accessor.getLatestTreatments(howOld: nil) },
+                reconcileReminders: { reconciliations += 1 })
+            UserDefaults.standard.quickCarbohydrateGrams = 17
+            list.handleUserDefaultsDidChange()
+            XCTAssertEqual(list.filteredTreatments.map(\.rawValue), [1])
+            XCTAssertEqual(loads, 1)
+            list.initializeViewIfNeeded()
+            XCTAssertEqual(loads, 2, "A defaults event must not suppress explicit tab initialization")
+
+            now = dayDate(8, hour: 13, calendar: calendar)
+            UserDefaults.standard.quickCarbohydrateGrams = 18
+            list.handleUserDefaultsDidChange()
+            XCTAssertEqual(list.filteredTreatments.map(\.rawValue), [2])
+            XCTAssertEqual(list.selectedDate, calendar.startOfDay(for: now))
+            XCTAssertEqual(loads, 3)
+            XCTAssertEqual(reconciliations, 3)
+            list.handleCurrentDayChanged()
+            XCTAssertEqual(loads, 3)
+        }
+    }
+
     @MainActor func testRelevantFiltersUnitsAndQuickCarbsStillRefresh() throws {
         try withListDefaults {
             let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
@@ -2869,7 +3039,12 @@ final class TreatmentListRefreshTests: XCTestCase {
             second.healthKitSampleUUID = UUID().uuidString
             second.healthKitSourceBundleIdentifier = "test.source.b"
             XCTAssertTrue(core.saveChangesSynchronously())
-            let list = TreatmentsViewModel(coreDataManager: core)
+            let accessor = TreatmentEntryAccessor(coreDataManager: core)
+            var loads = 0
+            var reconciliations = 0
+            let list = TreatmentsViewModel(coreDataManager: core,
+                loadTreatments: { loads += 1; return accessor.getLatestTreatments(howOld: nil) },
+                reconcileReminders: { reconciliations += 1 })
             list.reloadTreatments()
             XCTAssertEqual(list.filteredTreatments.map(\.rawValue), [1])
             defaults.set("test.source.b", forKey: "healthTherapyImport.v1.insulin.sourceBundleID")
@@ -2882,6 +3057,15 @@ final class TreatmentListRefreshTests: XCTestCase {
                 insulinSourceBundleID: "test.source.a", carbohydrateSourceBundleID: "test.carbs")))
             list.handleUserDefaultsDidChange()
             XCTAssertEqual(list.filteredTreatments.map(\.rawValue), [1], "Stored pre-cutover history remains visible with ongoing import off")
+            XCTAssertEqual(loads, 4)
+            XCTAssertEqual(reconciliations, 4, "Each source/import/cutover change retains reminder reconciliation")
+            defaults.set(Data("invalid".utf8), forKey: TreatmentSourceCutover.defaultsKey)
+            list.handleUserDefaultsDidChange()
+            XCTAssertEqual(loads, 5)
+            defaults.removeObject(forKey: TreatmentSourceCutover.defaultsKey)
+            list.handleUserDefaultsDidChange()
+            XCTAssertEqual(loads, 6, "Invalid-to-missing cutover also changes eligibility state")
+            XCTAssertEqual(reconciliations, 6)
         }
     }
 
@@ -2901,6 +3085,9 @@ final class TreatmentListRefreshTests: XCTestCase {
             XCTAssertTrue(metrics.hasUncommittedTreatmentChanges)
             list.handleTherapyMetricsChanged()
             XCTAssertTrue(list.filteredTreatments.isEmpty, "An unfinished parent commit must not publish")
+            UserDefaults.standard.quickCarbohydrateGrams = 17
+            list.handleUserDefaultsDidChange()
+            XCTAssertTrue(list.filteredTreatments.isEmpty, "Display settings must reuse rows while the parent commit is unfinished")
             let inserted = expectation(description: "inserted treatment reaches list")
             let insertObserver = list.$filteredTreatments.first(where: { $0.count == 1 }).sink { _ in inserted.fulfill() }
             XCTAssertTrue(core.saveChangesSynchronously())

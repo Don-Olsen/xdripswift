@@ -1,4 +1,5 @@
 import XCTest
+import CryptoKit
 @testable import xdrip
 
 final class GlucoseForecastLogTests: XCTestCase {
@@ -53,6 +54,63 @@ final class GlucoseForecastLogTests: XCTestCase {
     private func log(at date: Date? = nil, diagnostic: @escaping (GlucoseForecastLogFailure) -> Void = { _ in }) -> GlucoseForecastLog {
         let date = date ?? now
         return GlucoseForecastLog(directory: folder, clock: { date }, diagnostic: diagnostic)
+    }
+
+    func testJSONDateCodecPreservesFixedUTCBytesAndOffsetParsing() throws {
+        let dates = [now, now.addingTimeInterval(-36000), now.addingTimeInterval(86400)]
+        let expected = #"["2027-01-15T08:00:00.125Z","2027-01-14T22:00:00.125Z","2027-01-16T08:00:00.125Z"]"#
+        let encoder = GlucoseForecastLogSnapshot.encoder()
+        XCTAssertEqual(try encoder.encode(dates), Data(expected.utf8))
+        XCTAssertEqual(try encoder.encode(Array(dates.reversed())),
+            Data(#"["2027-01-16T08:00:00.125Z","2027-01-14T22:00:00.125Z","2027-01-15T08:00:00.125Z"]"#.utf8))
+        let decoder = GlucoseForecastLogSnapshot.decoder()
+        XCTAssertEqual(try decoder.decode([Date].self, from: Data(expected.utf8)), dates)
+        let offsetDates = #"["2027-01-15T09:00:00.125+01:00","2027-01-14T17:00:00.125-05:00","2027-01-16T08:00:00.125Z"]"#
+        XCTAssertEqual(try decoder.decode([Date].self, from: Data(offsetDates.utf8)), dates)
+        XCTAssertThrowsError(try decoder.decode([Date].self, from: Data(#"["not-a-date"]"#.utf8)))
+    }
+
+    func testJSONLSnapshotAndFingerprintPreserveLegacyEncoding() throws {
+        let treatments = [TherapyTreatment(date: now.addingTimeInterval(-300), amount: 1, isIOB: true),
+            TherapyTreatment(date: now.addingTimeInterval(-600), amount: 10, isIOB: false)]
+        let value = try snapshot(input(treatments: treatments))
+        XCTAssertEqual(value.referenceIdentity,
+            "916bb4eeb1ff72806f33c0817466a2f4f2db13f499f2294cb37706893c6c4cca")
+        // Pin the fingerprint's wire contract independently of the production codec.
+        struct Fingerprint: Encodable {
+            let source: String; let sensor: String?; let horizon: Int
+            let inputs: GlucoseForecastLogSnapshot.Inputs
+            let parameters: GlucoseForecastLogSnapshot.Parameters
+            let constants: GlucoseForecastEngineConfiguration
+        }
+        let fingerprint = Fingerprint(source: value.sourceIdentity, sensor: value.sensorIdentity,
+            horizon: value.horizonMinutes, inputs: try XCTUnwrap(value.inputs),
+            parameters: value.parameters, constants: value.constants)
+        let expectedFingerprint = SHA256.hash(data: try legacyEncoder().encode(fingerprint))
+            .map { String(format: "%02x", $0) }.joined()
+        XCTAssertEqual(value.inputFingerprint, expectedFingerprint)
+        let legacyBytes = try legacyEncoder().encode(value)
+        XCTAssertEqual(try GlucoseForecastLogSnapshot.encoder().encode(value), legacyBytes)
+        let decoded = try GlucoseForecastLogSnapshot.decoder().decode(GlucoseForecastLogSnapshot.self, from: legacyBytes)
+        XCTAssertEqual(try legacyEncoder().encode(decoded), legacyBytes)
+        let logger = log(); logger.enqueue(value); logger.waitUntilIdle()
+        var expectedLine = legacyBytes
+        expectedLine.append(contentsOf: [UInt8(10)])
+        XCTAssertEqual(try Data(contentsOf: XCTUnwrap(dailyFiles().first)), expectedLine)
+    }
+
+    /// Pre-optimization JSON date strategy, kept local to the compatibility fixture.
+    private func legacyEncoder() -> JSONEncoder {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        encoder.dateEncodingStrategy = .custom { date, encoder in
+            let formatter = ISO8601DateFormatter()
+            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            formatter.timeZone = TimeZone(secondsFromGMT: 0)
+            var container = encoder.singleValueContainer()
+            try container.encode(formatter.string(from: date))
+        }
+        return encoder
     }
 
     func testFirstValidSnapshotSurvivesRepeatedCallsAndRestart() throws {
@@ -246,6 +304,38 @@ final class GlucoseForecastLogTests: XCTestCase {
         }
         XCTAssertEqual(column(error, "reason"), "missingGlucose")
         XCTAssertEqual(rows.dropFirst().filter { column($0, "offset_minutes") == "120" }.count, 1)
+    }
+
+    func testCSVInvariantCellsAndPointColumnsRemainExactForBothHorizons() throws {
+        let source = "sensor:Æble,\"one\"\r\nline"
+        for horizon in [60, 120] {
+            let value = try snapshot(input(horizon: horizon), computedAt: now.addingTimeInterval(86400), source: source)
+            let encodedRows = try GlucoseForecastCSV.rows(value)
+            XCTAssertEqual(encodedRows.count, horizon / 5 + 1)
+            XCTAssertTrue(encodedRows.allSatisfy { $0.hasSuffix("\r\n") })
+            XCTAssertTrue(encodedRows.allSatisfy { $0.contains("\"sensor:Æble,\"\"one\"\"\r\nline\"") })
+            let rows = parseCSV(encodedRows.joined())
+            XCTAssertEqual(rows.count, horizon / 5 + 1)
+            let expectedCells = ["source_identity": source,
+                "reference_date_utc": "2027-01-15T08:00:00.125Z",
+                "computed_at_utc": "2027-01-16T08:00:00.125Z",
+                "treatment_window_start_utc": "2027-01-14T22:00:00.125Z",
+                "treatment_window_end_utc": "2027-01-15T08:00:00.125Z",
+                "horizon_minutes": String(horizon), "reference_glucose_mgdl": "120.0",
+                "prediction_mgdl": "120.0", "reason": "", "insulin_model": "Fiasp"]
+            let offsetColumn = try XCTUnwrap(GlucoseForecastCSV.columns.firstIndex(of: "offset_minutes"))
+            for (index, row) in rows.enumerated() {
+                guard row.count == GlucoseForecastCSV.columns.count else {
+                    XCTFail("Unexpected CSV column count: \(row.count)")
+                    continue
+                }
+                for (name, expected) in expectedCells {
+                    let column = try XCTUnwrap(GlucoseForecastCSV.columns.firstIndex(of: name))
+                    XCTAssertEqual(row[column], expected, "\(name), horizon \(horizon), row \(index)")
+                }
+                XCTAssertEqual(row[offsetColumn], String(index * 5))
+            }
+        }
     }
 
     func testSourceLogIsIncludedInBackupAndProtected() throws {

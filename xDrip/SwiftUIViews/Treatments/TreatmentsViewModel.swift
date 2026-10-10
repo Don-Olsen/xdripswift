@@ -40,6 +40,8 @@ import OSLog
     private let localSaveJournal: PenDoseLogJournal
     private let therapyMetricsManager: TherapyMetricsManager
     private let localSaveOverride: (() -> Bool)?
+    private let loadTreatments: () -> [TreatmentEntry]
+    private let reconcileReminders: () -> Void
     private let clock: () -> Date
     private let calendarProvider: () -> Calendar
     private var followsCurrentDay = true
@@ -50,8 +52,8 @@ import OSLog
     private var loadedTreatmentRevision: Int?
     private var lastSettings = ListSettings()
 
-    /// Only preferences read by this list may trigger a reload. Glucose/export timestamps and
-    /// unrelated defaults are frequent; observing them must not fetch history or reconcile files.
+    /// Only source preferences require new treatment snapshots. Display settings reuse the loaded
+    /// rows; unrelated defaults must not fetch history, reconcile files or republish the list.
     private struct ListSettings: Equatable {
         let filters: [Bool]
         let smallBolusThreshold: Double
@@ -64,6 +66,13 @@ import OSLog
         let importsCarbs: Bool
         let cutover: TreatmentSourceCutover?
         let invalidCutover: Bool
+
+        func hasSameTreatmentSources(as other: Self) -> Bool {
+            sourcePolicy == other.sourcePolicy && insulinSource == other.insulinSource &&
+                carbsSource == other.carbsSource && importsInsulin == other.importsInsulin &&
+                importsCarbs == other.importsCarbs && cutover == other.cutover &&
+                invalidCutover == other.invalidCutover
+        }
 
         init() {
             let defaults = UserDefaults.standard
@@ -93,10 +102,19 @@ import OSLog
          localSaveOverride: (() -> Bool)? = nil,
          therapyMetricsManager: TherapyMetricsManager = .shared,
          clock: @escaping () -> Date = Date.init,
-         calendarProvider: @escaping () -> Calendar = { .current }) {
+         calendarProvider: @escaping () -> Calendar = { .current },
+         loadTreatments: (() -> [TreatmentEntry])? = nil,
+         reconcileReminders: (() -> Void)? = nil) {
         self.coreDataManager = coreDataManager
-        self.treatmentEntryAccessor = TreatmentEntryAccessor(coreDataManager: coreDataManager)
-        self.localSaveJournal = localSaveJournal ?? .shared
+        let accessor = TreatmentEntryAccessor(coreDataManager: coreDataManager)
+        self.treatmentEntryAccessor = accessor
+        let journal = localSaveJournal ?? .shared
+        self.localSaveJournal = journal
+        self.loadTreatments = loadTreatments ?? { accessor.getLatestTreatments(howOld: nil) }
+        self.reconcileReminders = reconcileReminders ?? {
+            MealPlanReminderCoordinator.reconcile(coreDataManager: coreDataManager,
+                journal: journal, onIssue: MealReminderIssueCenter.report)
+        }
         self.localSaveOverride = localSaveOverride
         self.therapyMetricsManager = therapyMetricsManager
         self.clock = clock
@@ -126,7 +144,7 @@ import OSLog
         loadedTreatmentRevision = therapyMetricsManager.treatmentChangeRevision
         syncFilterSettingsFromUserDefaults()
 
-        let fetched = treatmentEntryAccessor.getLatestTreatments(howOld: nil)
+        let fetched = loadTreatments()
         let importer = HealthKitTherapyImportManager.shared
         let cutover = TreatmentSourceCutover.current()
         // Match the source, cutover and origin-dedup rules used by live IOB/COB. Turning the
@@ -174,8 +192,7 @@ import OSLog
         allTreatments = treatments.map { TreatmentSnapshot(treatmentEntry: $0) }
 
         applyFilters()
-        MealPlanReminderCoordinator.reconcile(coreDataManager: coreDataManager,
-            journal: localSaveJournal, onIssue: MealReminderIssueCenter.report)
+        reconcileReminders()
     }
 
     func plannedMealSnapshot(uuid: String) -> TreatmentSnapshot? {
@@ -183,8 +200,19 @@ import OSLog
     }
 
     func handleUserDefaultsDidChange() {
-        guard ListSettings() != lastSettings else { return }
-        reloadTreatments()
+        let settings = ListSettings()
+        guard settings != lastSettings else { return }
+        guard loadedTreatmentRevision != nil,
+              settings.hasSameTreatmentSources(as: lastSettings),
+              !updateSelectedDayIfNeeded() else {
+            reloadTreatments()
+            return
+        }
+        lastSettings = settings
+        syncFilterSettingsFromUserDefaults()
+        // Snapshot formatting reads current units/thresholds, and quick-carbs controls redraw
+        // with this publication. Neither presentation change needs a database/reminder pass.
+        applyFilters()
     }
 
     /// Data changes must not depend on an incidental defaults write. Ignore glucose-only/status
@@ -219,44 +247,37 @@ import OSLog
         }
 
         UserDefaults.standard.showSmallBolusTreatmentsInList.toggle()
-        showSmallBolusTreatments = UserDefaults.standard.showSmallBolusTreatmentsInList
-        applyFilters()
+        handleUserDefaultsDidChange()
     }
 
     func toggleBolusFilter() {
         UserDefaults.standard.showBolusTreatmentsInList.toggle()
-        showBolusTreatments = UserDefaults.standard.showBolusTreatmentsInList
-        applyFilters()
+        handleUserDefaultsDidChange()
     }
 
     func toggleCarbsFilter() {
         UserDefaults.standard.showCarbsTreatmentsInList.toggle()
-        showCarbsTreatments = UserDefaults.standard.showCarbsTreatmentsInList
-        applyFilters()
+        handleUserDefaultsDidChange()
     }
 
     func toggleBasalFilter() {
         UserDefaults.standard.showBasalTreatmentsInList.toggle()
-        showBasalTreatments = UserDefaults.standard.showBasalTreatmentsInList
-        applyFilters()
+        handleUserDefaultsDidChange()
     }
 
     func toggleBgCheckFilter() {
         UserDefaults.standard.showBgCheckTreatmentsInList.toggle()
-        showBgCheckTreatments = UserDefaults.standard.showBgCheckTreatmentsInList
-        applyFilters()
+        handleUserDefaultsDidChange()
     }
 
     func toggleBasalInjectionFilter() {
         UserDefaults.standard.showBasalInjectionTreatmentsInList.toggle()
-        showBasalInjectionTreatments = UserDefaults.standard.showBasalInjectionTreatmentsInList
-        applyFilters()
+        handleUserDefaultsDidChange()
     }
 
     func toggleNoteFilter() {
         UserDefaults.standard.showNoteTreatmentsInList.toggle()
-        showNoteTreatments = UserDefaults.standard.showNoteTreatmentsInList
-        applyFilters()
+        handleUserDefaultsDidChange()
     }
 
     @discardableResult

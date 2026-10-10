@@ -32,6 +32,52 @@ De følgende afsnit bevarer integrations- og testhistorikken før denne udgivels
 - Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
 <!-- testflight-7.1.1-4314:end -->
 
+## Treatment-filtre og prognoselog — afgrænset optimering efter 4316
+
+10. oktober 2026: rene visningsændringer i Treatment-fanen genindlæste
+hele behandlingshistorikken og afstemte måltidspåmindelser. Listen genbruger
+nu sine indlæste værdibaserede snapshots ved filtre, små-bolusgrænse,
+glukoseenheder og hurtige kulhydrater. Direkte filtertryk opdaterer samme
+indstillingssnapshot, så efterfølgende defaults-notifikation ikke gentager
+arbejdet. Første indlæsning, fanegenåbning, dagsskift, kilde/import/cutover-
+ændringer og verificerede behandlingsændringer beholder frisk genindlæsning
+og påmindelsesafstemning. Historisk datovalg, kilde-/dubletregler og
+behandlingslagring er uændrede.
+
+Prognoseloggens JSON-encoder og -decoder ejer hver én ISO-datoformatter i
+stedet for at oprette en formatter pr. dato. Ingen global formatter deles
+mellem workers. CSV-eksport formaterer og escaper et snapshots faste
+metadata én gang i stedet for for hvert prognosepunkt. Skema, UTC-format,
+fraktioner, kolonner, escaping, tomme felter, CRLF, referenceidentiteter og
+input-fingerprints bevares; retention, dedup og den serielle filworker er
+uændrede. Ingen ændring af prognose-/ML-matematik, dosisregler, HealthKit,
+alarmer, Nightscout eller Libre/Watch. Komplikationer og HealthKit-status
+indgår ikke i denne rettelse.
+
+Syv nye regressionstests og skærpede eksisterende kilde-/commit-tests
+kontrollerer de faktiske listehandlere med syntetisk Core Data, antal
+historikhentninger/afstemninger, uændrede snapshots under en ikke-afsluttet
+commit, dynamiske enheder og frisk kilde-/datoopdatering. Logtests sammenligner
+JSONL og fingerprints med tidligere kodning, faste UTC-strenge,
+offset-parsing samt CSV-rækker for begge horisonter. Ingen eksisterende
+tests er fjernet eller svækket.
+
+Forberedende `scripts/local-build.sh release-test` bestod: **1.499/1.499
+XCTest-tests**, 0 fejl og 0 skipped, **166 Python-tests**, **30 + 24 syntetiske
+kontroller** samt iPhone- og Watch-simulatorbuilds. Lokal kvittering:
+`~/DeveloperBuildData/xDrip/local-runs/xdripswift/20261010T085254Z-32323/`.
+Diff-, syntaks- og særskilt krydsgennemgang bestod. Releaseproceduren vælger
+nummer hos Apple og gentester det præcise nummererede checkpoint; faktisk
+Apple-status og release-tests registreres særskilt ovenfor.
+
+Læsende `devicectl`-kontrol viste den parrede fysiske iPhone og Watch som
+utilgængelige; den tilsluttede iPhone 18 Pro er en simulator. Ingen lokal
+installation eller fysisk ydelses-/batterimåling er foretaget. Fysisk
+opfølgning efter TestFlight-opdatering: kontrollér filtre og enheder i
+Treatment-fanen samt nye/redigerede behandlinger og CSV-eksport. Der er
+fjernet dokumenteret gentaget arbejde, men ingen hastigheds- eller
+batterigevinst er målt. Brugeren har autoriseret byg og upload.
+
 ## Home og minigraf — afgrænset optimering efter 4315
 
 10. oktober 2026: `handleBgPostProcessingDidUpdate` lavede en fuld
