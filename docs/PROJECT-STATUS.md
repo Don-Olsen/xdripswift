@@ -44,6 +44,34 @@ De følgende afsnit bevarer integrations- og testhistorikken før denne udgivels
 - Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
 <!-- testflight-7.1.1-4314:end -->
 
+## Watch — Libre-genvej til venstre efter 4317
+
+10. oktober 2026: Libre-kontrolsiden er fjernet fra RootViews carousel.
+Et lille `l.circle.fill` øverst til venstre åbner samme `LibreDirectView`
+som en fuldskærmsvisning; bolusberegnerens plus bliver til højre. Begge
+genveje findes på Main, AGP og Big Number og har 44 × 44 point trykflade.
+watchOS leverer samme standardlukning som for bolusberegneren. Det gamle
+gemte Libre-sidevalg (3) falder gennem eksisterende ugyldigt-sidevalg tilbage
+til Main. Ved Watch-overtagelse vælges Big Number bag den åbne Libre-visning;
+ingen ny overtagelse udføres ved åbning eller lukning.
+
+Kun `RootView.swift` er ændret i produktionskode. LibreDirectView, collector,
+Watch/iPhone-kommunikation, runtime, alarmer, komplikationer og beregneren
+bevares. `scripts/local-build.sh build` bestod for iPhone og Watch; kvittering:
+`~/DeveloperBuildData/xDrip/local-runs/xdripswift/20261010T091909Z-49538/`.
+Diffkontrol og særskilt læsende review bestod. Forberedelsen kørte kun
+simulatorbuilds; releaseproceduren kører hele XCTest-suiten, Python-kontroller,
+syntetiske Watch-kontroller og begge simulatorbuilds på det præcise nummererede
+checkpoint. Faktiske release-tests og Apple-status registreres særskilt ovenfor.
+Native simulatorstyring kunne ikke initialiseres på grund af miljøets
+symlinkede writable-root-konfiguration. L/X/+, visningen på små/store ure og
+overtagelse mens visningen er åben er derfor ikke visuelt eller fysisk
+verificeret. Læsende device-kontrol viste den fysiske iPhone og Watch som
+utilgængelige. Ingen lokal installation; brugeren har nu autoriseret TestFlight-
+upload af denne konkrete rettelse. Fysisk opfølgning: åbn/luk Libre via L på
+Main, AGP og Big Number, kontrollér +, og kontrollér at åbning/lukning alene
+ikke overdrager sensoren.
+
 ## Treatment-filtre og prognoselog — afgrænset optimering efter 4316
 
 10. oktober 2026: rene visningsændringer i Treatment-fanen genindlæste

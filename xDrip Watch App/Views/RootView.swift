@@ -16,6 +16,7 @@ struct RootView: View {
     // save the last selected tab on the Watch so re-opening the app returns to the same page
     @AppStorage("watchAppSelectedPage") private var selectedPage = WatchAppPage.main.rawValue
     @State private var showingBolusCalculator = false
+    @State private var showingLibreControls = false
 
     // keep both main pages on the same chart range so swiping between them only changes whether
     // the AGP background is visible. The chart content should not jump between pages.
@@ -34,10 +35,6 @@ struct RootView: View {
             // large number page
             BigNumberView(libreDirectCollector: libreDirectCollector)
                 .tag(WatchAppPage.bigNumber.rawValue)
-
-            // Explicit persistent hand-off between iPhone and direct Watch reception.
-            LibreDirectView(collector: libreDirectCollector)
-                .tag(WatchAppPage.libreDirect.rawValue)
         }
         .modifier(RootViewTabViewStyleModifier())
         .environmentObject(watchState)
@@ -45,6 +42,7 @@ struct RootView: View {
             if selectedPage == WatchAppPage.main.rawValue ||
                 selectedPage == WatchAppPage.agp.rawValue ||
                 selectedPage == WatchAppPage.bigNumber.rawValue {
+                ToolbarItem(placement: .topBarLeading) { libreButton }
                 ToolbarItem(placement: .topBarTrailing) { calculatorButton }
             }
         }
@@ -52,9 +50,14 @@ struct RootView: View {
             WatchManualTreatmentsView()
                 .environmentObject(watchState)
         }
+        .fullScreenCover(isPresented: $showingLibreControls) {
+            // Reuse the hand-off screen and watchOS' standard close button outside the carousel.
+            LibreDirectView(collector: libreDirectCollector)
+                .environmentObject(watchState)
+        }
         .onAppear {
             if WatchAppPage(rawValue: selectedPage) == nil {
-                // The former treatments page (4) and other unknown saved values return to Main.
+                // Former Libre (3), treatments (4) and other unknown saved pages return to Main.
                 selectedPage = WatchAppPage.main.rawValue
             } else if watchState.libreWatchOwnership == .watch {
                 selectedPage = WatchAppPage.bigNumber.rawValue
@@ -92,6 +95,19 @@ struct RootView: View {
             hours: ConstantsAppleWatch.hoursToShow[hoursToShowIndex])
     }
 
+    private var libreButton: some View {
+        Button {
+            showingLibreControls = true
+        } label: {
+            Image(systemName: "l.circle.fill")
+                .font(.system(size: 24))
+                .frame(width: 44, height: 44)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Libre – sensorforbindelse")
+    }
+
     private var calculatorButton: some View {
         Button {
             showingBolusCalculator = true
@@ -121,7 +137,6 @@ private enum WatchAppPage: Int {
     case main = 0
     case agp = 1
     case bigNumber = 2
-    case libreDirect = 3
 }
 
 private struct WatchManualTreatmentsView: View {
