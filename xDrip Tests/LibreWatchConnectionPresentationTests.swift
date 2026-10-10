@@ -13,6 +13,61 @@ final class LibreWatchConnectionPresentationTests: XCTestCase {
             directReadingIsCurrent: isCurrent, at: now)
     }
 
+    private func timedPresentation(measuredAt: Date, renderedAt: Date,
+                                   stage: LibreWatchDirectStage = .receiving) -> LibreWatchConnectionPresentation {
+        LibreWatchConnectionPresentation(ownership: .watch, stage: stage,
+            directReadingAt: measuredAt,
+            directReadingIsCurrent: ComplicationReadingSource.directLibre.isCurrent(measuredAt: measuredAt, at: renderedAt),
+            at: renderedAt)
+    }
+
+    func testFreshReadingAfterSuspendedDisplayTickUsesActualRenderTime() {
+        let suspendedTick = now.addingTimeInterval(-99)
+        let measuredAt = now.addingTimeInterval(-39)
+        // Reproduce the old view's stale timestamp, then compose the actual policy at render time.
+        let old = timedPresentation(measuredAt: measuredAt, renderedAt: suspendedTick)
+        XCTAssertEqual(old.reading, .stale)
+        XCTAssertEqual(old.readingAge, 0)
+
+        let current = timedPresentation(measuredAt: measuredAt, renderedAt: now)
+        XCTAssertEqual(current.connection, .connected)
+        XCTAssertEqual(current.reading, .current)
+        XCTAssertEqual(current.readingAge, 39)
+        XCTAssertEqual(current.emphasis, .healthy)
+    }
+
+    func testActualRenderTimeStillExpiresDirectReadingAfterThreeMinutes() {
+        let measuredAt = now.addingTimeInterval(-180)
+        XCTAssertEqual(timedPresentation(measuredAt: measuredAt, renderedAt: now).reading, .current)
+        let expired = timedPresentation(measuredAt: measuredAt, renderedAt: now.addingTimeInterval(0.001))
+        XCTAssertEqual(expired.connection, .connected)
+        XCTAssertEqual(expired.reading, .stale)
+        XCTAssertEqual(expired.readingAge ?? -1, 180.001, accuracy: 0.0001)
+        XCTAssertEqual(expired.emphasis, .attention)
+    }
+
+    func testActualRenderTimePreservesFutureTimestampTolerance() {
+        XCTAssertEqual(timedPresentation(measuredAt: now.addingTimeInterval(20), renderedAt: now).reading, .current)
+        let future = timedPresentation(measuredAt: now.addingTimeInterval(20.001), renderedAt: now)
+        XCTAssertEqual(future.connection, .connected)
+        XCTAssertEqual(future.reading, .stale)
+        XCTAssertEqual(future.emphasis, .attention)
+    }
+
+    func testClockRollbackMustNotSubstituteLaterDisplayTickForActualTime() {
+        let actualNow = now.addingTimeInterval(-60)
+        XCTAssertEqual(timedPresentation(measuredAt: now, renderedAt: now).reading, .current)
+        XCTAssertEqual(timedPresentation(measuredAt: now, renderedAt: actualNow).reading, .stale)
+    }
+
+    func testFreshReadingAtActualRenderTimeDoesNotHideReconnection() {
+        let value = timedPresentation(measuredAt: now.addingTimeInterval(-39), renderedAt: now, stage: .reconnecting)
+        XCTAssertEqual(value.connection, .reconnecting)
+        XCTAssertEqual(value.reading, .current)
+        XCTAssertEqual(value.readingAge, 39)
+        XCTAssertEqual(value.emphasis, .attention)
+    }
+
     func testNormalMinuteOldReadingRemainsConnectedAndHealthy() {
         let value = presentation(age: 61)
         XCTAssertEqual(value.connection, .connected)

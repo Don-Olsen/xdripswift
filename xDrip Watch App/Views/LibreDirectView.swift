@@ -10,6 +10,12 @@ struct LibreDirectView: View {
     private let displayTimer = Timer.publish(every: 15, on: .main, in: .common).autoconnect()
 
     var body: some View {
+        // Keep timer-driven redraws, but never use a suspended timer's date as now.
+        let _ = displayDate
+        let now = Date()
+        let presentation = watchState.directLibrePresentation(stage: collector.state.stage, at: now)
+        let statusColor = presentation.statusColor
+
         ScrollView {
             VStack(spacing: 10) {
                 Image(systemName: watchState.libreWatchOwnership == .watch ? "applewatch.radiowaves.left.and.right" : "iphone")
@@ -23,7 +29,7 @@ struct LibreDirectView: View {
 
                 if watchState.libreWatchOwnership == .watch,
                    watchState.isShowingDirectLibreReading || collector.state.directReading != nil {
-                    let isCurrent = watchState.directLibreReadingIsCurrent(at: displayDate)
+                    let isCurrent = watchState.directLibreReadingIsCurrent(at: now)
                     let isRecovering = collector.state.connectionRecoveryIsInProgress
                     let hasFinalReading = watchState.isShowingDirectLibreReading
                     let showsLiveReading = hasFinalReading && isCurrent && !isRecovering && collector.state.stage == .receiving
@@ -166,14 +172,6 @@ struct LibreDirectView: View {
             }
             .tint(.red)
         }
-    }
-
-    private var statusColor: Color {
-        presentation.statusColor
-    }
-
-    private var presentation: LibreWatchConnectionPresentation {
-        watchState.directLibrePresentation(stage: collector.state.stage, at: displayDate)
     }
 }
 

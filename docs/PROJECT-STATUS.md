@@ -68,6 +68,42 @@ De følgende afsnit bevarer integrations- og testhistorikken før denne udgivels
 - Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
 <!-- testflight-7.1.1-4314:end -->
 
+## Watch — friskhed ved Always On efter 4319
+
+10. oktober 2026: Big Number og Libre-kontrolvisningen vurderede en ny
+måling mod den gemte dato fra visningens 15-sekunders timer. Hvis timeren
+var forsinket, kunne en faktisk frisk måling ligge mere end 20 sekunder
+foran denne gamle dato og fejlagtigt blive vist som "Ikke aktuel". Den
+konkrete kodevej er reproduceret med produktionsreglerne. Den læsende
+undersøgelse af det fysiske ur viste modtagelse og varig lagring før
+håndledsaktivering; det præcise render-tidspunkt/label blev ikke logget,
+så journalen alene beviser ikke den viste fejlvej.
+
+De to views tager nu ét aktuelt `Date()` pr. body-evaluering og bruger det
+sammenhængende til friskhed og målingsalder. Den eksisterende timer-state
+læses fortsat som trigger for periodiske redraws. Timer, livscykluskald,
+180-sekunders friskhedsgrænse og 20-sekunders fremtidstolerance er urørte.
+Produktionsændringen er kun i de to visninger; collector, Bluetooth,
+ejerskab, workout-runtime, alarmer, komplikationer og beregninger er urørte.
+
+Fem nye XCTest-regressioner bruger den faktiske friskhedspolitik sammen
+med forbindelsespræsentationen: ny måling efter forsinket tick, faktisk
+udløb, fremtidstolerance, tilbageskift af klokke og frisk måling under
+genforbindelse. De verificerer politik og reproduktion, ikke Watch-only
+SwiftUI-rendering eller Always On på hardware. Diffkontrol og uafhængigt
+læsende review bestod. Releaseproceduren vælger nummer hos Apple og kører
+hele XCTest-suiten, Python-kontroller, syntetiske Watch-kontroller og begge
+simulatorbuilds på det præcise nummererede checkpoint; faktiske resultater
+og Apple-status registreres i releaseafsnittet ovenfor.
+
+Læsende `devicectl` bekræftede iPhone 7.1.1 (4319) med forventet bundle og
+et tilgængeligt parret Watch. Ingen lokal installation eller afbrydelse af
+CGM. Fysisk opfølgning efter TestFlight: bekræft urets nye build, lad Big
+Number stå med håndleddet nede under flere sensormålinger, og kontrollér
+at friskhed/målingsalder stemmer uden håndledsaktivering. Gentag i Libre-
+visningen; en faktisk målingspause over tre minutter skal stadig vise
+advarsel. Den rettede Always On-adfærd er endnu ikke fysisk verificeret.
+
 ## Watch — automatisk store tal efter 4318
 
 10. oktober 2026: efter flytningen til et fuldskærmsark valgte RootView

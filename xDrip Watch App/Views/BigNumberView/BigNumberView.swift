@@ -36,11 +36,11 @@ struct BigNumberView: View {
     let animatedGaugeOpacityValue = 1.0
     @State private var gaugeOpacityValue = 0.8
     
-    private var directPresentation: LibreWatchConnectionPresentation {
-        watchState.directLibrePresentation(stage: libreDirectCollector.state.stage, at: displayDate)
-    }
-    
     var body: some View {
+        // Keep timer-driven redraws, but never use a suspended timer's date as now.
+        let _ = displayDate
+        let now = Date()
+        let directPresentation = watchState.directLibrePresentation(stage: libreDirectCollector.state.stage, at: now)
         let showsDirectReading = watchState.libreWatchOwnership == .watch
         let directReadingIsStale = showsDirectReading && directPresentation.reading == .stale
         let awaitsFirstDirectReading = showsDirectReading && directPresentation.reading == .waiting
@@ -144,7 +144,7 @@ struct BigNumberView: View {
                         .padding(.top, 4)
                         .padding(.trailing, 2)
 
-                    Text(watchState.lastUpdatedMinsAgoString(at: displayDate))
+                    Text(watchState.lastUpdatedMinsAgoString(at: now))
                         .font(.system(size: isSmallScreen ? 16 : 18))
                         .monospacedDigit()
                         .foregroundStyle(watchState.lastUpdatedTimeColor())
