@@ -81,6 +81,14 @@ struct RootView: View {
                 selectedPage = WatchAppPage.bigNumber.rawValue
             }
         }
+        .onChange(of: watchState.libreWatchOwnership == .watch && libreDirectCollector.state.stage == .receiving) { connected in
+            if connected {
+                // The Libre controls now cover the carousel. Reveal Big Number on connection;
+                // leave an open bolus calculator and its entered amounts untouched.
+                selectedPage = WatchAppPage.bigNumber.rawValue
+                showingLibreControls = false
+            }
+        }
         .onChange(of: selectedPage) { _ in updatePhoneRefreshVisibility() }
         .onChange(of: hoursToShowIndex) { _ in updatePhoneRefreshVisibility() }
         .onDisappear {

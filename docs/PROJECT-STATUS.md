@@ -56,6 +56,35 @@ De følgende afsnit bevarer integrations- og testhistorikken før denne udgivels
 - Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
 <!-- testflight-7.1.1-4314:end -->
 
+## Watch — automatisk store tal efter 4318
+
+10. oktober 2026: efter flytningen til et fuldskærmsark valgte RootView
+fortsat Big Number ved Watch-overtagelse, men Libre-arket dækkede siden.
+RootView reagerer nu på overgangen til både Watch-ejerskab og collectorens
+`receiving`-status: vælger Big Number og lukker kun Libre-arket. Det virker
+uanset rækkefølgen af de to tilstandsændringer og også ved genforbindelse.
+En allerede aktiv forbindelse og gentagne målinger lukker ikke et manuelt
+genåbnet L-ark. Bolusarkets binding og indtastningernes identitet er urørte.
+Ingen ændring af collector, Bluetooth, ejerskab, runtime, alarmer, kø eller
+beregningslogik; produktionsdiffen er otte linjer i `RootView.swift`.
+
+Ny lokal `scripts/local-build.sh release-test` bestod: **1.499/1.499 XCTest**,
+0 fejl og 0 skipped, **166 Python-tests**, **30 + 24 syntetiske kontroller**
+samt iPhone- og Watch-simulatorbuilds. Kvittering:
+`~/DeveloperBuildData/xDrip/local-runs/xdripswift/20261010T112659Z-67459/`.
+Diffkontrol og separat læsende review bestod. Eksisterende tests dækker
+forbindelsesreglerne; den synlige lukning af arket og bevarelse af en åben
+bolusberegner er endnu ikke UI- eller fysisk verificeret. Fysisk opfølgning:
+overtag sensor via L, kontrollér automatisk store tal ved etableret
+forbindelse, genåbn L under aktiv forbindelse, og kontrollér en genforbindelse
+mens bolusberegneren er åben. Forberedelsen ændrede intet versionsnummer og
+udførte ingen commit, push, upload eller lokal installation. Brugeren har nu
+autoriseret byg og TestFlight-upload af rettelsen. Releaseproceduren vælger
+nummer hos Apple og gentester det præcise nummererede checkpoint; faktiske
+release-resultater og Apple-status registreres særskilt ovenfor. Læsende
+`devicectl` viste nu fysisk iPhone og Watch som tilgængelige, men der er ikke
+installeret lokalt eller udført en fysisk skærmskifttest.
+
 ## Watch — Libre-genvej til venstre efter 4317
 
 10. oktober 2026: Libre-kontrolsiden er fjernet fra RootViews carousel.
