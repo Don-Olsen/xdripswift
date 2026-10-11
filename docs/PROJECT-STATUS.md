@@ -1,3 +1,46 @@
+## Forebyggende kulhydrathjælp efter 4321 — 11. oktober 2026
+
+Den eksisterende iPhone-beregner får en lille, separat forebyggende kulhydrathjælp.
+Den genbruger samme færdige sikkerhedsprognose, input og fastlåste prognoseparametre.
+Et punktvist modelestimat for de næste 30 minutter anvender eksisterende hurtigkurve
+og 4,4 mmol/L-margin. 1–15 g er funktionens afgrænsning, ikke en personlig grænse
+for behandling af lavt blodsukker. Allerede lavt, for kort varsel, større modelleret
+behov, nylige hurtige kulhydrater eller utilstrækkelige data giver ingen gramangivelse.
+Funktionen holder ikke blodsukkeret på 6,8–6,9 og garanterer ikke mod hypoglykæmi.
+
+Registrering åbner den eksisterende editor med hurtige, spiste kulhydrater;
+kun Gem registrerer faktisk indtag. Parentens måltid/insulin bevares, og automatisk
+insulinudfyldning pauses for kladden, indtil et nyt forslag vælges eksplicit.
+Det forhindrer, at hjælperens efterfølgende COB-opdatering automatisk øger dosisfeltet.
+En separat lokal JSONL-journal gemmer uforanderlige vurderinger og verificerede
+registreringer på en utility-kø. Ingen automatisk eksport, netværk eller ny timer.
+Modelafgrænsning, datagrundlag og kildehenvisninger står i GLUCOSE-FORECAST.md.
+
+Foreløbig validering før Apples buildnummer:
+- Hele XCTest: **1.555/1.555**, 0 fejl, 0 skipped; heraf 39 nye tests for model,
+  journal og rigtig beregner-/editorintegration. Kvittering: lokal kørsel
+  `20261011T083634Z-65921` (uden for Git).
+- Python-/release-/Watch-syntetiske kontroller bestod (`20261011T082948Z-62257`).
+- Begge simulatorbuilds bestod under integrationen. Det endelige nummererede
+  release-checkpoint skal genkøre alle krævede kontroller; gamle kvitteringer
+  erstatter ikke den kørsel.
+- Apples procedure valgte **7.1.1 (4322)**. En usigneret iPhoneOS/arm64-build
+  af den nummererede kode bestod, inklusive Create ML-stien. Log uden for Git:
+  `/private/tmp/xdrip-carb-advice-4322-iphoneos.log`. Den afsluttende releasekvittering
+  og Apples bekræftede status registreres særskilt af releaseproceduren.
+- En ny test fangede en Swift partial-range-fejl i hjælperens øvre grænse;
+  eksplicit ClosedRange bevarer hele 20–600 mg/dL-kontrollen. Eksisterende tests
+  blev ikke fjernet eller svækket. Simulatoren eksponerer ikke fysisk iOS
+  filbeskyttelsesstatus; den kontrol er en fysisk enhedskontrol, ikke et simulatorbevis.
+
+`devicectl` den 11. oktober viste fysisk iPhone og Watch som unavailable. Ingen
+lokal installation, fysisk UI-/notifikationsafprøvning eller klinisk validering
+blev foretaget. Der er ikke taget nye UI-skærmbilleder. De automatiske tests er
+ikke dokumentation for forebyggede lave episoder, personligt korrekt gramestimat
+eller stabilt mål hele døgnet. Prospektiv opfølgning kræver faktisk indtag og
+målinger efter vurderingen; journalen dækker beregnerbrug, ikke hele døgn.
+Bolusformel, motor/ML, alarmer, Watch/Libre, HealthKit og Nightscout er uændrede.
+
 <!-- testflight-7.1.1-4321:start -->
 ### TestFlight 7.1.1 (4321)
 

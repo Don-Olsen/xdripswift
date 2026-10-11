@@ -13,6 +13,7 @@ import SwiftUI
 struct TreatmentEditorContainerView: View {
     let coreDataManager: CoreDataManager
     let editorState: TreatmentEditorState
+    var carbohydrateAdviceEvidence: CarbohydrateAdviceEvidence? = nil
     let onSave: () -> Void
     let onCancel: () -> Void
 
@@ -58,6 +59,7 @@ struct TreatmentEditorContainerView: View {
                     treatmentToEdit: nil,
                     initialType: .Carbs,
                     quickCarbohydrateGrams: grams,
+                    carbohydrateAdviceEvidence: carbohydrateAdviceEvidence,
                     onSave: onSave,
                     onCancel: onCancel
                 )
@@ -108,6 +110,7 @@ private struct TreatmentEditorScreen: View {
         treatmentToEdit: TreatmentEntry?,
         initialType: TreatmentType = .Carbs,
         quickCarbohydrateGrams: Double? = nil,
+        carbohydrateAdviceEvidence: CarbohydrateAdviceEvidence? = nil,
         onSave: @escaping () -> Void,
         onCancel: (() -> Void)? = nil
     ) {
@@ -115,7 +118,8 @@ private struct TreatmentEditorScreen: View {
             coreDataManager: coreDataManager,
             treatmentToEdit: treatmentToEdit,
             initialType: initialType,
-            quickCarbohydrateGrams: quickCarbohydrateGrams
+            quickCarbohydrateGrams: quickCarbohydrateGrams,
+            carbohydrateAdviceEvidence: carbohydrateAdviceEvidence
         ))
         self.onSave = onSave
         self.onCancel = onCancel
@@ -267,16 +271,20 @@ struct TreatmentEditorView: View {
                 }
 
                 if viewModel.selectedType == .Carbs {
-                    Picker("Madtype", selection: $viewModel.selectedMealKind) {
-                        Text("🍭 Hurtig · 30 min").tag(TreatmentMealKind.fast)
-                        Text("🌮 Normal · 240 min").tag(TreatmentMealKind.normal)
-                        Text("🍕 Fed/langsom · 300 min").tag(TreatmentMealKind.slow)
+                    if viewModel.isCarbohydrateAdviceEntry {
+                        Text("🍭 Hurtige kulhydrater · spist")
+                    } else {
+                        Picker("Madtype", selection: $viewModel.selectedMealKind) {
+                            Text("🍭 Hurtig · 30 min").tag(TreatmentMealKind.fast)
+                            Text("🌮 Normal · 240 min").tag(TreatmentMealKind.normal)
+                            Text("🍕 Fed/langsom · 300 min").tag(TreatmentMealKind.slow)
+                        }
                     }
                     Text("Valgt optagelse: \(Int(viewModel.selectedCarbohydrateDurationMinutes)) minutter")
                         .font(.footnote)
                         .foregroundStyle(Color(.colorSecondary))
 
-                    if viewModel.isAddMode {
+                    if viewModel.isAddMode && !viewModel.isCarbohydrateAdviceEntry {
                         Toggle("Planlæg til senere", isOn: $viewModel.isPlanningNewMeal)
                         if viewModel.isPlanningNewMeal {
                             Text("Tæller først som spist, når du bekræfter. Planen kan højst ligge 60 minutter fremme.")
@@ -373,6 +381,9 @@ struct TreatmentEditorView: View {
     }
 
     @ViewBuilder private func editorFooterView() -> some View {
+        if let evidence = viewModel.carbohydrateAdviceEvidence {
+            Text("Vejledende estimat fra kl. \(evidence.recordedAt.formatted(date: .omitted, time: .shortened)). Ret mængde og tidspunkt til det, du faktisk har spist. Gem registrerer kun kulhydrater, ingen insulin.")
+        }
         if viewModel.selectedType == .BasalInjection, viewModel.didPrefillBasalInjection {
             Text(Texts_TreatmentsView.basalInjectionCopiedFooter)
         }
@@ -418,6 +429,7 @@ enum PenDoseCOBPresentation {
 struct PenDoseCalculatorScreen: View {
     @StateObject private var viewModel: PenDoseCalculatorViewModel
     @State private var information: PenDoseInformationSnapshot?
+    @State private var carbohydrateEditor: CarbohydrateAdviceEditorRequest?
     @State private var showsLogConfirmation = false
     @State private var showsReminderWarning = false
     @State private var didSetInitialFocus = false
@@ -437,7 +449,7 @@ struct PenDoseCalculatorScreen: View {
         self.onCancel = onCancel
         _viewModel = StateObject(wrappedValue: PenDoseCalculatorViewModel(
             coreDataManager: coreDataManager, reminderMealUUID: reminderMealUUID,
-            automaticallyFillMealDose: true))
+            automaticallyFillMealDose: true, enablesCarbohydrateAdvice: true))
     }
 
     var body: some View {
@@ -446,6 +458,7 @@ struct PenDoseCalculatorScreen: View {
                 VStack(spacing: 16) {
                     storageStatus
                     glucoseCard
+                    carbohydrateAdviceCard
                     if viewModel.reminderMealUUID == nil {
                         mealCard
                     } else {
@@ -487,6 +500,14 @@ struct PenDoseCalculatorScreen: View {
             }
             .sheet(item: $information) { snapshot in
                 PenDoseInformationView(snapshot: snapshot)
+            }
+            .sheet(item: $carbohydrateEditor) { request in
+                TreatmentEditorContainerView(coreDataManager: coreDataManager,
+                    editorState: .quickCarbs(request.grams), carbohydrateAdviceEvidence: request.evidence,
+                    onSave: {
+                        carbohydrateEditor = nil
+                        viewModel.scheduleCalculation(debounce: false)
+                    }, onCancel: { carbohydrateEditor = nil })
             }
             .alert(logConfirmationTitle, isPresented: Binding(
                 get: { showsLogConfirmation && viewModel.confirmationDraft != nil },
@@ -601,6 +622,38 @@ struct PenDoseCalculatorScreen: View {
                 }
             }
             .buttonStyle(.bordered)
+        }
+    }
+
+    @ViewBuilder private var carbohydrateAdviceCard: some View {
+        if let advice = viewModel.currentCarbohydrateAdvice, advice.status != .noRisk {
+            card {
+                Label("Forebyggende kulhydrathjælp", systemImage: "fork.knife.circle")
+                    .font(.headline).foregroundStyle(.orange)
+                if let minimum = advice.forecastMinimumMgdl, let date = advice.forecastMinimumDate {
+                    Text("Estimeret laveste værdi: \(PenDoseDisplayFormatter.glucose(minimum, mgdl: viewModel.glucoseUnitIsMgdl)) \(viewModel.glucoseUnitIsMgdl ? "mg/dL" : "mmol/L") kl. \(date.formatted(date: .omitted, time: .shortened))")
+                        .font(.subheadline)
+                }
+                Text(CarbohydrateAdvicePresentation.message(advice))
+                    .font(.subheadline).fixedSize(horizontal: false, vertical: true)
+                if let recent = advice.latestFastCarbs,
+                   viewModel.currentTime.timeIntervalSince(recent.date) < CarbohydrateAdvice.recentFastCarbohydrateInterval {
+                    Text("Senest registreret: \(PenDoseDisplayFormatter.carbs(recent.grams)) g hurtige kulhydrater kl. \(recent.date.formatted(date: .omitted, time: .shortened))")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
+                if advice.status == .estimated, let grams = advice.grams {
+                    Button("Registrér hurtige kulhydrater · \(grams) g") {
+                        focusedField = nil
+                        carbohydrateEditor = viewModel.carbohydrateAdviceEditorRequest()
+                    }
+                    .buttonStyle(.bordered)
+                    .accessibilityHint("Åbner separat registrering. Ret mængden og tryk Gem, når du har spist. Ingen insulin indsættes.")
+                    Text("Ud fra allerede registreret insulin og mad, uden nye indtastninger. Estimatet kan tage fejl; det garanterer ikke mod lavt blodsukker. Gem kun det, du faktisk spiser.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                    Text("Estimat kl. \(advice.computedAt.formatted(date: .omitted, time: .shortened)) · kort gyldighed")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
         }
     }
 
@@ -1036,5 +1089,21 @@ private struct PenDoseInformationView: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityElement(children: .combine)
+    }
+}
+
+/// Wording distinguishes model abstention from an instruction to delay treating a low.
+enum CarbohydrateAdvicePresentation {
+    static func message(_ result: CarbohydrateAdviceResult) -> String {
+        switch result.status {
+        case .noRisk: return "Intet forebyggende gramestimat i denne beregning."
+        case .estimated: return "Vejledende estimat: \(result.grams.map(String.init) ?? "—") g hurtige kulhydrater nu. Prognosen ser 30 minutter frem."
+        case .currentLow: return "Blodsukkeret er allerede lavt. Følg din aftalte plan for lavt blodsukker; den forebyggende model giver intet gramforslag her."
+        case .tooSoon: return "Faldet ligger for tæt på til et brugbart forebyggende gramestimat. Følg din plan ved risiko for lavt blodsukker."
+        case .aboveModelLimit: return "Behovet ligger uden for denne models begrænsede gramestimat. Følg din plan ved risiko for lavt blodsukker."
+        case .recentCarbs: return "Hurtige kulhydrater er allerede registreret. Intet nyt gramestimat, mens deres virkning er usikker. Det er ikke en besked om at vente ved lavt blodsukker."
+        case .missingData: return "Kan ikke estimere hurtige kulhydrater med de aktuelle data."
+        case .manualGlucose: return "Kulhydratestimatet kræver frisk CGM med trend."
+        }
     }
 }

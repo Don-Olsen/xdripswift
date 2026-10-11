@@ -7,6 +7,7 @@
 //
 
 import Foundation
+import CryptoKit
 import CoreData
 import OSLog
 import UserNotifications
@@ -34,6 +35,8 @@ import UserNotifications
 
     /// Only show the copied-values footer when both fields were prefilled for a new injection.
     let didPrefillBasalInjection: Bool
+    let carbohydrateAdviceEvidence: CarbohydrateAdviceEvidence?
+    private let carbohydrateAdviceJournal: CarbohydrateAdviceJournal
 
     // MARK: - private properties
 
@@ -54,7 +57,11 @@ import UserNotifications
 
     init(coreDataManager: CoreDataManager?, treatmentToEdit: TreatmentEntry?, initialType: TreatmentType = .Carbs,
          quickCarbohydrateGrams: Double? = nil, localSaveJournal: PenDoseLogJournal? = nil,
-         localSaveOverride: (() -> Bool)? = nil, mealMetadataStore: MealPlanMetadataStore? = nil) {
+         localSaveOverride: (() -> Bool)? = nil, mealMetadataStore: MealPlanMetadataStore? = nil,
+         carbohydrateAdviceEvidence: CarbohydrateAdviceEvidence? = nil,
+         carbohydrateAdviceJournal: CarbohydrateAdviceJournal = .shared) {
+        self.carbohydrateAdviceEvidence = carbohydrateAdviceEvidence
+        self.carbohydrateAdviceJournal = carbohydrateAdviceJournal
         let localSaveJournal = localSaveJournal ?? .shared
         self.didPrefillBasalInjection = treatmentToEdit == nil && initialType == .BasalInjection
             && UserDefaults.standard.lastBasalInjectionUnits > 0
@@ -205,7 +212,23 @@ import UserNotifications
         }
     }
 
+    var isCarbohydrateAdviceEntry: Bool { carbohydrateAdviceEvidence != nil }
+
+    private var carbohydrateAdviceEntryIsValid: Bool {
+        guard isCarbohydrateAdviceEntry else { return true }
+        let defaults = UserDefaults.standard
+        return isAddMode && selectedType == .Carbs && selectedMealKind == .fast &&
+            !isPlanningNewMeal && selectedDate <= Date() &&
+            TherapyMetricsManager.doseSourceIsReady(defaults.dataFlowPolicy,
+                cutover: TreatmentSourceCutover.current(defaults: defaults), defaults: defaults)
+    }
+
     func saveTreatment() -> Bool {
+        guard carbohydrateAdviceEntryIsValid else {
+            alertMessage = TreatmentEditorAlertMessage(title: Texts_Common.warning,
+                message: "Kontrollér lokal logning og registrér kun hurtige kulhydrater, du har spist.")
+            return false
+        }
         validateSelectedDateIfNeeded()
         guard currentInputIsValid else { return false }
 
@@ -480,6 +503,12 @@ import UserNotifications
             UserDefaults.standard.lastBasalInjectionInsulinDescription = storedNotesValue ?? ""
         }
 
+        if let evidence = carbohydrateAdviceEvidence, requiresDurableLocalInsert,
+           let entry = savedTreatment, entry.isConfirmedMeal, !entry.treatmentdeleted,
+           let identity = entry.localTreatmentUUID {
+            carbohydrateAdviceJournal.enqueue(evidence.recordingVerifiedCarbohydrates(
+                id: identity, grams: entry.value, date: entry.date, at: now))
+        }
         return true
     }
 
@@ -645,6 +674,7 @@ import UserNotifications
     }
 
     private var currentInputIsValid: Bool {
+        guard carbohydrateAdviceEntryIsValid else { return false }
         guard selectedDate <= latestSelectableDate else { return false }
         if selectedType == .Carbs, isAddMode, isPlanningNewMeal, selectedDate <= Date() { return false }
 
@@ -866,6 +896,9 @@ struct PenDoseCalculationDetails {
         }
     }
     @Published private(set) var calculation: PenDoseCalculation?
+    @Published private(set) var carbohydrateAdvice: CarbohydrateAdviceResult?
+    private var carbohydrateAdviceContext: CarbohydrateAdviceContext?
+    private var carbohydrateAdviceEvidence: CarbohydrateAdviceEvidence?
     @Published private(set) var calculationDetails: PenDoseCalculationDetails?
     @Published private(set) var latestGlucoseDate: Date?
     @Published private(set) var latestGlucoseValueMgdl: Double?
@@ -897,6 +930,9 @@ struct PenDoseCalculationDetails {
     private var debounceTask: Task<Void, Never>?
     private var isOpen = false
     private let automaticallyFillMealDose: Bool
+    private let enablesCarbohydrateAdvice: Bool
+    private let carbohydrateAdviceJournal: CarbohydrateAdviceJournal
+    private let forecastDefaults: UserDefaults
     private var hasManualInsulinEntry = false
     private var isUpdatingAutomaticInsulin = false
 
@@ -907,7 +943,10 @@ struct PenDoseCalculationDetails {
          profileProvider: @escaping () -> PenDoseProfile = { PenDoseProfile.load() },
          sourceReadyOverride: (() -> Bool)? = nil,
          snapshotProvider: ((Date, Bool) async -> Result<PenDoseInputSnapshot, PenDoseUnavailableReason>)? = nil,
-         automaticallyFillMealDose: Bool = false) {
+         automaticallyFillMealDose: Bool = false,
+         enablesCarbohydrateAdvice: Bool = false,
+         carbohydrateAdviceJournal: CarbohydrateAdviceJournal = .shared,
+         forecastDefaults: UserDefaults = .standard) {
         let logJournal = logJournal ?? .shared
         self.coreDataManager = coreDataManager
         self.reminderMealUUID = reminderMealUUID
@@ -918,6 +957,9 @@ struct PenDoseCalculationDetails {
         self.sourceReadyOverride = sourceReadyOverride
         self.snapshotProvider = snapshotProvider
         self.automaticallyFillMealDose = automaticallyFillMealDose
+        self.enablesCarbohydrateAdvice = enablesCarbohydrateAdvice
+        self.carbohydrateAdviceJournal = carbohydrateAdviceJournal
+        self.forecastDefaults = forecastDefaults
         self.storageGateState = logJournal.recoveryState(coreDataManager: coreDataManager)
         if storageGateState != .ready { statusMessage = storageGateState.message }
     }
@@ -1040,6 +1082,9 @@ struct PenDoseCalculationDetails {
         debounceTask?.cancel()
         debounceTask = nil
         isCalculating = false
+        carbohydrateAdvice = nil
+        carbohydrateAdviceContext = nil
+        carbohydrateAdviceEvidence = nil
         pinnedCGM = nil
         glucoseChoice = .currentCGM
     }
@@ -1138,8 +1183,12 @@ struct PenDoseCalculationDetails {
         }
         guard generation == calculationGeneration, signature == draftSignature else { return }
         let chosenProfile = profile
+        let forecastSensitivity = forecastDefaults.glucoseForecastManualSensitivityMgdlPerUnit
+        let forecastRatio = forecastDefaults.glucoseForecastManualCarbRatioGramsPerUnit
         let safety = glucoseChoice == .currentCGM
-            ? PenBolusCalculator.safetyForecast(snapshot: snapshot, at: now) : nil
+            ? PenBolusCalculator.safetyForecast(snapshot: snapshot, at: now,
+                sensitivityMgdlPerUnit: forecastSensitivity,
+                carbohydrateRatioGramsPerUnit: forecastRatio) : nil
         let result = PenBolusCalculator.calculate(snapshot: snapshot, profile: chosenProfile,
             glucose: glucose, newCarbs: newCarbs, safetyForecast: safety, at: now)
         guard generation == calculationGeneration, signature == draftSignature else { return }
@@ -1175,9 +1224,69 @@ struct PenDoseCalculationDetails {
         } else {
             calculationDetails = nil
         }
+        if enablesCarbohydrateAdvice {
+            let context = CarbohydrateAdviceContext(snapshot: snapshot,
+                forecast: safety ?? GlucoseForecastResult(points: [], referenceDate: nil, reason: .dataUnavailable),
+                glucoseInput: glucose, sensitivityMgdlPerUnit: forecastSensitivity,
+                carbohydrateRatioGramsPerUnit: forecastRatio, computedAt: now)
+            let advice = CarbohydrateAdvice.evaluate(context, at: now)
+            carbohydrateAdviceContext = context
+            carbohydrateAdvice = advice
+            let rawID = "\(CarbohydrateAdvice.version)|\(now.timeIntervalSince1970)|\(snapshot.capturedAt.timeIntervalSince1970)|\(signature)|\(snapshot.sourceSignature)|\(snapshot.glucose.last?.date.timeIntervalSince1970 ?? 0)|\(snapshot.treatmentRevision)|\(advice.status.rawValue)"
+            let identity = SHA256.hash(data: Data(rawID.utf8)).map { String(format: "%02x", $0) }.joined()
+            let evidence = CarbohydrateAdviceEvidence(recordID: identity, event: .assessed,
+                recordedAt: now, referenceDate: snapshot.glucose.last?.date,
+                engineVersion: GlucoseForecastEngine.engineVersion,
+                sourceSignature: snapshot.sourceSignature, treatmentRevision: snapshot.treatmentRevision,
+                glucoseMgdl: snapshot.glucose.last?.glucoseMgdl,
+                predictedMinimumMgdl: advice.forecastMinimumMgdl,
+                predictedMinimumDate: advice.forecastMinimumDate,
+                estimatedGrams: advice.grams.map(Double.init), status: advice.status.rawValue,
+                sensitivityMgdlPerUnit: forecastSensitivity,
+                carbohydrateRatioGramsPerUnit: forecastRatio,
+                fastAbsorptionMinutes: TreatmentMealKind.fast.durationMinutes,
+                targetMgdl: LowSoonAlertPolicy.predictedLimitMgdl,
+                forecastPoints: (safety?.points ?? []).map { .init(date: $0.date, glucoseMgdl: $0.glucoseMgdl) },
+                observedGlucose: snapshot.glucose.map { .init(date: $0.date, glucoseMgdl: $0.glucoseMgdl) })
+            carbohydrateAdviceEvidence = evidence
+            carbohydrateAdviceJournal.enqueue(evidence)
+        }
         statusMessage = result.unavailableReason.map(Self.unavailableText)
         isCalculating = false
         refreshAutomaticInsulin()
+    }
+
+    var currentCarbohydrateAdvice: CarbohydrateAdviceResult? {
+        carbohydrateAdviceForDisplay(at: max(currentTime, Date()))
+    }
+
+    // The existing view clock redraws this state. Never silently replace a stored
+    // assessment with a different gram amount from aging the same inputs.
+    func carbohydrateAdviceForDisplay(at now: Date) -> CarbohydrateAdviceResult? {
+        guard isReviewCurrent, enablesCarbohydrateAdvice, localLoggingIsActive,
+              let context = carbohydrateAdviceContext, let previous = carbohydrateAdvice else { return nil }
+        let fresh = CarbohydrateAdvice.evaluate(context, at: now)
+        if fresh.status != .estimated { return fresh }
+        guard previous.status == .estimated, fresh.grams == previous.grams else { return nil }
+        return previous
+    }
+
+    func carbohydrateAdviceEditorRequest(at now: Date = .now) -> CarbohydrateAdviceEditorRequest? {
+        guard !isSaving, confirmationDraft == nil, isReviewCurrent, localLoggingIsActive,
+              storageGateState == .ready,
+              let context = carbohydrateAdviceContext, let previous = carbohydrateAdvice,
+              let evidence = carbohydrateAdviceEvidence else { return nil }
+        let fresh = CarbohydrateAdvice.evaluate(context, at: now)
+        guard fresh.status == .estimated, let grams = fresh.grams,
+              fresh.grams == previous.grams else {
+            scheduleCalculation(debounce: false)
+            return nil
+        }
+        // Food saved in the child becomes ordinary COB. Preserve the current draft
+        // instead of allowing that commit to autofill additional insulin. The user
+        // can explicitly copy a fresh suggestion later to resume automatic filling.
+        hasManualInsulinEntry = true
+        return CarbohydrateAdviceEditorRequest(grams: Double(grams), evidence: evidence)
     }
 
     /// A user edit owns the field until an explicit selection of the current suggestion.
@@ -1441,6 +1550,9 @@ struct PenDoseCalculationDetails {
         if let generation, generation != calculationGeneration { return }
         calculation = nil
         calculationDetails = nil
+        carbohydrateAdvice = nil
+        carbohydrateAdviceContext = nil
+        carbohydrateAdviceEvidence = nil
         snapshotAtCalculation = nil
         calculatedDraftSignature = nil
         statusMessage = message
@@ -1977,4 +2089,11 @@ struct PenDoseLogIntent: Codable, Equatable {
             plannedDate == nil && carbohydrateGrams > 0 ? operation.mealUUID : nil,
             reminderWarning: reminderWarning))
     }
+}
+
+/// One displayed estimate opens a separate carb-only editor. No insulin field or log is touched.
+struct CarbohydrateAdviceEditorRequest: Identifiable {
+    let id = UUID()
+    let grams: Double
+    let evidence: CarbohydrateAdviceEvidence
 }

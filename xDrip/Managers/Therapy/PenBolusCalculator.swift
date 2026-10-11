@@ -474,6 +474,18 @@ enum PenBolusCalculator {
     static func safetyForecast(snapshot: PenDoseInputSnapshot, at now: Date = .now,
                                defaults: UserDefaults = .standard,
                                horizonMinutes: Int = 120) -> GlucoseForecastResult {
+        safetyForecast(snapshot: snapshot, at: now,
+            sensitivityMgdlPerUnit: defaults.glucoseForecastManualSensitivityMgdlPerUnit,
+            carbohydrateRatioGramsPerUnit: defaults.glucoseForecastManualCarbRatioGramsPerUnit,
+            horizonMinutes: horizonMinutes)
+    }
+
+    /// Freeze the forecast parameters with its input snapshot. Callers deriving a read-only
+    /// carbohydrate estimate must use these same values, never the separate pen profile.
+    static func safetyForecast(snapshot: PenDoseInputSnapshot, at now: Date,
+                               sensitivityMgdlPerUnit: Double?,
+                               carbohydrateRatioGramsPerUnit: Double?,
+                               horizonMinutes: Int = 120) -> GlucoseForecastResult {
         guard let reference = snapshot.glucose.last else {
             return GlucoseForecastResult(points: [], referenceDate: nil, reason: .missingGlucose)
         }
@@ -483,8 +495,8 @@ enum PenBolusCalculator {
                 reason: .awaitingNextReading)
         }
         let parameters = GlucoseForecastDataAdapter.manualParameters(
-            sensitivity: defaults.glucoseForecastManualSensitivityMgdlPerUnit,
-            ratio: defaults.glucoseForecastManualCarbRatioGramsPerUnit)
+            sensitivity: sensitivityMgdlPerUnit,
+            ratio: carbohydrateRatioGramsPerUnit)
         guard case .success(let pair) = parameters else {
             if case .failure(let reason) = parameters {
                 return GlucoseForecastResult(points: [], referenceDate: reference.date, reason: reason)

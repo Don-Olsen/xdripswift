@@ -886,6 +886,11 @@
 		B34C0F010000000000000002 /* GlucoseForecastMLBackgroundScheduler.swift in Sources */ = {isa = PBXBuildFile; fileRef = B34C0F020000000000000002 /* GlucoseForecastMLBackgroundScheduler.swift */; };
 		B34C0F010000000000000003 /* GlucoseForecastMLBackgroundTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B34C0F020000000000000003 /* GlucoseForecastMLBackgroundTests.swift */; };
 		B34C0F010000000000000004 /* GlucoseForecastMLBackgroundSchedulerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B34C0F020000000000000004 /* GlucoseForecastMLBackgroundSchedulerTests.swift */; };
+		CE1A9605A0E64D1E9756CAEC /* CarbohydrateAdvice.swift in Sources */ = {isa = PBXBuildFile; fileRef = FDE36F9D756D4CDCA63387DF /* CarbohydrateAdvice.swift */; };
+		205DA6CB784044ACB689345A /* CarbohydrateAdviceJournal.swift in Sources */ = {isa = PBXBuildFile; fileRef = 318E68ED8AE54E328802EFA0 /* CarbohydrateAdviceJournal.swift */; };
+		D0D045AD9AE84E90BFAB143D /* CarbohydrateAdviceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1D9A058F13348E5996F928A /* CarbohydrateAdviceTests.swift */; };
+		A6578F46A4174EBAB2638CA4 /* CarbohydrateAdviceJournalTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 708A04FD11E44167BC4CD48E /* CarbohydrateAdviceJournalTests.swift */; };
+		B1008D9B6B3F48CDBB2B7D94 /* CarbohydrateAdviceIntegrationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BFEB545466334C33ACB5FF17 /* CarbohydrateAdviceIntegrationTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -2147,6 +2152,11 @@
 		B34C0F020000000000000002 /* GlucoseForecastMLBackgroundScheduler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "GlucoseForecastMLBackgroundScheduler.swift"; sourceTree = "<group>"; };
 		B34C0F020000000000000003 /* GlucoseForecastMLBackgroundTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "xDrip Tests/GlucoseForecastMLBackgroundTests.swift"; sourceTree = SOURCE_ROOT; };
 		B34C0F020000000000000004 /* GlucoseForecastMLBackgroundSchedulerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "xDrip Tests/GlucoseForecastMLBackgroundSchedulerTests.swift"; sourceTree = SOURCE_ROOT; };
+		FDE36F9D756D4CDCA63387DF /* CarbohydrateAdvice.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "xDrip/Managers/Therapy/CarbohydrateAdvice.swift"; sourceTree = SOURCE_ROOT; };
+		318E68ED8AE54E328802EFA0 /* CarbohydrateAdviceJournal.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "xDrip/Managers/Therapy/CarbohydrateAdviceJournal.swift"; sourceTree = SOURCE_ROOT; };
+		C1D9A058F13348E5996F928A /* CarbohydrateAdviceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "xDrip Tests/CarbohydrateAdviceTests.swift"; sourceTree = SOURCE_ROOT; };
+		708A04FD11E44167BC4CD48E /* CarbohydrateAdviceJournalTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "xDrip Tests/CarbohydrateAdviceJournalTests.swift"; sourceTree = SOURCE_ROOT; };
+		BFEB545466334C33ACB5FF17 /* CarbohydrateAdviceIntegrationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "xDrip Tests/CarbohydrateAdviceIntegrationTests.swift"; sourceTree = SOURCE_ROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -2809,6 +2819,9 @@
 				4F2600113002000200000001 /* SensorNoisePersistenceTests.swift */,
 				4D7A00053014000100000001 /* TroubleshootingLogTests.swift */,
 				50E2401E5ED94424A2FEC5E8 /* xDrip Tests/TherapyMetricsTests.swift */,
+				BFEB545466334C33ACB5FF17 /* CarbohydrateAdviceIntegrationTests.swift */,
+				708A04FD11E44167BC4CD48E /* CarbohydrateAdviceJournalTests.swift */,
+				C1D9A058F13348E5996F928A /* CarbohydrateAdviceTests.swift */,
 				FC0303000000000000000007 /* GlucoseForecastEngineTests.swift */,
 				FC0303000000000000000008 /* GlucoseForecastDataAdapterTests.swift */,
 				FA0310000000000000000012 /* GlucoseForecastLogTests.swift */,
@@ -3207,6 +3220,8 @@
 				05272484BD024BDAAA341C1C /* xDrip/SwiftUIViews/Settings/TherapyMetricsSettingsView.swift */,
 				5F219EC5BAAF4D5E924415FA /* xDrip/Managers/Therapy/TherapyMetricsManager.swift */,
 				C30000023017000100000003 /* PenBolusCalculator.swift */,
+				318E68ED8AE54E328802EFA0 /* CarbohydrateAdviceJournal.swift */,
+				FDE36F9D756D4CDCA63387DF /* CarbohydrateAdvice.swift */,
 				4D20C0032FF1000100000001 /* RootHomeView.swift */,
 				4D20C0092FF1000100000001 /* RootTabView.swift */,
 				475F2A862D0DA80E00DE6019 /* ShowHideItemsView.swift */,
@@ -4649,6 +4664,9 @@
 				4F2600013002000200000001 /* SensorNoisePersistenceTests.swift in Sources */,
 				377EBC0A484BFC8EA77C623C /* CareLinkTests.swift in Sources */,
 				0A51F9C534B04BD682E1EF4D /* xDrip Tests/TherapyMetricsTests.swift in Sources */,
+				B1008D9B6B3F48CDBB2B7D94 /* CarbohydrateAdviceIntegrationTests.swift in Sources */,
+				A6578F46A4174EBAB2638CA4 /* CarbohydrateAdviceJournalTests.swift in Sources */,
+				D0D045AD9AE84E90BFAB143D /* CarbohydrateAdviceTests.swift in Sources */,
 				FC0303000000000000000003 /* GlucoseForecastEngineTests.swift in Sources */,
 				FC0303000000000000000004 /* GlucoseForecastDataAdapterTests.swift in Sources */,
 				FA0310000000000000000002 /* GlucoseForecastLogTests.swift in Sources */,
@@ -5059,6 +5077,8 @@
 				C30000013017000100000001 /* LowSoonAlert.swift in Sources */,
 				C30000013017000100000004 /* LowSoonStatistics.swift in Sources */,
 				C30000013017000100000003 /* PenBolusCalculator.swift in Sources */,
+				205DA6CB784044ACB689345A /* CarbohydrateAdviceJournal.swift in Sources */,
+				CE1A9605A0E64D1E9756CAEC /* CarbohydrateAdvice.swift in Sources */,
 				F80D916B24F82913006840B5 /* CGMLibre2Transmitter.swift in Sources */,
 				4D800002301F000100000001 /* Libre2FrameAssembler.swift in Sources */,
 				F8297F59238EE14E00D74D66 /* TextsBluetoothPeripheralsView.swift in Sources */,

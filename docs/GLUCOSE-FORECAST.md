@@ -4,6 +4,70 @@ The iPhone Home chart can show a separate, dotted estimate for the next 60 minut
 
 Forecast points are never saved as BG readings or sent to Nightscout, Apple Health or Watch. From the post-4294 local-treatment change, the existing engine can also supply a separate bolus safety check and the new optional “Low soon” warning. Neither use writes forecast points as measurements, and ML never supplies the safety check or warning. Watch sensor ownership, Bluetooth recovery and workout runtime are unchanged. These checks use new glucose events, without polling or a keepalive timer.
 
+## Preventive carbohydrate help in the iPhone calculator (after 4321)
+
+The iPhone pen calculator can show a separate **Forebyggende kulhydrathjælp**
+card. This experimental estimate uses the already completed, authoritative
+120-minute safety forecast and the same frozen forecast ISF/carbohydrate ratio.
+The pen dosing profile and ML do not supply this estimate. The existing engine,
+bolus formula, CGM-estimated calculator COB, alarms and Watch are unchanged.
+
+The helper inspects the next **30 minutes from calculation time**. For each
+engine point (and interpolated window endpoints), it estimates how many grams
+on the existing fast-food curve would reach the existing **4.4 mmol/L warning
+margin**. The curve retains its existing 10-minute delay and 30-minute duration;
+food is not backdated to the CGM reference. The largest required contribution
+is rounded up to whole grams. Existing bolus and carbohydrate effects are
+already in the forecast; neither IOB nor COB is subtracted a second time.
+This is a what-if estimate at discrete points, not evidence that actual glucose
+or the entire continuous curve stays above that margin. Unlike the separate
+Low soon alert's +30 endpoint, this checks the minimum throughout the window.
+A stable value below the warning margin does not trigger eating to a personal
+6.8–6.9 mmol/L target.
+
+Automatic quantities are limited to **1–15 g**. A requirement above 15 g is
+withheld, never clipped; 15 g is this feature's output boundary, **not a maximum
+amount for treating hypoglycaemia**. Current glucose below 3.9, a fall before
+the modeled food effect, invalid/stale/incomplete inputs, missing forecast
+parameters, sensor mismatch, or manual/untrended glucose produce explanations
+without a quantity. Recently registered fast food prevents another automatic
+quantity during the curve's delay plus duration (40 minutes); this does not
+instruct the user to wait during a low and does not suppress any alarm.
+A fresh input snapshot expires after 30 seconds, and the existing view clock
+and button validation keep an expired quantity from being reused. A new
+assessment is needed when an aging snapshot would change the quantity.
+
+The button opens the **existing carb-only treatment editor**, fixed to fast,
+actually eaten food. Amount and actual eating time remain editable; only
+explicit Save registers a treatment through the existing durable journal.
+The parent calculator's meal and insulin fields are preserved. Opening the
+child also pauses automatic insulin filling for that draft until the user
+explicitly copies a fresh dose suggestion, so the child's later COB commit
+cannot automatically increase the existing insulin entry. The
+new food is not entered as new meal grams to autofill a new insulin dose.
+After saving, ordinary registered-treatment/COB rules still apply; this is
+not a new special treatment type or a guarantee about subsequent insulin.
+
+Immutable completed assessments and verified carb saves are recorded in a
+separate local Application Support journal, with each assessment's timestamp,
+source/revision, exact forecast parameters, points and observed input glucose.
+The serial utility worker does not delay presentation or registration. Daily
+JSONL files use protected storage, ordinary device backup, 400-day retention,
+persistent record-ID deduplication and interrupted-tail recovery. The journal
+is not another treatment store and exports/transmits nothing automatically.
+It records calculator use, not continuous background outcomes. Later observed
+values can be paired during local analysis; no efficacy claim is derived from
+unit tests or from unobserved periods.
+
+Conceptual reference: [Trio's advisory carbs-required feature](https://triodocs.org/configuration/settings/features/user-interface/#show-carbs-required-badge)
+and [pinned Trio oref implementation](https://github.com/nightscout/Trio/blob/0b29cd53415e7f0e668677749cad8daf81c68c2f/trio-oref/lib/determine-basal/determine-basal.js#L1233-L1254).
+No Trio code is copied. Its pump zero-temp credit and its separate COB subtraction
+are not applicable to this pen forecast. This feature is not an automated insulin
+system, a treatment algorithm for an existing low, or clinically validated
+protection against hypoglycaemia. Follow-up requires actual prospective data
+and review of the user's existing hypo plan; software tests establish only the
+stated calculation and storage behavior.
+
 ## Home visual follow-up after 4309
 
 The compact badge shows +30/+60 and, when selected, +120. Its ⓘ button opens
