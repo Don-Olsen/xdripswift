@@ -1,3 +1,15 @@
+<!-- testflight-7.1.1-4323:start -->
+### TestFlight 7.1.1 (4323)
+
+- Kildecommit og tag: `62fad5c8fc0a84d9b3eb845989e68d474286702b` / `testflight-7.1.1-4323`.
+- Tests: 1566/1566 bestået; 0 fejlet; 0 skipped. iPhone- og Watch-simulatorbuilds bestod.
+- Apple-status (2026-10-11T09:41:54.243125+00:00): [Internal / Testing](https://appstoreconnect.apple.com/apps/6795645396/testflight/ios/989de4e2-55d6-4319-af9b-18bdb9956e5c).
+- Eksisterende intern gruppe: Ole Internal er bekræftet tilknyttet.
+- Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
+<!-- testflight-7.1.1-4323:end -->
+
+De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
+
 ## To afgrænsede optimeringer efter 4322 — 11. oktober 2026
 
 Behandlingsfanen genbruger sine uforanderlige snapshots ved uændret genåbning.
