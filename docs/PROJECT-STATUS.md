@@ -1,3 +1,15 @@
+<!-- testflight-7.1.1-4324:start -->
+### TestFlight 7.1.1 (4324)
+
+- Kildecommit og tag: `32216c5bd5987076ace713a56d751a1be725fdb7` / `testflight-7.1.1-4324`.
+- Tests: 1573/1573 bestået; 0 fejlet; 0 skipped. iPhone- og Watch-simulatorbuilds bestod.
+- Apple-status (2026-10-11T11:07:24.553478+00:00): [Internal / Testing](https://appstoreconnect.apple.com/apps/6795645396/testflight/ios/f98ddcdc-34fa-4fdb-9e98-9ad9f112951d).
+- Eksisterende intern gruppe: Ole Internal er bekræftet tilknyttet.
+- Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
+<!-- testflight-7.1.1-4324:end -->
+
+De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
+
 ## Begrænset kalibreringshistorik efter 4323 — 11. oktober 2026
 
 `BgReadingsAccessor.calibrationHistory` henter normalt højst 32 tidligere
