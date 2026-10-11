@@ -733,3 +733,21 @@ phone completion, iOS scheduling/expiration and battery/runtime effects remain
 for physical follow-up after TestFlight installation. No new prediction
 accuracy is claimed, and engine mathematics, ML features/approval criteria,
 dosing rules, HealthKit import/export, alarms and Libre/Watch are unchanged.
+
+## Watch availability and dose read failures after 4324
+
+New combined Watch logs retain the event time recorded on the Watch. Their
+local created/modified timestamps use the accepted iPhone save attempt instead,
+so replay cannot use a delayed Watch treatment before it reached the phone's
+accepted logging path. A source-rejected attempt creates no treatment; a later
+successful attempt uses that later time. Existing receipts and journal checks
+preserve the stored timestamps across retries and do not rewrite edited or
+deleted treatments. Older already-stored timestamps are not repaired without
+reliable arrival evidence. This change does not establish improved ML accuracy.
+
+The dose snapshot distinguishes a thrown CGM database read from a successful
+empty/filtered result. Both consistency reads must succeed, including for an
+explicitly manual or confirmed untrended glucose input. An actual read error
+returns a specific Danish unavailable reason; successful missing history still
+permits the existing explicit manual calculation with valid therapy inputs.
+Engine mathematics, ML features, dose formula and safety limits are unchanged.

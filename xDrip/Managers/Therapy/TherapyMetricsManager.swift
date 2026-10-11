@@ -137,6 +137,11 @@ final class TherapyMetricsManager {
     private var chartCache: [String: TherapyChartSeries] = [:]
     private var preferenceSignature = ""
     private var observers: [NSObjectProtocol] = []
+    private let doseGlucoseFetch: GlucoseForecastDataAdapter.GlucoseFetch?
+
+    init(doseGlucoseFetch: GlucoseForecastDataAdapter.GlucoseFetch? = nil) {
+        self.doseGlucoseFetch = doseGlucoseFetch
+    }
 
     deinit { observers.forEach(NotificationCenter.default.removeObserver) }
 
@@ -375,9 +380,10 @@ final class TherapyMetricsManager {
         // a save or arriving minute cannot make a mixed, apparently fresh dosing snapshot.
         let glucoseReader = GlucoseForecastDataAdapter(coreDataManager: coreDataManager,
             therapyManager: self, defaults: defaults, healthImporter: importer)
-        let firstGlucose = glucoseReader.recentGlucose(at: date)
-        guard firstGlucose != nil || allowMissingGlucose else {
-            return .failure(.missingGlucose)
+        // Manual/untrended input may use a successfully read empty CGM series,
+        // but it must never turn a failed database read into a valid empty snapshot.
+        guard let firstGlucose = glucoseReader.recentGlucose(at: date, fetch: doseGlucoseFetch) else {
+            return .failure(.glucoseReadFailed)
         }
         // Include a meal that began before the CGM window but still overlaps it,
         // plus any rapid bolus already active when that overlap began.
@@ -411,9 +417,10 @@ final class TherapyMetricsManager {
                 -PenCGMCOBEstimator.maximumRawGapSeconds), through: date, latest: latest)
         }
         let firstHistory = readScopedHistory(for: firstGlucose)
-        let finalGlucose = glucoseReader.recentGlucose(at: date)
+        guard let finalGlucose = glucoseReader.recentGlucose(at: date, fetch: doseGlucoseFetch) else {
+            return .failure(.glucoseReadFailed)
+        }
         guard firstGlucose == finalGlucose,
-              finalGlucose != nil || allowMissingGlucose,
               abs(Date().timeIntervalSince(date)) <= 30,
               revision == treatmentChangeRevision,
               !hasUncommittedForecastInputChanges,
@@ -435,7 +442,7 @@ final class TherapyMetricsManager {
             return .failure(.treatmentChangedDuringRead)
         }
         let historyChanged = firstHistory != finalHistory
-        return PenDoseInputSnapshot.make(capturedAt: date, glucose: finalGlucose ?? [],
+        return PenDoseInputSnapshot.make(capturedAt: date, glucose: finalGlucose,
             treatments: treatments.filter { $0.date <= date }, therapySettings: settings,
             treatmentRevision: revision,
             historicalGlucose: historyChanged ? nil : finalHistory.samples,

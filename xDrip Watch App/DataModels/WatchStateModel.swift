@@ -190,6 +190,11 @@ final class WatchStateModel: NSObject, ObservableObject {
     @Published private(set) var manualTreatmentDeliveryIssue: String?
     private var lastManualTreatmentSendAt: [UUID: Date] = [:]
     private var manualTreatmentRetryScheduled = false
+    private var treatmentQueueNeedsRecovery = false
+    // A write can reach disk before its final check throws. Keep the user-confirmed
+    // payload until both storage and the UI retry are resolved; never assign it new IDs.
+    private var uncertainManualWrite: (entry: WatchManualTreatment, verified: Bool)?
+    private var uncertainBolusWrite: (entry: WatchBolusOperation, verified: Bool)?
 
     // Combined pen logs share the durable treatment queue. The operation is written
     // before either an interactive message or an offline transfer is attempted.
@@ -255,8 +260,10 @@ final class WatchStateModel: NSObject, ObservableObject {
             pendingManualTreatments = try Self.loadManualTreatments()
             pendingBolusOperations = try Self.loadBolusOperations()
         } catch WatchManualTreatmentKind.DecodingError.unsupportedKind {
+            treatmentQueueNeedsRecovery = true
             manualTreatmentStorageIssue = "Ukendt behandlingstype · opdatér appen. Køen er bevaret på uret"
         } catch {
+            treatmentQueueNeedsRecovery = true
             manualTreatmentStorageIssue = "Kunne ikke læse gemte behandlinger på uret"
             log.error("Manual Watch treatment queue load failed: \(error.localizedDescription, privacy: .public)")
         }
@@ -1514,31 +1521,84 @@ final class WatchStateModel: NSObject, ObservableObject {
         try WatchManualTreatmentQueue.persistBolusOperations(operations, to: manualTreatmentQueueURL())
     }
 
+    /// Only a successful read/reconciliation/write clears a storage failure. Input validation
+    /// messages never stop delivery of earlier durable entries. Existing retry events call here.
+    private func recoverTreatmentQueueIfNeeded() -> Bool {
+        guard treatmentQueueNeedsRecovery else { return true }
+        do {
+            let manualToRecover = pendingManualTreatments +
+                (uncertainManualWrite.flatMap { $0.verified ? nil : $0.entry }.map { [$0] } ?? [])
+            let bolusToRecover = pendingBolusOperations +
+                (uncertainBolusWrite.flatMap { $0.verified ? nil : $0.entry }.map { [$0] } ?? [])
+            let recovered = try WatchManualTreatmentQueue.recover(
+                manualTreatments: manualToRecover,
+                bolusOperations: bolusToRecover, from: Self.manualTreatmentQueueURL())
+            if pendingManualTreatments != recovered.manualTreatments ||
+                pendingBolusOperations != recovered.bolusOperations {
+                invalidateWatchPenCalculation()
+            }
+            pendingManualTreatments = recovered.manualTreatments
+            pendingBolusOperations = recovered.bolusOperations
+            uncertainManualWrite?.verified = true
+            uncertainBolusWrite?.verified = true
+            treatmentQueueNeedsRecovery = false
+            manualTreatmentStorageIssue = nil
+            bolusStorageIssue = nil
+            return true
+        } catch {
+            // A failed read is never an empty queue; retain both memory and the file.
+            return false
+        }
+    }
+
     /// Return success only after the entry is safely written on the Watch. No dose is calculated.
     @discardableResult
     func recordManualTreatment(kind: WatchManualTreatmentKind, amount: Double) -> Bool {
+        guard recoverTreatmentQueueIfNeeded() else { return false }
+        if let uncertain = uncertainManualWrite {
+            guard uncertain.verified else { return false }
+            uncertainManualWrite = nil
+            manualTreatmentDeliveryIssue = "Den tidligere registrering er allerede gemt. Intet nyt er registreret. Kontrollér den før en ny registrering."
+            return false
+        }
         let treatment = WatchManualTreatment(id: UUID(), recordedAt: Date(), kind: kind, amount: amount)
         guard treatment.isValid() else {
             manualTreatmentStorageIssue = kind.validationMessage
             return false
         }
-        guard manualTreatmentStorageIssue == nil else { return false }
         let updated = pendingManualTreatments + [treatment]
         do {
             try Self.persistManualTreatments(updated)
             pendingManualTreatments = updated
+            manualTreatmentStorageIssue = nil
             invalidateWatchPenCalculation()
             flushManualTreatmentQueue()
             return true
         } catch {
-            manualTreatmentStorageIssue = "Behandlingen kunne ikke gemmes på uret"
+            uncertainManualWrite = (treatment, false)
+            treatmentQueueNeedsRecovery = true
+            manualTreatmentStorageIssue = "Afventer sikker lagring af den bekræftede registrering."
             log.error("Manual Watch treatment write failed: \(error.localizedDescription, privacy: .public)")
-            return false
+            retryPendingManualTreatments()
+            // If the atomic write succeeded before its final check failed, it is already
+            // the same frozen operation, not permission to create another registration.
+            let stored = uncertainManualWrite?.verified == true
+            if stored { uncertainManualWrite = nil }
+            return stored
         }
     }
 
     private func flushManualTreatmentQueue() {
-        guard manualTreatmentStorageIssue == nil, !pendingManualTreatments.isEmpty else { return }
+        // Arm the existing retry before recovery: a still-unavailable file must not silently
+        // consume the final retry. No new timer or background execution is introduced.
+        if !manualTreatmentRetryScheduled && (!pendingManualTreatments.isEmpty || treatmentQueueNeedsRecovery) {
+            manualTreatmentRetryScheduled = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 5 * 60) { [weak self] in
+                self?.manualTreatmentRetryScheduled = false
+                self?.flushManualTreatmentQueue()
+            }
+        }
+        guard recoverTreatmentQueueIfNeeded(), !pendingManualTreatments.isEmpty else { return }
         guard session.activationState == .activated else {
             requestSessionActivationIfNeeded()
             return
@@ -1561,13 +1621,6 @@ final class WatchStateModel: NSObject, ObservableObject {
             lastManualTreatmentSendAt[treatment.id] = now
             log.info("Queued manual Watch treatment \(treatment.id.uuidString, privacy: .public) for phone delivery")
         }
-        if !manualTreatmentRetryScheduled {
-            manualTreatmentRetryScheduled = true
-            DispatchQueue.main.asyncAfter(deadline: .now() + 5 * 60) { [weak self] in
-                self?.manualTreatmentRetryScheduled = false
-                self?.flushManualTreatmentQueue()
-            }
-        }
     }
 
     func retryPendingManualTreatments() {
@@ -1578,6 +1631,9 @@ final class WatchStateModel: NSObject, ObservableObject {
     @discardableResult
     private func processManualTreatmentReceipt(_ message: [String: Any]) -> Bool {
         guard let receipt = WatchManualTreatmentReceipt(message) else { return false }
+        // Reconcile first: an earlier uncertain append may be on disk but not in memory.
+        // If unavailable, retain the queue and obtain the receipt again through normal retry.
+        guard recoverTreatmentQueueIfNeeded() else { return true }
         let id = receipt.id
         let idString = id.uuidString
         // Ignore a delayed failure for an entry already acknowledged and removed.
@@ -1600,6 +1656,7 @@ final class WatchStateModel: NSObject, ObservableObject {
             log.info("iPhone confirmed manual Watch treatment \(idString, privacy: .public)")
         } catch {
             // Retaining the Watch record is safe: the phone deduplicates by the stable UUID.
+            treatmentQueueNeedsRecovery = true
             manualTreatmentStorageIssue = "iPhone har gemt behandlingen, men uret kan ikke opdatere køen"
             log.error("Manual Watch treatment receipt write failed: \(error.localizedDescription, privacy: .public)")
         }
@@ -1764,6 +1821,15 @@ final class WatchStateModel: NSObject, ObservableObject {
     func recordWatchBolus(carbohydrateGrams: Double, insulinUnits: Double,
                           mealKindRaw: String, manualWithoutCurrentSuggestion: Bool,
                           at recordedAt: Date = Date()) -> Bool {
+        guard recoverTreatmentQueueIfNeeded() else { return false }
+        if let uncertain = uncertainBolusWrite {
+            guard uncertain.verified else { return false }
+            uncertainBolusWrite = nil
+            // Amounts are not an operation identity. Explain the completed earlier attempt
+            // before accepting any new confirmation, even if its quantities are identical.
+            bolusStorageIssue = "Den tidligere registrering er allerede gemt. Intet nyt er registreret. Kontrollér den før en ny registrering."
+            return false
+        }
         let frozenProfile = insulinUnits > 0 ? watchPenProfileSettings : nil
         let operation = WatchBolusOperation(operationID: UUID(), insulinID: UUID(), carbsID: UUID(),
             recordedAt: recordedAt, insulinUnits: insulinUnits, carbohydrateGrams: carbohydrateGrams,
@@ -1780,10 +1846,6 @@ final class WatchStateModel: NSObject, ObservableObject {
             bolusStorageIssue = "Pen-trin og maksimum mangler eller passer ikke. Synkronisér iPhone."
             return false
         }
-        guard manualTreatmentStorageIssue == nil else {
-            bolusStorageIssue = manualTreatmentStorageIssue
-            return false
-        }
         do {
             let updated = pendingBolusOperations + [operation]
             try Self.persistBolusOperations(updated)
@@ -1794,15 +1856,26 @@ final class WatchStateModel: NSObject, ObservableObject {
             flushBolusOperationQueue()
             return true
         } catch {
-            bolusStorageIssue = "Registreringen kunne ikke gemmes på uret."
+            uncertainBolusWrite = (operation, false)
+            treatmentQueueNeedsRecovery = true
+            bolusStorageIssue = "Afventer sikker lagring af den bekræftede registrering."
             log.error("Watch bolus queue write failed: \(error.localizedDescription, privacy: .public)")
-            return false
+            retryPendingManualTreatments()
+            let stored = uncertainBolusWrite?.verified == true
+            if stored { uncertainBolusWrite = nil }
+            return stored
         }
     }
 
     private func flushBolusOperationQueue() {
-        guard manualTreatmentStorageIssue == nil, bolusStorageIssue == nil,
-              !pendingBolusOperations.isEmpty else { return }
+        if !bolusRetryScheduled && (!pendingBolusOperations.isEmpty || treatmentQueueNeedsRecovery) {
+            bolusRetryScheduled = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 5 * 60) { [weak self] in
+                self?.bolusRetryScheduled = false
+                self?.flushBolusOperationQueue()
+            }
+        }
+        guard recoverTreatmentQueueIfNeeded(), !pendingBolusOperations.isEmpty else { return }
         guard session.activationState == .activated else {
             requestSessionActivationIfNeeded()
             return
@@ -1844,13 +1917,6 @@ final class WatchStateModel: NSObject, ObservableObject {
                 sendQueuedBolusTransfer(message, id: operation.id)
             }
         }
-        if !bolusRetryScheduled {
-            bolusRetryScheduled = true
-            DispatchQueue.main.asyncAfter(deadline: .now() + 5 * 60) { [weak self] in
-                self?.bolusRetryScheduled = false
-                self?.flushBolusOperationQueue()
-            }
-        }
     }
 
     private func sendQueuedBolusTransfer(_ message: [String: Any], id: UUID) {
@@ -1864,6 +1930,7 @@ final class WatchStateModel: NSObject, ObservableObject {
     @discardableResult
     private func processWatchPenLogReceipt(_ message: [String: Any]) -> Bool {
         guard let receipt = WatchPenLogReceipt(message) else { return false }
+        guard recoverTreatmentQueueIfNeeded() else { return true }
         guard let confirmed = pendingBolusOperations.first(where: { $0.id == receipt.id }) else { return true }
         guard receipt.stored else {
             bolusDeliveryIssue = receipt.failureMessage
@@ -1879,6 +1946,7 @@ final class WatchStateModel: NSObject, ObservableObject {
             bolusDirectSendInFlight.remove(receipt.id)
             bolusDeliveryIssue = nil
         } catch {
+            treatmentQueueNeedsRecovery = true
             bolusStorageIssue = "iPhone har gemt registreringen, men uret kan ikke opdatere køen."
             log.error("Watch bolus receipt write failed: \(error.localizedDescription, privacy: .public)")
         }

@@ -244,7 +244,39 @@ enum WatchManualTreatmentQueue {
         return contents
     }
 
-    enum QueueError: Error { case unsupportedVersion }
+    enum QueueError: Error { case unsupportedVersion, conflictingContents }
+
+    struct RecoveredContents {
+        let manualTreatments: [WatchManualTreatment]
+        let bolusOperations: [WatchBolusOperation]
+    }
+
+    /// A failed atomic write can have left either the previous or the new file on disk.
+    /// Reconcile both with the last acknowledged in-memory queue before resuming delivery.
+    /// Unknown/corrupt formats and conflicting UUID contents stay blocked and untouched.
+    static func recover(manualTreatments: [WatchManualTreatment],
+                        bolusOperations: [WatchBolusOperation], from url: URL) throws -> RecoveredContents {
+        let disk = try readContents(from: url)
+        let manual = try merging(disk.manualTreatments, manualTreatments)
+        let bolus = try merging(disk.bolusOperations, bolusOperations)
+        try write(Contents(manualTreatments: manual, bolusOperations: bolus), to: url)
+        return RecoveredContents(manualTreatments: manual, bolusOperations: bolus)
+    }
+
+    private static func merging<Entry: Identifiable & Equatable>(_ disk: [Entry],
+                                                                  _ pending: [Entry]) throws -> [Entry] {
+        var contents: [Entry] = []
+        var byID: [Entry.ID: Entry] = [:]
+        for entry in disk + pending {
+            if let prior = byID[entry.id] {
+                guard prior == entry else { throw QueueError.conflictingContents }
+            } else {
+                byID[entry.id] = entry
+                contents.append(entry)
+            }
+        }
+        return contents
+    }
 
     static func load(from url: URL) throws -> [WatchManualTreatment] {
         try readContents(from: url).manualTreatments

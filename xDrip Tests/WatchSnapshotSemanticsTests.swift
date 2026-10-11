@@ -121,3 +121,190 @@ final class WatchSnapshotSemanticsTests: XCTestCase {
         XCTAssertEqual(merged["contentIDs"] as? [String: String], ["bgReadings": "graph1", "status": "status1"])
     }
 }
+
+
+final class WatchTreatmentQueueRecoveryTests: XCTestCase {
+    private let when = Date(timeIntervalSince1970: 1_800_000_000)
+
+    private func queueURL() throws -> URL {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WatchTreatmentQueueRecovery-\(UUID())", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+        return root.appendingPathComponent("queue.json")
+    }
+
+    private func bolus(id: UUID = UUID(), amount: Double = 2) -> WatchBolusOperation {
+        WatchBolusOperation(operationID: id, insulinID: UUID(), carbsID: UUID(),
+            recordedAt: when, insulinUnits: amount, carbohydrateGrams: 30,
+            mealKindRaw: "slow", pizzaReminderRequested: false,
+            manualWithoutCurrentSuggestion: true, penStepUnits: 0.5,
+            maximumUnits: 25, profileSignature: "synthetic-profile")
+    }
+
+    func testReceiptWriteFailureRecoversSameDurableOperationWithoutDuplicates() throws {
+        let url = try queueURL()
+        let operation = bolus()
+        try WatchManualTreatmentQueue.persistBolusOperations([operation], to: url)
+        let root = url.deletingLastPathComponent()
+        let temporarilyUnavailable = root.appendingPathExtension("unavailable")
+        try FileManager.default.moveItem(at: root, to: temporarilyUnavailable)
+        defer {
+            if FileManager.default.fileExists(atPath: temporarilyUnavailable.path) {
+                try? FileManager.default.moveItem(at: temporarilyUnavailable, to: root)
+            }
+        }
+        // Acknowledged on iPhone, but the Watch cannot commit removal from its queue.
+        XCTAssertThrowsError(try WatchManualTreatmentQueue.persistBolusOperations([], to: url))
+        XCTAssertThrowsError(try WatchManualTreatmentQueue.recover(
+            manualTreatments: [], bolusOperations: [operation], from: url))
+        try FileManager.default.moveItem(at: temporarilyUnavailable, to: root)
+        let recovered = try WatchManualTreatmentQueue.recover(
+            manualTreatments: [], bolusOperations: [operation], from: url)
+        XCTAssertEqual(recovered.bolusOperations, [operation])
+        XCTAssertEqual(try WatchManualTreatmentQueue.loadBolusOperations(from: url), [operation])
+        // A repeated durable receipt can now remove precisely the same operation.
+        try WatchManualTreatmentQueue.persistBolusOperations([], to: url)
+        XCTAssertTrue(try WatchManualTreatmentQueue.loadBolusOperations(from: url).isEmpty)
+    }
+
+    func testFailedNewLogDoesNotReplaceEarlierDurableQueue() throws {
+        let url = try queueURL()
+        let prior = bolus()
+        let new = bolus()
+        try WatchManualTreatmentQueue.persistBolusOperations([prior], to: url)
+        let root = url.deletingLastPathComponent()
+        let temporarilyUnavailable = root.appendingPathExtension("unavailable")
+        try FileManager.default.moveItem(at: root, to: temporarilyUnavailable)
+        defer {
+            if FileManager.default.fileExists(atPath: temporarilyUnavailable.path) {
+                try? FileManager.default.moveItem(at: temporarilyUnavailable, to: root)
+            }
+        }
+        XCTAssertThrowsError(try WatchManualTreatmentQueue.persistBolusOperations([prior, new], to: url))
+        try FileManager.default.moveItem(at: temporarilyUnavailable, to: root)
+        // The user-confirmed candidate retains its identity even if the first write
+        // failed before reaching disk. Recovery must preserve the earlier entry too.
+        let recovered = try WatchManualTreatmentQueue.recover(
+            manualTreatments: [], bolusOperations: [prior, new], from: url)
+        XCTAssertEqual(recovered.bolusOperations, [prior, new])
+        XCTAssertEqual(try WatchManualTreatmentQueue.loadBolusOperations(from: url), [prior, new])
+    }
+
+    func testUncertainNewWriteIsRecoveredFromDiskWithFrozenIdentityAndContent() throws {
+        let url = try queueURL()
+        let prior = bolus()
+        let new = bolus()
+        // An atomic write may have landed before its final file-handle check failed.
+        try WatchManualTreatmentQueue.persistBolusOperations([prior, new], to: url)
+        let recovered = try WatchManualTreatmentQueue.recover(
+            manualTreatments: [], bolusOperations: [prior], from: url)
+        XCTAssertEqual(recovered.bolusOperations, [prior, new])
+        XCTAssertEqual(recovered.bolusOperations.last?.recordedAt, when)
+        XCTAssertEqual(recovered.bolusOperations.last?.mealKindRaw, "slow")
+        XCTAssertEqual(recovered.bolusOperations.last?.pizzaReminderRequested, false)
+        XCTAssertEqual(try WatchManualTreatmentQueue.recover(manualTreatments: [],
+            bolusOperations: recovered.bolusOperations, from: url).bolusOperations, [prior, new])
+    }
+
+    func testUncertainAppendAndOlderReceiptKeepTheFrozenOperationExactlyOnce() throws {
+        let url = try queueURL()
+        let prior = bolus()
+        let frozen = bolus()
+        // Atomic write landed, but its final check and immediate recovery failed.
+        // The frozen candidate must participate in recovery before an older receipt writes.
+        try WatchManualTreatmentQueue.persistBolusOperations([prior, frozen], to: url)
+        let recovered = try WatchManualTreatmentQueue.recover(
+            manualTreatments: [], bolusOperations: [prior, frozen], from: url)
+        XCTAssertEqual(recovered.bolusOperations, [prior, frozen])
+        let remaining = recovered.bolusOperations.filter { $0.id != prior.id }
+        try WatchManualTreatmentQueue.persistBolusOperations(remaining, to: url)
+        XCTAssertEqual(try WatchManualTreatmentQueue.loadBolusOperations(from: url), [frozen])
+        let retry = try WatchManualTreatmentQueue.recover(
+            manualTreatments: [], bolusOperations: remaining, from: url)
+        XCTAssertEqual(retry.bolusOperations, [frozen])
+        XCTAssertEqual(retry.bolusOperations.first?.insulinID, frozen.insulinID)
+        XCTAssertEqual(retry.bolusOperations.first?.carbsID, frozen.carbsID)
+        XCTAssertEqual(retry.bolusOperations.first?.recordedAt, frozen.recordedAt)
+    }
+
+    func testLegacyUncertainAppendSurvivesOlderManualReceipt() throws {
+        let url = try queueURL()
+        let prior = WatchManualTreatment(id: UUID(), recordedAt: when,
+            kind: .insulin, amount: 1.5)
+        let frozen = WatchManualTreatment(id: UUID(), recordedAt: when,
+            kind: .basalInjection, amount: 20)
+        try WatchManualTreatmentQueue.persist([prior, frozen], to: url)
+        let recovered = try WatchManualTreatmentQueue.recover(
+            manualTreatments: [prior, frozen], bolusOperations: [], from: url)
+        let receipt = try XCTUnwrap(WatchManualTreatmentReceipt([
+            WatchManualTreatmentMessageKey.treatmentID: prior.id.uuidString,
+            WatchManualTreatmentMessageKey.stored: true]))
+        try WatchManualTreatmentQueue.persist(WatchManualTreatmentQueue.applying(receipt,
+            to: recovered.manualTreatments), to: url)
+        XCTAssertEqual(try WatchManualTreatmentQueue.load(from: url), [frozen])
+    }
+
+    func testInterruptedReceiptWriteRetainsKnownPendingOperationUntilReceiptCanRepeat() throws {
+        let url = try queueURL()
+        let prior = bolus()
+        // File has the new empty contents, while a final write check left memory pending.
+        try WatchManualTreatmentQueue.persistBolusOperations([], to: url)
+        let recovered = try WatchManualTreatmentQueue.recover(
+            manualTreatments: [], bolusOperations: [prior], from: url)
+        XCTAssertEqual(recovered.bolusOperations, [prior])
+        XCTAssertEqual(try WatchManualTreatmentQueue.loadBolusOperations(from: url), [prior])
+    }
+
+    func testLegacyBasalAndCombinedOperationsRecoverTogetherAndKeepSeparateReceipts() throws {
+        let url = try queueURL()
+        let basal = WatchManualTreatment(id: UUID(), recordedAt: when,
+            kind: .basalInjection, amount: 20)
+        let legacyInsulin = WatchManualTreatment(id: UUID(), recordedAt: when,
+            kind: .insulin, amount: 1.5)
+        let operation = bolus()
+        try WatchManualTreatmentQueue.persist([basal, legacyInsulin], to: url)
+        try WatchManualTreatmentQueue.persistBolusOperations([operation], to: url)
+        let recovered = try WatchManualTreatmentQueue.recover(
+            manualTreatments: [basal, legacyInsulin], bolusOperations: [operation], from: url)
+        XCTAssertEqual(recovered.manualTreatments, [basal, legacyInsulin])
+        XCTAssertEqual(recovered.bolusOperations, [operation])
+        let receipt = try XCTUnwrap(WatchManualTreatmentReceipt([
+            WatchManualTreatmentMessageKey.treatmentID: basal.id.uuidString,
+            WatchManualTreatmentMessageKey.stored: true]))
+        try WatchManualTreatmentQueue.persist(WatchManualTreatmentQueue.applying(receipt,
+            to: recovered.manualTreatments), to: url)
+        XCTAssertEqual(try WatchManualTreatmentQueue.load(from: url), [legacyInsulin])
+        XCTAssertEqual(try WatchManualTreatmentQueue.loadBolusOperations(from: url), [operation])
+    }
+
+    func testUnknownCorruptOrFutureQueueRemainsBlockedAndByteIdentical() throws {
+        let url = try queueURL()
+        let operation = bolus()
+        let unknownLegacy = Data("[{\"id\":\"\(UUID())\",\"recordedAt\":0,\"kind\":\"futureKind\",\"amount\":1}]".utf8)
+        let future = Data("{\"version\":99,\"manualTreatments\":[],\"bolusOperations\":[]}".utf8)
+        for data in [unknownLegacy, future, Data("interrupted json".utf8)] {
+            try data.write(to: url)
+            XCTAssertThrowsError(try WatchManualTreatmentQueue.recover(
+                manualTreatments: [], bolusOperations: [operation], from: url))
+            XCTAssertEqual(try Data(contentsOf: url), data)
+        }
+    }
+
+    func testConflictingUUIDInMemoryOrOnDiskCannotBeReconciled() throws {
+        let url = try queueURL()
+        let id = UUID()
+        let prior = bolus(id: id)
+        let conflict = bolus(id: id, amount: 3)
+        try WatchManualTreatmentQueue.persistBolusOperations([prior], to: url)
+        let original = try Data(contentsOf: url)
+        XCTAssertThrowsError(try WatchManualTreatmentQueue.recover(
+            manualTreatments: [], bolusOperations: [conflict], from: url))
+        XCTAssertEqual(try Data(contentsOf: url), original)
+        try WatchManualTreatmentQueue.persistBolusOperations([prior, conflict], to: url)
+        let conflictingFile = try Data(contentsOf: url)
+        XCTAssertThrowsError(try WatchManualTreatmentQueue.recover(
+            manualTreatments: [], bolusOperations: [], from: url))
+        XCTAssertEqual(try Data(contentsOf: url), conflictingFile)
+    }
+}

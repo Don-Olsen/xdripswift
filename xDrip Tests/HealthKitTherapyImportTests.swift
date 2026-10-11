@@ -2163,3 +2163,140 @@ final class WatchBasalTreatmentTests: XCTestCase {
             .getLatestTreatmentsForNightscout(limit: 10).isEmpty)
     }
 }
+
+
+/// Production Watch receipt -> shared phone logger -> historical forecast selection.
+/// All dates, doses and stores below are synthetic and never access HealthKit.
+@MainActor final class WatchPhoneTreatmentProvenanceTests: XCTestCase {
+    private let recordedAt = Date(timeIntervalSince1970: 1_791_633_600) // 12:00 UTC
+    private var receivedAt: Date { recordedAt.addingTimeInterval(60 * 60) }
+
+    private func operation() -> WatchBolusOperation {
+        WatchBolusOperation(operationID: UUID(), insulinID: UUID(), carbsID: UUID(),
+            recordedAt: recordedAt, insulinUnits: 2.5, carbohydrateGrams: 30,
+            mealKindRaw: "slow", pizzaReminderRequested: false,
+            manualWithoutCurrentSuggestion: true, penStepUnits: 0.5,
+            maximumUnits: 25, profileSignature: "synthetic-confirmed-profile")
+    }
+
+    private func storedInputs(_ core: CoreDataManager) throws -> [TherapyTreatment] {
+        let context = NSManagedObjectContext(concurrencyType: .privateQueueConcurrencyType)
+        context.persistentStoreCoordinator = try XCTUnwrap(
+            core.privateManagedObjectContext.persistentStoreCoordinator)
+        var result: Result<[TherapyTreatment], Error>!
+        context.performAndWait {
+            result = Result {
+                try context.fetch(TreatmentEntry.fetchRequest()).map { row in
+                    TherapyTreatment(date: row.date, amount: row.value,
+                        isIOB: row.treatmentType == .Insulin,
+                        carbohydrateDurationMinutes: row.treatmentType == .Carbs
+                            ? row.effectiveCarbohydrateDurationMinutes : nil,
+                        knownAt: row.knownAtForCurrentRevision,
+                        createdAt: row.createdAt, modifiedAt: row.modifiedAt,
+                        isAppLocal: row.isAppLocalTreatment,
+                        isDeletedCurrentRevision: row.treatmentdeleted,
+                        stableIdentity: row.localTreatmentUUID)
+                }
+            }
+        }
+        return try result.get()
+    }
+
+    func testOfflineWatchReceiptKeepsEventTimeButExcludesEarlierReplayAnchors() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let ledgerDirectory = root.appendingPathComponent("receipts")
+        let ledger = WatchPenOperationLedger(directory: ledgerDirectory)
+        let journal = PenDoseLogJournal(directory: root)
+        let metadata = MealPlanMetadataStore(directory: root)
+        let frozen = operation()
+        XCTAssertEqual(WatchPenPhoneService.log(frozen, coreDataManager: core,
+            ledger: ledger, journal: journal, metadataStore: metadata,
+            sourceReadyOverride: { true }, now: receivedAt), .stored)
+
+        let inputs = try storedInputs(core)
+        XCTAssertEqual(inputs.count, 2)
+        XCTAssertEqual(Set(inputs.compactMap(\.stableIdentity)),
+            Set([frozen.insulinID.uuidString, frozen.carbsID.uuidString]))
+        XCTAssertTrue(inputs.allSatisfy {
+            $0.date == recordedAt && $0.createdAt == receivedAt &&
+                $0.modifiedAt == receivedAt && $0.knownAt == receivedAt && $0.isAppLocal
+        })
+        XCTAssertEqual(inputs.first(where: \.isIOB)?.amount, 2.5)
+        XCTAssertEqual(inputs.first(where: { !$0.isIOB })?.amount, 30)
+        XCTAssertEqual(inputs.first(where: { !$0.isIOB })?.carbohydrateDurationMinutes, 300)
+
+        let anchor = recordedAt.addingTimeInterval(30 * 60)
+        let start = recordedAt.addingTimeInterval(-10 * 60 * 60)
+        XCTAssertTrue(GlucoseForecastDataAdapter.treatmentsKnownAtReference(
+            inputs, from: start, referenceDate: anchor).isEmpty)
+        XCTAssertEqual(GlucoseForecastDataAdapter.treatmentsKnownAtReference(
+            inputs, from: start, referenceDate: receivedAt).count, 2)
+        XCTAssertTrue(GlucoseForecastDataAdapter.hasTreatmentAfterReading(
+            inputs, referenceDate: anchor, calculationDate: receivedAt))
+        let snapshot = try PenDoseInputSnapshot.make(capturedAt: receivedAt,
+            glucose: [.init(date: anchor, glucoseMgdl: 120, sensorID: "synthetic-sensor")],
+            treatments: inputs, therapySettings: TherapyModelSettings(),
+            treatmentRevision: 1).get()
+        XCTAssertEqual(PenBolusCalculator.safetyForecast(snapshot: snapshot,
+            at: receivedAt, sensitivityMgdlPerUnit: 36,
+            carbohydrateRatioGramsPerUnit: 10).reason, .awaitingNextReading)
+
+        // Lost acknowledgement and recreated receipt store must not shift known-at.
+        XCTAssertEqual(WatchPenPhoneService.log(frozen, coreDataManager: core,
+            ledger: WatchPenOperationLedger(directory: ledgerDirectory),
+            journal: journal, metadataStore: metadata, sourceReadyOverride: { true },
+            now: receivedAt.addingTimeInterval(60 * 60)), .stored)
+        let retried = try storedInputs(core)
+        XCTAssertEqual(retried.count, 2)
+        XCTAssertTrue(retried.allSatisfy { $0.date == recordedAt && $0.knownAt == receivedAt })
+        XCTAssertNil(try metadata.metadata(for: frozen.carbsID.uuidString)?.pizzaReminderAt)
+    }
+
+    func testPhoneAvailabilityStartsAtAcceptedSaveAndSurvivesRetryAfterUserChanges() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let ledgerDirectory = root.appendingPathComponent("receipts")
+        let journal = PenDoseLogJournal(directory: root)
+        let metadata = MealPlanMetadataStore(directory: root)
+        let frozen = operation()
+        XCTAssertEqual(WatchPenPhoneService.log(frozen, coreDataManager: core,
+            ledger: WatchPenOperationLedger(directory: ledgerDirectory), journal: journal,
+            metadataStore: metadata, sourceReadyOverride: { false }, now: receivedAt),
+            .sourceUnavailable)
+        XCTAssertTrue(try storedInputs(core).isEmpty)
+        let savedAt = receivedAt.addingTimeInterval(60 * 60)
+        XCTAssertEqual(WatchPenPhoneService.log(frozen, coreDataManager: core,
+            ledger: WatchPenOperationLedger(directory: ledgerDirectory), journal: journal,
+            metadataStore: metadata, sourceReadyOverride: { true },
+            now: savedAt), .stored)
+        let committed = try storedInputs(core)
+        XCTAssertTrue(committed.allSatisfy { $0.knownAt == savedAt })
+        XCTAssertTrue(GlucoseForecastDataAdapter.treatmentsKnownAtReference(committed,
+            from: recordedAt.addingTimeInterval(-60),
+            referenceDate: receivedAt.addingTimeInterval(30 * 60)).isEmpty,
+            "A reserved operation rejected by source validation was not available to iPhone forecasts")
+
+        let entries = try core.mainManagedObjectContext.fetch(TreatmentEntry.fetchRequest())
+        let bolus = try XCTUnwrap(entries.first { $0.localTreatmentUUID == frozen.insulinID.uuidString })
+        let meal = try XCTUnwrap(entries.first { $0.localTreatmentUUID == frozen.carbsID.uuidString })
+        let editDate = receivedAt.addingTimeInterval(90 * 60)
+        bolus.value = 3
+        bolus.modifiedAt = editDate
+        meal.treatmentdeleted = true
+        meal.modifiedAt = editDate
+        XCTAssertTrue(core.saveChangesSynchronously())
+        XCTAssertEqual(WatchPenPhoneService.log(frozen, coreDataManager: core,
+            ledger: WatchPenOperationLedger(directory: ledgerDirectory), journal: journal,
+            metadataStore: metadata, sourceReadyOverride: { true },
+            now: receivedAt.addingTimeInterval(120 * 60)), .stored)
+        let changed = try storedInputs(core)
+        XCTAssertEqual(changed.count, 2)
+        XCTAssertEqual(changed.first(where: \.isIOB)?.amount, 3)
+        XCTAssertTrue(try XCTUnwrap(changed.first(where: { !$0.isIOB })).isDeletedCurrentRevision)
+        XCTAssertTrue(changed.allSatisfy { $0.createdAt == savedAt && $0.knownAt == editDate })
+    }
+
+}

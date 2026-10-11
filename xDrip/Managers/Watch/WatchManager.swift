@@ -377,7 +377,7 @@ enum WatchManualTreatmentStore {
                 insulinUnits: operation.insulinUnits,
                 carbohydrateGrams: operation.carbohydrateGrams,
                 mealKind: mealKind, plannedDate: nil, operation: logOperation,
-                now: operation.recordedAt, journal: journal,
+                now: operation.recordedAt, knownAt: now, journal: journal,
                 penSettings: settings,
                 frozenPenStepUnits: operation.penStepUnits,
                 frozenMaximumUnits: operation.maximumUnits,

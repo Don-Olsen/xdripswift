@@ -3372,3 +3372,171 @@ final class TreatmentListRefreshTests: XCTestCase {
         }
     }
 }
+
+/// Exercises the actual adapter fetch and serial pen-snapshot path. A database failure
+/// is not an empty CGM history that the person can replace with a manual value.
+@MainActor final class PenDoseGlucoseReadTests: XCTestCase {
+    private func withLocalSource(_ body: () async throws -> Void) async rethrows {
+        let defaults = UserDefaults.standard
+        let keys = ["isMaster", "therapyDataSourceType", "nightscoutEnabled",
+            TreatmentSourceCutover.defaultsKey, TreatmentSourceCutover.restoreRequiresSourceSetupKey,
+            "healthTherapyImport.v1.insulin.enabled", "healthTherapyImport.v1.carbohydrates.enabled"]
+        let saved = keys.map { defaults.object(forKey: $0) }
+        defer {
+            for (key, value) in zip(keys, saved) {
+                if let value { defaults.set(value, forKey: key) }
+                else { defaults.removeObject(forKey: key) }
+            }
+        }
+        defaults.isMaster = true
+        defaults.therapyDataSourceType = .none
+        defaults.nightscoutEnabled = false
+        defaults.removeObject(forKey: TreatmentSourceCutover.restoreRequiresSourceSetupKey)
+        defaults.set(false, forKey: "healthTherapyImport.v1.insulin.enabled")
+        defaults.set(false, forKey: "healthTherapyImport.v1.carbohydrates.enabled")
+        XCTAssertTrue(TreatmentSourceCutover.persist(.init(
+            cutoff: Date().addingTimeInterval(-7 * 86400),
+            insulinSourceBundleID: "synthetic.insulin",
+            carbohydrateSourceBundleID: "synthetic.carbs"), defaults: defaults))
+        try await body()
+    }
+
+    private func assertManualCalculation(_ snapshot: PenDoseInputSnapshot, at now: Date,
+                                         file: StaticString = #filePath, line: UInt = #line) {
+        var profile = PenDoseProfile.prefilledUnconfirmed
+        XCTAssertTrue(profile.confirm(at: now), file: file, line: line)
+        let manual = PenBolusCalculator.calculate(snapshot: snapshot, profile: profile,
+            glucose: .manual(valueMgdl: 120, measuredAt: now),
+            newCarbs: .unrecorded(grams: 30), safetyForecast: nil, at: now)
+        XCTAssertNil(manual.unavailableReason, file: file, line: line)
+        XCTAssertNotNil(manual.suggestedUnits, file: file, line: line)
+        XCTAssertTrue(manual.trendWasIntentionallyZero, file: file, line: line)
+        let automatic = PenBolusCalculator.calculate(snapshot: snapshot, profile: profile,
+            glucose: .currentCGM, newCarbs: .unrecorded(grams: 30),
+            safetyForecast: nil, at: now)
+        XCTAssertEqual(automatic.unavailableReason, .missingGlucose, file: file, line: line)
+        XCTAssertNil(automatic.suggestedUnits, file: file, line: line)
+    }
+
+    func testAdapterDistinguishesSuccessfulEmptyFetchFromThrownReadFailure() {
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let adapter = GlucoseForecastDataAdapter(coreDataManager: core)
+        XCTAssertEqual(adapter.recentGlucose(at: Date()), [])
+        let failed = adapter.recentGlucose(at: Date()) { _, _ in
+            throw NSError(domain: "SyntheticCGMRead", code: 1)
+        }
+        XCTAssertNil(failed)
+    }
+
+    func testFirstFetchFailureBlocksBothNormalAndManualSnapshotWithoutASecondRead() async throws {
+        try await withLocalSource {
+            for allowMissing in [false, true] {
+                let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+                var reads = 0
+                let manager = TherapyMetricsManager(doseGlucoseFetch: { _, request in
+                    XCTAssertEqual(request.entityName, "BgReading")
+                    reads += 1
+                    throw NSError(domain: "SyntheticCGMRead", code: 2)
+                })
+                manager.configure(coreDataManager: core, externalStatus: { nil })
+                let result = await manager.penDoseSnapshot(allowMissingGlucose: allowMissing)
+                guard case .failure(let reason) = result else {
+                    XCTFail("A failed CGM read must not become a manual-dose snapshot"); continue
+                }
+                XCTAssertEqual(reason, .glucoseReadFailed)
+                XCTAssertEqual(reads, 1)
+            }
+        }
+    }
+
+    func testFinalFetchFailureIsAReadErrorAfterSuccessfulFirstRead() async throws {
+        try await withLocalSource {
+            for allowMissing in [false, true] {
+                let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+                var reads = 0
+                let manager = TherapyMetricsManager(doseGlucoseFetch: { context, request in
+                    reads += 1
+                    if reads == 2 { throw NSError(domain: "SyntheticCGMRead", code: 3) }
+                    return try context.fetch(request)
+                })
+                manager.configure(coreDataManager: core, externalStatus: { nil })
+                let result = await manager.penDoseSnapshot(allowMissingGlucose: allowMissing)
+                guard case .failure(let reason) = result else {
+                    XCTFail("Failure of the final consistency read must invalidate the snapshot"); continue
+                }
+                XCTAssertEqual(reason, .glucoseReadFailed)
+                XCTAssertEqual(reads, 2)
+            }
+        }
+    }
+
+    func testSuccessfulEmptyCGMStillAllowsExplicitManualCalculationWithKnownTherapy() async throws {
+        try await withLocalSource {
+            let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+            let manager = TherapyMetricsManager()
+            manager.configure(coreDataManager: core, externalStatus: { nil })
+            let now = Date()
+            let result = await manager.penDoseSnapshot(at: now, allowMissingGlucose: true)
+            let snapshot = try result.get()
+            XCTAssertTrue(snapshot.glucose.isEmpty)
+            XCTAssertEqual(snapshot.iobUnits, 0)
+            XCTAssertEqual(snapshot.cobGrams, 0)
+            assertManualCalculation(snapshot, at: now)
+        }
+    }
+
+    func testSuccessfullyReadRejectedCGMStillAllowsManualWithoutInventingCGM() async throws {
+        try await withLocalSource {
+            let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+            let now = Date()
+            let sensor = Sensor(startDate: now.addingTimeInterval(-3600),
+                nsManagedObjectContext: core.mainManagedObjectContext)
+            let invalid = BgReading(timeStamp: now.addingTimeInterval(-60), sensor: sensor,
+                calibration: nil, rawData: 0, deviceName: "Synthetic",
+                nsManagedObjectContext: core.mainManagedObjectContext)
+            invalid.calculatedValue = 0
+            XCTAssertTrue(core.saveChangesSynchronously())
+            let manager = TherapyMetricsManager()
+            manager.configure(coreDataManager: core, externalStatus: { nil })
+            let result = await manager.penDoseSnapshot(at: now, allowMissingGlucose: true)
+            let snapshot = try result.get()
+            XCTAssertTrue(snapshot.glucose.isEmpty)
+            assertManualCalculation(snapshot, at: now)
+            XCTAssertEqual(invalid.calculatedValue, 0)
+        }
+    }
+
+    func testChangedCGMBetweenSuccessfulReadsStillRejectsMixedSnapshot() async throws {
+        try await withLocalSource {
+            let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+            let now = Date()
+            let sensor = Sensor(startDate: now.addingTimeInterval(-3600),
+                nsManagedObjectContext: core.mainManagedObjectContext)
+            let valid = BgReading(timeStamp: now.addingTimeInterval(-60), sensor: sensor,
+                calibration: nil, rawData: 120, deviceName: "Synthetic",
+                nsManagedObjectContext: core.mainManagedObjectContext)
+            valid.calculatedValue = 120
+            XCTAssertTrue(core.saveChangesSynchronously())
+            var reads = 0
+            let manager = TherapyMetricsManager(doseGlucoseFetch: { context, request in
+                reads += 1
+                let fetched = try context.fetch(request)
+                return reads == 1 ? fetched : []
+            })
+            manager.configure(coreDataManager: core, externalStatus: { nil })
+            let result = await manager.penDoseSnapshot(at: now, allowMissingGlucose: true)
+            guard case .failure(let reason) = result else {
+                return XCTFail("Two different successful reads must not form one snapshot")
+            }
+            XCTAssertEqual(reason, .treatmentChangedDuringRead)
+            XCTAssertEqual(reads, 2)
+        }
+    }
+
+    func testCGMReadFailureHasConcreteDanishReasonDistinctFromMissingCGM() {
+        XCTAssertEqual(PenDoseCalculatorViewModel.unavailableText(.glucoseReadFailed),
+            "CGM-data kunne ikke læses. Prøv igen.")
+        XCTAssertNotEqual(PenDoseCalculatorViewModel.unavailableText(.glucoseReadFailed),
+            PenDoseCalculatorViewModel.unavailableText(.missingGlucose))
+    }
+}

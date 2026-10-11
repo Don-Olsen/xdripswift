@@ -33,6 +33,8 @@ struct GlucoseForecastSafetyOutcome: Sendable {
 /// Core Data reads run on a serial worker. Home can cancel or supersede its awaiting Task
 /// without ever blocking rendering or adding a polling timer.
 final class GlucoseForecastDataAdapter {
+    /// Executes on the managed-object context queue; injectable for read-failure tests.
+    typealias GlucoseFetch = (NSManagedObjectContext, NSFetchRequest<BgReading>) throws -> [BgReading]
     private let coreDataManager: CoreDataManager
     private let therapyManager: TherapyMetricsManager
     private let defaults: UserDefaults
@@ -408,7 +410,8 @@ final class GlucoseForecastDataAdapter {
 
     /// Read the same downstream-valid final glucose value used by the Home graph. A fresh
     /// sensor's history is never spliced to an older sensor just to manufacture momentum.
-    func recentGlucose(at now: Date) -> [GlucoseForecastSample]? {
+    /// A successful empty/filtered selection is []; nil means the store could not be read.
+    func recentGlucose(at now: Date, fetch: GlucoseFetch? = nil) -> [GlucoseForecastSample]? {
         let context = coreDataManager.privateManagedObjectContext
         var result: [GlucoseForecastSample]?
         context.performAndWait {
@@ -423,7 +426,7 @@ final class GlucoseForecastDataAdapter {
             request.fetchBatchSize = 200
             request.relationshipKeyPathsForPrefetching = ["sensor"]
             do {
-                let fetched = try context.fetch(request)
+                let fetched = try fetch?(context, request) ?? context.fetch(request)
                 let observations = fetched.map { reading in
                     GlucoseForecastGlucoseObservation(date: reading.timeStamp,
                         glucoseMgdl: reading.finalValue, sensorID: reading.sensor?.id,

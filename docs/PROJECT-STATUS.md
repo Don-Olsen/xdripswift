@@ -1,3 +1,58 @@
+## Fejlrettelser efter 4324 — 11. oktober 2026
+
+Tre afgrænsede rettelser er implementeret og gennemgået:
+
+- Watch-køens eksisterende genforsøg afstemmer den varige fil efter midlertidige
+  skrivefejl. Usikre førsteskrivninger beholder samme bekræftede operation,
+  UUID'er, tidspunkt og indhold. Også kvitteringer afstemmer filen før omskrivning,
+  så en ældre kvittering ikke fjerner en nyere registrering. Ukendt format,
+  ødelagt fil og modstridende UUID-indhold overskrives fortsat ikke. Når et
+  usikkert forsøg er afklaret senere, viser næste Log tydeligt, at den tidligere
+  registrering er gemt, og at intet nyt er registreret. En ny registrering kræver
+  derefter en ny særskilt bekræftelse; ens mængder bruges ikke som identitet.
+- Nye forsinkede Watch-behandlinger beholder deres oprindelige hændelsestid,
+  mens `createdAt`/`modifiedAt` sættes ved det accepterede iPhone-lagringsforsøg.
+  Et kildeafvist forsøg giver ikke kunstigt tidlig tilgængelighed. Kvitterings-
+  genforsøg, redigeringer og sletninger omskriver ikke kendt-tiden.
+- En faktisk CGM-databasefejl afviser dosissnapshot med en konkret dansk fejl.
+  En vellykket læsning uden CGM tillader fortsat eksplicit manuel beregning;
+  ukendt IOB/COB bliver ikke nul. Dosisformel og beregningsgrænser er uændrede.
+
+Validering på den færdige lokale kode, stadig med buildnummer 4324:
+- **1.591/1.591 XCTest**, 0 fejl, 0 skipped. Heraf 18 nye regressionstests:
+  9 for Watch-kø, 2 for Watch-kendt-tid og 7 for CGM-læsefejl. Kvittering:
+  `20261011T171045Z-46886/results/AllTests.xcresult`.
+- Projektets Python-/syntetiske Watch-kontroller bestod; kvittering
+  `20261011T171308Z-47399`.
+- Begge simulatorbuilds bestod; kvittering `20261011T171141Z-47064`.
+- Usigneret iPhoneOS-build bestod, og programmets arm64-arkitektur blev
+  kontrolleret. Log: `/private/tmp/xdrip-audit-fixes-final-device-build.log`.
+- Seks supplerende syntetiske fejlsekvenser gennem de faktiske Watch-metoder
+  bestod i en isoleret Swift-probe uden for Git. `git diff --check` bestod.
+- XCTest registrerede SwiftUI frame/publication- og QoS-advarsler. De samme
+  advarselstyper findes i den tidligere 1.573-tests-kørsel for 4324; de er ikke
+  rettet her. Grønne tests er ikke dokumentation for fejlfri fysisk adfærd.
+
+Kvitteringerne ligger under det eksisterende lokale buildområde uden for Git.
+De dokumenterer ikke et senere ændret eller nummereret release-checkpoint.
+Den fysiske iPhone blev kun inspiceret læsende: forventet bundle-ID og 7.1.1
+(4324) er installeret. Ingen lokal installation eller fysisk fejlindsprøjtning,
+Watch-leveringstest, HealthKit-sletningstest eller ML-præcisionsmåling er udført.
+Allerede gemte historiske Watch-posters faktiske modtagelsestid kan ikke sikkert
+rekonstrueres og bliver ikke omskrevet. Prognosemotor, ML-matematik, dosisformel,
+alarmer, sensorforbindelse og Nightscout er uændrede.
+
+Sundhed-forslaget om genforsøg af kadencesletninger er bevidst udeladt efter
+brugerens indsigelse mod ændring af gamle Sundhed-kopier. Den uanvendte patch
+ligger kun uden for Git. HealthKitManager, backupfiltrering og eksisterende
+HealthKit-sletningsadfærd er uændrede. Kandidaten omfatter kun de tre rettelser
+ovenfor. Ingen gamle glukosemålinger omskrives af disse ændringer.
+
+Den normale releaseprocedure vælger buildnummer via Apple og gentester det
+præcise nummererede checkpoint. Endelig Apple-status og releasekvittering
+registreres særskilt nedenfor/øverst; de lokale resultater ovenfor erstatter dem
+ikke. Fysisk afprøvning af de nye fejlforløb er fortsat udestående.
+
 <!-- testflight-7.1.1-4324:start -->
 ### TestFlight 7.1.1 (4324)
 

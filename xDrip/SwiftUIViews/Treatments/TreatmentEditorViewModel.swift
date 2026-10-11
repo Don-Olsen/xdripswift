@@ -1602,6 +1602,7 @@ struct PenDoseCalculationDetails {
         case .uncommittedTreatments, .treatmentReadFailed,
              .treatmentChangedDuringRead, .invalidTreatment:
             return "Kan ikke beregne: insulin- eller kulhydratgrundlaget er ufuldstændigt."
+        case .glucoseReadFailed: return "CGM-data kunne ikke læses. Prøv igen."
         case .invalidGlucose, .missingGlucose: return "Kan ikke beregne: ingen gyldig blodsukkerværdi."
         case .glucoseNeedsConfirmation: return "Målingen er over 15 minutter gammel. Bekræft den eller indtast en manuel værdi."
         case .missingTwentyMinuteTrend: return "Kan ikke beregne: der mangler sammenhængende 20-minutters glukosehistorik."
@@ -1971,7 +1972,8 @@ struct PenDoseLogIntent: Codable, Equatable {
     static func log(coreDataManager: CoreDataManager, insulinUnits: Double,
                     carbohydrateGrams: Double, mealKind: TreatmentMealKind,
                     plannedDate: Date?, operation: PenDoseLogOperation = .init(),
-                    now: Date = .now, journal: PenDoseLogJournal? = nil,
+                    now: Date = .now, knownAt: Date? = nil,
+                    journal: PenDoseLogJournal? = nil,
                     penSettings: PenDoseProfile.Settings? = nil,
                     frozenPenStepUnits: Double? = nil,
                     frozenMaximumUnits: Double? = nil,
@@ -1984,6 +1986,10 @@ struct PenDoseLogIntent: Codable, Equatable {
         -> Result<PenDoseLogReceipt, PenDoseLogError> {
         let journal = journal ?? .shared
         let metadataStore = metadataStore ?? .shared
+        // Delayed Watch delivery keeps its event date but cannot claim that the phone
+        // knew the treatment before it arrived. Existing phone callers keep their time.
+        let knownAt = knownAt ?? now
+        guard knownAt.timeIntervalSince1970.isFinite else { return .failure(.invalidInput) }
         let settings = penSettings ?? PenDoseProfile.load().settings
         let step = frozenPenStepUnits ?? settings.penStepUnits
         let maximum = frozenMaximumUnits ?? settings.maximumSuggestionUnits
@@ -2054,8 +2060,8 @@ struct PenDoseLogIntent: Codable, Equatable {
             if manualWithoutCurrentSuggestion {
                 bolus.notes = "Manuelt logget uden aktuelt kontrolleret forslag"
             }
-            bolus.createdAt = now
-            bolus.modifiedAt = now
+            bolus.createdAt = knownAt
+            bolus.modifiedAt = knownAt
             bolus.healthKitSyncVersion = NSNumber(value: 1)
             bolus.healthKitSyncStateRaw = HealthLocalTherapySyncState.pending(version: 1)
         }
@@ -2065,8 +2071,8 @@ struct PenDoseLogIntent: Codable, Equatable {
                 enteredBy: enteredBy,
                 nsManagedObjectContext: context)
             meal.localTreatmentUUID = operation.mealUUID
-            meal.createdAt = now
-            meal.modifiedAt = now
+            meal.createdAt = knownAt
+            meal.modifiedAt = knownAt
             meal.mealKindRaw = mealKind.rawValue
             meal.carbohydrateDurationMinutes = NSNumber(value: mealKind.durationMinutes)
             meal.plannedMealStateRaw = plannedDate == nil

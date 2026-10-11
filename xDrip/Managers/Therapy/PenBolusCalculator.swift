@@ -144,6 +144,7 @@ enum PenDoseUnavailableReason: String, Error, Sendable {
     case incompleteTherapySources
     case uncommittedTreatments
     case treatmentReadFailed
+    case glucoseReadFailed
     case treatmentChangedDuringRead
     case invalidTreatment
     case invalidGlucose
