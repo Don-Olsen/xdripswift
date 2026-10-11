@@ -1,3 +1,43 @@
+## Begrænset kalibreringshistorik efter 4323 — 11. oktober 2026
+
+`BgReadingsAccessor.calibrationHistory` henter normalt højst 32 tidligere
+råpositive poster for den samme sensor og vælger de samme tre gyldige målinger.
+Før ændringen hentede funktionen hele sensorens tidligere historik ved hver
+accepteret live-/historikmåling, selv om kun tre målinger blev brugt.
+
+Er der færre end tre gyldige poster, ens tidsstempler eller en udvalgt post ved
+udsnittets slutgrænse, bruges den oprindelige fulde hentning. Dermed bevares
+ældre gyldige poster, den eksisterende rækkefølge ved ens tider og endnu ikke
+gemte ændringer i hovedkonteksten. Ingen offset-paginering, ny cache eller
+ændring af kalibreringsalgoritmen. Hentefejl giver fortsat et tomt resultat.
+
+Foreløbig validering:
+- Hele XCTest: **1.573/1.573**, 0 fejl, 0 skipped. Lokal kvittering
+  `20261011T104309Z-5927` (uden for Git).
+- Syv nye tests sammenligner med den tidligere ubegrænsede produktionsforespørgsel.
+  SQLite-testen med 5.000 poster kontrollerer højst 32 registrerede måleobjekter
+  på normalstien før referencehentningen og identiske valgte poster.
+- Dækningen omfatter ugyldige/ikke-endelige værdier, mere end 32 ugyldige nyere
+  poster, korte historikker, sensor-/tidsgrænser, kadenceskjulte poster, ens
+  tidsstempler og ugemte indsættelser, rettelser og sletninger. Begge Libre-
+  kalibratorer giver identiske værdier, hældninger og kurver gennem en
+  flertrins historikindlæsning. De eksisterende tests er bevaret.
+- Python-/release-/Watch-syntetiske kontroller bestod. Det præcise nummererede
+  checkpoint gentestes af releaseproceduren; den afsluttende kvittering og
+  Apple-status registreres særskilt øverst i dette dokument.
+- Apple valgte **7.1.1 (4324)**. Usigneret iPhoneOS/arm64-build af den
+  nummererede kode bestod med automatisk SDK-valg pr. target. Log uden for Git:
+  `/private/tmp/xdrip-calibration-history-4324-device-build.log`.
+  Første manuelle kommando tvang iPhone-SDK på Watch-target og fejlede på
+  WatchKit-import; den korrigerede kommando bestod uden kildeændringer.
+
+Den fysiske iPhone var tilgængelig; en læsende kontrol bekræftede 7.1.1 (4323)
+og forventet bundle-ID før udgivelsen. Ingen lokal installation eller fysisk
+måling af denne rettelses hastighed/batteriforbrug er udført. Automatiske tests
+beviser færre hentede poster på normalstien og bevarede resultater, ikke en
+målt gevinst på telefonen. Doseringsregler, motor/ML, IOB/COB, HealthKit,
+alarmer, Watch/Libre og Nightscout er uændrede.
+
 <!-- testflight-7.1.1-4323:start -->
 ### TestFlight 7.1.1 (4323)
 

@@ -62,9 +62,27 @@ class BgReadingsAccessor: ObservableObject {
             let request: NSFetchRequest<BgReading> = BgReading.fetchRequest()
             request.predicate = NSPredicate(format: "sensor == %@ AND timeStamp < %@ AND rawData > 0", sensor, date as NSDate)
             request.sortDescriptors = [NSSortDescriptor(key: #keyPath(BgReading.timeStamp), ascending: false)]
-            // Invalid calculated rows are not calibration/curve evidence.
-            readings = Array(((try? coreDataManager.mainManagedObjectContext.fetch(request)) ?? [])
-                .lazy.filter { $0.isValidForDownstream }.prefix(3))
+            // Usually the first few rows contain all three valid predecessors. Avoid
+            // fetching the sensor's entire history on every live/backfilled reading.
+            // Keep pending main-context changes and the original validity/order rules.
+            request.fetchLimit = 32
+            do {
+                let recent = try coreDataManager.mainManagedObjectContext.fetch(request)
+                readings = Array(recent.lazy.filter { $0.isValidForDownstream }.prefix(3))
+                let hasTimestampTies = Set(recent.map(\.timeStamp)).count != recent.count
+                let selectionTouchesBoundary = readings.last?.timeStamp == recent.last?.timeStamp
+                if readings.count < 3 || hasTimestampTies || selectionTouchesBoundary {
+                    // An invalid prefix (or pending edits/deletions) must not hide older
+                    // evidence. Preserve the original fetch's unspecified tie ordering too,
+                    // including a possible tie beyond the limited window's final row.
+                    request.fetchLimit = 0
+                    readings = Array(try coreDataManager.mainManagedObjectContext.fetch(request)
+                        .lazy.filter { $0.isValidForDownstream }.prefix(3))
+                }
+            } catch {
+                // Preserve the original all-or-empty failure behavior.
+                readings = []
+            }
         }
         return readings
     }

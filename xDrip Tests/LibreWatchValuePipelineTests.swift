@@ -8831,3 +8831,244 @@ extension LibreWatchValuePipelineTests {
         try verifyFractionalGlucoseAlarm(.veryHigh, glucose: 280)
     }
 }
+
+// The literal pre-optimization query is retained only as an independent test oracle.
+// These tests use the real managed-object contexts, including their pending changes.
+extension LibreWatchValuePipelineTests {
+    @MainActor
+    private func calibrationHistoryReference(_ stack: CoreDataManager, before date: Date,
+                                             sensor: Sensor) throws -> [BgReading] {
+        let request: NSFetchRequest<BgReading> = BgReading.fetchRequest()
+        request.predicate = NSPredicate(format: "sensor == %@ AND timeStamp < %@ AND rawData > 0", sensor, date as NSDate)
+        request.sortDescriptors = [NSSortDescriptor(key: #keyPath(BgReading.timeStamp), ascending: false)]
+        return Array(try stack.mainManagedObjectContext.fetch(request).lazy
+            .filter { $0.isValidForDownstream }.prefix(3))
+    }
+
+    @MainActor @discardableResult
+    private func calibrationHistoryRow(_ name: String, at date: Date, sensor: Sensor,
+                                       context: NSManagedObjectContext, raw: Double = 100,
+                                       calculated: Double = 100, suppressed: Bool = false) -> BgReading {
+        let row = BgReading(timeStamp: date, sensor: sensor, calibration: nil, rawData: raw,
+                            deviceName: "Calibration history test", nsManagedObjectContext: context)
+        row.id = name
+        row.calculatedValue = calculated
+        row.ageAdjustedRawValue = raw
+        row.isSuppressedByFiveMinuteCadence = suppressed
+        return row
+    }
+
+    @MainActor
+    private func calibrationHistorySQLiteStack() throws -> CoreDataManager {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CalibrationHistory-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        return try CoreDataManager(testModelName: ConstantsCoreData.modelName,
+                                   persistentStoreURL: directory.appendingPathComponent("history.sqlite"))
+    }
+
+    @MainActor
+    func testCalibrationHistoryBoundsMaterializedSQLiteRowsAndMatchesFullHistory() throws {
+        let stack = try calibrationHistorySQLiteStack()
+        let context = stack.mainManagedObjectContext
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let sensor = Sensor(startDate: now.addingTimeInterval(-400_000), nsManagedObjectContext: context)
+        for index in 1...5_000 {
+            calibrationHistoryRow("stored-\(index)", at: now.addingTimeInterval(-Double(index) * 60),
+                                  sensor: sensor, context: context, calculated: Double(100 + index % 40))
+        }
+        try context.obtainPermanentIDs(for: [sensor])
+        let sensorObjectID = sensor.objectID
+        XCTAssertTrue(stack.saveChangesSynchronously())
+        context.reset()
+        stack.privateManagedObjectContext.performAndWait { stack.privateManagedObjectContext.reset() }
+        context.retainsRegisteredObjects = true
+        let reloadedSensor = try XCTUnwrap(context.existingObject(with: sensorObjectID) as? Sensor)
+        let actual = BgReadingsAccessor(coreDataManager: stack).calibrationHistory(before: now, for: reloadedSensor)
+        // Assert before the reference fetch itself materializes the complete history.
+        let materializedCount = context.registeredObjects.filter { $0 is BgReading }.count
+        XCTAssertGreaterThanOrEqual(materializedCount, 3)
+        XCTAssertLessThanOrEqual(materializedCount, 32, "The normal path must not materialize all 5,000 rows")
+        XCTAssertEqual(actual.map(\.id), ["stored-1", "stored-2", "stored-3"])
+        XCTAssertEqual(actual.map(\.objectID),
+                       try calibrationHistoryReference(stack, before: now, sensor: reloadedSensor).map(\.objectID))
+    }
+
+    @MainActor
+    func testCalibrationHistoryPreservesSensorTimeRawAndSuppressedSelection() throws {
+        let stack = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let context = stack.mainManagedObjectContext
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let sensor = Sensor(startDate: now.addingTimeInterval(-3_600), nsManagedObjectContext: context)
+        let other = Sensor(startDate: now.addingTimeInterval(-4_000), nsManagedObjectContext: context)
+        calibrationHistoryRow("future", at: now.addingTimeInterval(1), sensor: sensor, context: context)
+        calibrationHistoryRow("at-boundary", at: now, sensor: sensor, context: context)
+        calibrationHistoryRow("other-sensor", at: now.addingTimeInterval(-1), sensor: other, context: context)
+        calibrationHistoryRow("zero-raw", at: now.addingTimeInterval(-2), sensor: sensor, context: context, raw: 0)
+        calibrationHistoryRow("negative-raw", at: now.addingTimeInterval(-3), sensor: sensor, context: context, raw: -1)
+        calibrationHistoryRow("suppressed", at: now.addingTimeInterval(-4), sensor: sensor, context: context, suppressed: true)
+        let native38 = calibrationHistoryRow("native-38", at: now.addingTimeInterval(-5), sensor: sensor,
+                                            context: context, raw: 38, calculated: 38)
+        native38.ageAdjustedRawValue = 0
+        calibrationHistoryRow("valid-39", at: now.addingTimeInterval(-6), sensor: sensor, context: context, calculated: 39)
+        calibrationHistoryRow("older", at: now.addingTimeInterval(-7), sensor: sensor, context: context)
+        let actual = BgReadingsAccessor(coreDataManager: stack).calibrationHistory(before: now, for: sensor)
+        XCTAssertEqual(actual.map(\.id), ["suppressed", "native-38", "valid-39"])
+        XCTAssertEqual(actual.map(\.objectID), try calibrationHistoryReference(stack, before: now, sensor: sensor).map(\.objectID))
+    }
+
+    @MainActor
+    func testCalibrationHistoryInvalidPrefixFallsBackToFullSQLiteHistory() throws {
+        let stack = try calibrationHistorySQLiteStack()
+        let context = stack.mainManagedObjectContext
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let sensor = Sensor(startDate: now.addingTimeInterval(-20_000), nsManagedObjectContext: context)
+        for index in 1...96 {
+            let row = calibrationHistoryRow("invalid-\(index)", at: now.addingTimeInterval(-Double(index)),
+                                            sensor: sensor, context: context)
+            switch index % 4 {
+            case 0: row.calculatedValue = 0
+            case 1: row.calculatedValue = ConstantsCalibrationAlgorithms.bgReadingErrorValue
+            case 2: row.adjustedValue = NSNumber(value: 0)
+            default: row.smoothedValue = NSNumber(value: -1)
+            }
+            XCTAssertFalse(row.isValidForDownstream)
+        }
+        for index in 1...5 {
+            calibrationHistoryRow("valid-\(index)", at: now.addingTimeInterval(-100 - Double(index)),
+                                  sensor: sensor, context: context, suppressed: index == 1)
+        }
+        XCTAssertTrue(stack.saveChangesSynchronously())
+        let actual = BgReadingsAccessor(coreDataManager: stack).calibrationHistory(before: now, for: sensor)
+        XCTAssertEqual(actual.map(\.id), ["valid-1", "valid-2", "valid-3"])
+        XCTAssertEqual(actual.map(\.objectID), try calibrationHistoryReference(stack, before: now, sensor: sensor).map(\.objectID))
+    }
+
+    @MainActor
+    func testCalibrationHistoryHandlesEmptyShortAndNonFinitePendingHistory() throws {
+        let stack = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let context = stack.mainManagedObjectContext
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let sensor = Sensor(startDate: now.addingTimeInterval(-3_600), nsManagedObjectContext: context)
+        let accessor = BgReadingsAccessor(coreDataManager: stack)
+        XCTAssertTrue(accessor.calibrationHistory(before: now, for: sensor).isEmpty)
+        for index in 1...40 {
+            let row = calibrationHistoryRow("nonfinite-\(index)", at: now.addingTimeInterval(-Double(index)),
+                                            sensor: sensor, context: context)
+            switch index % 4 {
+            case 0: row.calculatedValue = .infinity
+            case 1: row.ageAdjustedRawValue = .nan
+            case 2: row.adjustedValue = NSNumber(value: Double.infinity)
+            default: row.smoothedValue = NSNumber(value: Double.nan)
+            }
+            XCTAssertFalse(row.isValidForDownstream)
+        }
+        XCTAssertTrue(accessor.calibrationHistory(before: now, for: sensor).isEmpty)
+        for index in 1...2 {
+            calibrationHistoryRow("short-\(index)", at: now.addingTimeInterval(-50 - Double(index)),
+                                  sensor: sensor, context: context)
+            let actual = accessor.calibrationHistory(before: now, for: sensor)
+            XCTAssertEqual(actual.count, index)
+            XCTAssertEqual(actual.map(\.objectID), try calibrationHistoryReference(stack, before: now, sensor: sensor).map(\.objectID))
+        }
+    }
+
+    @MainActor
+    func testCalibrationHistorySQLiteIncludesPendingInsertUpdateAndDeletion() throws {
+        let stack = try calibrationHistorySQLiteStack()
+        let context = stack.mainManagedObjectContext
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let sensor = Sensor(startDate: now.addingTimeInterval(-20_000), nsManagedObjectContext: context)
+        let other = Sensor(startDate: now.addingTimeInterval(-30_000), nsManagedObjectContext: context)
+        var stored = [BgReading]()
+        for index in 1...80 {
+            stored.append(calibrationHistoryRow("stored-\(index)", at: now.addingTimeInterval(-Double(index) * 60),
+                                                sensor: sensor, context: context))
+        }
+        XCTAssertTrue(stack.saveChangesSynchronously())
+        context.delete(stored[0])
+        stored[1].calculatedValue = 0
+        stored[2].sensor = other
+        stored[3].timeStamp = now
+        stored[69].timeStamp = now.addingTimeInterval(-20)
+        stored[69].isSuppressedByFiveMinuteCadence = true
+        calibrationHistoryRow("pending-new", at: now.addingTimeInterval(-10), sensor: sensor, context: context)
+        calibrationHistoryRow("pending-invalid", at: now.addingTimeInterval(-5), sensor: sensor, context: context, calculated: 0)
+        XCTAssertTrue(context.hasChanges)
+        let actual = BgReadingsAccessor(coreDataManager: stack).calibrationHistory(before: now, for: sensor)
+        XCTAssertEqual(actual.map(\.id), ["pending-new", "stored-70", "stored-5"])
+        XCTAssertEqual(actual.map(\.objectID), try calibrationHistoryReference(stack, before: now, sensor: sensor).map(\.objectID))
+        XCTAssertTrue(context.hasChanges, "History selection must not save the pending batch")
+    }
+
+    @MainActor
+    func testCalibrationHistoryPreservesFullFetchOrderForTiedSQLiteTimestamps() throws {
+        let stack = try calibrationHistorySQLiteStack()
+        let context = stack.mainManagedObjectContext
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let sensor = Sensor(startDate: now.addingTimeInterval(-3_600), nsManagedObjectContext: context)
+        for index in 0..<80 {
+            calibrationHistoryRow("tied-\(index)", at: now.addingTimeInterval(-60), sensor: sensor,
+                                  context: context, calculated: Double(100 + index))
+        }
+        XCTAssertTrue(stack.saveChangesSynchronously())
+        for iteration in 0..<2 {
+            if iteration == 1 {
+                calibrationHistoryRow("pending-tie", at: now.addingTimeInterval(-60), sensor: sensor, context: context)
+            }
+            let actual = BgReadingsAccessor(coreDataManager: stack).calibrationHistory(before: now, for: sensor)
+            XCTAssertEqual(actual.count, 3)
+            XCTAssertEqual(actual.map(\.objectID), try calibrationHistoryReference(stack, before: now, sensor: sensor).map(\.objectID))
+        }
+    }
+
+    @MainActor
+    func testCalibrationHistoryPendingBackfillProducesIdenticalCalibratedValuesAndCurves() throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        for fixedSlope in [true, false] {
+            func replay(optimized: Bool) throws -> [[Double]] {
+                let stack = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+                let context = stack.mainManagedObjectContext
+                let sensor = Sensor(startDate: now.addingTimeInterval(-50_000), nsManagedObjectContext: context)
+                let calibration = Calibration(timeStamp: now.addingTimeInterval(-1_800), sensor: sensor,
+                    bg: 100, rawValue: 100, adjustedRawValue: 100, sensorConfidence: 1,
+                    rawTimeStamp: now.addingTimeInterval(-1_800), slope: 1.1, intercept: 4,
+                    distanceFromEstimate: 0, estimateRawAtTimeOfCalibration: 100, slopeConfidence: 1,
+                    deviceName: nil, nsManagedObjectContext: context)
+                for index in 1...100 {
+                    let row = calibrationHistoryRow("seed-\(index)", at: now.addingTimeInterval(-Double(index) * 60),
+                        sensor: sensor, context: context, raw: Double(100 + index % 10),
+                        calculated: Double(114 + index % 10), suppressed: index % 2 == 0)
+                    row.calibration = calibration
+                }
+                calibrationHistoryRow("future", at: now.addingTimeInterval(3_600), sensor: sensor, context: context)
+                XCTAssertTrue(stack.saveChangesSynchronously())
+                let accessor = BgReadingsAccessor(coreDataManager: stack)
+                let calibrator: Calibrator = fixedSlope ? Libre1Calibrator() : Libre1NonFixedSlopeCalibrator()
+                var outputs = [[Double]]()
+                for index in 0..<4 {
+                    let date = now.addingTimeInterval(Double(index) * 60)
+                    var history = optimized ? accessor.calibrationHistory(before: date, for: sensor)
+                        : try calibrationHistoryReference(stack, before: date, sensor: sensor)
+                    XCTAssertEqual(history.count, 3)
+                    if index > 0 { XCTAssertEqual(history.first?.id, "backfill-\(index - 1)") }
+                    var calibrations = [calibration]
+                    let row = calibrator.createHistoricalBgReading(rawData: Double(110_000 + index * 1_000),
+                        timeStamp: date, sensor: sensor, last3Readings: &history,
+                        lastCalibrationsForActiveSensorInLastXDays: &calibrations,
+                        firstCalibration: calibration, lastCalibration: calibration,
+                        deviceName: nil, nsManagedObjectContext: context)
+                    row.id = "backfill-\(index)"
+                    XCTAssertTrue(row.isValidForDownstream)
+                    outputs.append([row.calculatedValue, row.finalValue, row.ageAdjustedRawValue,
+                                    row.calculatedValueSlope, row.a, row.b, row.c, row.ra, row.rb, row.rc,
+                                    row.hideSlope ? 1 : 0, calibration.slope, calibration.intercept])
+                }
+                XCTAssertTrue(context.hasChanges, "Successive backfill readings remain in the pending batch")
+                return outputs
+            }
+            XCTAssertEqual(try replay(optimized: true), try replay(optimized: false))
+        }
+    }
+}
