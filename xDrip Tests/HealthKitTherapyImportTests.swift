@@ -6,6 +6,145 @@ import XCTest
 /// The query adapter is replaced with synthetic pages. These tests never read or write the
 /// device's Health database, and every imported treatment uses an isolated Core Data store.
 final class HealthKitTherapyImportTests: XCTestCase {
+    func testGlucoseStatusScanCoalescesRequestsAndRejectsChangedExportInputs() {
+        let checkpoint = Date(timeIntervalSince1970: 1_800_000_000)
+        let initial = HealthKitGlucoseStatusScan.Input(checkpoint: checkpoint,
+            frequent: false, dataRevision: 0)
+        for changed in [
+            HealthKitGlucoseStatusScan.Input(checkpoint: checkpoint.addingTimeInterval(360), frequent: false, dataRevision: 0),
+            .init(checkpoint: checkpoint, frequent: true, dataRevision: 0),
+            .init(checkpoint: checkpoint, frequent: false, dataRevision: 1)
+        ] {
+            var scan = HealthKitGlucoseStatusScan()
+            XCTAssertTrue(scan.begin(initial))
+            for _ in 0..<10 { XCTAssertFalse(scan.begin(initial)) }
+            XCTAssertFalse(scan.begin(changed), "A changed request cannot start a parallel scan")
+            XCTAssertFalse(scan.finish(current: changed), "Never publish a count from the old checkpoint/cadence/data")
+            XCTAssertTrue(scan.begin(changed), "The current state gets one replacement scan")
+            XCTAssertTrue(scan.finish(current: changed))
+            XCTAssertNil(scan.input)
+        }
+    }
+
+    func testGlucoseStatusScanWaitsForDurableParentCommitAndInvalidatesEarlierScan() {
+        var scan = HealthKitGlucoseStatusScan()
+        let checkpoint = Date(timeIntervalSince1970: 1_800_000_000)
+        func input() -> HealthKitGlucoseStatusScan.Input {
+            .init(checkpoint: checkpoint, frequent: true, dataRevision: scan.dataRevision)
+        }
+        XCTAssertTrue(scan.begin(input()))
+        scan.didSave(isChild: true)
+        XCTAssertTrue(scan.awaitingCommit)
+        XCTAssertFalse(scan.finish(current: input()))
+        XCTAssertFalse(scan.begin(input()), "Child save alone is not a durable-store count")
+        // A failed parent save emits no successful didSave: remain unknown, never zero.
+        XCTAssertFalse(scan.begin(input()))
+        scan.didSave(isChild: false)
+        XCTAssertFalse(scan.awaitingCommit)
+        XCTAssertEqual(scan.dataRevision, 2)
+        XCTAssertTrue(scan.begin(input()))
+        XCTAssertTrue(scan.finish(current: input()))
+    }
+
+    func testGlucosePendingCountUsesPrivateQueueAndSameCadenceAcross5000CommittedRows() throws {
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let checkpoint = Date(timeIntervalSince1970: 1_800_000_000)
+        let sensor = Sensor(startDate: checkpoint, nsManagedObjectContext: core.mainManagedObjectContext)
+        for index in 1...5000 {
+            let reading = BgReading(timeStamp: checkpoint.addingTimeInterval(Double(index) * 60),
+                sensor: sensor, calibration: nil, rawData: 100, deviceName: "Synthetic",
+                nsManagedObjectContext: core.mainManagedObjectContext)
+            reading.calculatedValue = 100
+            // Entire leading pages fail downstream validation. Later rows still count.
+            if index <= 300 { reading.smoothedValue = NSNumber(value: Double.nan) }
+            if index == 600 { reading.isSuppressedByFiveMinuteCadence = true }
+        }
+        XCTAssertTrue(core.saveChangesSynchronously())
+        let accessor = BgReadingsAccessor(coreDataManager: core)
+        for frequent in [false, true] {
+            let expected = HealthKitGlucoseBacklog.countEligible(after: checkpoint,
+                frequent: frequent, pageSize: 256, page: { offset in
+                    let result = accessor.getOldestBgReadingSnapshotPage(limit: 256, fromDate: checkpoint, offset: offset)
+                    return (result.snapshots, result.scannedCount)
+                }, time: { $0.timeStamp })
+            XCTAssertGreaterThan(try XCTUnwrap(expected), 0)
+            let done = expectation(description: "private count")
+            accessor.countPendingHealthKitGlucose(after: checkpoint, frequent: frequent, pageSize: 256) { count in
+                XCTAssertFalse(Thread.isMainThread, "The full scan and its scalar result run off main")
+                XCTAssertEqual(count, expected, "Reuse export validation, suppression, ordering and cadence")
+                done.fulfill()
+            }
+            wait(for: [done], timeout: 10)
+        }
+        // The status reader cannot alter the shared latest-first fetch contract.
+        XCTAssertEqual(accessor.getLatestBgReadingSnapshots(limit: 1, fromDate: checkpoint,
+            forSensor: nil, ignoreRawData: true, ignoreCalculatedValue: false).first?.timeStamp,
+            checkpoint.addingTimeInterval(5000 * 60))
+    }
+
+    func testGlucosePrivateCountSeesOnlyCommittedRowsThenNewCommitOnNextScan() throws {
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let checkpoint = Date(timeIntervalSince1970: 1_800_000_000)
+        let sensor = Sensor(startDate: checkpoint, nsManagedObjectContext: core.mainManagedObjectContext)
+        let reading = BgReading(timeStamp: checkpoint.addingTimeInterval(360), sensor: sensor,
+            calibration: nil, rawData: 100, deviceName: "Synthetic",
+            nsManagedObjectContext: core.mainManagedObjectContext)
+        reading.calculatedValue = 100
+        try core.mainManagedObjectContext.save()
+        let accessor = BgReadingsAccessor(coreDataManager: core)
+        let before = expectation(description: "uncommitted parent")
+        accessor.countPendingHealthKitGlucose(after: checkpoint, frequent: true, pageSize: 256) { count in
+            XCTAssertNil(count, "An uncommitted parent must never look like a confirmed empty backlog")
+            before.fulfill()
+        }
+        wait(for: [before], timeout: 5)
+        XCTAssertTrue(core.saveChangesSynchronously())
+        let after = expectation(description: "committed parent")
+        accessor.countPendingHealthKitGlucose(after: checkpoint, frequent: true, pageSize: 256) { count in
+            XCTAssertEqual(count, 1)
+            after.fulfill()
+        }
+        wait(for: [after], timeout: 5)
+        // Reproduce an older parent notification clearing the main-queue gate after
+        // a newer child save. The real private reader must still reject that snapshot.
+        let second = BgReading(timeStamp: checkpoint.addingTimeInterval(720), sensor: sensor,
+            calibration: nil, rawData: 100, deviceName: "Synthetic",
+            nsManagedObjectContext: core.mainManagedObjectContext)
+        second.calculatedValue = 100
+        try core.mainManagedObjectContext.save()
+        var scan = HealthKitGlucoseStatusScan()
+        scan.didSave(isChild: true)
+        scan.didSave(isChild: false) // delayed notification from the older commit
+        XCTAssertFalse(scan.awaitingCommit)
+        let raced = expectation(description: "pending newer commit")
+        accessor.countPendingHealthKitGlucose(after: checkpoint, frequent: true, pageSize: 256) { count in
+            XCTAssertNil(count, "The actual parent state overrides the delayed notification")
+            raced.fulfill()
+        }
+        wait(for: [raced], timeout: 5)
+        XCTAssertTrue(core.saveChangesSynchronously())
+        reading.calculatedValue = 0
+        XCTAssertTrue(core.saveChangesSynchronously())
+        let revised = expectation(description: "fresh context after correction")
+        accessor.countPendingHealthKitGlucose(after: checkpoint, frequent: true, pageSize: 256) { count in
+            XCTAssertEqual(count, 1)
+            revised.fulfill()
+        }
+        wait(for: [revised], timeout: 5)
+    }
+
+    func testGlucoseStatusCountFailureIsUnknownAndDoesNotBecomeZero() {
+        let count: Int? = HealthKitGlucoseBacklog.countEligible(after: .distantPast,
+            frequent: true, pageSize: 256,
+            page: { _ -> (rows: [Date], scannedCount: Int?) in ([], nil) }, time: { $0 })
+        XCTAssertNil(count)
+        var scan = HealthKitGlucoseStatusScan()
+        let input = HealthKitGlucoseStatusScan.Input(checkpoint: .distantPast, frequent: true, dataRevision: 0)
+        XCTAssertTrue(scan.begin(input))
+        XCTAssertTrue(scan.finish(current: input))
+        XCTAssertTrue(scan.begin(input), "A failed count must leave the worker retryable")
+    }
+
     private let sourceA = HealthTherapyImportSource(bundleIdentifier: "org.example.therapy.a", name: "Pump A")
     private let sourceB = HealthTherapyImportSource(bundleIdentifier: "org.example.therapy.b", name: "Pump B")
 

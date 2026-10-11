@@ -15,6 +15,72 @@ import XCTest
 final class RootHomeInteractionTests: XCTestCase {
 
     @MainActor
+    func testHomeBecomingVisibleKeepsControlsCurrentWithoutTwoExtraFullRefreshes() {
+        withHomeRefreshDefaults {
+            let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+            let sensorStart = Date(timeIntervalSince1970: 1_800_000_000)
+            let sensor = Sensor(startDate: sensorStart,
+                nsManagedObjectContext: core.mainManagedObjectContext)
+            let model = RootHomeStateModel()
+            let coordinator = RootApplicationCoordinator(homeStateModelForTesting: model,
+                activeSensorForTesting: sensor)
+            model.refresh(activeSensor: nil, isScreenLocked: false, usesScreenLockNightLayout: false)
+            var publications: [RootHomeState] = []
+            var publishedStartDates: [Date?] = []
+            let observation = model.$state.dropFirst().sink { state in
+                publications.append(state)
+                publishedStartDates.append(UserDefaults.standard.activeSensorStartDate)
+            }
+            defer { observation.cancel() }
+
+            UserDefaults.standard.enableSmoothing = true
+            coordinator.homeDidBecomeVisible()
+
+            XCTAssertEqual(publications.count, 4,
+                "Keep the chart reset and three existing full updates, without two redundant control updates")
+            XCTAssertEqual(publications.map(\.chartResetToNowRevision), [1, 1, 1, 1])
+            XCTAssertEqual(publications.map { $0.controls.postProcessingSystemImage },
+                ["dial.low", "dial.low.fill", "dial.low.fill", "dial.low.fill"])
+            XCTAssertEqual(publications.map { $0.controls.snoozeSystemImage },
+                Array(repeating: "speaker.wave.2", count: 4))
+            XCTAssertEqual(publishedStartDates, [nil, nil, sensorStart, sensorStart],
+                "The existing data-source update still publishes after updating sensor metadata")
+            XCTAssertTrue(model.state.controls.postProcessingEnabled)
+            XCTAssertTrue(UserDefaults.standard.nightscoutSyncRequired)
+            XCTAssertNotNil(UserDefaults.standard.timeStampLatestNightscoutSyncRequest)
+            XCTAssertFalse(coordinator.hasFollowerConnectionTimerForTesting)
+
+            publications.removeAll()
+            UserDefaults.standard.enableSmoothing = false
+            UserDefaults.standard.enableAdjustment = true
+            coordinator.homeDidBecomeVisible()
+            XCTAssertEqual(publications.count, 4, "A later Home entry still refreshes immediately")
+            XCTAssertEqual(publications.map(\.chartResetToNowRevision), [2, 2, 2, 2])
+            XCTAssertEqual(model.state.controls.postProcessingSystemImage, "dial.medium")
+            XCTAssertEqual(model.state.chartRevision, 0)
+        }
+    }
+
+    @MainActor
+    func testStandaloneSnoozeStatusCallbackStillPublishesImmediately() {
+        withHomeRefreshDefaults {
+            let model = RootHomeStateModel()
+            let coordinator = RootApplicationCoordinator(homeStateModelForTesting: model)
+            var publications: [RootHomeState] = []
+            let observation = model.$state.dropFirst().sink { publications.append($0) }
+            defer { observation.cancel() }
+
+            coordinator.observeValue(forKeyPath: UserDefaults.Key.updateSnoozeStatus.rawValue,
+                of: UserDefaults.standard, change: [.newKey: true], context: nil)
+
+            XCTAssertEqual(publications.count, 1,
+                "An independent snooze callback must keep its own Home publication")
+            XCTAssertEqual(model.state.controls.snoozeSystemImage, "speaker.wave.2")
+            XCTAssertEqual(model.state.chartResetToNowRevision, 0)
+        }
+    }
+
+    @MainActor
     func testPostProcessingEventRefreshesHomeOnceAndPreservesEveryChartReset() {
         withHomeRefreshDefaults {
             let model = RootHomeStateModel()

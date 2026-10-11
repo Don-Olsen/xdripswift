@@ -10,7 +10,7 @@ import CoreFoundation
 import Foundation
 
 /// model of the data we'll store in the shared app group to pass from the watch app to the widgets
-struct ComplicationSharedUserDefaultsModel: Codable {
+struct ComplicationSharedUserDefaultsModel: Codable, Equatable {
     var bgReadingValues: [Double]
     var bgReadingDatesAsDouble: [Double]
     var isMgDl: Bool
@@ -53,6 +53,27 @@ struct ComplicationSharedUserDefaultsModel: Codable {
     func timelineDates(startingAt date: Date) -> [Date] {
         guard readingIsCurrent(at: date), let expiresAt = readingExpiresAt else { return [date] }
         return [date, expiresAt.addingTimeInterval(0.001)]
+    }
+}
+
+/// In-memory publication state: a new Watch process still refreshes WidgetKit once,
+/// even when it restored exactly the same payload from persistent storage.
+struct ComplicationPublicationState {
+    private var lastModel: ComplicationSharedUserDefaultsModel?
+    private var lastReadingIsCurrent: Bool?
+
+    @discardableResult
+    mutating func publishIfChanged(_ model: ComplicationSharedUserDefaultsModel, at date: Date,
+                                  write: (Data) -> Void, reload: () -> Void) -> Bool {
+        let readingIsCurrent = model.readingIsCurrent(at: date)
+        guard model != lastModel || readingIsCurrent != lastReadingIsCurrent,
+              let data = try? JSONEncoder().encode(model) else { return false }
+        // Never cache an unencoded publication or reload WidgetKit against an old payload.
+        write(data)
+        reload()
+        lastModel = model
+        lastReadingIsCurrent = readingIsCurrent
+        return true
     }
 }
 

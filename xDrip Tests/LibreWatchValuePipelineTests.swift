@@ -265,6 +265,137 @@ extension LibreWatchValuePipelineTests {
         return generation.map { WatchPhoneSnapshotStore.attaching($0, to: payload) } ?? payload
     }
 
+    private func complicationSnapshot(at date: Date,
+                                      source: ComplicationReadingSource = .phone) -> ComplicationSharedUserDefaultsModel {
+        ComplicationSharedUserDefaultsModel(bgReadingValues: [123, 120],
+            bgReadingDatesAsDouble: [date.timeIntervalSince1970, date.timeIntervalSince1970 - 60],
+            isMgDl: true, slopeOrdinal: 4, deltaValueInUserUnit: 3,
+            urgentLowLimitInMgDl: 60, lowLimitInMgDl: 80, highLimitInMgDl: 170,
+            urgentHighLimitInMgDl: 250, keepAliveIsDisabled: false, readingSource: source)
+    }
+
+    func testComplicationUnchangedStatusPublishesOnceAndWritesBeforeReload() throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let model = complicationSnapshot(at: now)
+        var publication = ComplicationPublicationState()
+        var written: Data?
+        var events: [String] = []
+        for seconds in [0.0, 1, 15, 60] {
+            let published = publication.publishIfChanged(model, at: now.addingTimeInterval(seconds), write: {
+                written = $0
+                events.append("write")
+            }, reload: {
+                XCTAssertNotNil(written, "WidgetKit must reload only after the new payload is stored")
+                events.append("reload")
+            })
+            XCTAssertEqual(published, seconds == 0)
+        }
+        XCTAssertEqual(events, ["write", "reload"])
+        XCTAssertEqual(try JSONDecoder().decode(ComplicationSharedUserDefaultsModel.self, from: XCTUnwrap(written)), model)
+    }
+
+    func testComplicationEveryDisplayedInputAndHistoricalPointInvalidatesPublication() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let initial = complicationSnapshot(at: now)
+        let changes: [(String, (inout ComplicationSharedUserDefaultsModel) -> Void)] = [
+            ("latest glucose", { $0.bgReadingValues[0] += 1 }),
+            ("historical glucose", { $0.bgReadingValues[1] += 1 }),
+            ("latest date", { $0.bgReadingDatesAsDouble[0] += 1 }),
+            ("historical date", { $0.bgReadingDatesAsDouble[1] -= 1 }),
+            ("units", { $0.isMgDl = false }),
+            ("slope", { $0.slopeOrdinal = 3 }),
+            ("delta", { $0.deltaValueInUserUnit = 4 }),
+            ("missing delta", { $0.deltaValueInUserUnit = nil }),
+            ("urgent low", { $0.urgentLowLimitInMgDl += 1 }),
+            ("low", { $0.lowLimitInMgDl += 1 }),
+            ("high", { $0.highLimitInMgDl += 1 }),
+            ("urgent high", { $0.urgentHighLimitInMgDl += 1 }),
+            ("disabled", { $0.keepAliveIsDisabled = true }),
+            ("source", { $0.readingSource = .directLibre }),
+            ("legacy source", { $0.readingSource = nil })
+        ]
+        for (name, change) in changes {
+            var publication = ComplicationPublicationState()
+            var writes = 0
+            var reloads = 0
+            XCTAssertTrue(publication.publishIfChanged(initial, at: now,
+                write: { _ in writes += 1 }, reload: { reloads += 1 }), name)
+            var changed = initial
+            change(&changed)
+            XCTAssertTrue(publication.publishIfChanged(changed, at: now,
+                write: { _ in writes += 1 }, reload: { reloads += 1 }), name)
+            XCTAssertFalse(publication.publishIfChanged(changed, at: now,
+                write: { _ in writes += 1 }, reload: { reloads += 1 }), name)
+            XCTAssertEqual(writes, 2, name)
+            XCTAssertEqual(reloads, 2, name)
+        }
+    }
+
+    func testComplicationRestartStillPublishesRestoredUnchangedSnapshot() throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let model = complicationSnapshot(at: now)
+        var previous = ComplicationPublicationState()
+        var stored: Data?
+        XCTAssertTrue(previous.publishIfChanged(model, at: now, write: { stored = $0 }, reload: {}))
+        let restored = try XCTUnwrap(ComplicationSharedUserDefaultsModel.decodeStoredData(stored))
+        var restarted = ComplicationPublicationState()
+        var reloads = 0
+        XCTAssertTrue(restarted.publishIfChanged(restored, at: now,
+            write: { stored = $0 }, reload: { reloads += 1 }))
+        XCTAssertEqual(reloads, 1)
+    }
+
+    func testComplicationFreshnessTransitionReloadsAndPreservesScheduledExpiry() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let sourceLifetimes: [(ComplicationReadingSource, TimeInterval)] = [(.directLibre, 180), (.phone, 1200)]
+        for (source, lifetime) in sourceLifetimes {
+            let model = complicationSnapshot(at: now, source: source)
+            var publication = ComplicationPublicationState()
+            var writes = 0
+            var reloads = 0
+            func publish(at date: Date) -> Bool {
+                publication.publishIfChanged(model, at: date,
+                    write: { _ in writes += 1 }, reload: { reloads += 1 })
+            }
+            XCTAssertTrue(publish(at: now))
+            XCTAssertEqual(model.timelineDates(startingAt: now), [now, now.addingTimeInterval(lifetime + 0.001)])
+            XCTAssertFalse(publish(at: now.addingTimeInterval(lifetime)))
+            let expiredAt = now.addingTimeInterval(lifetime + 0.001)
+            XCTAssertTrue(publish(at: expiredAt))
+            XCTAssertEqual(model.timelineDates(startingAt: expiredAt), [expiredAt])
+            XCTAssertFalse(publish(at: now.addingTimeInterval(lifetime + 30)))
+            XCTAssertTrue(publish(at: now), "A clock correction back to a current reading is also a presentation change")
+            XCTAssertEqual(writes, 3)
+            XCTAssertEqual(reloads, 3)
+        }
+    }
+
+    func testComplicationEncodingFailureDoesNotReloadOrConsumeLaterValidPublication() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let initial = complicationSnapshot(at: now)
+        var publication = ComplicationPublicationState()
+        var writes = 0
+        var reloads = 0
+        func publish(_ model: ComplicationSharedUserDefaultsModel) -> Bool {
+            publication.publishIfChanged(model, at: now,
+                write: { _ in writes += 1 }, reload: { reloads += 1 })
+        }
+        var invalid = initial
+        invalid.deltaValueInUserUnit = .infinity
+        XCTAssertFalse(publish(invalid))
+        XCTAssertFalse(publish(invalid))
+        XCTAssertEqual(writes, 0)
+        XCTAssertEqual(reloads, 0)
+        XCTAssertTrue(publish(initial))
+        XCTAssertFalse(publish(invalid))
+        XCTAssertFalse(publish(initial), "A failed encoding must not replace the last successful snapshot")
+        var corrected = initial
+        corrected.deltaValueInUserUnit = 4
+        XCTAssertTrue(publish(corrected))
+        XCTAssertEqual(writes, 2)
+        XCTAssertEqual(reloads, 2)
+    }
+
     func testDisplayedDirectProvenanceKeepsThreeMinuteExpiryAcrossPersistence() throws {
         let measuredAt = Date(timeIntervalSince1970: 1_800_000_000)
         var cached = ComplicationSharedUserDefaultsModel(bgReadingValues: [123],

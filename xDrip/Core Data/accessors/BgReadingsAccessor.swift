@@ -230,23 +230,57 @@ class BgReadingsAccessor: ObservableObject {
 
     /// HealthKit catch-up starts at the oldest unprocessed row. This leaves the ordering
     /// contract of getLatestBgReadingSnapshots unchanged for every other caller.
-    func getOldestBgReadingSnapshotPage(limit: Int, fromDate: Date?, offset: Int) ->
+    func getOldestBgReadingSnapshotPage(limit: Int, fromDate: Date?, offset: Int,
+                                        context: NSManagedObjectContext? = nil) ->
         (snapshots: [BgReadingSnapshot], scannedCount: Int?) {
         getBgReadingSnapshots(limit: limit, fromDate: fromDate, forSensor: nil,
             ignoreRawData: true, ignoreCalculatedValue: false,
-            includingSuppressed: false, ascending: true, offset: offset)
+            includingSuppressed: false, ascending: true, offset: offset, context: context)
+    }
+
+    /// Read only committed rows on a separate coordinator-backed queue. A child of the
+    /// main context would still ask the UI queue to fetch the entire backlog.
+    func countPendingHealthKitGlucose(after checkpoint: Date, frequent: Bool, pageSize: Int,
+                                     completion: @escaping (Int?) -> Void) {
+        let parent = coreDataManager.privateManagedObjectContext
+        // A queued parent-save notification can arrive after a newer child save.
+        // Check the actual parent on its queue; that newer uncommitted row is not zero.
+        parent.perform {
+            guard ![parent.insertedObjects, parent.updatedObjects, parent.deletedObjects]
+                .contains(where: { $0.contains { $0 is BgReading } }) else {
+                completion(nil)
+                return
+            }
+            let context = NSManagedObjectContext(concurrencyType: .privateQueueConcurrencyType)
+            context.persistentStoreCoordinator = parent.persistentStoreCoordinator
+            context.perform {
+                let count = HealthKitGlucoseBacklog.countEligible(after: checkpoint, frequent: frequent,
+                    pageSize: pageSize, page: { offset in
+                        autoreleasepool {
+                            let page = self.getOldestBgReadingSnapshotPage(limit: pageSize,
+                                fromDate: checkpoint, offset: offset, context: context)
+                            // Snapshots are values; do not retain every fetched managed object.
+                            context.reset()
+                            return (page.snapshots, page.scannedCount)
+                        }
+                    }, time: { $0.timeStamp })
+                completion(count)
+            }
+        }
     }
 
     private func getBgReadingSnapshots(limit: Int?, fromDate: Date?, forSensor sensor: Sensor?,
                                        ignoreRawData: Bool, ignoreCalculatedValue: Bool,
-                                       includingSuppressed: Bool, ascending: Bool, offset: Int) ->
+                                       includingSuppressed: Bool, ascending: Bool, offset: Int,
+                                       context: NSManagedObjectContext? = nil) ->
         (snapshots: [BgReadingSnapshot], scannedCount: Int?) {
         var returnValue: [BgReadingSnapshot] = []
         var scannedCount: Int?
 
         // Core Data contexts are not thread-safe. We must run fetches/updates inside
         // performAndWait to ensure all access happens on the context's own queue.
-        coreDataManager.mainManagedObjectContext.performAndWait {
+        let context = context ?? coreDataManager.mainManagedObjectContext
+        context.performAndWait {
             let fetchRequest: NSFetchRequest<BgReading> = BgReading.fetchRequest()
             fetchRequest.sortDescriptors = [NSSortDescriptor(key: #keyPath(BgReading.timeStamp), ascending: ascending)]
             fetchRequest.returnsObjectsAsFaults = false
@@ -281,7 +315,7 @@ class BgReadingsAccessor: ObservableObject {
             fetchRequest.fetchOffset = offset
 
             do {
-                let bgReadings = try fetchRequest.execute()
+                let bgReadings = try context.fetch(fetchRequest)
                 scannedCount = bgReadings.count
                 let sensorId = sensor?.id
                 let ignoreSensorId = (sensorId == nil)

@@ -167,6 +167,7 @@ final class WatchStateModel: NSObject, ObservableObject {
     @Published var lastUpdatedTimeAgoString: String = ""
     @Published var requestingDataIconColor: Color = ConstantsAppleWatch.requestingDataIconColorInactive
     @Published var lastComplicationUpdateTimeStamp: Date = .distantPast
+    private var complicationPublication = ComplicationPublicationState()
 
     /// NFC-authenticated direct Libre session and its persistent connection owner.
     @Published private(set) var libreWatchDirectSession: LibreWatchDirectSession?
@@ -2545,12 +2546,13 @@ final class WatchStateModel: NSObject, ObservableObject {
     private func updateComplicationData() {
         guard let sharedUserDefaults = UserDefaults(suiteName: Bundle.main.appGroupSuiteName) else { return }
 
+        let publicationDate = Date()
         // Do not leave stale glucose behind the warning when disabled. Complications may remain
         // visible long after watchOS stops receiving updates from the phone.
         let complicationBgReadingValues = keepAliveIsDisabled ? [] : bgReadingValues
         let complicationBgReadingDates = keepAliveIsDisabled ? [] : bgReadingDates
         let hidesDirectDerivedValues = isShowingDirectLibreReading &&
-            !directLibreReadingIsCurrent()
+            !directLibreReadingIsCurrent(at: publicationDate)
         let complicationSlopeOrdinal = keepAliveIsDisabled || hidesDirectDerivedValues ? 0 : slopeOrdinal
         let complicationDeltaValueInUserUnit: Double? = keepAliveIsDisabled || hidesDirectDerivedValues
             ? nil
@@ -2564,14 +2566,12 @@ final class WatchStateModel: NSObject, ObservableObject {
 
         // store the model in the shared user defaults using a name that is uniquely specific to this copy of the app as installed on
         // the user's device - this allows several copies of the app to be installed without cross-contamination of widget/complication data
-        if let stateData = try? JSONEncoder().encode(complicationSharedUserDefaultsModel) {
-            sharedUserDefaults.set(stateData, forKey: "complicationSharedUserDefaults.\(Bundle.main.mainAppBundleIdentifier)")
+        if complicationPublication.publishIfChanged(complicationSharedUserDefaultsModel, at: publicationDate,
+            write: { stateData in
+                sharedUserDefaults.set(stateData, forKey: "complicationSharedUserDefaults.\(Bundle.main.mainAppBundleIdentifier)")
+            }, reload: { WidgetCenter.shared.reloadAllTimelines() }) {
+            lastComplicationUpdateTimeStamp = publicationDate
         }
-
-        // now that the new data is stored in the app group, try to force the complications to reload
-        WidgetCenter.shared.reloadAllTimelines()
-
-        lastComplicationUpdateTimeStamp = .now
     }
 }
 

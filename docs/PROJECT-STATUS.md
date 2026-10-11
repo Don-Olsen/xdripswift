@@ -80,6 +80,47 @@ De følgende afsnit bevarer integrations- og testhistorikken før denne udgivels
 - Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
 <!-- testflight-7.1.1-4314:end -->
 
+## Tre afgrænsede optimeringer efter 4320
+
+11. oktober 2026: Home-indgangens to afsluttende fulde opdateringer er fjernet;
+kontrollerne for snooze og efterbehandling indgår allerede i de tre foregående
+opdateringer. De selvstændige callbacks og grafens reset bevares.
+
+Watch sammenligner hele komplikationsmodellen og dens friskhedsfase før
+kodning, App Group-skrivning og WidgetKit-reload. Første publicering efter
+processtart, nye/ændrede målinger, historik, kilde, enheder, grænser og faktisk
+udløb giver stadig opdatering. Den eksisterende udløbstidslinje er uændret;
+mislykket kodning forbruger ikke næste forsøg.
+
+Sundheds fulde optælling af ventende glukoseskrivninger kører nu på en separat
+Core Data-kø med en frisk, coordinator-backed context. Samme eksportpager og
+kadenceregler bruges; andre kaldere beholder deres sortering. Samtidige
+forespørgsler deler én igangværende scanning. Checkpoint, kadence, datarevision,
+ulåste data og afventende commit kontrolleres før publicering på main. En
+supplerende kontrol på parent-køen afviser ucommittede rækker, også hvis en
+ældre save-notifikation ankommer forsinket. Ukendt/fejl bliver ikke nul.
+Seneste antal historiske rettelser tilføjes på main ved publiceringen.
+Eksportens rækkefølge, checkpoints, retries og faktiske HealthKit-skrivning
+ændres ikke. Der tilføjes ingen timer, netværk, capability eller afhængighed.
+
+Tolv nye XCTest-regressioner dækker Home-hændelser, komplikationspublicering,
+hele payloaden/friskhed/fejl samt privat optælling med 5.000 syntetiske rækker,
+kadence, suppression, forsinkede commits og forældede scan-resultater. Den
+indledende samlede XCTest-kørsel bestod **1.516/1.516**, 0 fejl og 0 skipped
+(`20261011T041605Z-36954`). En afsluttende retry-markering efter ukendt scan
+indgår i releaseprocedurens nye fulde validering på det nummererede checkpoint;
+resultaterne og Apples status registreres særskilt i releaseafsnittet.
+Uafhængigt læsende review fandt commit-racen, som er rettet og dækket; Home og
+Watch-review havde ingen udestående fund. Diffkontrol bestod.
+
+Læsende devicectl bekræftede den tilsluttede iPhone med korrekt bundle og
+7.1.1 (4320), samt et parret fysisk Watch. Ingen lokal installation, ændring
+af telefondata eller afbrydelse af CGM blev udført. Disse ændringer er ikke
+fysisk verificeret, og der er ikke målt en hastigheds- eller batterigevinst.
+Efter TestFlight bør Home/genåbning, Sundheds køstatus og komplikationens nye
+måling samt reelle udløb kontrolleres på enhederne. Beregning, dosisregler,
+ML/prognose, alarmer og Watch/Libre-forbindelsen er urørte.
+
 ## Watch — friskhed ved Always On efter 4319
 
 10. oktober 2026: Big Number og Libre-kontrolvisningen vurderede en ny

@@ -355,6 +355,36 @@ enum HealthKitGlucoseBacklog {
     }
 }
 
+/// Main-queue bookkeeping for the read-only status scan. Repeated entry/foreground
+/// requests share one scan; a changed export/data context cannot publish its old count.
+struct HealthKitGlucoseStatusScan {
+    struct Input: Equatable {
+        let checkpoint: Date
+        let frequent: Bool
+        let dataRevision: UInt64
+    }
+    private(set) var input: Input?
+    private(set) var dataRevision: UInt64 = 0
+    private(set) var awaitingCommit = false
+
+    mutating func didSave(isChild: Bool) {
+        dataRevision &+= 1
+        awaitingCommit = isChild
+    }
+
+    mutating func begin(_ input: Input) -> Bool {
+        guard self.input == nil, !awaitingCommit else { return false }
+        self.input = input
+        return true
+    }
+
+    mutating func finish(current: Input) -> Bool {
+        let matches = input == current && !awaitingCommit
+        input = nil
+        return matches
+    }
+}
+
 public class HealthKitManager: NSObject {
     static weak var active: HealthKitManager?
     // MARK: - public properties
@@ -393,6 +423,8 @@ public class HealthKitManager: NSObject {
     private let replacementQueueKey = "healthKitPendingReplacements.v1"
     private let glucosePageSize = 256
     private var lastGlucoseStatusScan: Date?
+    private var glucoseStatusScan = HealthKitGlucoseStatusScan()
+    private var glucoseStatusRefreshAfterSave = false
     
     /// metadata key used to identify individual BG readings in HealthKit
     private let bgReadingIdMetadataKey = "BgReadingId"
@@ -508,7 +540,22 @@ public class HealthKitManager: NSObject {
         guard changedKeys.contains(where: {
             (notification.userInfo?[$0] as? Set<NSManagedObject>)?.contains(where: { $0 is BgReading }) == true
         }) else { return }
-        HealthKitExportStatusStore.shared.invalidatePendingWrites(kind: .glucose)
+        // Inspect objects on the posting context's queue; only scalar invalidation crosses
+        // to main. The committed-store scan must be retried if either save changed its rows.
+        let isChildSave = context === coreDataManager.mainManagedObjectContext
+        let invalidate = { [weak self] in
+            guard let self else { return }
+            self.glucoseStatusScan.didSave(isChild: isChildSave)
+            HealthKitExportStatusStore.shared.invalidatePendingWrites(kind: .glucose)
+            if isChildSave, self.glucoseStatusScan.input != nil {
+                self.glucoseStatusRefreshAfterSave = true
+            }
+            if self.glucoseStatusScan.input != nil || self.glucoseStatusRefreshAfterSave {
+                self.refreshGlucosePendingStatus(force: true)
+            }
+        }
+        if Thread.isMainThread { invalidate() }
+        else { DispatchQueue.main.async(execute: invalidate) }
     }
     
     /// stores latest readings in healthkit, only if HK supported, authorized, enabled in settings
@@ -566,8 +613,20 @@ public class HealthKitManager: NSObject {
             }, time: { $0.timeStamp })
     }
 
-    /// Full pending count is computed on entry/foreground, then maintained from confirmed
-    /// callbacks. The throttle avoids re-reading the entire backlog after every sample.
+    private var glucoseStatusInput: HealthKitGlucoseStatusScan.Input {
+        .init(checkpoint: UserDefaults.standard.timeStampLatestHealthKitStoreBgReading ?? .distantPast,
+              frequent: UserDefaults.standard.storeFrequentReadingsInHealthKit,
+              dataRevision: glucoseStatusScan.dataRevision)
+    }
+
+    private var hasUncommittedGlucoseChanges: Bool {
+        let context = coreDataManager.mainManagedObjectContext
+        return [context.insertedObjects, context.updatedObjects, context.deletedObjects]
+            .contains { $0.contains { $0 is BgReading } }
+    }
+
+    /// Count off the UI queue, with the existing page/cadence rules. Only the status is
+    /// asynchronous: actual export, checkpoints and retries retain their existing order.
     func refreshGlucosePendingStatus(force: Bool = false) {
         guard Thread.isMainThread else {
             DispatchQueue.main.async { [weak self] in self?.refreshGlucosePendingStatus(force: force) }
@@ -579,24 +638,43 @@ public class HealthKitManager: NSObject {
             HealthKitExportStatusStore.shared.clearPending(kind: .glucose)
             return
         }
-        let checkpoint = UserDefaults.standard.timeStampLatestHealthKitStoreBgReading ?? .distantPast
-        let count = HealthKitGlucoseBacklog.countEligible(after: checkpoint,
-            frequent: UserDefaults.standard.storeFrequentReadingsInHealthKit,
-            pageSize: glucosePageSize,
-            page: { offset in
-                let result = bgReadingsAccessor.getOldestBgReadingSnapshotPage(
-                    limit: glucosePageSize, fromDate: checkpoint, offset: offset)
-                return (result.snapshots, result.scannedCount)
-            }, time: { $0.timeStamp })
-        guard let count else {
+        guard !glucoseStatusScan.awaitingCommit, !hasUncommittedGlucoseChanges else {
+            glucoseStatusRefreshAfterSave = true
             HealthKitExportStatusStore.shared.clearPending(kind: .glucose)
             return
         }
-        lastGlucoseStatusScan = Date()
-        HealthKitExportStatusStore.shared.setPending(kind: .glucose,
-            writes: count + replacementQueue.entries.count)
+        glucoseStatusRefreshAfterSave = false
+        let input = glucoseStatusInput
+        guard glucoseStatusScan.begin(input) else { return }
+        bgReadingsAccessor.countPendingHealthKitGlucose(after: input.checkpoint,
+            frequent: input.frequent, pageSize: glucosePageSize) { [weak self] count in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                let isCurrent = self.glucoseStatusScan.finish(current: self.glucoseStatusInput)
+                guard UIApplication.shared.isProtectedDataAvailable else {
+                    HealthKitExportStatusStore.shared.clearPending(kind: .glucose)
+                    return
+                }
+                guard isCurrent, !self.glucoseStatusScan.awaitingCommit, !self.hasUncommittedGlucoseChanges else {
+                    // Checkpoint/cadence/saves changed during the scan. Never overwrite
+                    // callback-maintained status with that old snapshot; coalesce a retry.
+                    self.refreshGlucosePendingStatus(force: true)
+                    return
+                }
+                guard let count else {
+                    // A parent commit may still be pending despite an older queued save
+                    // notification. Retry after the next save as well as foreground entry.
+                    self.glucoseStatusRefreshAfterSave = true
+                    HealthKitExportStatusStore.shared.clearPending(kind: .glucose)
+                    return
+                }
+                self.lastGlucoseStatusScan = Date()
+                HealthKitExportStatusStore.shared.setPending(kind: .glucose,
+                    writes: count + self.replacementQueue.entries.count)
+            }
+        }
     }
-    
+
     /// Backfill respects destination cadence using surrounding stored readings, not just
     /// the small newly inserted subset. It never advances the ordinary live checkpoint.
     public func storeHistoricalBgReadingsInHealthKit(bgReadings: [BgReading]) {

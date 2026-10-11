@@ -297,9 +297,7 @@ struct InitialCalibrationRequestGate {
         
         watchManager?.updateWatchApp(forceComplicationUpdate: false)
         
-        self.updateSnoozeStatus()
-        self.updatePostProcessingStatus()
-        
+        // The full Home updates above already include snooze and post-processing controls.
         IntentDonationManager.shared.donate(intent: GlucoseIntent())
     }
 
