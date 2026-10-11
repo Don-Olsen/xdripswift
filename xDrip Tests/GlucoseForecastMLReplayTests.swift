@@ -3,6 +3,159 @@ import XCTest
 @testable import xdrip
 
 final class GlucoseForecastMLReplayTests: XCTestCase {
+    func testHistoryIntervalLookupPreservesInclusiveEdgesDuplicatesAndOriginalOrder() {
+        let dates = [-1, 0, 0, 1, 2, 2, 3].map {
+            reference.addingTimeInterval(Double($0) * 60)
+        }
+        for offsets in [Array(dates.indices), [6, 2, 4, 0, 5, 1, 3]] {
+            let index = GlucoseForecastMLHistoryIntervalIndex(offsets, date: { dates[$0] })
+            for (start, end) in [(-2, -1), (0, 0), (0, 2), (2, 4), (4, 5), (3, 2)] {
+                let first = reference.addingTimeInterval(Double(start) * 60)
+                let last = reference.addingTimeInterval(Double(end) * 60)
+                XCTAssertEqual(index.values(from: first, through: last), offsets.filter {
+                    dates[$0] >= first && dates[$0] <= last
+                })
+            }
+        }
+        let empty = GlucoseForecastMLHistoryIntervalIndex<Int>([], date: { _ in reference })
+        XCTAssertTrue(empty.values(from: reference, through: reference).isEmpty)
+    }
+
+    func testHistoryIntervalLookupReadsInputDatesOnceInsteadOfForEveryDay() {
+        let rows = Array(0..<10_000)
+        var inputDateReads = 0
+        let index = GlucoseForecastMLHistoryIntervalIndex(rows, date: { minute in
+            inputDateReads += 1
+            return reference.addingTimeInterval(Double(minute) * 60)
+        })
+        XCTAssertEqual(inputDateReads, rows.count)
+        for day in 0..<7 {
+            let start = reference.addingTimeInterval(Double(day * 1440) * 60)
+            let end = start.addingTimeInterval(1440 * 60)
+            let expected = rows.filter {
+                let date = reference.addingTimeInterval(Double($0) * 60)
+                return date >= start && date <= end
+            }
+            XCTAssertEqual(index.values(from: start, through: end), expected)
+        }
+        XCTAssertEqual(inputDateReads, rows.count,
+            "Day lookups use the frozen date index, not another scan of original values")
+    }
+
+    @MainActor func testIndexedRealLoaderKeepsMultiDayReplayRowsAcrossCutoverAndSourceBreak() async throws {
+        let suite = "MLHistoryIndexedWindows.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let calendar = utcCalendar
+        let finalDay = calendar.startOfDay(for: reference)
+        let firstDay = finalDay.addingTimeInterval(-2 * 24 * 3600)
+        let cutoff = finalDay.addingTimeInterval(-24 * 3600)
+        let endDate = finalDay.addingTimeInterval(14 * 3600)
+        let selected = "com.example.selected.therapy"
+        XCTAssertTrue(TreatmentSourceCutover.persist(.init(cutoff: cutoff,
+            insulinSourceBundleID: selected, carbohydrateSourceBundleID: selected),
+            defaults: defaults))
+        let importer = HealthKitTherapyImportManager(query: NoopTherapyQuery(), defaults: defaults)
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let manager = TherapyMetricsManager()
+        manager.configure(coreDataManager: core, externalStatus: { nil })
+        var glucose = [GlucoseForecastMLHealthSample]()
+        var insulin = [GlucoseForecastMLHealthSample]()
+        var carbs = [GlucoseForecastMLHealthSample]()
+        var canonicalInsulin = [TherapyTreatment]()
+        var canonicalCarbs = [TherapyTreatment]()
+        for minute in stride(from: 0, to: Int(endDate.timeIntervalSince(firstDay) / 60), by: 5) {
+            let date = firstDay.addingTimeInterval(Double(minute) * 60)
+            // The final source change must remain a real replay segment boundary.
+            let bundle = date < finalDay ? "com.xdrip.first" : "com.xdrip.second"
+            glucose.append(.init(uuid: UUID(), sourceBundleIdentifier: bundle,
+                startDate: date, endDate: date, value: 120,
+                insulinReason: nil, hasUndeterminedDuration: false, sampleCount: 1))
+        }
+        for offset in 0..<3 {
+            let date = firstDay.addingTimeInterval(Double(offset * 24 + 4) * 3600)
+            for (kind, amount) in [(TreatmentType.Insulin, 1.0), (.Carbs, 10.0)] {
+                let local = date >= cutoff
+                let treatment = TherapyTreatment(date: date, amount: amount,
+                    isIOB: kind == .Insulin,
+                    carbohydrateDurationMinutes: kind == .Carbs ? 240 : nil,
+                    knownAt: local ? date : nil, createdAt: local ? date : nil,
+                    modifiedAt: local ? date : nil, isAppLocal: local)
+                if kind == .Insulin { canonicalInsulin.append(treatment) }
+                else { canonicalCarbs.append(treatment) }
+                if local {
+                    let entry = TreatmentEntry(date: date, value: amount, treatmentType: kind,
+                        nightscoutEventType: nil, enteredBy: "xDrip4iOS",
+                        nsManagedObjectContext: core.mainManagedObjectContext)
+                    entry.localTreatmentUUID = UUID().uuidString
+                    entry.createdAt = date
+                    entry.modifiedAt = date
+                }
+                let sample = GlucoseForecastMLHealthSample(uuid: UUID(),
+                    sourceBundleIdentifier: selected, startDate: date, endDate: date,
+                    value: local ? 99 : amount,
+                    insulinReason: kind == .Insulin ? HKInsulinDeliveryReason.bolus.rawValue : nil,
+                    hasUndeterminedDuration: false, sampleCount: 1)
+                // The selected Health source after cutoff is diagnostic only.
+                if kind == .Insulin { insulin.append(sample) }
+                else { carbs.append(sample) }
+            }
+        }
+        XCTAssertTrue(core.saveChangesSynchronously())
+        let query = FakeHistoryHealthQuery(glucoseSamples: glucose,
+            insulinSamples: insulin, carbohydrateSamples: carbs)
+        let loader = GlucoseForecastMLHistoryLoader(coreDataManager: core,
+            therapyManager: manager, healthImporter: importer, healthQuery: query,
+            defaults: defaults)
+        let loadedResult = await loader.load(days: 3, at: endDate, policy: historyPolicy,
+            settings: settings, sensitivityMgdlPerUnit: 40,
+            carbohydrateRatioGramsPerUnit: 10, calendar: calendar)
+        let loaded = try XCTUnwrap(loadedResult)
+        XCTAssertEqual(loaded.coverage.usableDays, 3)
+        XCTAssertEqual(loaded.coverage.acceptedHealthInsulinCount, 1)
+        XCTAssertEqual(loaded.coverage.acceptedHealthCarbohydrateCount, 1)
+        XCTAssertEqual(loaded.coverage.insulinQuery.cutoffExcludedCount, 2)
+        XCTAssertEqual(loaded.coverage.carbohydrateQuery.cutoffExcludedCount, 2)
+        XCTAssertEqual(loaded.segments.count, 2)
+        for date in [firstDay.addingTimeInterval(11 * 3600 + 5 * 60),
+                     cutoff.addingTimeInterval(11 * 3600 + 5 * 60),
+                     finalDay.addingTimeInterval(11 * 3600 + 5 * 60)] {
+            let segment = try XCTUnwrap(loaded.segments.first {
+                $0.startDate <= date && $0.endDate >= date
+            })
+            let observations = glucose.filter {
+                $0.startDate >= segment.startDate && $0.startDate <= segment.endDate
+            }.map {
+                GlucoseForecastGlucoseObservation(date: $0.startDate, glucoseMgdl: $0.value,
+                    sensorID: segment.sensorID, isValidForDownstream: true,
+                    isSuppressedByFiveMinuteCadence: false)
+            }
+            // Preserve the previous full-scan window/order as the expected input.
+            let treatmentStart = date.addingTimeInterval(
+                -max(settings.insulinDuration, settings.carbDuration) * 60)
+            let expected = GlucoseForecastMLReplay.batch(observations: observations,
+                treatments: (canonicalInsulin + canonicalCarbs).filter {
+                    $0.date >= treatmentStart && $0.date <= date
+                }, settings: settings, sensitivityMgdlPerUnit: 40,
+                carbohydrateRatioGramsPerUnit: 10, anchorStart: date,
+                anchorEnd: date.addingTimeInterval(1), calendar: calendar).examples
+            let actual = loaded.examples.filter { $0.row.referenceDate == date }
+            XCTAssertEqual(actual.count, 3)
+            XCTAssertEqual(expected.count, 3)
+            for (a, b) in zip(actual, expected) {
+                XCTAssertEqual(a.row.values, b.row.values)
+                XCTAssertEqual(a.row.engineValue, b.row.engineValue)
+                XCTAssertEqual(a.engineTrajectoryMgdl, b.engineTrajectoryMgdl)
+                XCTAssertEqual(a.targetDate, b.targetDate)
+                XCTAssertEqual(a.targetGlucoseMgdl, b.targetGlucoseMgdl)
+                XCTAssertEqual(a.bolusUnitsInWindow, 1)
+                XCTAssertEqual(a.carbohydrateGramsInWindow, 10)
+                XCTAssertEqual(a.treatmentAvailability, b.treatmentAvailability)
+                XCTAssertEqual(a.settingsAvailability, b.settingsAvailability)
+            }
+        }
+    }
+
     func testHistoricalTrainingRequestsAllThreeReadOnlyHealthTypes() {
         XCTAssertEqual(Set(GlucoseForecastMLTrainingCoordinator.historicalReadIdentifiers),
             Set([.bloodGlucose, .insulinDelivery, .dietaryCarbohydrates]))

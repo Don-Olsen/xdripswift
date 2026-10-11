@@ -2796,10 +2796,270 @@ final class TreatmentListRefreshTests: XCTestCase {
         }
     }
 
+    @MainActor func testUnchangedTabReopeningReusesRowsButKeepsReminderRecovery() throws {
+        try withListDefaults {
+            let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+            let metrics = TherapyMetricsManager()
+            metrics.configure(coreDataManager: core, externalStatus: { nil })
+            _ = TreatmentEntry(date: Date(), value: 2, treatmentType: .Insulin,
+                nightscoutEventType: nil, enteredBy: "Test", nsManagedObjectContext: core.mainManagedObjectContext)
+            XCTAssertTrue(core.saveChangesSynchronously())
+            let accessor = TreatmentEntryAccessor(coreDataManager: core)
+            var loads = 0, reconciliations = 0
+            let list = TreatmentsViewModel(coreDataManager: core, therapyMetricsManager: metrics,
+                loadTreatments: { loads += 1; return accessor.getLatestTreatmentsIfAvailable() },
+                reconcileReminders: { reconciliations += 1 })
+            list.initializeViewIfNeeded()
+            let rows = list.filteredTreatments
+            var publications = 0
+            let observer = list.$filteredTreatments.dropFirst().sink { _ in publications += 1 }
+            defer { observer.cancel() }
+            for _ in 0..<10 { list.initializeViewIfNeeded() }
+            XCTAssertEqual(loads, 1)
+            XCTAssertEqual(reconciliations, 11, "Tab reopening must keep reminder/protected-data retry")
+            XCTAssertEqual(publications, 0)
+            XCTAssertEqual(list.filteredTreatments, rows)
+
+            // Display changes missed while hidden use the snapshots, including current units.
+            UserDefaults.standard.showBolusTreatmentsInList = false
+            list.initializeViewIfNeeded()
+            XCTAssertTrue(list.filteredTreatments.isEmpty)
+            XCTAssertEqual(loads, 1)
+            XCTAssertEqual(reconciliations, 12)
+        }
+    }
+
+    @MainActor func testHiddenCommittedInsertEditAndDeletionRequireFreshRowsOnReopening() throws {
+        try withListDefaults {
+            let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+            let metrics = TherapyMetricsManager()
+            metrics.configure(coreDataManager: core, externalStatus: { nil })
+            let accessor = TreatmentEntryAccessor(coreDataManager: core)
+            var loads = 0
+            let list = TreatmentsViewModel(coreDataManager: core, therapyMetricsManager: metrics,
+                loadTreatments: { loads += 1; return accessor.getLatestTreatmentsIfAvailable() },
+                reconcileReminders: {})
+            list.initializeViewIfNeeded()
+            let row = TreatmentEntry(date: Date(), value: 2, treatmentType: .Insulin,
+                nightscoutEventType: nil, enteredBy: "Test", nsManagedObjectContext: core.mainManagedObjectContext)
+            XCTAssertTrue(core.saveChangesSynchronously())
+            list.initializeViewIfNeeded()
+            XCTAssertEqual(list.filteredTreatments.map(\.rawValue), [2])
+            row.value = 3
+            XCTAssertTrue(core.saveChangesSynchronously())
+            list.initializeViewIfNeeded()
+            XCTAssertEqual(list.filteredTreatments.map(\.rawValue), [3])
+            row.treatmentdeleted = true
+            XCTAssertTrue(core.saveChangesSynchronously())
+            list.initializeViewIfNeeded()
+            XCTAssertTrue(list.filteredTreatments.isEmpty)
+            XCTAssertEqual(loads, 4)
+        }
+    }
+
+    @MainActor func testReopeningDuringPendingCommitRetainsPreviousSnapshotsUntilDurableSave() throws {
+        try withListDefaults {
+            let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+            let metrics = TherapyMetricsManager()
+            metrics.configure(coreDataManager: core, externalStatus: { nil })
+            let row = TreatmentEntry(date: Date(), value: 2, treatmentType: .Insulin,
+                nightscoutEventType: nil, enteredBy: "Test", nsManagedObjectContext: core.mainManagedObjectContext)
+            XCTAssertTrue(core.saveChangesSynchronously())
+            let accessor = TreatmentEntryAccessor(coreDataManager: core)
+            var loads = 0
+            let list = TreatmentsViewModel(coreDataManager: core, therapyMetricsManager: metrics,
+                loadTreatments: { loads += 1; return accessor.getLatestTreatmentsIfAvailable() },
+                reconcileReminders: {})
+            list.initializeViewIfNeeded()
+            row.value = 4
+            try core.mainManagedObjectContext.save()
+            XCTAssertTrue(metrics.hasUncommittedTreatmentChanges)
+            list.initializeViewIfNeeded()
+            XCTAssertEqual(loads, 1)
+            XCTAssertEqual(list.filteredTreatments.map(\.rawValue), [2])
+            let changed = expectation(description: "Durable commit publishes edited rows")
+            let observer = list.$filteredTreatments.first(where: { $0.first?.rawValue == 4 })
+                .sink { _ in changed.fulfill() }
+            let notifications = NotificationCenter.default.publisher(for: TherapyMetricsManager.changed)
+                .receive(on: RunLoop.main).sink { _ in list.handleTherapyMetricsChanged() }
+            defer { observer.cancel(); notifications.cancel() }
+            XCTAssertTrue(core.saveChangesSynchronously())
+            wait(for: [changed], timeout: 3)
+            XCTAssertEqual(loads, 2)
+        }
+    }
+
+    @MainActor func testMidnightDuringPendingCommitFiltersOnlyDurableSnapshots() throws {
+        try withListDefaults {
+            let calendar = dayCalendar()
+            var now = dayDate(7, hour: 23, minute: 59, calendar: calendar)
+            let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+            let metrics = TherapyMetricsManager()
+            metrics.configure(coreDataManager: core, externalStatus: { nil })
+            _ = TreatmentEntry(date: now, value: 2, treatmentType: .Insulin,
+                nightscoutEventType: nil, enteredBy: "Test", nsManagedObjectContext: core.mainManagedObjectContext)
+            XCTAssertTrue(core.saveChangesSynchronously())
+            let accessor = TreatmentEntryAccessor(coreDataManager: core)
+            var loads = 0
+            let list = TreatmentsViewModel(coreDataManager: core, therapyMetricsManager: metrics,
+                clock: { now }, calendarProvider: { calendar },
+                loadTreatments: { loads += 1; return accessor.getLatestTreatmentsIfAvailable() },
+                reconcileReminders: {})
+            list.initializeViewIfNeeded()
+            XCTAssertEqual(list.filteredTreatments.map(\.rawValue), [2])
+            now = now.addingTimeInterval(120)
+            _ = TreatmentEntry(date: now, value: 4, treatmentType: .Insulin,
+                nightscoutEventType: nil, enteredBy: "Test", nsManagedObjectContext: core.mainManagedObjectContext)
+            try core.mainManagedObjectContext.save()
+            XCTAssertTrue(metrics.hasUncommittedTreatmentChanges)
+            list.handleCurrentDayChanged()
+            list.initializeViewIfNeeded()
+            XCTAssertEqual(list.selectedDate, calendar.startOfDay(for: now))
+            XCTAssertTrue(list.filteredTreatments.isEmpty,
+                "Today's header must not retain yesterday's rows or publish the pending insert")
+            XCTAssertEqual(loads, 1)
+            XCTAssertTrue(core.saveChangesSynchronously())
+            list.initializeViewIfNeeded()
+            XCTAssertEqual(list.filteredTreatments.map(\.rawValue), [4])
+            XCTAssertEqual(loads, 2)
+        }
+    }
+
+    @MainActor func testFirstPresentationDuringPendingCommitLoadsOnCommitNotification() throws {
+        try withListDefaults {
+            let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+            let metrics = TherapyMetricsManager()
+            metrics.configure(coreDataManager: core, externalStatus: { nil })
+            _ = TreatmentEntry(date: Date(), value: 2, treatmentType: .Insulin,
+                nightscoutEventType: nil, enteredBy: "Test", nsManagedObjectContext: core.mainManagedObjectContext)
+            try core.mainManagedObjectContext.save()
+            XCTAssertTrue(metrics.hasUncommittedTreatmentChanges)
+            let accessor = TreatmentEntryAccessor(coreDataManager: core)
+            var loads = 0
+            let list = TreatmentsViewModel(coreDataManager: core, therapyMetricsManager: metrics,
+                loadTreatments: { loads += 1; return accessor.getLatestTreatmentsIfAvailable() },
+                reconcileReminders: {})
+            list.initializeViewIfNeeded()
+            XCTAssertEqual(loads, 0)
+            XCTAssertTrue(list.filteredTreatments.isEmpty)
+            let changed = expectation(description: "First pending presentation completes after durable commit")
+            let observer = list.$filteredTreatments.first(where: { $0.count == 1 })
+                .sink { _ in changed.fulfill() }
+            let notifications = NotificationCenter.default.publisher(for: TherapyMetricsManager.changed)
+                .receive(on: RunLoop.main).sink { _ in list.handleTherapyMetricsChanged() }
+            defer { observer.cancel(); notifications.cancel() }
+            XCTAssertTrue(core.saveChangesSynchronously())
+            wait(for: [changed], timeout: 3)
+            XCTAssertEqual(loads, 1)
+        }
+    }
+
+    @MainActor func testFailedHistoryReadNeverBecomesAReusableEmptyList() throws {
+        try withListDefaults {
+            let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+            let metrics = TherapyMetricsManager()
+            let row = TreatmentEntry(date: Date(), value: 2, treatmentType: .Insulin,
+                nightscoutEventType: nil, enteredBy: "Test", nsManagedObjectContext: core.mainManagedObjectContext)
+            XCTAssertTrue(core.saveChangesSynchronously())
+            var readable = false, loads = 0
+            let list = TreatmentsViewModel(coreDataManager: core, therapyMetricsManager: metrics,
+                loadTreatments: { loads += 1; return readable ? [row] : nil },
+                reconcileReminders: {})
+            list.initializeViewIfNeeded()
+            list.initializeViewIfNeeded()
+            XCTAssertEqual(loads, 2, "A failed read must be retried")
+            readable = true
+            list.initializeViewIfNeeded()
+            XCTAssertEqual(loads, 3)
+            let rows = list.filteredTreatments
+            readable = false
+            list.reloadTreatments()
+            XCTAssertEqual(list.filteredTreatments, rows, "Failure must retain the prior valid snapshots")
+            list.initializeViewIfNeeded()
+            XCTAssertEqual(loads, 5)
+            readable = true
+            list.initializeViewIfNeeded()
+            XCTAssertEqual(loads, 6)
+            list.initializeViewIfNeeded()
+            XCTAssertEqual(loads, 6, "Only a successful read becomes reusable")
+        }
+    }
+
+    @MainActor func testMidnightReadFailureKeepsDayFilterAndRetriesTheLoad() throws {
+        try withListDefaults {
+            let calendar = dayCalendar()
+            var now = dayDate(7, hour: 23, minute: 59, calendar: calendar)
+            let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+            let metrics = TherapyMetricsManager()
+            let yesterday = TreatmentEntry(date: now, value: 2, treatmentType: .Insulin,
+                nightscoutEventType: nil, enteredBy: "Test", nsManagedObjectContext: core.mainManagedObjectContext)
+            XCTAssertTrue(core.saveChangesSynchronously())
+            var readable = true, loads = 0
+            let list = TreatmentsViewModel(coreDataManager: core, therapyMetricsManager: metrics,
+                clock: { now }, calendarProvider: { calendar },
+                loadTreatments: { loads += 1; return readable ? [yesterday] : nil },
+                reconcileReminders: {})
+            list.initializeViewIfNeeded()
+            XCTAssertEqual(list.filteredTreatments.map(\.rawValue), [2])
+            now = now.addingTimeInterval(120)
+            readable = false
+            list.initializeViewIfNeeded()
+            XCTAssertEqual(list.selectedDate, calendar.startOfDay(for: now))
+            XCTAssertTrue(list.filteredTreatments.isEmpty)
+            XCTAssertEqual(loads, 2)
+            // Failed reads retain the snapshots, not yesterday's displayed day.
+            list.selectedDateChanged(yesterday.date)
+            XCTAssertEqual(list.filteredTreatments.map(\.rawValue), [2])
+            list.initializeViewIfNeeded()
+            XCTAssertEqual(loads, 3, "A failed load must still retry on the historical day")
+            readable = true
+            list.initializeViewIfNeeded()
+            list.initializeViewIfNeeded()
+            XCTAssertEqual(loads, 4)
+        }
+    }
+
+    @MainActor func testHiddenSourceChangesAndTimeZoneChangesInvalidateReopeningCache() throws {
+        try withListDefaults {
+            let defaults = UserDefaults.standard
+            defaults.set(true, forKey: "healthTherapyImport.v1.insulin.enabled")
+            defaults.set("test.source.a", forKey: "healthTherapyImport.v1.insulin.sourceBundleID")
+            var calendar = dayCalendar()
+            let now = dayDate(10, month: 10, hour: 2, calendar: calendar)
+            let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+            let metrics = TherapyMetricsManager()
+            metrics.configure(coreDataManager: core, externalStatus: { nil })
+            for (source, units) in [("test.source.a", 1.0), ("test.source.b", 2.0)] {
+                let row = TreatmentEntry(date: now, value: units, treatmentType: .Insulin,
+                    nightscoutEventType: nil, enteredBy: "Test", nsManagedObjectContext: core.mainManagedObjectContext)
+                row.healthKitSampleUUID = UUID().uuidString
+                row.healthKitSourceBundleIdentifier = source
+            }
+            XCTAssertTrue(core.saveChangesSynchronously())
+            let accessor = TreatmentEntryAccessor(coreDataManager: core)
+            var loads = 0
+            let list = TreatmentsViewModel(coreDataManager: core, therapyMetricsManager: metrics,
+                clock: { now }, calendarProvider: { calendar },
+                loadTreatments: { loads += 1; return accessor.getLatestTreatmentsIfAvailable() },
+                reconcileReminders: {})
+            list.initializeViewIfNeeded()
+            defaults.set("test.source.b", forKey: "healthTherapyImport.v1.insulin.sourceBundleID")
+            list.initializeViewIfNeeded()
+            XCTAssertEqual(list.filteredTreatments.map(\.rawValue), [2])
+            XCTAssertEqual(loads, 2)
+            calendar = dayCalendar("America/Los_Angeles")
+            list.initializeViewIfNeeded()
+            XCTAssertEqual(list.selectedDate, calendar.startOfDay(for: now))
+            XCTAssertEqual(list.filteredTreatments.map(\.rawValue), [2])
+            XCTAssertEqual(loads, 3)
+        }
+    }
+
     @MainActor func testUnrelatedDefaultsAndStatusNeverReloadOrPublishTheList() throws {
         try withListDefaults {
             let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
             let metrics = TherapyMetricsManager()
+            metrics.configure(coreDataManager: core, externalStatus: { nil })
             let list = TreatmentsViewModel(coreDataManager: core, therapyMetricsManager: metrics)
             list.initializeViewIfNeeded()
             var publications = 0
@@ -2813,7 +3073,7 @@ final class TreatmentListRefreshTests: XCTestCase {
             }
             XCTAssertEqual(publications, 0, "No history fetch/reconciliation/publication for unrelated defaults or glucose/status changes")
 
-            // Returning to the tab still performs its established explicit refresh.
+            // A committed treatment revision while hidden still requires fresh rows on return.
             _ = TreatmentEntry(date: Date(), value: 1, treatmentType: .BasalInjection,
                 nightscoutEventType: nil, enteredBy: "Test", nsManagedObjectContext: core.mainManagedObjectContext)
             XCTAssertTrue(core.saveChangesSynchronously())

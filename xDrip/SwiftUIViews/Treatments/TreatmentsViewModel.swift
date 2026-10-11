@@ -40,7 +40,7 @@ import OSLog
     private let localSaveJournal: PenDoseLogJournal
     private let therapyMetricsManager: TherapyMetricsManager
     private let localSaveOverride: (() -> Bool)?
-    private let loadTreatments: () -> [TreatmentEntry]
+    private let loadTreatments: () -> [TreatmentEntry]?
     private let reconcileReminders: () -> Void
     private let clock: () -> Date
     private let calendarProvider: () -> Calendar
@@ -50,6 +50,7 @@ import OSLog
     private var allTreatments: [TreatmentSnapshot] = []
     private var didInitializeView = false
     private var loadedTreatmentRevision: Int?
+    private var loadedCalendar: Calendar?
     private var lastSettings = ListSettings()
 
     /// Only source preferences require new treatment snapshots. Display settings reuse the loaded
@@ -103,14 +104,14 @@ import OSLog
          therapyMetricsManager: TherapyMetricsManager = .shared,
          clock: @escaping () -> Date = Date.init,
          calendarProvider: @escaping () -> Calendar = { .current },
-         loadTreatments: (() -> [TreatmentEntry])? = nil,
+         loadTreatments: (() -> [TreatmentEntry]?)? = nil,
          reconcileReminders: (() -> Void)? = nil) {
         self.coreDataManager = coreDataManager
         let accessor = TreatmentEntryAccessor(coreDataManager: coreDataManager)
         self.treatmentEntryAccessor = accessor
         let journal = localSaveJournal ?? .shared
         self.localSaveJournal = journal
-        self.loadTreatments = loadTreatments ?? { accessor.getLatestTreatments(howOld: nil) }
+        self.loadTreatments = loadTreatments ?? { accessor.getLatestTreatmentsIfAvailable() }
         self.reconcileReminders = reconcileReminders ?? {
             MealPlanReminderCoordinator.reconcile(coreDataManager: coreDataManager,
                 journal: journal, onIssue: MealReminderIssueCenter.report)
@@ -126,11 +127,20 @@ import OSLog
 
     // MARK: - public functions
 
-    /// Performs the first load, or refreshes the existing model when the tab becomes visible again.
+    /// First presentation loads fresh rows. Reopening an unchanged, successfully loaded list
+    /// reuses its snapshots; reminder reconciliation still retries protected-data/notification work.
     func initializeViewIfNeeded() {
         if didInitializeView {
-            reloadTreatments()
-            return
+            let dayChanged = updateSelectedDayIfNeeded()
+            if !dayChanged, let loadedTreatmentRevision,
+               loadedTreatmentRevision == therapyMetricsManager.treatmentChangeRevision,
+               !therapyMetricsManager.hasUncommittedTreatmentChanges,
+               loadedCalendar == calendarProvider(),
+               ListSettings().hasSameTreatmentSources(as: lastSettings) {
+                handleUserDefaultsDidChange()
+                reconcileReminders()
+                return
+            }
         }
 
         didInitializeView = true
@@ -140,11 +150,19 @@ import OSLog
     /// Reloads the treatment history and reapplies the current filters.
     func reloadTreatments() {
         updateSelectedDayIfNeeded()
-        lastSettings = ListSettings()
-        loadedTreatmentRevision = therapyMetricsManager.treatmentChangeRevision
-        syncFilterSettingsFromUserDefaults()
-
-        let fetched = loadTreatments()
+        // The previous snapshots stay immutable until the parent save is durable. A day
+        // rollover still filters those snapshots so yesterday's rows cannot appear under today.
+        guard !therapyMetricsManager.hasUncommittedTreatmentChanges else {
+            applyFilters()
+            return
+        }
+        let settings = ListSettings()
+        let revision = therapyMetricsManager.treatmentChangeRevision
+        guard let fetched = loadTreatments() else {
+            loadedTreatmentRevision = nil
+            applyFilters()
+            return
+        }
         let importer = HealthKitTherapyImportManager.shared
         let cutover = TreatmentSourceCutover.current()
         // Match the source, cutover and origin-dedup rules used by live IOB/COB. Turning the
@@ -186,11 +204,24 @@ import OSLog
             }
         } catch {
             trace("failed to obtain permanent treatment IDs", log: log, category: ConstantsLog.categoryApplicationDataTreatments, type: .error)
+            loadedTreatmentRevision = nil
+            applyFilters()
             return
         }
 
-        allTreatments = treatments.map { TreatmentSnapshot(treatmentEntry: $0) }
-
+        let snapshots = treatments.map { TreatmentSnapshot(treatmentEntry: $0) }
+        guard revision == therapyMetricsManager.treatmentChangeRevision,
+              !therapyMetricsManager.hasUncommittedTreatmentChanges,
+              settings.hasSameTreatmentSources(as: ListSettings()) else {
+            loadedTreatmentRevision = nil
+            applyFilters()
+            return
+        }
+        allTreatments = snapshots
+        lastSettings = settings
+        loadedTreatmentRevision = revision
+        loadedCalendar = calendarProvider()
+        syncFilterSettingsFromUserDefaults()
         applyFilters()
         reconcileReminders()
     }
@@ -218,7 +249,7 @@ import OSLog
     /// Data changes must not depend on an incidental defaults write. Ignore glucose-only/status
     /// notifications and wait for the existing durable treatment commit before refreshing rows.
     func handleTherapyMetricsChanged() {
-        guard let loadedTreatmentRevision,
+        guard didInitializeView || loadedTreatmentRevision != nil,
               loadedTreatmentRevision != therapyMetricsManager.treatmentChangeRevision,
               !therapyMetricsManager.hasUncommittedTreatmentChanges else { return }
         reloadTreatments()

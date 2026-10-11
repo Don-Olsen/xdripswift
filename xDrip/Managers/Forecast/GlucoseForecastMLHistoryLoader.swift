@@ -47,6 +47,48 @@ final class GlucoseForecastMLHistoryCancellation: @unchecked Sendable {
     }
 }
 
+/// A bounded date lookup over immutable replay inputs. The date index is built
+/// once, while returned values retain the original order (including equal dates)
+/// so treatment summation and provenance checks receive the same rows as filter.
+struct GlucoseForecastMLHistoryIntervalIndex<Element> {
+    private let values: [Element]
+    private let orderedDates: [(date: Date, offset: Int)]
+    private let alreadyOrdered: Bool
+
+    init(_ values: [Element], date: (Element) -> Date) {
+        self.values = values
+        let dates = values.enumerated().map { (date: date($0.element), offset: $0.offset) }
+        let ordered = zip(dates, dates.dropFirst()).allSatisfy { $0.0.date <= $0.1.date }
+        alreadyOrdered = ordered
+        orderedDates = ordered ? dates : dates.sorted {
+            $0.date != $1.date ? $0.date < $1.date : $0.offset < $1.offset
+        }
+    }
+
+    /// Both bounds are inclusive, matching the previous daily window filters.
+    func values(from start: Date, through end: Date) -> [Element] {
+        guard start <= end else { return [] }
+        let lower = bound(start, includesEqual: false)
+        let upper = bound(end, includesEqual: true)
+        if alreadyOrdered { return Array(values[lower..<upper]) }
+        return orderedDates[lower..<upper].map(\.offset).sorted().map { values[$0] }
+    }
+
+    private func bound(_ date: Date, includesEqual: Bool) -> Int {
+        var low = 0, high = orderedDates.count
+        while low < high {
+            let middle = low + (high - low) / 2
+            let candidate = orderedDates[middle].date
+            if candidate < date || (includesEqual && candidate == date) {
+                low = middle + 1
+            } else {
+                high = middle
+            }
+        }
+        return low
+    }
+}
+
 final class GlucoseForecastMLHistoryLoader {
     private struct LocalDay {
         let glucose: [GlucoseForecastGlucoseObservation]
@@ -495,19 +537,24 @@ final class GlucoseForecastMLHistoryLoader {
         var healthCandidates = [GlucoseForecastMLReplayExample]()
         var localCandidates = [GlucoseForecastMLReplayExample]()
         let longestTreatment = max(settings.insulinDuration, settings.carbDuration) * 60
+        let localInsulinEvents = localTreatments.filter(\.isIOB)
+        let localCarbEvents = localTreatments.filter { !$0.isIOB }
+        let healthInsulinEvents = cutover != nil ? directHealthInsulin + localInsulinEvents
+            : (insulinEnabled ? directHealthInsulin : localInsulinEvents)
+        let healthCarbEvents = cutover != nil ? directHealthCarbs + localCarbEvents
+            : (carbsEnabled ? directHealthCarbs : localCarbEvents)
+        let healthTreatmentIndex = GlucoseForecastMLHistoryIntervalIndex(
+            healthInsulinEvents + healthCarbEvents, date: { $0.date })
+        let localTreatmentIndex = cutover != nil ? healthTreatmentIndex
+            : GlucoseForecastMLHistoryIntervalIndex(localInsulinEvents + localCarbEvents,
+                date: { $0.date })
         for (segment, readings) in separated {
             guard !cancellation.isCancelled else { return nil }
             let usingLocal = segment.source == .local
             let insulinEvidence = usingLocal || !insulinEnabled ? localInsulin : healthInsulin
             let carbEvidence = usingLocal || !carbsEnabled ? localCarbs : healthCarbs
-            let insulinEvents = cutover != nil
-                ? directHealthInsulin + localTreatments.filter(\.isIOB)
-                : (insulinEnabled && !usingLocal ? directHealthInsulin :
-                    localTreatments.filter(\.isIOB))
-            let carbEvents = cutover != nil
-                ? directHealthCarbs + localTreatments.filter { !$0.isIOB }
-                : (carbsEnabled && !usingLocal ? directHealthCarbs :
-                    localTreatments.filter { !$0.isIOB })
+            let glucoseIndex = GlucoseForecastMLHistoryIntervalIndex(readings, date: { $0.date })
+            let treatmentIndex = usingLocal ? localTreatmentIndex : healthTreatmentIndex
             var lastAnchorDate: Date?
             var anchorDay = calendar.startOfDay(for: segment.startDate)
             while anchorDay <= segment.endDate {
@@ -522,13 +569,11 @@ final class GlucoseForecastMLHistoryLoader {
                     let lookbackStart = anchorStart.addingTimeInterval(
                         -GlucoseForecastGlucoseSelection.fetchWindow)
                     let targetEnd = anchorEnd.addingTimeInterval(122 * 60)
-                    let windowReadings = readings.filter {
-                        $0.date >= lookbackStart && $0.date <= targetEnd
-                    }
+                    let windowReadings = glucoseIndex.values(from: lookbackStart,
+                        through: targetEnd)
                     let treatmentStart = anchorStart.addingTimeInterval(-longestTreatment)
-                    let windowTreatments = (insulinEvents + carbEvents).filter {
-                        $0.date >= treatmentStart && $0.date <= anchorEnd
-                    }
+                    let windowTreatments = treatmentIndex.values(from: treatmentStart,
+                        through: anchorEnd)
                     let batch = GlucoseForecastMLReplay.batch(observations: windowReadings,
                         treatments: windowTreatments, settings: settings,
                         sensitivityMgdlPerUnit: sensitivityMgdlPerUnit,

@@ -1,3 +1,43 @@
+## To afgrænsede optimeringer efter 4322 — 11. oktober 2026
+
+Behandlingsfanen genbruger sine uforanderlige snapshots ved uændret genåbning.
+En ny behandling, rettelse, sletning, kildeændring, kalender-/tidszoneændring eller
+nyt døgn kræver fortsat en frisk læsning. Visningsfiltre bruger de allerede indlæste
+rækker. Genforsøg af måltidspåmindelser bevares ved genåbning. Et læsefejlresultat
+bliver aldrig cachet som en gyldig tom liste; det tidligere snapshot bevares, og
+næste forsøg læser igen. Under en uafsluttet lagring publiceres ingen delvis
+behandlingstilstand. Dagsfilteret følger dog overskriften, også ved midnat og fejl.
+
+ML-historikloaderen bygger ét intervalindeks pr. glukosesegment og ét for hver
+relevant behandlingssamling. Daglige vinduer findes med binære tidsgrænser i
+stedet for en fuld gennemgang af historikken pr. døgn. Inklusive grænser,
+dubletter og oprindelig rækkefølge bevares. Motor, features, accepterede poster,
+kildeskift, dækningskrav, træning og modelkompatibilitet er uændrede.
+
+Foreløbig validering før Apples buildnummer:
+- Hele XCTest på den færdige kode: **1.566/1.566**, 0 fejl, 0 skipped; 11 nye
+  regressionstests (8 for behandlingslisten og 3 for ML-vinduer/produktionsloader).
+  Lokal kørsel og resultater ligger uden for Git; den første samlede kørsel
+  havde 1.565 tests, inden den ekstra midnats-/læsefejltest blev tilføjet.
+- Python-/release-/Watch-syntetiske kontroller samt begge simulatorbuilds bestod
+  i den indledende samlede kørsel. Releaseproceduren gentester det præcise
+  nummererede checkpoint; disse foreløbige kvitteringer erstatter det ikke.
+- ML-regressionen bruger den rigtige loader med syntetiske data på tværs af
+  midnat, kildeskift og segmentbrud og sammenligner eksakte features,
+  motorpunkter, facit og provenance med de tidligere fulde historikfiltre.
+- Behandlingsregressionerne kontrollerer uændrede genåbninger, gemte ændringer,
+  uafsluttet/første lagring, læsefejl, midnat, kilde og tidszone.
+- Apples procedure valgte **7.1.1 (4323)**. Den usignerede iPhoneOS/arm64-build
+  af den nummererede kode bestod, inklusive Create ML-stien. Log uden for Git:
+  `/private/tmp/xdrip-two-optimizations-4323-iphoneos.log`. Den endelige fulde
+  testkvittering, kildecommit/tag og Apple-status registreres af releaseproceduren.
+
+Ingen fysisk iPhone-/Watch-afprøvning eller måling af hastighed/batteri er udført
+for denne ændring; de fysiske enheder var utilgængelige i devicectl. Ingen lokal
+installation er foretaget. Kontrollerne dokumenterer bevaret funktion og færre
+historikgennemgange, ikke en målt tids- eller batterigevinst. Doseringsregler,
+glukose, IOB/COB, HealthKit, alarmer, Watch/Libre og Nightscout er uændrede.
+
 <!-- testflight-7.1.1-4322:start -->
 ### TestFlight 7.1.1 (4322)
 

@@ -38,6 +38,12 @@ class TreatmentEntryAccessor {
         return getLatestTreatments(limit: nil, howOld: howOld)
     }
 
+    /// A successful empty history is different from a failed read when retaining list snapshots.
+    /// Other callers keep the established empty-array-on-error behavior.
+    func getLatestTreatmentsIfAvailable() -> [TreatmentEntry]? {
+        fetchTreatmentsIfAvailable(limit: nil, fromDate: nil)
+    }
+
     /// Gives latest treatments
     ///
     /// - parameters:
@@ -313,6 +319,11 @@ class TreatmentEntryAccessor {
     /// - returns:
     ///     List of treatments, descending, ie first is youngest
     private func fetchTreatments(limit:Int?, fromDate:Date?, excludingExternalLocalOnly: Bool = false) -> [TreatmentEntry] {
+        fetchTreatmentsIfAvailable(limit: limit, fromDate: fromDate,
+            excludingExternalLocalOnly: excludingExternalLocalOnly) ?? []
+    }
+
+    private func fetchTreatmentsIfAvailable(limit:Int?, fromDate:Date?, excludingExternalLocalOnly: Bool = false) -> [TreatmentEntry]? {
         let fetchRequest: NSFetchRequest<TreatmentEntry> = TreatmentEntry.fetchRequest()
         fetchRequest.sortDescriptors = [NSSortDescriptor(key: #keyPath(TreatmentEntry.date), ascending: false)]
         fetchRequest.returnsObjectsAsFaults = false
@@ -340,7 +351,7 @@ class TreatmentEntryAccessor {
             fetchRequest.fetchLimit = limit
         }
 
-        var treatments: [TreatmentEntry] = []
+        var treatments: [TreatmentEntry]?
 
         coreDataManager.mainManagedObjectContext.performAndWait {
             do {

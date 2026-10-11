@@ -224,6 +224,15 @@ checkpoints are never used with this history path. Settings shows completed
 history days, completed model fits, self-check progress and usable-day/example
 counts in Danish; final success appears only after the model decision.
 
+After 4322, daily replay windows use a single immutable interval index per
+source segment and treatment collection instead of filtering the entire history
+for every day. Both time boundaries remain inclusive, duplicate timestamps and
+original treatment order are retained, and the real-loader regression compares
+features, engine trajectories, targets and provenance against the former filters.
+This is an input lookup optimization: it changes no accepted data, coverage,
+engine/feature version, training rules or model compatibility. Preparation speed
+and battery use have not been measured on a physical iPhone.
+
 The fixed 16-column feature contract uses raw glucose slopes, the existing
 treatment curves, IOB/COB from bolus/carbohydrates only, and the local time at
 the reference reading. Retrospective examples use all original glucose samples
