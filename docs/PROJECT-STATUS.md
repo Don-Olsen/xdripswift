@@ -1,3 +1,15 @@
+<!-- testflight-7.1.1-4322:start -->
+### TestFlight 7.1.1 (4322)
+
+- Kildecommit og tag: `33bbde74d5617fe3c65c0dbd8f7feca038e5db68` / `testflight-7.1.1-4322`.
+- Tests: 1555/1555 bestået; 0 fejlet; 0 skipped. iPhone- og Watch-simulatorbuilds bestod.
+- Apple-status (2026-10-11T08:53:05.743684+00:00): [Internal / Testing](https://appstoreconnect.apple.com/apps/6795645396/testflight/ios/0a5f84f4-d013-46e6-8218-fb0f94f1a94b).
+- Eksisterende intern gruppe: Ole Internal er bekræftet tilknyttet.
+- Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
+<!-- testflight-7.1.1-4322:end -->
+
+De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
+
 ## Forebyggende kulhydrathjælp efter 4321 — 11. oktober 2026
 
 Den eksisterende iPhone-beregner får en lille, separat forebyggende kulhydrathjælp.
