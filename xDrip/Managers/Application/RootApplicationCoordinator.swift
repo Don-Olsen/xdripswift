@@ -1477,13 +1477,8 @@ struct InitialCalibrationRequestGate {
                     queueLowSoonForLatestReading()
                     rootHomeStateModel.invalidateCharts()
                     
-                    // update all text in  first screen
+                    // The full Home refresh includes pump/AID and mini-chart state.
                     updateLabelsAndChart(overrideApplicationState: false)
-                    
-                    updatePumpAndAIDStatusViews()
-                    
-                    // update mini-chart
-                    updateMiniChart()
                     
                     // update statistics related outlets
                     updateStatistics(animate: false)

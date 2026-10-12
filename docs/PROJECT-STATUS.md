@@ -1,3 +1,29 @@
+## Home-opdatering ved nye sensormålinger efter 4326 — 12. oktober 2026
+
+I `RootApplicationCoordinator.processNewGlucoseData` er de to umiddelbart
+følgende kald til `updatePumpAndAIDStatusViews` og `updateMiniChart` fjernet.
+Det beholdte `updateLabelsAndChart` publicerer allerede hele Home-tilstanden,
+både i forgrund og baggrund. De to fjernede helpers havde ingen anden effekt
+end at kalde den samme fulde opdatering med nye databaseopslag på hovedtråden.
+Netop denne sekvens går derfor fra tre fulde opdateringer til én.
+
+Grafens eksisterende invalidering, statistik- og datakildeopdateringer samt
+selvstændige pump-/minigrafkald andre steder bevares. Der er ingen ændring i
+målinger, behandlinger, dosering, motor/ML, alarmer, HealthKit, Watch/Libre eller
+Nightscout. Ændringen til produktionskoden er to fjernede kald og en kommentar.
+
+Indledende Python- og syntetiske Watch-kontroller bestod; `git diff --check`
+bestod. Den færdige diff er gennemgået særskilt. Releaseproceduren vælger
+nummer via Apple og registrerer den nye, fulde XCTest-kørsel og begge
+simulatorbuilds på det præcise nummererede checkpoint i releasejournalen.
+Eksisterende Home-interaktions- og Libre-regressioner bevares; der er ingen
+ny testindgang eller ændring af tests alene for de to fjernede alias-kald.
+
+Læseadgang til den tilsluttede iPhone bekræftede 7.1.1 (4326) og forventet
+bundle-ID før udgivelsen. Ingen lokal installation, fysisk funktionstest eller
+måling af denne rettelses hastighed eller batteriforbrug er udført. Færre
+opdateringer er dokumenteret i kaldestien, men en fysisk gevinst er ikke målt.
+
 <!-- testflight-7.1.1-4326:start -->
 ### TestFlight 7.1.1 (4326)
 
