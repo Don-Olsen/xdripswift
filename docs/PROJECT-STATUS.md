@@ -10,6 +10,55 @@
 
 De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
 
+## Tre afgrænsede optimeringer efter 4325 — 12. oktober 2026
+
+- Grafens `loadRange` henter og materialiserer glukose én gang pr. faktisk
+  intervalindlæsning og fordeler samme snapshots til de eksisterende synlige
+  og originale caches. Accessorens strikte tidsgrænser, suppression, sensor-
+  vurdering, cachefletning og den lettere minigrafsti bevares.
+- Frasorterede debugbeskeder afsluttes efter typed fejlfindingshistorik og OSLog,
+  før tekst-/datoformatering og filarbejde. Den næste filskrivbare besked tjekker
+  rotation. Testen afslørede også, at den beholdte URL kunne cache en forældet
+  filstørrelse; kun størrelsesnøglen invalideres nu før det eksisterende tjek.
+  En isoleret Foundation-probe reproducerede den gamle stale-size-fejl.
+- Støjhistorikkens midlertidige estimatliste begrænses til det allerede anvendte
+  inklusive 12-timersvindue, også ved punkter uden støjværdi. Hele den lagrede
+  historik, alle outputpunkter, medianen og dækningsreglerne bevares.
+
+Foreløbig validering på den færdige kode, før Apples nummerændring:
+- **1.601/1.601 XCTest**, 0 fejl, 0 skipped. Ti nye regressioner: fire gennem
+  grafmanagerens fulde/mini-stier og Core Data, tre gennem støjmanagerens
+  `historySnapshot` og tre gennem den faktiske `trace`-funktion.
+- Kvittering uden for Git: `20261012T103334Z-87335/results/AllTests.xcresult`
+  under det eksisterende lokale buildområde.
+- Grafdækningen omfatter originale/synlige/suppressed punkter, tidsgrænser,
+  ens tider/sensorer, deduplikering og frisk genlæsning efter rettelse/sletning.
+  Grænsefixturen bruger eksakte heltalssekunder, så accessorens eksisterende
+  NSDate-roundtrip ikke flytter en brøksekundsgrænse i selve testen.
+- Støjtests sammenligner punkt for punkt med den tidligere ubegrænsede liste
+  over 14 dage, inklusive huller, manglende støj og præcis 12-timersgrænse.
+- Logtests dækker debug fra/til, almindelige niveauer, typed historik og rotation
+  ved næste filskrivbare besked. OSLog-stien er aktiveret og gennemgået, men
+  selve OSLog-emissionen er ikke direkte aflæst/asserteret.
+- Indledende testkørsler fandt type-/fixturefejl i nye tests og den nu rettede
+  stale-size-fejl. Én eksisterende asynkron HealthKit-importtest havde desuden
+  en forbigående statusassertion; den bestod gentesten uden ændring af testen
+  eller HealthKit-koden. De tidligere kørsler er bevaret uden for Git.
+- Apple valgte **7.1.1 (4326)** gennem den officielle inventory-procedure.
+  Den supplerende usignerede iPhoneOS-build af den nummererede kode bestod;
+  `lipo -archs` bekræftede **arm64**. Log uden for Git:
+  `/private/tmp/xdrip-three-optimizations-4326-iphoneos.log`.
+- `git diff --check` og projektets plist-syntakskontrol bestod. Koden er også
+  uafhængigt gennemgået. Releaseproceduren vælger Apples nummer og gentester
+  det præcise staged checkpoint; denne kvittering erstatter ikke release-tests.
+
+En læsende devicectl-kontrol bekræftede forventet bundle-ID og 7.1.1 (4325) på
+brugerens iPhone. Ingen lokal installation, fysisk funktionstest eller måling
+af hastighed/batteriforbrug er udført. Ændringerne dokumenterer færre hentninger
+og mindre unødigt arbejde, ikke en målt tids- eller batterigevinst. Doserings-
+regler, behandlinger, motor/ML, HealthKit, alarmer, Watch/Libre og Nightscout er
+uændrede. Endelig release-/buildstatus registreres særskilt i releasejournalen.
+
 ## Fejlrettelser efter 4324 — 11. oktober 2026
 
 Tre afgrænsede rettelser er implementeret og gennemgået:

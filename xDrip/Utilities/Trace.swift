@@ -60,7 +60,8 @@ fileprivate var traceFileName:URL?
 
 /// Writes the existing developer trace and optionally offers a typed fact to the consumer log.
 ///
-/// The developer outputs retain their existing settings, formatting and rotation behavior. Consumer
+/// The developer outputs retain their existing settings and formatting. Filtered debug messages
+/// skip file maintenance; the next file-eligible message still checks rotation. Consumer
 /// persistence is evaluated first and independently, so disabling OSLog, NSLog or trace files does not
 /// disable troubleshooting history. The consumer store may suppress routine or repeated operational
 /// facts that do not add support value.
@@ -96,7 +97,7 @@ func trace(
     if traceFileName ==  nil {
         traceFileName = getDocumentsDirectory().appendingPathComponent(ConstantsTrace.traceFileName + ".0.log")
     }
-    guard let traceFileName = traceFileName else {return}
+    guard var traceFileName = traceFileName else {return}
     
     // if oslog is enabled in settings, then do os_log
     if UserDefaults.standard.OSLogEnabled {
@@ -132,6 +133,12 @@ func trace(
 
     }
     
+    // OSLog and typed troubleshooting remain independent of the file/NSLog debug setting.
+    // A discarded debug message needs neither formatting nor a trace-file size/rotation check.
+    if type == .debug && !UserDefaults.standard.addDebugLevelLogsInTraceFileAndNSLog {
+        return
+    }
+
     // calculate string to log, replacing arguments
     
     var argumentsCounter: Int = 0
@@ -239,6 +246,8 @@ func trace(
     // The old version used the extension fileSize which called FileManager.attributesOfItem(atPath:) - this could
     // crash if the file was being rotated or removed concurrently (race condition during trace log writes).
     // Using URL.resourceValues(forKeys:) makes the lookup safe and avoids trapping on transient I/O states.
+    // The retained URL caches resource values; invalidate size after writes so rotation sees growth.
+    traceFileName.removeCachedResourceValue(forKey: .fileSizeKey)
     if let resourceValues = try? traceFileName.resourceValues(forKeys: [.fileSizeKey]),
        let fileSizeInt = resourceValues.fileSize {
         let maxBytes = UInt64(ConstantsTrace.maximumFileSizeInMB) * 1024 * 1024

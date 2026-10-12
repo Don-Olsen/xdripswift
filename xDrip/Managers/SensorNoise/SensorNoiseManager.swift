@@ -360,6 +360,10 @@ final class SensorNoiseManager {
         var estimates = [(timeStamp: Date, noise: Double)]()
 
         return points.map { point in
+            let windowStart = point.timeStamp.addingTimeInterval(-ConstantsSensorNoise.persistentNoiseWindow)
+            if let first = estimates.first, first.timeStamp < windowStart {
+                estimates.removeAll { $0.timeStamp < windowStart }
+            }
             if let shortTermNoise = point.shortTermNoise {
                 estimates.append((point.timeStamp, shortTermNoise))
             }

@@ -275,21 +275,16 @@ final class GlucoseChartStateManager: ObservableObject, @unchecked Sendable {
 
         let managedObjectContext = coreDataManager.privateManagedObjectContext
 
-        // Glucose and original/suppressed rows share the same cache range in both modes.
-        // The mini-chart omits marker sources that its overview renderer does not use.
-        cachedReadings.merge(
-            mapBgReadings(
-                bgReadingsAccessor.getBgReadings(from: startDate, to: endDate, on: managedObjectContext),
-                on: managedObjectContext
-            )
+        // Fetch and materialise the shared range once. Suppressed rows remain available for
+        // original rendering and source validity, while the processed cache keeps visible rows.
+        let readings = mapBgReadings(
+            bgReadingsAccessor.getBgReadings(from: startDate, to: endDate, on: managedObjectContext, includingSuppressed: true),
+            on: managedObjectContext
         )
+        cachedReadings.merge(readings.filter { !$0.isSuppressedByFiveMinuteCadence })
+        cachedOriginalReadings.merge(readings)
 
-        cachedOriginalReadings.merge(
-            mapBgReadings(
-                bgReadingsAccessor.getBgReadings(from: startDate, to: endDate, on: managedObjectContext, includingSuppressed: true),
-                on: managedObjectContext
-            )
-        )
+        // The mini-chart omits marker sources that its overview renderer does not use.
 
         if loadMode == .fullChart {
             cachedCalibrations.merge(

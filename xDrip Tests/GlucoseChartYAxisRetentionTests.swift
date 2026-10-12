@@ -599,6 +599,181 @@ final class GlucoseChartYAxisRetentionTests: XCTestCase {
         XCTAssertEqual(updated.dataStartDate, initial.dataStartDate)
     }
 
+    /// One shared glucose load must retain processed values and all original/suppressed rows.
+    @MainActor
+    func testSharedGlucoseLoadPreservesBothCachesInFullAndMiniModes() async {
+        for mode in [GlucoseChartStateManager.LoadMode.fullChart, .miniChart] {
+            let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+            let end = Date().addingTimeInterval(-48 * 3600)
+            let start = end.addingTimeInterval(-3600)
+            let sensor = Sensor(startDate: start, nsManagedObjectContext: core.mainManagedObjectContext)
+            _ = addChartReading(core, at: end.addingTimeInterval(-120), raw: 120,
+                                processed: 140, sensor: sensor, suppressed: false)
+            _ = addChartReading(core, at: end.addingTimeInterval(-60), raw: 130,
+                                processed: 150, sensor: sensor, suppressed: true)
+            XCTAssertTrue(core.saveChangesSynchronously())
+            let chart = GlucoseChartStateManager(coreDataManager: core,
+                nightscoutSyncManager: NightscoutSyncManager(coreDataManager: core, messageHandler: nil),
+                loadMode: mode)
+            let visible = await loadChart(chart, start: start, end: end)
+            XCTAssertEqual(visible.bgReadingValues, [140])
+            XCTAssertEqual(visible.bgReadingDates, [end.addingTimeInterval(-120)])
+            XCTAssertEqual(visible.newestBgReadingSensorID, sensor.id)
+            XCTAssertTrue(visible.newestBgReadingIsValidForDownstream)
+            let original = await loadChart(chart, start: start, end: end, originalsOnly: true)
+            XCTAssertTrue(original.bgReadingValues.isEmpty)
+            XCTAssertEqual(original.additionalBgReadingDataSets.first?.bgReadingValues, [120, 130])
+            XCTAssertEqual(original.additionalBgReadingDataSets.first?.bgReadingDates,
+                           [end.addingTimeInterval(-120), end.addingTimeInterval(-60)])
+            XCTAssertEqual(original.dataStartDate, visible.dataStartDate)
+            XCTAssertEqual(original.dataEndDate, visible.dataEndDate)
+        }
+    }
+
+    /// Keep the accessor's strict bounds on the buffered range; do not change them to inclusive.
+    @MainActor
+    func testSharedGlucoseLoadKeepsStrictIntervalBoundsInFullAndMiniModes() async {
+        for mode in [GlucoseChartStateManager.LoadMode.fullChart, .miniChart] {
+            let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+            // Whole seconds round-trip exactly through the accessor's NSDate(Unix time)
+            // predicate conversion. Fractional Date() values can shift an exact boundary.
+            let end = Date(timeIntervalSince1970: 1_700_000_000)
+            let start = end.addingTimeInterval(-3600)
+            let cacheStart = start.addingTimeInterval(-6 * 3600)
+            let cacheEnd = end.addingTimeInterval(6 * 3600)
+            let dates = [cacheStart, cacheStart.addingTimeInterval(1),
+                         cacheEnd.addingTimeInterval(-1), cacheEnd]
+            for (index, date) in dates.enumerated() {
+                _ = addChartReading(core, at: date, raw: Double(100 + index),
+                                    processed: Double(120 + index), sensor: nil,
+                                    suppressed: index == 2)
+            }
+            XCTAssertTrue(core.saveChangesSynchronously())
+            let chart = GlucoseChartStateManager(coreDataManager: core,
+                nightscoutSyncManager: NightscoutSyncManager(coreDataManager: core, messageHandler: nil),
+                loadMode: mode)
+            let visible = await loadChart(chart, start: start, end: end)
+            XCTAssertEqual(visible.bgReadingDates, [dates[1]])
+            XCTAssertEqual(visible.bgReadingValues, [121])
+            XCTAssertEqual(visible.dataStartDate, cacheStart)
+            XCTAssertEqual(visible.dataEndDate, cacheEnd)
+            let original = await loadChart(chart, start: start, end: end, originalsOnly: true)
+            XCTAssertEqual(original.additionalBgReadingDataSets.first?.bgReadingDates, [dates[1], dates[2]])
+            XCTAssertEqual(original.additionalBgReadingDataSets.first?.bgReadingValues, [101, 102])
+        }
+    }
+
+    /// Equal-time peers keep distinct values/sensors and still invalidate an ambiguous anchor.
+    @MainActor
+    func testSharedGlucoseLoadRetainsEqualTimeSensorAndSuppressionChecks() async {
+        for mode in [GlucoseChartStateManager.LoadMode.fullChart, .miniChart] {
+            let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+            let end = Date().addingTimeInterval(-48 * 3600)
+            let start = end.addingTimeInterval(-3600)
+            let date = end.addingTimeInterval(-60)
+            let sensorA = Sensor(startDate: start, nsManagedObjectContext: core.mainManagedObjectContext)
+            let sensorB = Sensor(startDate: start, nsManagedObjectContext: core.mainManagedObjectContext)
+            _ = addChartReading(core, at: date, raw: 120, processed: 140,
+                                sensor: sensorA, suppressed: false)
+            // An identical snapshot remains deduplicated by the existing cache merge.
+            _ = addChartReading(core, at: date, raw: 120, processed: 140,
+                                sensor: sensorA, suppressed: false)
+            let otherSensor = addChartReading(core, at: date, raw: 130, processed: 160,
+                                              sensor: sensorB, suppressed: false)
+            let suppressed = addChartReading(core, at: date, raw: 150, processed: 180,
+                                             sensor: sensorA, suppressed: true)
+            XCTAssertTrue(core.saveChangesSynchronously())
+            let chart = GlucoseChartStateManager(coreDataManager: core,
+                nightscoutSyncManager: NightscoutSyncManager(coreDataManager: core, messageHandler: nil),
+                loadMode: mode)
+            let visible = await loadChart(chart, start: start, end: end)
+            XCTAssertEqual(visible.bgReadingValues.count, 2)
+            XCTAssertEqual(Set(visible.bgReadingValues), Set([140, 160]))
+            XCTAssertEqual(visible.bgReadingDates, [date, date])
+            XCTAssertEqual(visible.newestBgReadingDate, date)
+            XCTAssertFalse(visible.newestBgReadingIsValidForDownstream)
+            let original = await loadChart(chart, start: start, end: end, originalsOnly: true)
+            XCTAssertEqual(Set(original.additionalBgReadingDataSets.first?.bgReadingValues ?? []),
+                           Set([120, 130, 150]))
+            XCTAssertEqual(original.additionalBgReadingDataSets.first?.bgReadingValues.count, 3)
+
+            core.mainManagedObjectContext.delete(otherSensor)
+            core.mainManagedObjectContext.delete(suppressed)
+            XCTAssertTrue(core.saveChangesSynchronously())
+            let refreshed = await loadChart(chart, start: start, end: end, refresh: true)
+            XCTAssertEqual(refreshed.bgReadingValues, [140])
+            XCTAssertEqual(refreshed.newestBgReadingSensorID, sensorA.id)
+            XCTAssertTrue(refreshed.newestBgReadingIsValidForDownstream)
+        }
+    }
+
+    /// Refresh must replace both caches after edits, suppression changes, insertion and deletion.
+    @MainActor
+    func testSharedGlucoseLoadRefreshesEditsAndDeletionsInFullAndMiniModes() async {
+        for mode in [GlucoseChartStateManager.LoadMode.fullChart, .miniChart] {
+            let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+            let end = Date().addingTimeInterval(-48 * 3600)
+            let start = end.addingTimeInterval(-3600)
+            let sensor = Sensor(startDate: start, nsManagedObjectContext: core.mainManagedObjectContext)
+            let visible = addChartReading(core, at: end.addingTimeInterval(-120), raw: 120,
+                                          processed: 140, sensor: sensor, suppressed: false)
+            let suppressed = addChartReading(core, at: end.addingTimeInterval(-60), raw: 130,
+                                             processed: 150, sensor: sensor, suppressed: true)
+            XCTAssertTrue(core.saveChangesSynchronously())
+            let chart = GlucoseChartStateManager(coreDataManager: core,
+                nightscoutSyncManager: NightscoutSyncManager(coreDataManager: core, messageHandler: nil),
+                loadMode: mode)
+            let initial = await loadChart(chart, start: start, end: end)
+            XCTAssertEqual(initial.bgReadingValues, [140])
+            visible.calculatedValue = 180
+            visible.smoothedValue = NSNumber(value: 190)
+            suppressed.calculatedValue = 230
+            suppressed.smoothedValue = NSNumber(value: 250)
+            suppressed.isSuppressedByFiveMinuteCadence = false
+            let inserted = addChartReading(core, at: end.addingTimeInterval(-30), raw: 160,
+                                           processed: 170, sensor: sensor, suppressed: true)
+            XCTAssertTrue(core.saveChangesSynchronously())
+            let refreshed = await loadChart(chart, start: start, end: end, refresh: true)
+            XCTAssertEqual(refreshed.bgReadingValues, [190, 250])
+            let originals = await loadChart(chart, start: start, end: end, originalsOnly: true)
+            XCTAssertEqual(originals.additionalBgReadingDataSets.first?.bgReadingValues, [180, 230, 160])
+
+            core.mainManagedObjectContext.delete(visible)
+            core.mainManagedObjectContext.delete(inserted)
+            suppressed.isSuppressedByFiveMinuteCadence = true
+            XCTAssertTrue(core.saveChangesSynchronously())
+            let deleted = await loadChart(chart, start: start, end: end, refresh: true)
+            XCTAssertTrue(deleted.bgReadingValues.isEmpty)
+            XCTAssertNil(deleted.newestBgReadingDate)
+            XCTAssertFalse(deleted.newestBgReadingIsValidForDownstream)
+            let remaining = await loadChart(chart, start: start, end: end, originalsOnly: true)
+            XCTAssertEqual(remaining.additionalBgReadingDataSets.first?.bgReadingValues, [230])
+        }
+    }
+
+    @MainActor
+    private func addChartReading(_ core: CoreDataManager, at date: Date, raw: Double,
+                                 processed: Double, sensor: Sensor?, suppressed: Bool) -> BgReading {
+        let reading = BgReading(timeStamp: date, sensor: sensor, calibration: nil, rawData: raw,
+                                deviceName: "Synthetic chart fixture",
+                                nsManagedObjectContext: core.mainManagedObjectContext)
+        reading.calculatedValue = raw
+        reading.smoothedValue = NSNumber(value: processed)
+        reading.isSuppressedByFiveMinuteCadence = suppressed
+        return reading
+    }
+
+    @MainActor
+    private func loadChart(_ chart: GlucoseChartStateManager, start: Date, end: Date,
+                           originalsOnly: Bool = false, refresh: Bool = false) async -> GlucoseChartState {
+        await withCheckedContinuation { continuation in
+            chart.updateState(endDate: end, startDate: start, refreshCachedData: refresh,
+                              showTreatments: false, showOriginalReadingsOnly: originalsOnly) {
+                continuation.resume(returning: $0)
+            }
+        }
+    }
+
     /// Repeated chart updates must not retain the owner through queued closures or old work items.
     @MainActor
     func testDelayedStateReleasesAfterHeavyRescheduling() {
