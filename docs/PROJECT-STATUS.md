@@ -3,8 +3,8 @@
 
 - Kildecommit og tag: `a173a95a9081df087fdb461dff7a531bbc8fc2b2` / `testflight-7.1.1-4326`.
 - Tests: 1601/1601 bestået; 0 fejlet; 0 skipped. iPhone- og Watch-simulatorbuilds bestod.
-- Apple-status (2026-10-12T10:53:34.573889+00:00): [Apple kræver en konkret handling](https://appstoreconnect.apple.com/apps/6795645396/testflight/ios/801afa9c-c5f1-4667-a0d9-39614bc3d22b).
-- Ole Internal: endnu ikke bekræftet tilknyttet.
+- Apple-status (2026-10-12T10:58:55.932965+00:00): [Internal / Testing](https://appstoreconnect.apple.com/apps/6795645396/testflight/ios/801afa9c-c5f1-4667-a0d9-39614bc3d22b).
+- Eksisterende intern gruppe: Ole Internal er bekræftet tilknyttet.
 - Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
 <!-- testflight-7.1.1-4326:end -->
 
