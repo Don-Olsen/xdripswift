@@ -1,3 +1,15 @@
+<!-- testflight-7.1.1-4327:start -->
+### TestFlight 7.1.1 (4327)
+
+- Kildecommit og tag: `439a43f45617a8fa53815b2c9c42414f966ce7b5` / `testflight-7.1.1-4327`.
+- Tests: 1601/1601 bestået; 0 fejlet; 0 skipped. iPhone- og Watch-simulatorbuilds bestod.
+- Apple-status (2026-10-12T12:36:59.343997+00:00): [Internal / Testing](https://appstoreconnect.apple.com/apps/6795645396/testflight/ios/90c620e7-1681-4b86-93b4-994ba5ac6dcc).
+- Eksisterende intern gruppe: Ole Internal er bekræftet tilknyttet.
+- Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
+<!-- testflight-7.1.1-4327:end -->
+
+De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
+
 ## Home-opdatering ved nye sensormålinger efter 4326 — 12. oktober 2026
 
 I `RootApplicationCoordinator.processNewGlucoseData` er de to umiddelbart
