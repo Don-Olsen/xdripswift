@@ -6,6 +6,170 @@ import XCTest
 /// The query adapter is replaced with synthetic pages. These tests never read or write the
 /// device's Health database, and every imported treatment uses an isolated Core Data store.
 final class HealthKitTherapyImportTests: XCTestCase {
+    private final class ReplacementCountingDefaults: UserDefaults {
+        let queueKey = "syntheticReplacementQueue"
+        private(set) var queueWriteCount = 0
+
+        override func set(_ value: Any?, forKey defaultName: String) {
+            if defaultName == queueKey { queueWriteCount += 1 }
+            super.set(value, forKey: defaultName)
+        }
+    }
+
+    private func replacementDefaults(suiteName: String? = nil) throws -> ReplacementCountingDefaults {
+        let suite = suiteName ?? "HealthKitReplacementPersistence-" + UUID().uuidString
+        let defaults = try XCTUnwrap(ReplacementCountingDefaults(suiteName: suite))
+        addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
+        return defaults
+    }
+
+    private func persistedReplacementQueue(_ defaults: ReplacementCountingDefaults) throws -> HealthKitReplacementQueue {
+        try JSONDecoder().decode(HealthKitReplacementQueue.self,
+            from: XCTUnwrap(defaults.data(forKey: defaults.queueKey)))
+    }
+
+    func testReplacementPersistenceSkipsRepeatedUnchangedDrainAndEnqueue() throws {
+        let defaults = try replacementDefaults()
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        var queue = HealthKitReplacementQueue()
+        var persisted: HealthKitReplacementQueue?
+        queue.enqueue(id: "first", timeStamp: now.addingTimeInterval(-600), value: 100, now: now)
+        queue.enqueue(id: "second", timeStamp: now.addingTimeInterval(-300), value: 120, now: now)
+        queue.persistIfChanged(to: defaults, key: defaults.queueKey, lastPersisted: &persisted)
+        let savedData = try XCTUnwrap(defaults.data(forKey: defaults.queueKey))
+
+        for _ in 0..<20 {
+            queue.prune(at: now)
+            queue.persistIfChanged(to: defaults, key: defaults.queueKey, lastPersisted: &persisted)
+            queue.enqueue(id: "first", timeStamp: now.addingTimeInterval(-600), value: 100, now: now)
+            queue.persistIfChanged(to: defaults, key: defaults.queueKey, lastPersisted: &persisted)
+        }
+        XCTAssertEqual(defaults.queueWriteCount, 1)
+        XCTAssertEqual(defaults.data(forKey: defaults.queueKey), savedData)
+        XCTAssertEqual(try persistedReplacementQueue(defaults), queue)
+        XCTAssertEqual(persisted, queue)
+    }
+
+    func testReplacementPersistenceKeepsNewRevisionDuringOlderConfirmation() throws {
+        let defaults = try replacementDefaults()
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        var queue = HealthKitReplacementQueue()
+        var persisted: HealthKitReplacementQueue?
+        queue.enqueue(id: "changed", timeStamp: now, value: 100, now: now)
+        let old = try XCTUnwrap(queue.entries.first)
+        queue.persistIfChanged(to: defaults, key: defaults.queueKey, lastPersisted: &persisted)
+        queue.enqueue(id: "changed", timeStamp: now, value: 110, now: now)
+        let current = try XCTUnwrap(queue.entries.first)
+        XCTAssertEqual(queue.entries.count, 1)
+        XCTAssertGreaterThan(current.revision, old.revision)
+        queue.persistIfChanged(to: defaults, key: defaults.queueKey, lastPersisted: &persisted)
+        XCTAssertEqual(defaults.queueWriteCount, 2, "The same ID and count can contain changed values/revisions")
+        XCTAssertEqual(try persistedReplacementQueue(defaults).entries, [current])
+
+        queue.confirm(old)
+        queue.persistIfChanged(to: defaults, key: defaults.queueKey, lastPersisted: &persisted)
+        XCTAssertEqual(defaults.queueWriteCount, 2)
+        XCTAssertEqual(try persistedReplacementQueue(defaults).entries, [current])
+        queue.confirm(current)
+        queue.persistIfChanged(to: defaults, key: defaults.queueKey, lastPersisted: &persisted)
+        XCTAssertEqual(defaults.queueWriteCount, 3)
+        let restarted = try persistedReplacementQueue(defaults)
+        XCTAssertTrue(restarted.entries.isEmpty, "A successful confirmation must remain removed after decoding")
+        XCTAssertEqual(restarted.lastRevision, current.revision)
+    }
+
+    func testReplacementPersistenceIncludesRevisionEvenWhenQueueRemainsEmpty() throws {
+        let defaults = try replacementDefaults()
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        var queue = HealthKitReplacementQueue()
+        var persisted: HealthKitReplacementQueue?
+        XCTAssertNil(defaults.data(forKey: defaults.queueKey))
+        queue.persistIfChanged(to: defaults, key: defaults.queueKey, lastPersisted: &persisted)
+        XCTAssertEqual(defaults.queueWriteCount, 1, "A previously unpersisted empty queue is stored once")
+        XCTAssertEqual(try persistedReplacementQueue(defaults), queue)
+        let firstRevision = queue.lastRevision
+        queue.enqueue(id: "confirmed", timeStamp: now, value: 100, now: now)
+        queue.confirm(try XCTUnwrap(queue.entries.first))
+        XCTAssertTrue(queue.entries.isEmpty)
+        XCTAssertGreaterThan(queue.lastRevision, firstRevision)
+        queue.persistIfChanged(to: defaults, key: defaults.queueKey, lastPersisted: &persisted)
+        queue.persistIfChanged(to: defaults, key: defaults.queueKey, lastPersisted: &persisted)
+        XCTAssertEqual(defaults.queueWriteCount, 2)
+        XCTAssertEqual(try persistedReplacementQueue(defaults), queue)
+    }
+
+    func testReplacementPersistenceRestartKeepsPendingEntriesWithoutExtraWrite() throws {
+        let suite = "HealthKitReplacementRestart-" + UUID().uuidString
+        let defaults = try replacementDefaults(suiteName: suite)
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        var queue = HealthKitReplacementQueue()
+        var persisted: HealthKitReplacementQueue?
+        queue.enqueue(id: "pending", timeStamp: now.addingTimeInterval(-60), value: 100, now: now)
+        queue.persistIfChanged(to: defaults, key: defaults.queueKey, lastPersisted: &persisted)
+
+        let savedData = try XCTUnwrap(defaults.data(forKey: defaults.queueKey))
+        let reopenedDefaults = try replacementDefaults(suiteName: suite)
+        var restarted = try persistedReplacementQueue(reopenedDefaults)
+        var restoredPersistence: HealthKitReplacementQueue? = restarted
+        restarted.prune(at: now)
+        restarted.persistIfChanged(to: reopenedDefaults, key: reopenedDefaults.queueKey,
+            lastPersisted: &restoredPersistence)
+        XCTAssertEqual(reopenedDefaults.queueWriteCount, 0)
+        XCTAssertEqual(reopenedDefaults.data(forKey: reopenedDefaults.queueKey), savedData)
+        XCTAssertEqual(restarted, queue)
+        XCTAssertEqual(try persistedReplacementQueue(reopenedDefaults), queue)
+        restarted.confirm(try XCTUnwrap(restarted.entries.first))
+        restarted.persistIfChanged(to: reopenedDefaults, key: reopenedDefaults.queueKey,
+            lastPersisted: &restoredPersistence)
+        XCTAssertEqual(reopenedDefaults.queueWriteCount, 1)
+        XCTAssertTrue(try persistedReplacementQueue(reopenedDefaults).entries.isEmpty)
+    }
+
+    func testReplacementPersistenceStoresPruningButRetainsSevenDayBoundary() throws {
+        let defaults = try replacementDefaults()
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        var queue = HealthKitReplacementQueue()
+        var persisted: HealthKitReplacementQueue?
+        queue.enqueue(id: "expires", timeStamp: now, value: 100, now: now)
+        queue.enqueue(id: "boundary", timeStamp: now.addingTimeInterval(60), value: 120, now: now)
+        queue.persistIfChanged(to: defaults, key: defaults.queueKey, lastPersisted: &persisted)
+        let later = now.addingTimeInterval(7 * 24 * 3600 + 60)
+        queue.prune(at: later)
+        queue.persistIfChanged(to: defaults, key: defaults.queueKey, lastPersisted: &persisted)
+        queue.prune(at: later)
+        queue.persistIfChanged(to: defaults, key: defaults.queueKey, lastPersisted: &persisted)
+        XCTAssertEqual(defaults.queueWriteCount, 2)
+        XCTAssertEqual(try persistedReplacementQueue(defaults).entries.map(\.id), ["boundary"])
+        XCTAssertEqual(try persistedReplacementQueue(defaults).lastRevision, queue.lastRevision)
+    }
+
+    func testReplacementPersistenceEncodingFailurePreservesReceiptAndCanRetry() throws {
+        let defaults = try replacementDefaults()
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        var queue = HealthKitReplacementQueue()
+        var persisted: HealthKitReplacementQueue?
+        queue.enqueue(id: "pending", timeStamp: now, value: 100, now: now)
+        queue.persistIfChanged(to: defaults, key: defaults.queueKey, lastPersisted: &persisted)
+        let previousQueue = persisted
+        let previousData = defaults.data(forKey: defaults.queueKey)
+        // A synthetic malformed date makes the real JSON encoder fail without changing
+        // production serialization or accessing HealthKit. It is never device health data.
+        queue.enqueue(id: "unencodable", timeStamp: Date(timeIntervalSinceReferenceDate: .infinity),
+            value: 100, now: now)
+        XCTAssertThrowsError(try JSONEncoder().encode(queue))
+        queue.persistIfChanged(to: defaults, key: defaults.queueKey, lastPersisted: &persisted)
+        XCTAssertEqual(defaults.queueWriteCount, 1)
+        XCTAssertEqual(persisted, previousQueue, "A failed encode must not claim the new queue was stored")
+        XCTAssertEqual(defaults.data(forKey: defaults.queueKey), previousData)
+
+        queue.remove(ids: ["unencodable"])
+        queue.enqueue(id: "pending", timeStamp: now, value: 110, now: now)
+        queue.persistIfChanged(to: defaults, key: defaults.queueKey, lastPersisted: &persisted)
+        XCTAssertEqual(defaults.queueWriteCount, 2)
+        XCTAssertEqual(persisted, queue)
+        XCTAssertEqual(try persistedReplacementQueue(defaults), queue)
+    }
+
     func testGlucoseStatusScanCoalescesRequestsAndRejectsChangedExportInputs() {
         let checkpoint = Date(timeIntervalSince1970: 1_800_000_000)
         let initial = HealthKitGlucoseStatusScan.Input(checkpoint: checkpoint,

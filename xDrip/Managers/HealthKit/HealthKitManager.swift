@@ -184,7 +184,7 @@ struct HealthKitExportReading: Codable, Equatable {
 
 /// Pending historical/recalculated values survive restart. Their sync revision is assigned
 /// once, so retries update one HealthKit object rather than creating another object.
-struct HealthKitReplacementQueue: Codable {
+struct HealthKitReplacementQueue: Codable, Equatable {
     private(set) var entries: [HealthKitExportReading] = []
     private(set) var lastRevision: Int64 = 1
 
@@ -211,6 +211,16 @@ struct HealthKitReplacementQueue: Codable {
 
     mutating func prune(at now: Date) {
         entries.removeAll { now.timeIntervalSince($0.timeStamp) > 7 * 24 * 3600 }
+    }
+
+    /// Drain/retry callbacks often revisit an unchanged queue. Avoid re-encoding it and
+    /// notifying UserDefaults observers until either its entries or revision changes.
+    /// Remember only an encoded value passed to UserDefaults; encoding failure stays retryable.
+    func persistIfChanged(to defaults: UserDefaults, key: String,
+                          lastPersisted: inout HealthKitReplacementQueue?) {
+        guard self != lastPersisted, let data = try? JSONEncoder().encode(self) else { return }
+        defaults.set(data, forKey: key)
+        lastPersisted = self
     }
 }
 
@@ -420,6 +430,7 @@ public class HealthKitManager: NSObject {
     private var replacementRetryWorkItem: DispatchWorkItem?
     private var replacementInFlight = false
     private var replacementQueue = HealthKitReplacementQueue()
+    private var lastPersistedReplacementQueue: HealthKitReplacementQueue?
     private let replacementQueueKey = "healthKitPendingReplacements.v1"
     private let glucosePageSize = 256
     private var lastGlucoseStatusScan: Date?
@@ -443,6 +454,7 @@ public class HealthKitManager: NSObject {
         if let data = UserDefaults.standard.data(forKey: replacementQueueKey),
            let stored = try? JSONDecoder().decode(HealthKitReplacementQueue.self, from: data) {
             replacementQueue = stored
+            lastPersistedReplacementQueue = stored
         }
 
         uploadState.synchronizeLatestStoredTimeStamp(
@@ -728,9 +740,8 @@ public class HealthKitManager: NSObject {
     }
 
     private func persistHealthKitReplacements() {
-        if let data = try? JSONEncoder().encode(replacementQueue) {
-            UserDefaults.standard.set(data, forKey: replacementQueueKey)
-        }
+        replacementQueue.persistIfChanged(to: .standard, key: replacementQueueKey,
+                                          lastPersisted: &lastPersistedReplacementQueue)
     }
 
     private func drainHealthKitReplacements() {

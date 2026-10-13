@@ -1,3 +1,58 @@
+## Sundhed-eksport: undgå uændret kølagring efter 4328 — 13. oktober 2026
+
+Den korte fysiske profil på 4327 (beskrevet nedenfor) pegede især på
+Sundhed-eksportens callbacks og databasearbejde. En efterfølgende kodegennemgang
+fandt, at `drainHealthKitReplacements` koder og skriver den samme kø før sine
+guards og igen efter genkontrol af den aktuelle post, selv når intet ændres.
+Et færdigt callback kan desuden kalde drain både direkte og via
+`storeBgReadings`. Det andet drain foretager ikke en ekstra rettelse, men
+foretog stadig den uændrede kølagring før sin in-flight-guard.
+
+Den afgrænsede rettelse sammenligner hele køværdien med den senest indlæste
+eller kodede og overgivne værdi til UserDefaults før JSON-kodning/skrivning.
+Sammenligningen inkluderer posternes værdier, tidspunkter og revisioner samt
+`lastRevision`, også når køen er tom. En kodningsfejl flytter ikke den huskede
+værdi, så næste forsøg ikke springes over. UserDefaults giver ingen selvstændig
+kvittering for fysisk diskpersistens; denne eksisterende lagringsmekanisme er
+uændret. Ved genstart bruges den faktisk dekodede kø som sammenligningsgrundlag.
+
+Alle eksisterende kald til kølagring, køændringer, checkpoints, eksport-
+rækkefølge, rettelser, sletninger og genforsøg er bevaret. Der tilføjes ingen
+ny sletning af gamle Sundhed-prøver. Ingen ændring af øvrige datakilder,
+dosering, prognose/ML, alarmer eller Watch/Libre. Køens format er
+uændret. Kun overflødig JSON-kodning og UserDefaults-skrivning undgås; en
+hastigheds- eller batterigevinst er ikke fysisk eftermålt. Den oprindelige
+profil må ikke tolkes som bevis for, at netop kølagringen var den største
+flaskehals; snapshotlæsning i eksporten er fortsat et særskilt muligt fokus.
+
+Faktisk lokal validering på ændringen:
+- `scripts/local-build.sh test-all`: **1.610/1.610 XCTest**, 0 fejl og 0 skipped.
+  Seks nye tests bruger den rigtige persistensfunktion, isolerede UserDefaults
+  og rigtig JSON-kodning. De kontrollerer antal skrivninger og identiske bytes
+  ved gentagelse, genindlæsning, ændrede værdier/revisioner med samme post-ID,
+  gammel kvittering efter ny revision, bekræftet fjernelse, tom kø med ændret
+  revisionsnummer, 7-dagesgrænsen og kodningsfejl med senere vellykket forsøg.
+  Genstart testes som ny defaults-instans og dekodning, ikke fysisk appdrab.
+- Resultatkvitteringen og alle otte krævede Watch-/Libre-/Home-suiter er
+  kontrolleret med `record-watch-test-results.py --include-verify-only`.
+- `scripts/local-build.sh python` og begge simulatorbuilds via
+  `scripts/local-build.sh build` bestod; `git diff --check` bestod.
+- Kode og tests er gennemgået uafhængigt. Kørslen har fortsat runtime-advarsler
+  om frame-dimensioner, publicering under view-opdatering og QoS-ventetid;
+  beståede tests er ikke dokumentation for, at disse er løst.
+
+Kvitteringer ligger uden for Git i `~/DeveloperBuildData/xDrip/local-runs/xdripswift/`:
+Python `20261013T172828Z-83429`, simulatorbuilds `20261013T173023Z-86046`,
+XCTest og `results/stability-summary.json` `20261013T173133Z-86299`.
+Testens sourceCommit er den uændrede baseline `652fe5d0`; de lokale kilde-/
+testændringer er med i selve testbygningen, men er endnu ikke et release-checkpoint.
+Ingen fysisk HealthKit-skrivning, genstartstest på iPhone, lokal installation
+eller før/efter-måling er udført for denne ændring. Den lokale forvalidering
+ændrede ikke version og udførte ikke push eller upload. Den nu autoriserede
+release gentester det nummererede checkpoint; resultater og Apple-status
+registreres særskilt i releasejournalen. Efter udgivelse bør faktisk køafvikling,
+genstart og Home under Sundhed-eksport kontrolleres på telefonen.
+
 <!-- testflight-7.1.1-4328:start -->
 ### TestFlight 7.1.1 (4328)
 
