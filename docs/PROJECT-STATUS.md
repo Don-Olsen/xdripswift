@@ -8,6 +8,20 @@
 - Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
 <!-- testflight-7.1.1-4329:end -->
 
+**Releaseproces ved 4329:** Apples buildliste returnerede først `VALID` og
+`INTERNAL_ONLY` med manglende inkluderet beta-detalje. Proceduren registrerede
+derfor foreløbigt `action-required`. Et læsende opslag på Apples offentlige
+`/v1/builds/<id>/buildBetaDetail` bekræftede den samme konkrete buildidentitet
+og `IN_BETA_TESTING`; den eksisterende gruppemetode bekræftede den faktiske
+relation til Ole Internal. Den endelige status ovenfor blev registreret med
+samme statusvalidering, checkpoint og uændret tag. Ingen ny upload eller
+compliance-erklæring blev udført. Tekniske API-kvitteringer ligger uden for
+Git i `build/testflight-7.1.1-4329/apple-beta-detail-confirmation.json`.
+Det manglende felt i listeopslaget er fortsat en kendt releaseprocesfejl.
+Automatisk cacheoprydning stoppede på samme listeopslag; den blev ikke
+omgået. Dette ændrer ikke Apples bekræftede Internal / Testing-status.
+
+
 De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
 
 ## Sundhed-eksport: undgå uændret kølagring efter 4328 — 13. oktober 2026
