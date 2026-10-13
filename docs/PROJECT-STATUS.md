@@ -1,3 +1,53 @@
+## Afgrænset Home-opdatering efter 4327 — 13. oktober 2026
+
+`processNewGlucoseData` bad efter den umiddelbare Home-opdatering både
+statistik og datakildestatus om hver sin fulde genopbygning. Statistik
+publicerer allerede sin indlæsningsstatus og sine resultater særskilt.
+Det nye, som standard aktive `refreshHomeState`-flag slås kun fra ved
+statistikkaldet i netop denne målingssekvens. Dermed fjernes én fuld,
+synkron Home-genopbygning i forgrunden. Den første glukosevisning og den
+sidste opdatering efter kildemetadata bevares i samme rækkefølge.
+
+Selvstændige statistik-/indstillingskald beholder fuld opdatering; skjulte
+statistikker, follower-timer og datakildeskift følger de eksisterende regler.
+Ingen kø-/snapshotomlægning eller ændring af dosering, alarmer, prognose/ML,
+HealthKit, Watch/Libre eller Nightscout. Baggrundsgrænsen for statistik er
+uændret. Reduktionen gælder dette ene kald, ikke alle Home-publiceringer i
+hele indlæsningsforløbet.
+
+Indledende `scripts/local-build.sh test-ci`: **669/669 bestået**, 0 fejl og
+0 skipped, inklusive tre nye Home-regressioner. De kontrollerer den faktiske
+statistikmetodes fravalg af fuld refresh ved skjult/synlig statistik, bevaret
+indlæsningsstatus og standardkaldets opdatering af synlighed og kontroller.
+Eksisterende Home-/genvejs-/Watch-/Libre-tests er bevaret. Den syntetiske
+koordinator starter ikke en statistikmanager, så de nye tests tester ikke
+asynkron statistikberegning eller hele sensorindlæsningsforløbet. De
+uændrede resultater og generationskontroller er kildegennemgået. Kvittering:
+`~/DeveloperBuildData/xDrip/local-runs/xdripswift/20261013T170015Z-66453/`.
+Eksisterende frame-, simulator-haptik- og QoS-advarsler ses i testloggen;
+beståede tests gør dem ikke til løste problemer.
+
+Fysisk, læsende kontrol bekræftede iPhone med forventet bundle-ID og
+**7.1.1 (4327)**. En passiv Time Profiler-systemoptagelse varede 46,18 sekunder
+kl. 18.56.29–18.57.15 lokal tid; brugeren udførte Home/faneskift. Den indeholdt
+2.520 rå CPU-samples for xDrip, heraf 1.464 på hovedtråden. Funktionsprofilens
+1.463 hovedtrådssamples blev sammenholdt med den matchende arm64-dSYM
+(UUID AB5280F4-9D88-38BE-A124-D6F47E86B487). De mest hyppige navngivne
+appkald i dette korte forløb vedrørte HealthKit-eksport/erstatningskø og
+snapshotlæsning; fuld Home-refresh fremstod ikke som en dokumenteret tung
+flaskehals. Inklusive samples overlapper og er ikke antal funktionskald.
+Der er ingen målt før/efter-gevinst eller dokumentation for en Bluetooth-årsag.
+En direkte PID-tilknytning lykkedes ikke; systemoptagelsen krævede hverken
+installation, genstart eller ændret data. Rå optagelse og lokale tekniske
+opsummeringer er bevaret uden for Git under
+`~/DeveloperBuildData/xDrip/diagnostics/home-refresh-20261013/`.
+
+Den nye kode er ikke installeret eller fysisk eftermålt. Sundhed-forløbets
+arbejde er et særskilt undersøgelsespunkt og ændres ikke i denne rettelse.
+Releaseproceduren vælger buildnummer via Apple og kører hele XCTest-suiten,
+Python-/Watch-kontroller og begge simulatorbuilds på det præcise checkpoint;
+disse endelige resultater og Apples status registreres i releasejournalen.
+
 <!-- testflight-7.1.1-4327:start -->
 ### TestFlight 7.1.1 (4327)
 

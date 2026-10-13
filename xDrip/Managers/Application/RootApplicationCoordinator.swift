@@ -273,6 +273,10 @@ struct InitialCalibrationRequestGate {
         updateDataSourceInfo()
     }
 
+    func updateStatisticsForTesting(refreshHomeState: Bool = true) {
+        updateStatistics(overrideApplicationState: true, refreshHomeState: refreshHomeState)
+    }
+
     var hasFollowerConnectionTimerForTesting: Bool { followerConnectionTimer != nil }
     #endif
     
@@ -1480,8 +1484,9 @@ struct InitialCalibrationRequestGate {
                     // The full Home refresh includes pump/AID and mini-chart state.
                     updateLabelsAndChart(overrideApplicationState: false)
                     
-                    // update statistics related outlets
-                    updateStatistics(animate: false)
+                    // Statistics publish their own loading/result state. The latest reading was
+                    // just published, and data-source metadata below gets its own full refresh.
+                    updateStatistics(animate: false, refreshHomeState: false)
                     
                     // update data source info
                     updateDataSourceInfo()
@@ -2517,12 +2522,14 @@ struct InitialCalibrationRequestGate {
     /// - Parameters:
     ///   - animate: requests animation where the current statistics presentation supports it
     ///   - overrideApplicationState: if true, it will update the statistics even if the app is, for example, in the background
-    private func updateStatistics(animate: Bool = false, overrideApplicationState: Bool = false) {
+    ///   - refreshHomeState: false only when the caller already refreshes the full Home state
+    private func updateStatistics(animate: Bool = false, overrideApplicationState: Bool = false,
+                                  refreshHomeState: Bool = true) {
         // don't calculate statis if app is not running in the foreground
         guard UIApplication.shared.applicationState == .active || overrideApplicationState else {return}
         
         defer {
-            publishRootHomeState()
+            if refreshHomeState { publishRootHomeState() }
         }
 
         // if the user doesn't want to see the statistics, then just return without doing anything

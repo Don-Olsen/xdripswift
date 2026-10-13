@@ -183,6 +183,92 @@ final class RootHomeInteractionTests: XCTestCase {
     }
 
     @MainActor
+    func testNewReadingStatisticsSkipsFullHomeRefreshWhenStatisticsAreHidden() {
+        withHomeRefreshDefaults {
+            let model = RootHomeStateModel()
+            let coordinator = RootApplicationCoordinator(homeStateModelForTesting: model)
+            model.refresh(activeSensor: nil, isScreenLocked: false, usesScreenLockNightLayout: false)
+            var publications: [RootHomeState] = []
+            let observation = model.$state.dropFirst().sink { publications.append($0) }
+            defer { observation.cancel() }
+
+            UserDefaults.standard.enableSmoothing = true
+            coordinator.updateStatisticsForTesting(refreshHomeState: false)
+            coordinator.updateStatisticsForTesting(refreshHomeState: false)
+
+            XCTAssertTrue(publications.isEmpty,
+                "Hidden statistics must not repeat the full Home refresh already owned by the new-reading caller")
+            XCTAssertFalse(model.state.controls.postProcessingEnabled)
+
+            coordinator.updateDataSourceInfoForTesting()
+            XCTAssertEqual(publications.count, 1,
+                "The following data-source update must still publish current Home state")
+            XCTAssertTrue(model.state.controls.postProcessingEnabled)
+            XCTAssertFalse(model.state.visibility.showsStatistics)
+        }
+    }
+
+    @MainActor
+    func testNewReadingStatisticsStillPublishesLoadingWithoutFullHomeRefresh() {
+        withHomeRefreshDefaults {
+            UserDefaults.standard.showStatistics = true
+            let model = RootHomeStateModel()
+            let coordinator = RootApplicationCoordinator(homeStateModelForTesting: model)
+            model.refresh(activeSensor: nil, isScreenLocked: false, usesScreenLockNightLayout: false)
+            model.updateStatistics(StatisticsManager.Statistics(lowStatisticValue: 0, highStatisticValue: 0,
+                inRangeStatisticValue: 100, averageStatisticValue: 100, gmiPercentage: 5,
+                cVStatisticValue: 0, lowLimitForTIR: 70, highLimitForTIR: 180, numberOfDaysUsed: 1))
+            XCTAssertNotEqual(model.state.statistics.average.value, "-")
+            var publications: [RootHomeState] = []
+            let observation = model.$state.dropFirst().sink { publications.append($0) }
+            defer { observation.cancel() }
+
+            UserDefaults.standard.enableSmoothing = true
+            coordinator.updateStatisticsForTesting(refreshHomeState: false)
+
+            XCTAssertEqual(publications.count, 1,
+                "Statistics loading must publish directly without another complete Home refresh")
+            XCTAssertTrue(model.state.statistics.showsActivityIndicator)
+            XCTAssertEqual(model.state.statistics.average.value, "-")
+            XCTAssertEqual(model.state.statistics.inRange.value, "-")
+            XCTAssertTrue(model.state.visibility.showsStatistics)
+            XCTAssertFalse(model.state.controls.postProcessingEnabled,
+                "The statistics-only publication must not rebuild unrelated Home controls")
+        }
+    }
+
+    @MainActor
+    func testIndependentStatisticsRefreshStillUpdatesVisibilityAndControls() {
+        withHomeRefreshDefaults {
+            let model = RootHomeStateModel()
+            let coordinator = RootApplicationCoordinator(homeStateModelForTesting: model)
+            model.refresh(activeSensor: nil, isScreenLocked: false, usesScreenLockNightLayout: false)
+            var publications: [RootHomeState] = []
+            let observation = model.$state.dropFirst().sink { publications.append($0) }
+            defer { observation.cancel() }
+
+            UserDefaults.standard.showStatistics = true
+            UserDefaults.standard.enableSmoothing = true
+            coordinator.updateStatisticsForTesting()
+
+            XCTAssertEqual(publications.count, 2,
+                "An independent statistics refresh keeps both loading and the full Home publication")
+            XCTAssertEqual(publications.map { $0.visibility.showsStatistics }, [false, true])
+            XCTAssertTrue(model.state.controls.postProcessingEnabled)
+
+            publications.removeAll()
+            UserDefaults.standard.showStatistics = false
+            UserDefaults.standard.enableSmoothing = false
+            coordinator.updateStatisticsForTesting()
+
+            XCTAssertEqual(publications.count, 1,
+                "Hiding statistics must refresh Home even when no statistics calculation is started")
+            XCTAssertFalse(model.state.visibility.showsStatistics)
+            XCTAssertFalse(model.state.controls.postProcessingEnabled)
+        }
+    }
+
+    @MainActor
     private func withHomeRefreshDefaults(_ body: () -> Void) {
         let defaults = UserDefaults.standard
         let keys = [UserDefaults.Key.nightscoutEnabled, .isMaster, .therapyDataSourceType,
