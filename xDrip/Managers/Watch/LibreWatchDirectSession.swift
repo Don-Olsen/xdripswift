@@ -112,6 +112,46 @@ struct WatchBolusOperation: Codable, Equatable, Identifiable {
     }
 }
 
+/// Presentation only: finish a submitted Watch draft after its exact operation is durably
+/// queued. Phone receipts can update this receipt, never the next editable draft.
+struct WatchBolusLogCompletion: Equatable {
+    let operation: WatchBolusOperation
+    private(set) var isStoredOnPhone = false
+
+    static func finish(didStore: Bool, at recordedAt: Date,
+                       previouslyPendingIDs: Set<UUID>, pending: [WatchBolusOperation],
+                       submitted: (carbs: Double, insulin: Double, meal: String),
+                       carbohydrateGrams: inout Double, insulinUnits: inout Double,
+                       mealKindRaw: String) -> Self? {
+        guard didStore else { return nil }
+        let candidates = pending.filter {
+            !previouslyPendingIDs.contains($0.id) && $0.recordedAt == recordedAt &&
+                $0.carbohydrateGrams == submitted.carbs && $0.insulinUnits == submitted.insulin &&
+                $0.mealKindRaw == submitted.meal
+        }
+        guard candidates.count == 1, let operation = candidates.first else { return nil }
+        // The frozen confirmation may differ from input edited behind the dialog.
+        // Always show the exact stored operation, but finish only its unchanged draft.
+        if carbohydrateGrams == submitted.carbs, insulinUnits == submitted.insulin,
+           mealKindRaw == submitted.meal {
+            carbohydrateGrams = 0
+            insulinUnits = 0
+        }
+        return Self(operation: operation)
+    }
+
+    mutating func acceptPhoneConfirmation(_ confirmed: WatchBolusOperation?) {
+        if confirmed == operation { isStoredOnPhone = true }
+    }
+
+    var amountText: String {
+        let food = operation.carbohydrateGrams > 0 ? "\(operation.carbohydrateGrams.formatted()) g" : nil
+        let insulin = operation.insulinUnits > 0 ? "\(operation.insulinUnits.formatted()) E" : nil
+        if let food, let insulin { return "\(food) og \(insulin)" }
+        return food ?? insulin ?? ""
+    }
+}
+
 struct WatchPenLogReceipt {
     let id: UUID
     let stored: Bool

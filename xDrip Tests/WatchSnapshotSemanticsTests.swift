@@ -308,3 +308,126 @@ final class WatchTreatmentQueueRecoveryTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: url), conflictingFile)
     }
 }
+
+
+final class WatchBolusLogCompletionTests: XCTestCase {
+    private let when = Date(timeIntervalSince1970: 1_800_000_000)
+
+    private func operation(carbs: Double = 30, insulin: Double = 2.5,
+                           at date: Date? = nil) -> WatchBolusOperation {
+        WatchBolusOperation(operationID: UUID(), insulinID: UUID(), carbsID: UUID(),
+            recordedAt: date ?? when, insulinUnits: insulin, carbohydrateGrams: carbs,
+            mealKindRaw: "normal", pizzaReminderRequested: false,
+            manualWithoutCurrentSuggestion: true, penStepUnits: 0.5,
+            maximumUnits: 25, profileSignature: "synthetic-profile")
+    }
+
+    func testDurableSuccessFinishesExactCombinedDraftAndRetainsReceipt() throws {
+        let prior = operation()
+        let submitted = operation()
+        var carbs = 30.0, insulin = 2.5
+        let receipt = try XCTUnwrap(WatchBolusLogCompletion.finish(didStore: true, at: when,
+            previouslyPendingIDs: [prior.id], pending: [prior, submitted],
+            submitted: (30, 2.5, "normal"), carbohydrateGrams: &carbs, insulinUnits: &insulin, mealKindRaw: "normal"))
+        XCTAssertEqual(carbs, 0)
+        XCTAssertEqual(insulin, 0)
+        XCTAssertEqual(receipt.operation, submitted)
+        XCTAssertEqual(receipt.operation.recordedAt, when)
+        XCTAssertFalse(receipt.isStoredOnPhone, "Durable Watch storage is not an iPhone receipt")
+        XCTAssertTrue(receipt.amountText.contains("30 g"))
+        XCTAssertTrue(receipt.amountText.contains(" E"))
+    }
+
+    func testCarbohydrateOnlyAndInsulinOnlyDraftsFinishWithoutInventingOtherQuantity() throws {
+        for (carbsValue, insulinValue) in [(30.0, 0.0), (0.0, 2.5)] {
+            let submitted = operation(carbs: carbsValue, insulin: insulinValue)
+            var carbs = carbsValue, insulin = insulinValue
+            let receipt = try XCTUnwrap(WatchBolusLogCompletion.finish(didStore: true, at: when,
+                previouslyPendingIDs: [], pending: [submitted],
+                submitted: (carbsValue, insulinValue, "normal"),
+                carbohydrateGrams: &carbs, insulinUnits: &insulin, mealKindRaw: "normal"))
+            XCTAssertEqual(carbs, 0)
+            XCTAssertEqual(insulin, 0)
+            XCTAssertFalse(receipt.amountText.contains(" og "))
+            XCTAssertEqual(receipt.operation.carbohydrateGrams, carbsValue)
+            XCTAssertEqual(receipt.operation.insulinUnits, insulinValue)
+        }
+    }
+
+    func testFailedOrUncertainWritePreservesDraftEvenIfOperationAppearsInRecoveredQueue() {
+        for pending in [[], [operation()]] {
+            var carbs = 30.0, insulin = 2.5
+            XCTAssertNil(WatchBolusLogCompletion.finish(didStore: false, at: when,
+                previouslyPendingIDs: [], pending: pending,
+                submitted: (30, 2.5, "normal"), carbohydrateGrams: &carbs, insulinUnits: &insulin, mealKindRaw: "normal"))
+            XCTAssertEqual(carbs, 30)
+            XCTAssertEqual(insulin, 2.5)
+        }
+    }
+
+    func testSynchronousVerifiedRecoveryUsesActualFrozenOperation() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WatchBolusCompletion-\(UUID())", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent("queue.json")
+        let prior = operation(at: when.addingTimeInterval(-60))
+        let submitted = operation()
+        // Atomic append landed before a final write check failed. The production queue
+        // recovers the same IDs and content, and the UI receives a verified true result.
+        try WatchManualTreatmentQueue.persistBolusOperations([prior, submitted], to: url)
+        let recovered = try WatchManualTreatmentQueue.recover(manualTreatments: [],
+            bolusOperations: [prior, submitted], from: url)
+        var carbs = 30.0, insulin = 2.5
+        let receipt = try XCTUnwrap(WatchBolusLogCompletion.finish(didStore: true, at: when,
+            previouslyPendingIDs: [prior.id], pending: recovered.bolusOperations,
+            submitted: (30, 2.5, "normal"), carbohydrateGrams: &carbs, insulinUnits: &insulin, mealKindRaw: "normal"))
+        XCTAssertEqual(receipt.operation, submitted)
+        XCTAssertEqual(carbs, 0)
+        XCTAssertEqual(insulin, 0)
+        XCTAssertEqual(try WatchManualTreatmentQueue.loadBolusOperations(from: url), [prior, submitted])
+    }
+
+    func testOldSameAmountsWrongTimeAndAmbiguousOperationsNeverFinishDraft() {
+        let prior = operation()
+        let differentTime = operation(at: when.addingTimeInterval(-60))
+        for (ids, pending) in [(Set([prior.id]), [prior]), (Set<UUID>(), [differentTime]),
+                               (Set<UUID>(), [operation(), operation()]), (Set<UUID>(), [])] {
+            var carbs = 30.0, insulin = 2.5
+            XCTAssertNil(WatchBolusLogCompletion.finish(didStore: true, at: when,
+                previouslyPendingIDs: ids, pending: pending,
+                submitted: (30, 2.5, "normal"), carbohydrateGrams: &carbs, insulinUnits: &insulin, mealKindRaw: "normal"))
+            XCTAssertEqual(carbs, 30)
+            XCTAssertEqual(insulin, 2.5)
+        }
+    }
+
+    func testChangedDraftKeepsItsInputsButGetsTheExactStoredConfirmation() throws {
+        let submitted = operation()
+        var carbs = 40.0, insulin = 3.0
+        let receipt = try XCTUnwrap(WatchBolusLogCompletion.finish(didStore: true, at: when,
+            previouslyPendingIDs: [], pending: [submitted],
+            submitted: (30, 2.5, "normal"), carbohydrateGrams: &carbs, insulinUnits: &insulin, mealKindRaw: "slow"))
+        XCTAssertEqual(receipt.operation, submitted)
+        XCTAssertEqual(carbs, 40)
+        XCTAssertEqual(insulin, 3)
+    }
+
+    func testDelayedReceiptOnlyConfirmsExactOperationAndLeavesNewDraftAlone() throws {
+        let submitted = operation()
+        var carbs = 30.0, insulin = 2.5
+        var receipt = try XCTUnwrap(WatchBolusLogCompletion.finish(didStore: true, at: when,
+            previouslyPendingIDs: [], pending: [submitted],
+            submitted: (30, 2.5, "normal"), carbohydrateGrams: &carbs, insulinUnits: &insulin, mealKindRaw: "normal"))
+        carbs = 45; insulin = 4
+        receipt.acceptPhoneConfirmation(operation()) // same amounts, different identity
+        XCTAssertFalse(receipt.isStoredOnPhone)
+        receipt.acceptPhoneConfirmation(submitted)
+        XCTAssertTrue(receipt.isStoredOnPhone)
+        receipt.acceptPhoneConfirmation(operation()) // a later receipt does not undo this one
+        XCTAssertTrue(receipt.isStoredOnPhone)
+        XCTAssertEqual(receipt.operation, submitted)
+        XCTAssertEqual(carbs, 45)
+        XCTAssertEqual(insulin, 4)
+    }
+}

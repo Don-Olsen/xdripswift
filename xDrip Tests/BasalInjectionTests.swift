@@ -8,6 +8,7 @@
 
 import XCTest
 import UIKit
+import SwiftUI
 import UserNotifications
 @testable import xdrip
 
@@ -1924,5 +1925,187 @@ private final class BasalInjectionTestURLProtocol: URLProtocol {
         XCTAssertFalse(WatchPenPhoneService.durablyStoredWatchReading(payloadID,
             sensorID: sensor.id, coreDataManager: core),
             "A persisted reading that fails downstream validation is not confirmed")
+    }
+}
+
+
+/// Exercises the production UUID loader and pending-request delivery, rather than a copy of
+/// its age/status rules. The hosting regression also runs the actual Treatments sheets.
+final class MealReminderNavigationTests: XCTestCase {
+    @MainActor private func meal(_ core: CoreDataManager, age: TimeInterval = 4 * 60 * 60,
+                                 state: TreatmentMealState = .confirmed) -> TreatmentEntry {
+        let entry = TreatmentEntry(date: Date().addingTimeInterval(-age), value: 45,
+            treatmentType: .Carbs, nightscoutEventType: nil, enteredBy: "Synthetic reminder test",
+            nsManagedObjectContext: core.mainManagedObjectContext)
+        entry.localTreatmentUUID = UUID().uuidString
+        entry.mealKindRaw = TreatmentMealKind.slow.rawValue
+        entry.plannedMealStateRaw = state.rawValue
+        // Match the persisted identity used by the editor. A child-context save alone
+        // can leave the test's original object with a temporary ID after parent commit.
+        XCTAssertNoThrow(try core.mainManagedObjectContext.obtainPermanentIDs(for: [entry]))
+        XCTAssertTrue(core.saveChangesSynchronously())
+        return entry
+    }
+
+    @MainActor func testFourHourAndDelayedPizzaTapsResolveExactPersistedUUID() throws {
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        for age in [4 * 60 * 60, 4 * 60 * 60 + 1, 7 * 24 * 60 * 60] as [TimeInterval] {
+            let entry = meal(core, age: age)
+            let uuid = try XCTUnwrap(entry.localTreatmentUUID)
+            guard case .pizza(let actual) = MealPlanReminderCoordinator.openDestination(
+                coreDataManager: core, uuid: uuid, pizza: true) else {
+                return XCTFail("A valid persisted meal must survive a delayed reminder tap")
+            }
+            XCTAssertEqual(actual, uuid)
+        }
+        XCTAssertEqual(TreatmentEntryAccessor(coreDataManager: core).getLatestTreatments(howOld: nil).count, 3,
+                       "Resolving a reminder never logs another treatment")
+    }
+
+    @MainActor func testPlannedMealUsesStoredIdentityAndPreservesActualDateAndAmount() throws {
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let entry = meal(core, age: 2 * 24 * 60 * 60, state: .planned)
+        guard case .plannedMeal(let snapshot) = MealPlanReminderCoordinator.openDestination(
+            coreDataManager: core, uuid: try XCTUnwrap(entry.localTreatmentUUID), pizza: false) else {
+            return XCTFail("An overdue plan still requires the existing confirmation editor")
+        }
+        XCTAssertEqual(snapshot.objectID, entry.objectID)
+        XCTAssertFalse(snapshot.objectID.isTemporaryID)
+        let editorEntry = try XCTUnwrap(TreatmentEntryAccessor(coreDataManager: core)
+            .getTreatment(objectID: snapshot.objectID))
+        XCTAssertEqual(editorEntry.localTreatmentUUID, entry.localTreatmentUUID)
+        XCTAssertEqual(snapshot.date, entry.date)
+        XCTAssertEqual(snapshot.rawValue, 45)
+        XCTAssertTrue(snapshot.isPlannedMeal)
+        XCTAssertTrue(entry.isPlannedMeal, "Opening does not confirm eating")
+    }
+
+    @MainActor func testDeletedCancelledAndChangedMealsGiveNoticeWithoutReopening() throws {
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let entry = meal(core)
+        let uuid = try XCTUnwrap(entry.localTreatmentUUID)
+        for state in [TreatmentMealState.planned, .cancelled] {
+            entry.plannedMealStateRaw = state.rawValue
+            XCTAssertTrue(core.saveChangesSynchronously())
+            guard case .notice = MealPlanReminderCoordinator.openDestination(
+                coreDataManager: core, uuid: uuid, pizza: true) else {
+                return XCTFail("An old pizza notification must not reopen a changed meal")
+            }
+        }
+        entry.treatmentdeleted = true
+        XCTAssertTrue(core.saveChangesSynchronously())
+        for pizza in [false, true] {
+            guard case .notice(let message) = MealPlanReminderCoordinator.openDestination(
+                coreDataManager: core, uuid: uuid, pizza: pizza) else { return XCTFail("Deleted meal reopened") }
+            XCTAssertTrue(message.contains("slettet"))
+        }
+    }
+
+    @MainActor func testUnavailableStoreKeepsPendingRequestDistinctFromDeletedMeal() throws {
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let entry = meal(core)
+        let uuid = try XCTUnwrap(entry.localTreatmentUUID)
+        try core.disconnectPersistentStoresForTesting()
+        var consumed = false
+        var reportedUnavailable = false
+        XCTAssertTrue(MealPlanReminderCoordinator.deliverOpenRequest(coreDataManager: core,
+            uuid: uuid, pizza: true, canPresent: true, present: {
+                if case .unavailable = $0 { reportedUnavailable = true }
+            }, consume: { _ in consumed = true }))
+        XCTAssertTrue(reportedUnavailable)
+        XCTAssertFalse(consumed)
+    }
+
+    @MainActor func testBlockedPresentationRetainsRequestAndRealSheetAwaitsAppearance() throws {
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let entry = meal(core)
+        let uuid = try XCTUnwrap(entry.localTreatmentUUID)
+        var presentations = 0
+        var consumed = false
+        for _ in 0..<3 {
+            XCTAssertFalse(MealPlanReminderCoordinator.deliverOpenRequest(coreDataManager: core,
+                uuid: uuid, pizza: true, canPresent: false,
+                present: { _ in presentations += 1 }, consume: { _ in consumed = true }))
+        }
+        XCTAssertEqual(presentations, 0)
+        XCTAssertFalse(consumed)
+        XCTAssertTrue(MealPlanReminderCoordinator.deliverOpenRequest(coreDataManager: core,
+            uuid: uuid, pizza: true, canPresent: true,
+            present: { _ in presentations += 1 }, consume: { _ in consumed = true }))
+        XCTAssertEqual(presentations, 1)
+        XCTAssertFalse(consumed, "Only actual sheet appearance acknowledges an opening request")
+        XCTAssertEqual(TreatmentEntryAccessor(coreDataManager: core).getLatestTreatments(howOld: nil).count, 1)
+    }
+
+    @MainActor func testOldPresentationAcknowledgementCannotConsumeNewerMealRequest() {
+        let defaults = UserDefaults.standard
+        let key = "pizzaSplitPendingOpenUUID"
+        let saved = defaults.object(forKey: key)
+        defer {
+            if let saved { defaults.set(saved, forKey: key) }
+            else { defaults.removeObject(forKey: key) }
+        }
+        let older = UUID().uuidString
+        let newer = UUID().uuidString
+        defaults.set(newer, forKey: key)
+        PizzaSplitReminder.clearPendingOpenUUID(older)
+        XCTAssertEqual(PizzaSplitReminder.pendingOpenUUID, newer)
+        PizzaSplitReminder.clearPendingOpenUUID(newer)
+        XCTAssertNil(PizzaSplitReminder.pendingOpenUUID)
+    }
+
+    @MainActor func testActualTreatmentsSheetOpensDelayedPizzaOnceAndPreservesOpenSheet() async throws {
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let entry = meal(core, age: 4 * 60 * 60 + 30)
+        let uuid = try XCTUnwrap(entry.localTreatmentUUID)
+        let defaults = UserDefaults.standard
+        let keys = ["pizzaSplitPendingOpenUUID", "plannedMealPendingOpenUUID"]
+        let saved = keys.map { ($0, defaults.object(forKey: $0)) }
+        keys.forEach { defaults.removeObject(forKey: $0) }
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+            .first { $0.activationState == .foregroundActive })
+        let previousWindow = scene.windows.first { $0.isKeyWindow }
+        let window = UIWindow(windowScene: scene)
+        let host = UIHostingController(rootView: TreatmentsView(coreDataManager: core)
+            .environment(\.scenePhase, .active))
+        window.rootViewController = host
+        window.makeKeyAndVisible()
+        defer {
+            host.dismiss(animated: false)
+            window.isHidden = true
+            previousWindow?.makeKeyAndVisible()
+            for (key, value) in saved {
+                if let value { defaults.set(value, forKey: key) }
+                else { defaults.removeObject(forKey: key) }
+            }
+            PlannedMealReminder.cancel(uuid: uuid)
+            PizzaSplitReminder.cancel(uuid: uuid)
+            try? MealPlanMetadataStore.shared.remove(uuid: uuid)
+        }
+        try await Task.sleep(nanoseconds: 200_000_000)
+        let blocker = UIViewController()
+        host.present(blocker, animated: false)
+        try await Task.sleep(nanoseconds: 100_000_000)
+        PizzaSplitReminder.recordTap(uuid: uuid)
+        XCTAssertTrue(host.presentedViewController === blocker)
+        XCTAssertEqual(PizzaSplitReminder.pendingOpenUUID, uuid,
+                       "A different root modal must retain the request and its inputs")
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            host.dismiss(animated: false) {
+                MealPlanReminderCoordinator.presentationFinished()
+                continuation.resume()
+            }
+        }
+        let shown = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            host.presentedViewController != nil && PizzaSplitReminder.pendingOpenUUID == nil
+        }, object: nil)
+        await fulfillment(of: [shown], timeout: 4)
+        let originalSheet = try XCTUnwrap(host.presentedViewController)
+        for _ in 0..<3 { PizzaSplitReminder.recordTap(uuid: uuid) }
+        try await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertTrue(host.presentedViewController === originalSheet)
+        XCTAssertNil(originalSheet.presentedViewController, "Repeated taps do not stack sheets")
+        XCTAssertNil(PizzaSplitReminder.pendingOpenUUID)
+        XCTAssertEqual(TreatmentEntryAccessor(coreDataManager: core).getLatestTreatments(howOld: nil).count, 1)
     }
 }

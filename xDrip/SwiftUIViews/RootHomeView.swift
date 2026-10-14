@@ -589,10 +589,10 @@ struct RootHomeView: View {
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in
             calculatorApplicationIsActive = false
         }
-        .fullScreenCover(isPresented: $showsExpandedIPadChart) {
+        .fullScreenCover(isPresented: $showsExpandedIPadChart, onDismiss: MealPlanReminderCoordinator.presentationFinished) {
             expandedIPadChart
         }
-        .sheet(isPresented: $showsPenCalculator) {
+        .sheet(isPresented: $showsPenCalculator, onDismiss: MealPlanReminderCoordinator.presentationFinished) {
             PenDoseCalculatorScreen(coreDataManager: coreDataManager,
                 reminderMealUUID: nil,
                 refreshRequestRevision: penCalculatorQuickActionDeliveryRevision,

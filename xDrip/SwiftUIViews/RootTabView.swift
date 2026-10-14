@@ -415,9 +415,9 @@ struct RootTabView: View {
                 selectedTab = .settings
             } else if stateModel.penCalculatorQuickActionRequest != nil {
                 selectHomeForCalculatorQuickAction()
-            } else if PlannedMealReminder.pendingOpenUUID != nil ||
-                        PizzaSplitReminder.pendingOpenUUID != nil ||
-                        BasalReminderScheduler.hasPendingOpen {
+            } else if PlannedMealReminder.pendingOpenUUID != nil || PizzaSplitReminder.pendingOpenUUID != nil {
+                selectTreatmentsForMealReminder()
+            } else if BasalReminderScheduler.hasPendingOpen {
                 selectedTab = .treatments
             }
             updateSupportedOrientations(for: selectedTab)
@@ -433,6 +433,7 @@ struct RootTabView: View {
             if scenePhase == .active {
                 updateSupportedOrientations(for: selectedTab)
                 selectHomeForCalculatorQuickAction()
+                selectTreatmentsForMealReminder()
                 if BasalReminderScheduler.hasPendingOpen {
                     selectedTab = .treatments
                 }
@@ -469,10 +470,20 @@ struct RootTabView: View {
             selectedTab = .home
         }
         .onReceive(NotificationCenter.default.publisher(for: PlannedMealReminder.openRequested)) { _ in
-            selectedTab = .treatments
+            selectTreatmentsForMealReminder()
         }
         .onReceive(NotificationCenter.default.publisher(for: PizzaSplitReminder.openRequested)) { _ in
-            selectedTab = .treatments
+            selectTreatmentsForMealReminder()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: MealPlanReminderCoordinator.presentationDidDismiss)) { _ in
+            selectTreatmentsForMealReminder()
+        }
+        .onChange(of: stateModel.dependencies != nil) { _ in
+            selectTreatmentsForMealReminder()
+        }
+        .onChange(of: stateModel.alertRequest != nil || stateModel.textInputRequest != nil ||
+                  stateModel.incomingBackupRequest != nil || stateModel.isPreparingIncomingBackup) { _ in
+            selectTreatmentsForMealReminder()
         }
         .onReceive(NotificationCenter.default.publisher(for: BasalReminderScheduler.openRequested)) { _ in
             selectedTab = .treatments
@@ -527,7 +538,7 @@ struct RootTabView: View {
                     .allowsHitTesting(false)
             }
         }
-        .sheet(item: $stateModel.pickerData) { pickerData in
+        .sheet(item: $stateModel.pickerData, onDismiss: MealPlanReminderCoordinator.presentationFinished) { pickerData in
             // Root-level requests are alerts. The preference changes their scale, not their actions.
             if UserDefaults.standard.preferLargeSnoozeScreen {
                 LargeSnoozePickerView(pickerData: pickerData)
@@ -658,6 +669,17 @@ struct RootTabView: View {
                 ProgressView()
             }
         }
+    }
+
+    private func selectTreatmentsForMealReminder() {
+        guard PlannedMealReminder.pendingOpenUUID != nil || PizzaSplitReminder.pendingOpenUUID != nil,
+              scenePhase == .active, stateModel.dependencies != nil,
+              stateModel.alertRequest == nil, stateModel.pickerData == nil,
+              stateModel.textInputRequest == nil, !stateModel.isPreparingIncomingBackup,
+              stateModel.incomingBackupRequest == nil else { return }
+        // Keep any active editor's inputs. Its existing dismiss event retries the durable request.
+        guard !MealPlanReminderCoordinator.hasPresentedController else { return }
+        selectedTab = .treatments
     }
 
     private func selectHomeForCalculatorQuickAction() {
@@ -819,7 +841,7 @@ private struct RootHomeTabView: View {
         .onDisappear {
             dependencies?.cancelScreenLock()
         }
-        .sheet(item: $presentedView) { presentedView in
+        .sheet(item: $presentedView, onDismiss: MealPlanReminderCoordinator.presentationFinished) { presentedView in
             destinationView(presentedView)
                 .colorScheme(.dark)
         }

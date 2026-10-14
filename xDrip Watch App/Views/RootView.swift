@@ -155,6 +155,7 @@ private struct WatchManualTreatmentsView: View {
     @State private var visibleNow = Date()
     @State private var showingConfirmation = false
     @State private var confirmedDraft: ConfirmationDraft?
+    @State private var completedLog: WatchBolusLogCompletion?
     @State private var copyingSuggestion = false
     @FocusState private var focusedInput: CrownInput?
 
@@ -286,6 +287,10 @@ private struct WatchManualTreatmentsView: View {
         }
         .onChange(of: carbohydrateGrams) { _ in watchState.invalidateWatchPenCalculation() }
         .onChange(of: mealKindRaw) { _ in watchState.invalidateWatchPenCalculation() }
+        .onReceive(watchState.$lastStoredBolusOperation) { confirmed in
+            // A delayed receipt belongs to its operation, never to the current input fields.
+            completedLog?.acceptPhoneConfirmation(confirmed)
+        }
         .onChange(of: insulinUnits) { _ in
             if copyingSuggestion { copyingSuggestion = false }
             else { watchState.invalidateWatchPenCalculation() }
@@ -294,10 +299,22 @@ private struct WatchManualTreatmentsView: View {
             Button("Annuller", role: .cancel) { confirmedDraft = nil }
             Button("Log") {
                 guard let draft = confirmedDraft else { return }
-                _ = watchState.recordWatchBolus(
+                let recordedAt = Date()
+                let previousIDs = Set(watchState.pendingBolusOperations.map(\.id))
+                let didStore = watchState.recordWatchBolus(
                     carbohydrateGrams: draft.carbohydrateGrams, insulinUnits: draft.insulinUnits,
                     mealKindRaw: draft.mealKindRaw,
-                    manualWithoutCurrentSuggestion: draft.manualWithoutCurrentSuggestion)
+                    manualWithoutCurrentSuggestion: draft.manualWithoutCurrentSuggestion,
+                    at: recordedAt)
+                if let completion = WatchBolusLogCompletion.finish(didStore: didStore, at: recordedAt,
+                    previouslyPendingIDs: previousIDs, pending: watchState.pendingBolusOperations,
+                    submitted: (draft.carbohydrateGrams, draft.insulinUnits, draft.mealKindRaw),
+                    carbohydrateGrams: &carbohydrateGrams, insulinUnits: &insulinUnits,
+                    mealKindRaw: mealKindRaw) {
+                    completedLog = completion
+                    completedLog?.acceptPhoneConfirmation(watchState.lastStoredBolusOperation)
+                    focusedInput = .carbohydrates
+                }
                 confirmedDraft = nil
             }
         } message: {
@@ -438,10 +455,26 @@ private struct WatchManualTreatmentsView: View {
             Label(issue, systemImage: "exclamationmark.triangle.fill")
                 .foregroundStyle(.red)
                 .accessibilityLabel("Registrering fejlede: \(issue)")
-        } else if !watchState.pendingBolusOperations.isEmpty {
+        } else if let completedLog {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("\(completedLog.amountText) · \(completedLog.operation.recordedAt.formatted(date: .numeric, time: .shortened))")
+                Label(completedLog.isStoredOnPhone ? "Logget på iPhone" : "Gemt på uret – afventer iPhone",
+                    systemImage: completedLog.isStoredOnPhone ? "checkmark.circle.fill" : "clock")
+                    .foregroundStyle(completedLog.isStoredOnPhone ? .green : .orange)
+                if !completedLog.isStoredOnPhone, let issue = watchState.bolusDeliveryIssue {
+                    Text(issue).foregroundStyle(.orange)
+                }
+                if watchState.pendingBolusOperations.contains(where: { $0.id != completedLog.operation.id }) {
+                    Label("Andre registreringer afventer iPhone", systemImage: "clock")
+                        .foregroundStyle(.orange)
+                }
+            }
+        } else if let pending = watchState.pendingBolusOperations.last {
+            Text("\(WatchBolusLogCompletion(operation: pending).amountText) · \(pending.recordedAt.formatted(date: .numeric, time: .shortened))")
             Label(watchState.bolusDeliveryIssue ?? "Gemt på uret – afventer iPhone", systemImage: "clock")
                 .foregroundStyle(.orange)
-        } else if watchState.lastStoredBolusOperation != nil {
+        } else if let stored = watchState.lastStoredBolusOperation {
+            Text("\(WatchBolusLogCompletion(operation: stored).amountText) · \(stored.recordedAt.formatted(date: .numeric, time: .shortened))")
             Label("Logget på iPhone", systemImage: "checkmark.circle.fill")
                 .foregroundStyle(.green)
         }

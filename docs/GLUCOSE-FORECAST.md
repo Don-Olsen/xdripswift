@@ -633,6 +633,28 @@ CGM-COB, rounding, safety checks and journal/storage are unchanged. Physical iPh
 interaction has not yet been verified for this change. Software validation and the
 authorised release outcome are recorded separately in PROJECT-STATUS.md.
 
+### Watch registration completion and meal reminder opening after 4330
+
+After a confirmed Watch registration has been durably queued, the calculator
+finishes that submitted draft and clears its quantities. A quantity/time receipt
+retains the exact operation identity and distinguishes waiting for iPhone from
+confirmed iPhone storage. Failed or uncertain storage preserves inputs; a later
+phone receipt updates only its matching receipt, never a newer draft. The queue,
+operation format, calculation, confirmation and treatment persistence are unchanged.
+
+Meal reminder opening resolves the saved meal UUID directly instead of searching
+only the most recent four hours. A valid 240-minute pizza reminder, or a later tap,
+can therefore open the existing fresh recalculation. Deleted or changed meals show
+status instead of opening an unrelated/new entry. Unavailable storage and a busy
+presentation retain the pending request; existing dismissal/foreground events
+resume it without adding polling. An already open draft is preserved. Tapping a
+reminder does not log food or insulin, and the pizza recalculation still uses the
+registered meal through current COB rather than re-entering its original grams.
+
+Automated validation and release evidence are recorded in PROJECT-STATUS.md.
+Actual notification delivery and the new Watch interaction still require physical
+follow-up; no local installation was performed as part of this change.
+
 ## Prospective evidence log and export
 
 A completed Home calculation supplies an immutable value snapshot to a separate serial IO worker. It never sends Core Data objects between queues or rereads settings while writing. Rendering does not wait for disk IO. The Home evidence log adds no timer or continuous background calculation; the separate “Low soon” event-driven calculation is described above. Off means no Home forecast attempt is logged; cache hits do not create records.

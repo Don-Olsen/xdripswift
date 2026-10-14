@@ -10,6 +10,45 @@
 
 De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
 
+## Watch-kvittering og måltidspåmindelser efter 4330 — 14. oktober 2026
+
+På Watch blev resultatet af den holdbare kølagring ignoreret i visningen, så
+mængderne stod klar til endnu et selvstændigt Log efter succes. Visningen
+matcher nu den præcise nye operation, viser mængder og tidspunkt og afslutter
+kun den samme indsendte kladde efter verificeret kølagring. Fejl/usikkerhed
+bevarer felterne. Telefonens senere kvittering opdaterer kun status for den
+matchende operation; den rydder ikke nye indtastninger. Ingen ændring af
+beregning, bekræftelse, køformat, operationernes identiteter eller transport.
+
+🍕-indstillingerne tillader 240 minutter, men åbningsforløbet søgte kun blandt
+poster nyere end fire timer og ryddede derefter den ventende anmodning.
+Det kunne derfor ignorere en gyldig påmindelse. Forløbet slår nu måltidets
+UUID op i det vedvarende lager og skelner mellem utilgængeligt lager og
+slettet/ændret måltid. Påmindelser venter på åbne ark og genoptages ved
+præsentations-/forgrundshændelser. Anmodningen forbruges, når det relevante
+ark vises; gentagne tryk erstatter ikke en åben kladde. Ingen ny polling,
+dosislogik, automatisk måltidsbekræftelse eller behandlingsregistrering.
+
+Indledende Python-kontroller inklusive de syntetiske Watch-kontroller bestod
+(`20261014T174652Z-67664`). Den endelige XCTest-/buildkvittering registreres
+nedenfor og i releasejournalen efter validering af det præcise checkpoint.
+Første compileforsøg afslørede en typefejl i den nye tidsgrænse-fixture.
+Den efterfølgende fulde kørsel (1.643 tests) fandt desuden et midlertidigt
+objekt-id i fixture samt et reelt hul: en coordinator uden tilknyttet lager
+kunne returnere tomt resultat. UUID-opslaget afviser nu dette som utilgængeligt
+lager og bevarer anmodningen. Fejlede resultater bevares lokalt; en ny fuld
+kørsel kræves før release. Ingen eksisterende testkrav er svækket.
+
+Læsende devicectl-kontrol fandt den forventede iPhone-app
+`com.GFZ896KN66.xdripswift`, 7.1.1 (4330), samt et parret Watch.
+Der er ikke installeret en lokal build eller udført en fysisk logning.
+De nye Watch-interaktioner og faktisk iOS-notifikationslevering skal derfor
+stadig afprøves på enhederne efter TestFlight-opdateringen.
+Hvis en native root-alert stadig er ved at lukke, bevares en ventende
+måltidsanmodning til næste eksisterende forgrunds-/datahændelse; øjeblikkelig
+åbning efter enhver alertanimation er ikke verificeret. De berørte sheets
+har eksplicit genoptagelse efter afsluttet lukning.
+
 ## Lavt om lidt: kommende lavpunkt og Åbn beregner — 14. oktober 2026
 
 På uændret 4329 kontrollerede advarslen kun reference-målingens +30-værdi.

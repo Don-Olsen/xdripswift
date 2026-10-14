@@ -1,6 +1,7 @@
 import CoreData
 import Foundation
 import UserNotifications
+import UIKit
 
 /// Local coordination data only. Core Data remains the sole source of treatments and IOB/COB.
 struct MealPlanMetadata: Codable, Equatable {
@@ -134,6 +135,32 @@ struct MealPlanMetadata: Codable, Equatable {
 
 /// A successful fresh-store read is required before metadata cleanup or notification updates.
 @MainActor enum MealPlanReminderCoordinator {
+    /// Existing pending reminder identities are retried when a blocking presentation ends.
+    static let presentationDidDismiss = Notification.Name("xdrip.mealReminder.presentationDidDismiss")
+
+    static func presentationFinished() {
+        NotificationCenter.default.post(name: presentationDidDismiss, object: nil)
+    }
+
+    static var hasPresentedController: Bool {
+        UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+            .first { $0.activationState == .foregroundActive }?
+            .keyWindow?.rootViewController?.presentedViewController != nil
+    }
+
+    /// Delivery consumes only a handled destination. A blocked presentation/read can be retried
+    /// with the original durable request, without touching any existing editor or calculator.
+    @discardableResult
+    static func deliverOpenRequest(coreDataManager: CoreDataManager, uuid: String, pizza: Bool,
+        canPresent: Bool, present: (OpenDestination) -> Void, consume: (String) -> Void) -> Bool {
+        guard canPresent else { return false }
+        let destination = openDestination(coreDataManager: coreDataManager, uuid: uuid, pizza: pizza)
+        present(destination)
+        // Real sheets acknowledge from onAppear; setting a binding is not presentation.
+        if case .notice = destination { consume(uuid) }
+        return true
+    }
+
     struct StoredTreatment {
         let uuid: String
         let type: TreatmentType
@@ -160,17 +187,57 @@ struct MealPlanMetadata: Codable, Equatable {
     enum MealStatus: Equatable { case planned, confirmed, cancelled, deleted, unavailable }
 
     static func storedTreatments(coreDataManager: CoreDataManager, uuids: [String]) throws -> [StoredTreatment] {
-        guard let coordinator = coreDataManager.privateManagedObjectContext.persistentStoreCoordinator else {
+        try storedTreatmentValues(coreDataManager: coreDataManager, uuids: uuids, transform: StoredTreatment.init)
+    }
+
+    /// Resolve the persisted identity, not an age-limited list or a potentially stale row cache.
+    /// An unavailable store is retryable and must not consume the notification's pending request.
+    enum OpenDestination {
+        case plannedMeal(TreatmentSnapshot)
+        case pizza(String)
+        case notice(String)
+        case unavailable
+    }
+
+    static func openDestination(coreDataManager: CoreDataManager, uuid: String,
+                                pizza: Bool) -> OpenDestination {
+        let rows: [(StoredTreatment, TreatmentSnapshot)]
+        do {
+            rows = try storedTreatmentValues(coreDataManager: coreDataManager, uuids: [uuid]) {
+                (StoredTreatment($0), TreatmentSnapshot(treatmentEntry: $0))
+            }
+        } catch { return .unavailable }
+        guard rows.count <= 1 else { return .unavailable }
+        guard let (meal, snapshot) = rows.first, meal.type == .Carbs, !meal.deleted else {
+            return .notice("Måltidsplanen er slettet.")
+        }
+        if pizza {
+            guard meal.isConfirmedMeal && meal.mealKind == .slow else {
+                return .notice("Måltidet er ændret. Påmindelsen gælder ikke længere.")
+            }
+            return .pizza(uuid)
+        }
+        if meal.isPlannedMeal { return .plannedMeal(snapshot) }
+        if meal.isConfirmedMeal { return .notice("Måltidet er allerede bekræftet.") }
+        return .notice("Måltidsplanen er annulleret.")
+    }
+
+    private static func storedTreatmentValues<Value>(coreDataManager: CoreDataManager,
+        uuids: [String], transform: (TreatmentEntry) -> Value) throws -> [Value] {
+        guard let coordinator = coreDataManager.privateManagedObjectContext.persistentStoreCoordinator,
+              !coordinator.persistentStores.isEmpty else {
+            // Core Data can return an empty fetch with no stores attached. That is not
+            // evidence that a previously saved meal was deleted.
             throw MealPlanMetadataStore.StoreError.unreadable
         }
         let context = NSManagedObjectContext(concurrencyType: .privateQueueConcurrencyType)
         context.persistentStoreCoordinator = coordinator
-        var rows: [StoredTreatment] = []
+        var rows: [Value] = []
         var readError: Error?
         context.performAndWait {
             let request: NSFetchRequest<TreatmentEntry> = TreatmentEntry.fetchRequest()
             request.predicate = NSPredicate(format: "localTreatmentUUID IN %@", uuids)
-            do { rows = try context.fetch(request).map(StoredTreatment.init) }
+            do { rows = try context.fetch(request).map(transform) }
             catch { readError = error }
         }
         if let readError { throw readError }

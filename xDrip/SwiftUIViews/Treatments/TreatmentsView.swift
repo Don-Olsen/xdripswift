@@ -15,11 +15,16 @@ struct TreatmentsView: View {
     // MARK: - private properties
 
     @StateObject private var viewModel: TreatmentsViewModel
+    @Environment(\.scenePhase) private var scenePhase
+    @State private var isVisible = false
     @State private var treatmentEditorState: TreatmentEditorState?
     @State private var showsPenCalculator = false
     @State private var calculatorReminderMealUUID: String?
     @State private var mealNotice: String?
     @State private var basalNotice: String?
+    @State private var openingMealReminder: (uuid: String, pizza: Bool)?
+    @State private var editorIsVisible = false
+    @State private var calculatorIsVisible = false
 
     // MARK: - initialization
 
@@ -46,7 +51,7 @@ struct TreatmentsView: View {
                 treatmentEditorState = .edit(treatment)
             }
         )
-        .sheet(item: $treatmentEditorState, onDismiss: openRequestedBasal) { editorState in
+        .sheet(item: $treatmentEditorState, onDismiss: reminderPresentationFinished) { editorState in
             TreatmentEditorContainerView(
                 coreDataManager: viewModel.coreDataManager,
                 editorState: editorState,
@@ -58,10 +63,17 @@ struct TreatmentsView: View {
                     treatmentEditorState = nil
                 }
             )
+            .onAppear {
+                editorIsVisible = true
+                if case .edit(let meal) = editorState {
+                    acknowledgeMealPresentation(uuid: meal.localTreatmentUUID, pizza: false)
+                }
+            }
+            .onDisappear { editorIsVisible = false }
         }
         .sheet(isPresented: $showsPenCalculator, onDismiss: {
             calculatorReminderMealUUID = nil
-            openRequestedBasal()
+            reminderPresentationFinished()
         }) {
             PenDoseCalculatorScreen(coreDataManager: viewModel.coreDataManager,
                 reminderMealUUID: calculatorReminderMealUUID,
@@ -70,18 +82,37 @@ struct TreatmentsView: View {
                     showsPenCalculator = false
                 },
                 onCancel: { showsPenCalculator = false })
+                .onAppear {
+                    calculatorIsVisible = true
+                    acknowledgeMealPresentation(uuid: calculatorReminderMealUUID, pizza: true)
+                }
+                .onDisappear { calculatorIsVisible = false }
         }
-        .onAppear(perform: openRequestedPlannedMeal)
+        .onAppear {
+            isVisible = true
+            openPendingReminders()
+        }
+        .onDisappear { isVisible = false }
+        .onChange(of: scenePhase) { phase in
+            if phase == .active { openPendingReminders() }
+        }
         .onReceive(NotificationCenter.default.publisher(for: PlannedMealReminder.openRequested)) { _ in
-            openRequestedPlannedMeal()
+            openPendingReminders()
         }
-        .onAppear(perform: openRequestedPizzaRecalculation)
         .onReceive(NotificationCenter.default.publisher(for: PizzaSplitReminder.openRequested)) { _ in
-            openRequestedPizzaRecalculation()
+            openPendingReminders()
         }
-        .onAppear(perform: openRequestedBasal)
         .onReceive(NotificationCenter.default.publisher(for: BasalReminderScheduler.openRequested)) { _ in
-            openRequestedBasal()
+            openPendingReminders()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
+            openPendingReminders()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: TherapyMetricsManager.changed)) { _ in
+            openPendingReminders()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: MealPlanReminderCoordinator.presentationDidDismiss)) { _ in
+            openPendingReminders()
         }
         .onReceive(NotificationCenter.default.publisher(for: MealReminderIssueCenter.reported)) { notification in
             mealNotice = notification.object as? String
@@ -104,39 +135,63 @@ struct TreatmentsView: View {
         }
     }
 
-    private func openRequestedPlannedMeal() {
-        guard let uuid = PlannedMealReminder.pendingOpenUUID else { return }
-        let status = MealPlanReminderCoordinator.status(coreDataManager: viewModel.coreDataManager, uuid: uuid)
-        switch status {
-        case .planned: break
-        case .confirmed: mealNotice = "Måltidet er allerede bekræftet."
-        case .cancelled: mealNotice = "Måltidsplanen er annulleret."
-        case .deleted: mealNotice = "Måltidsplanen er slettet."
-        case .unavailable: mealNotice = "Måltidsstatus kunne ikke læses. Prøv igen i behandlingshistorikken."
-        }
-        guard case .planned = status else {
-            PlannedMealReminder.clearPendingOpenUUID(uuid)
-            return
-        }
-        viewModel.reloadTreatments()
-        if let meal = viewModel.plannedMealSnapshot(uuid: uuid) {
-            treatmentEditorState = .edit(meal)
-        } else {
-            mealNotice = "Måltidsplanen kunne ikke åbnes. Kontrollér behandlingshistorikken."
-        }
-        PlannedMealReminder.clearPendingOpenUUID(uuid)
+    private func acknowledgeMealPresentation(uuid: String?, pizza: Bool) {
+        guard let request = openingMealReminder, request.uuid == uuid, request.pizza == pizza else { return }
+        if pizza { PizzaSplitReminder.clearPendingOpenUUID(request.uuid) }
+        else { PlannedMealReminder.clearPendingOpenUUID(request.uuid) }
+        openingMealReminder = nil
     }
 
-    private func openRequestedPizzaRecalculation() {
-        guard let uuid = PizzaSplitReminder.pendingOpenUUID else { return }
-        defer { PizzaSplitReminder.clearPendingOpenUUID(uuid) }
-        let meal = TreatmentEntryAccessor(coreDataManager: viewModel.coreDataManager)
-            .getLatestTreatments(howOld: 4 * 60 * 60)
-            .first { $0.localTreatmentUUID == uuid && $0.isConfirmedMeal &&
-                !$0.treatmentdeleted && $0.mealKind == .slow }
-        guard meal != nil else { return }
-        calculatorReminderMealUUID = uuid
-        showsPenCalculator = true
+    private func reminderPresentationFinished() {
+        openingMealReminder = nil
+        openPendingReminders()
+        MealPlanReminderCoordinator.presentationFinished()
+    }
+
+    private func openPendingReminders() {
+        guard isVisible, scenePhase == .active else { return }
+        // Repeated taps for an already open destination leave its draft untouched.
+        if editorIsVisible, let uuid = PlannedMealReminder.pendingOpenUUID,
+           case .edit(let meal) = treatmentEditorState, meal.localTreatmentUUID == uuid {
+            PlannedMealReminder.clearPendingOpenUUID(uuid)
+        }
+        if calculatorIsVisible, let uuid = PizzaSplitReminder.pendingOpenUUID,
+           calculatorReminderMealUUID == uuid {
+            PizzaSplitReminder.clearPendingOpenUUID(uuid)
+        }
+        guard treatmentEditorState == nil, !showsPenCalculator,
+              mealNotice == nil, basalNotice == nil else { return }
+        if let uuid = PlannedMealReminder.pendingOpenUUID {
+            openMealReminder(uuid: uuid, pizza: false)
+        } else if let uuid = PizzaSplitReminder.pendingOpenUUID {
+            openMealReminder(uuid: uuid, pizza: true)
+        } else {
+            openRequestedBasal()
+        }
+    }
+
+    private func openMealReminder(uuid: String, pizza: Bool) {
+        MealPlanReminderCoordinator.deliverOpenRequest(coreDataManager: viewModel.coreDataManager,
+            uuid: uuid, pizza: pizza,
+            canPresent: !MealPlanReminderCoordinator.hasPresentedController,
+            present: { destination in
+                switch destination {
+                case .plannedMeal(let meal):
+                    openingMealReminder = (uuid, false)
+                    treatmentEditorState = .edit(meal)
+                case .pizza(let uuid):
+                    openingMealReminder = (uuid, true)
+                    calculatorReminderMealUUID = uuid
+                    showsPenCalculator = true
+                case .notice(let message):
+                    mealNotice = message
+                case .unavailable:
+                    mealNotice = "Måltidsstatus kunne ikke læses. Påmindelsen er bevaret; prøv igen, når appen er klar."
+                }
+            }, consume: { handledUUID in
+                if pizza { PizzaSplitReminder.clearPendingOpenUUID(handledUUID) }
+                else { PlannedMealReminder.clearPendingOpenUUID(handledUUID) }
+            })
     }
 
     private func openRequestedBasal() {
