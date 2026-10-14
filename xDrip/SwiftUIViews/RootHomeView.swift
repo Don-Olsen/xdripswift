@@ -595,6 +595,7 @@ struct RootHomeView: View {
         .sheet(isPresented: $showsPenCalculator) {
             PenDoseCalculatorScreen(coreDataManager: coreDataManager,
                 reminderMealUUID: nil,
+                refreshRequestRevision: penCalculatorQuickActionDeliveryRevision,
                 onSave: {
                     showsPenCalculator = false
                     actions.refreshPumpAndLoopStatus()

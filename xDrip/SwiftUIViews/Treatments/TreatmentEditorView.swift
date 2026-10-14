@@ -437,14 +437,17 @@ struct PenDoseCalculatorScreen: View {
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     let coreDataManager: CoreDataManager
+    let refreshRequestRevision: Int
     let onSave: () -> Void
     let onCancel: () -> Void
 
     private enum InputField: Hashable { case carbohydrates, insulin, glucose }
 
     init(coreDataManager: CoreDataManager, reminderMealUUID: String? = nil,
+         refreshRequestRevision: Int = 0,
          onSave: @escaping () -> Void, onCancel: @escaping () -> Void) {
         self.coreDataManager = coreDataManager
+        self.refreshRequestRevision = refreshRequestRevision
         self.onSave = onSave
         self.onCancel = onCancel
         _viewModel = StateObject(wrappedValue: PenDoseCalculatorViewModel(
@@ -522,6 +525,11 @@ struct PenDoseCalculatorScreen: View {
             }
             .onAppear { viewModel.start() }
             .onDisappear { viewModel.stop() }
+            .onChange(of: refreshRequestRevision) { _ in
+                // Reuse the open screen and its draft, but invalidate the old suggestion and
+                // request current inputs even if an action arrived while the app was active.
+                viewModel.scheduleCalculation(debounce: false)
+            }
             .task {
                 guard !didSetInitialFocus else { return }
                 didSetInitialFocus = true

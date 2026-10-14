@@ -60,6 +60,7 @@ class FakeApple(AppleClient):
         self.group_builds = []
         self.link_succeeds = True
         self.extra_pages = {}
+        self.beta_details = {}
 
     def _request(self, path, method="GET", body=None):
         self.calls.append((path, method, copy.deepcopy(body)))
@@ -71,6 +72,8 @@ class FakeApple(AppleClient):
             return {}
         if path in self.extra_pages:
             return copy.deepcopy(self.extra_pages[path])
+        if path in self.beta_details:
+            return copy.deepcopy(self.beta_details[path])
         if path == "/v1/apps/" + APP_ID:
             return {"data": {"type": "apps", "id": APP_ID,
                              "attributes": {"bundleId": self.app_bundle}}}
@@ -200,6 +203,96 @@ class SnapshotTests(unittest.TestCase):
                 self.assertIsNone(result["builds"][0]["betaInternalState"])
                 self.assertFalse(any("/buildBetaDetail" in call[0] for call in client.calls))
 
+    def test_valid_build_fetches_missing_or_incomplete_beta_detail_read_only(self):
+        for included_state in ("omitted", None, "", 7):
+            with self.subTest(included_state=included_state):
+                client = FakeApple()
+                resource, included = build("exact-build", "4329", "7.1.1")
+                detail = copy.deepcopy(included[1])
+                if included_state == "omitted":
+                    included = included[:1]
+                else:
+                    included[1]["attributes"]["internalBuildState"] = included_state
+                client.build_pages[0] = page([resource], included)
+                endpoint = "/v1/builds/exact-build/buildBetaDetail"
+                client.beta_details[endpoint] = {"data": detail}
+                status = client.build_status("7.1.1", "4329")
+                self.assertEqual(status["id"], "exact-build")
+                self.assertEqual(status["betaInternalState"], "IN_BETA_TESTING")
+                self.assertEqual(status["processingState"], "VALID")
+                self.assertEqual(status["buildAudienceType"], "INTERNAL_ONLY")
+                self.assertEqual([call for call in client.calls if call[0] == endpoint],
+                                 [(endpoint, "GET", None)] * 2)
+                self.assertTrue(all(call[1] == "GET" for call in client.calls))
+
+    def test_missing_beta_relationship_requires_exact_build_id_in_fallback(self):
+        for returned_id in ("b1", "another-build"):
+            with self.subTest(returned_id=returned_id):
+                client = FakeApple()
+                resource = client.build_pages[0]["data"][0]
+                resource["relationships"].pop("buildBetaDetail")
+                client.build_pages[0]["included"] = client.build_pages[0]["included"][:1]
+                client.beta_details["/v1/builds/b1/buildBetaDetail"] = {"data": {
+                    "type": "buildBetaDetails", "id": returned_id,
+                    "attributes": {"internalBuildState": "IN_BETA_TESTING"}}}
+                if returned_id == "b1":
+                    self.assertEqual(client.build_status("7.0.0", "4263")["betaInternalState"],
+                                     "IN_BETA_TESTING")
+                else:
+                    with self.assertRaisesRegex(AppleError, "beta-detail identity"):
+                        client.snapshot("7.0.0")
+                self.assertTrue(all(call[1] == "GET" for call in client.calls))
+
+    def test_beta_detail_fallback_rejects_wrong_identity_and_missing_state(self):
+        detail = build()[1][1]
+        malformed_details = [None, [], {},
+                             dict(detail, id="different-detail"),
+                             dict(detail, type="builds"),
+                             dict(detail, attributes={}),
+                             dict(detail, attributes={"internalBuildState": None}),
+                             dict(detail, attributes={"internalBuildState": ""}),
+                             dict(detail, attributes={"internalBuildState": True})]
+        for malformed in malformed_details:
+            with self.subTest(detail=malformed):
+                client = FakeApple()
+                client.build_pages[0]["included"] = client.build_pages[0]["included"][:1]
+                client.beta_details["/v1/builds/b1/buildBetaDetail"] = {"data": malformed}
+                with self.assertRaises(AppleError):
+                    client.build_status("7.0.0", "4263")
+                self.assertTrue(all(call[1] == "GET" for call in client.calls))
+
+    def test_beta_detail_fallback_rejects_malformed_relationship(self):
+        for relation in ({}, [], {"type": "builds", "id": "db1"},
+                         {"type": "buildBetaDetails", "id": ""}):
+            with self.subTest(relation=relation):
+                client = FakeApple()
+                client.build_pages[0]["included"] = client.build_pages[0]["included"][:1]
+                client.build_pages[0]["data"][0]["relationships"]["buildBetaDetail"]["data"] = relation
+                with self.assertRaisesRegex(AppleError, "beta-detail relationship"):
+                    client.snapshot("7.0.0")
+                self.assertFalse(any("/buildBetaDetail" in call[0] for call in client.calls))
+
+    def test_beta_detail_fallback_preserves_action_required_state(self):
+        client = FakeApple()
+        detail = client.build_pages[0]["included"].pop()
+        detail["attributes"]["internalBuildState"] = "MISSING_EXPORT_COMPLIANCE"
+        client.beta_details["/v1/builds/b1/buildBetaDetail"] = {"data": detail}
+        self.assertEqual(client.build_status("7.0.0", "4263")["betaInternalState"],
+                         "MISSING_EXPORT_COMPLIANCE")
+        self.assertTrue(all(call[1] == "GET" for call in client.calls))
+
+    def test_beta_detail_fallback_propagates_api_failure(self):
+        client = FakeApple()
+        client.build_pages[0]["included"] = client.build_pages[0]["included"][:1]
+        original_request = client._request
+        def failed_detail(path, method="GET", body=None):
+            if path == "/v1/builds/b1/buildBetaDetail":
+                raise AppleError("Synthetic beta-detail permission failure")
+            return original_request(path, method, body)
+        with mock.patch.object(client, "_request", side_effect=failed_detail):
+            with self.assertRaisesRegex(AppleError, "permission failure"):
+                client.build_status("7.0.0", "4263")
+
     def test_new_build_in_scoped_lookup_reserves_next_number(self):
         client = FakeApple()
         original_request = client._request
@@ -250,7 +343,9 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(status["uploadState"], "PROCESSING")
 
     def test_processed_build_returns_exact_internal_state(self):
-        status = FakeApple().build_status("7.0.0", "4263")
+        client = FakeApple()
+        status = client.build_status("7.0.0", "4263")
+        self.assertFalse(any("/buildBetaDetail" in call[0] for call in client.calls))
         self.assertEqual(status["id"], "b1")
         self.assertEqual(status["processingState"], "VALID")
         self.assertEqual(status["betaInternalState"], "IN_BETA_TESTING")

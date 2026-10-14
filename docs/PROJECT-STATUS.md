@@ -1,3 +1,56 @@
+## Lavt om lidt: kommende lavpunkt og Åbn beregner — 14. oktober 2026
+
+På uændret 4329 kontrollerede advarslen kun reference-målingens +30-værdi.
+Et gyldigt motorforløb kunne derfor have et tidligere dyk efterfulgt af en
+stigning uden at udløse varsel. Den afgrænsede ændring undersøger i stedet
+minimum i de næste 30 minutter fra vurderingstidspunktet, med komplet gyldigt
+5-minuttersgrid og interpolation af vinduets grænser. Allerede passerede dyk
+tæller ikke. Aktuel målings friskhed, sensor/reference, IOB, tærskler, snooze
+og den vedvarende 30-minuttersbegrænsning bevares. Beskeden viser lavpunktets
+forventede værdi og tidspunkt. Journalens nye valgfrie versions-/minimumsfelter
+bevarer gamle poster og +30-feltets oprindelige betydning.
+
+En særskilt “Åbn beregner”-handling genbruger den eksisterende afventende
+anmodning, kildekontrol og beregnerskærm. Standardtryk beholder snooze.
+Åbning beregner på friske data og registrerer intet. Ingen gram eller dosis
+sendes med notifikationen; kulhydrathjælpens eksisterende afvisninger bevares,
+og advarslen afhænger ikke af, om et gramforslag er tilgængeligt. Ingen ny
+høj-rådgivning eller ændring af prognosemotor, dosisformel, ML, behandlinger,
+Sundhed eller Watch/Libre-forbindelse.
+
+Den dokumenterede releaseprocesfejl fra 4329 er samtidig rettet afgrænset:
+mangler Apples inkluderede beta-status for en VALID build, læses det samme
+builds offentlige buildBetaDetail-endpoint. Ressourcetype/identitet og faktisk
+status kontrolleres; fejl eller ukendt status godkendes ikke som Testing.
+Processing-/fejlede builds optager stadig deres nummer uden dette ekstra opslag.
+
+Indledende læsende enhedskontrol fandt den forventede iPhone-app
+`com.GFZ896KN66.xdripswift`, 7.1.1 (4329), og et tilgængeligt parret Watch.
+Ingen lokal installation eller fysisk notifikationsprøve er udført. Klinisk
+gevinst eller faktisk levering på låst telefon/Watch er ikke dokumenteret af
+softwaretests.
+
+Faktisk forvalidering: hele XCTest-suiten bestod **1.629/1.629**, 0 fejl,
+i `20261014T085114Z-27920`. De 19 nye tests dækker blandt andet et reelt
+motorberegnet dyk med genopretning, grænser og afvisninger, journalens gamle
+format, beskedens minimum/tid/enheder samt den rigtige Home/beregnerskærm med
+koldstart, ventende modal, gentagne åbninger og bevarede manuelle felter.
+Den første kørsel havde to assertions i én ny test, fordi fixture ikke havde
+aktiveret de eksterne kilder; fixture blev rettet og kontrollerer nu den
+faktiske kilde før åbning. Produktionskontrollen blev ikke ændret.
+Python-kontroller inklusive syntetiske Watch-tests og 46 Apple API-tests bestod
+(`20261014T085017Z-25329`). Diffen er gennemgået uafhængigt; ingen kendt
+uløst implementeringsfejl. Eksisterende simulator-/UI-runtime-advarsler er
+ikke i sig selv løst. Logfiler, xcresult og tekniske kvitteringer ligger uden
+for Git under `~/DeveloperBuildData/xDrip/local-runs/xdripswift/`.
+
+En faktisk notifikationshandling gennem iOS på låst telefon/Watch er stadig
+ikke afprøvet: navigationstesten bruger produktionsrouteren og den rigtige
+SwiftUI-skærm, mens operativsystemets response-delegate er kildegennemgået.
+Begge simulatorbuilds, signeret iPhoneOS-arkiv og fuld gentest på det af Apple
+valgte release-checkpoint følger releaseproceduren; den endelige kvittering
+registreres særskilt i releasejournalen.
+
 <!-- testflight-7.1.1-4329:start -->
 ### TestFlight 7.1.1 (4329)
 
@@ -17,7 +70,8 @@ relation til Ole Internal. Den endelige status ovenfor blev registreret med
 samme statusvalidering, checkpoint og uændret tag. Ingen ny upload eller
 compliance-erklæring blev udført. Tekniske API-kvitteringer ligger uden for
 Git i `build/testflight-7.1.1-4329/apple-beta-detail-confirmation.json`.
-Det manglende felt i listeopslaget er fortsat en kendt releaseprocesfejl.
+Det manglende felt i listeopslaget var en kendt releaseprocesfejl i 4329;
+den afgrænsede efterfølgende rettelse er beskrevet ovenfor.
 Automatisk cacheoprydning stoppede på samme listeopslag; den blev ikke
 omgået. Dette ændrer ikke Apples bekræftede Internal / Testing-status.
 

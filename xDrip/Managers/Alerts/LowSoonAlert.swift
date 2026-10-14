@@ -3,13 +3,20 @@ import os
 
 /// An engine prediction is advisory. It never substitutes for the existing measured-low alarms.
 enum LowSoonAlertPolicy {
+    static let version = "minimum-now30-v2"
+    static let horizonMinutes = 30
     static let currentMinimumMgdl = 3.9 / ConstantsBloodGlucose.mgDlToMmoll
     static let predictedLimitMgdl = 4.4 / ConstantsBloodGlucose.mgDlToMmoll
     static let minimumInterval: TimeInterval = 30 * 60
 
     struct ValidatedPrediction {
         let currentMgdl: Double
+        /// Retained as referenceDate + 30 minutes for existing prospective evidence.
         let predicted30Mgdl: Double
+        let minimumMgdl: Double
+        let minimumDate: Date
+        let windowStart: Date
+        let windowEnd: Date
         let activeInsulinUnits: Double
     }
 
@@ -20,22 +27,59 @@ enum LowSoonAlertPolicy {
                                     expectedGlucoseMgdl: Double,
                                     at now: Date) -> ValidatedPrediction? {
         let result = outcome.result
-        guard result.reason == nil,
+        let limits = GlucoseForecastEngine.configuration
+        let validGlucose: ClosedRange<Double> = limits.minimumGlucoseMgdl...limits.maximumGlucoseMgdl
+        guard now.timeIntervalSinceReferenceDate.isFinite,
+              expectedReferenceDate.timeIntervalSinceReferenceDate.isFinite,
+              result.reason == nil,
               result.referenceDate == expectedReferenceDate,
               result.referenceSensorID == expectedSensorID,
               (0...330).contains(now.timeIntervalSince(expectedReferenceDate)),
               let current = outcome.referenceGlucoseMgdl,
-              current.isFinite, current > 0, current == expectedGlucoseMgdl,
+              current.isFinite, validGlucose.contains(current), current == expectedGlucoseMgdl,
               let iob = outcome.activeInsulinUnits,
               iob.isFinite, iob >= 0,
-              let predicted = result.value(atMinutes: 30), predicted.isFinite else { return nil }
-        return ValidatedPrediction(currentMgdl: current, predicted30Mgdl: predicted,
-                                   activeInsulinUnits: iob)
+              let first = result.points.first, first.date == expectedReferenceDate,
+              first.glucoseMgdl == current else { return nil }
+
+        let end = now.addingTimeInterval(Double(horizonMinutes) * 60)
+        let step = limits.integrationStepMinutes * 60
+        // Require a complete, ordered engine grid from its measured anchor through the
+        // whole window. Do not sort, skip malformed points or bridge a missing interval.
+        guard end.timeIntervalSinceReferenceDate.isFinite,
+              let last = result.points.last, last.date >= end,
+              result.points.allSatisfy({
+                  $0.date.timeIntervalSinceReferenceDate.isFinite &&
+                      $0.glucoseMgdl.isFinite && validGlucose.contains($0.glucoseMgdl)
+              }),
+              zip(result.points, result.points.dropFirst()).allSatisfy({
+                  abs($0.1.date.timeIntervalSince($0.0.date) - step) < 0.001
+              }),
+              let atNow = interpolated(result.points, at: now),
+              let atEnd = interpolated(result.points, at: end),
+              let predicted30 = result.value(atMinutes: 30), predicted30.isFinite else { return nil }
+        // A piecewise-linear segment cannot have a lower interior value than its ends.
+        // Include interpolated boundaries, but exclude dips already behind the actual now.
+        let points = [atNow] + result.points.filter { $0.date > now && $0.date < end } + [atEnd]
+        guard let minimum = points.min(by: { $0.glucoseMgdl < $1.glucoseMgdl }) else { return nil }
+        return ValidatedPrediction(currentMgdl: current, predicted30Mgdl: predicted30,
+                                   minimumMgdl: minimum.glucoseMgdl, minimumDate: minimum.date,
+                                   windowStart: now, windowEnd: end, activeInsulinUnits: iob)
     }
 
-    static func condition(currentMgdl: Double, predicted30Mgdl: Double) -> Bool {
-        currentMgdl.isFinite && predicted30Mgdl.isFinite &&
-            currentMgdl >= currentMinimumMgdl && predicted30Mgdl < predictedLimitMgdl
+    static func condition(currentMgdl: Double, minimumMgdl: Double) -> Bool {
+        currentMgdl.isFinite && minimumMgdl.isFinite &&
+            currentMgdl >= currentMinimumMgdl && minimumMgdl < predictedLimitMgdl
+    }
+
+    private static func interpolated(_ points: [GlucoseForecastPoint], at date: Date)
+        -> GlucoseForecastPoint? {
+        if let exact = points.first(where: { $0.date == date }) { return exact }
+        guard let rightIndex = points.firstIndex(where: { $0.date > date }), rightIndex > 0 else { return nil }
+        let left = points[rightIndex - 1], right = points[rightIndex]
+        let fraction = date.timeIntervalSince(left.date) / right.date.timeIntervalSince(left.date)
+        return GlucoseForecastPoint(date: date,
+            glucoseMgdl: left.glucoseMgdl + fraction * (right.glucoseMgdl - left.glucoseMgdl))
     }
 
     static func maySchedule(lastScheduled: Date?, at now: Date) -> Bool {
@@ -75,6 +119,31 @@ struct LowSoonEvaluationRecord: Codable, Sendable {
     let sensorID: String?
     let status: Status
     let detail: String?
+    /// Absent in legacy records, whose decision used only referenceDate + 30 minutes.
+    let policyVersion: String?
+    let windowStart: Date?
+    let windowEnd: Date?
+    let minimumMgdl: Double?
+    let minimumDate: Date?
+
+    init(referenceDate: Date?, computedAt: Date, currentMgdl: Double?, predicted30Mgdl: Double?,
+         iobUnits: Double?, sensorID: String?, status: Status, detail: String?,
+         policyVersion: String? = nil, windowStart: Date? = nil, windowEnd: Date? = nil,
+         minimumMgdl: Double? = nil, minimumDate: Date? = nil) {
+        self.referenceDate = referenceDate
+        self.computedAt = computedAt
+        self.currentMgdl = currentMgdl
+        self.predicted30Mgdl = predicted30Mgdl
+        self.iobUnits = iobUnits
+        self.sensorID = sensorID
+        self.status = status
+        self.detail = detail
+        self.policyVersion = policyVersion
+        self.windowStart = windowStart
+        self.windowEnd = windowEnd
+        self.minimumMgdl = minimumMgdl
+        self.minimumDate = minimumDate
+    }
 }
 
 /// Small day-partitioned JSONL journal, separate from the Home-only forecast evidence log.

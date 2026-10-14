@@ -20,8 +20,8 @@ food is not backdated to the CGM reference. The largest required contribution
 is rounded up to whole grams. Existing bolus and carbohydrate effects are
 already in the forecast; neither IOB nor COB is subtracted a second time.
 This is a what-if estimate at discrete points, not evidence that actual glucose
-or the entire continuous curve stays above that margin. Unlike the separate
-Low soon alert's +30 endpoint, this checks the minimum throughout the window.
+or the entire continuous curve stays above that margin. Both this helper and the Low soon alert now inspect the minimum throughout
+the upcoming window. Their separate eligibility checks still apply.
 A stable value below the warning margin does not trigger eating to a personal
 6.8–6.9 mmol/L target.
 
@@ -525,9 +525,15 @@ never administers insulin. For a slow meal, the optional default 70% now and
 dose. These rules are software behavior, not demonstrated clinical accuracy.
 
 “Low soon” is a new, separately switchable iPhone alert, initially enabled.
-At each newly saved CGM reading, it requests a warning when the valid engine
-projection at +30 minutes is below 4.4 mmol/L while current glucose is at
-least 3.9 mmol/L; repeated requests are limited to one per 30 minutes. Its
+At each newly saved CGM reading, it requests a warning when the minimum of
+its valid engine projection in **now through now + 30 minutes** is below
+4.4 mmol/L while current measured glucose is at least 3.9 mmol/L. The full
+five-minute engine grid must be valid, anchored to the newest saved reading
+and cover the window; only the two window boundaries are linearly interpolated.
+Past dips are excluded, even when the CGM reference is older than now. A dip
+followed by recovery before +30 can now trigger a warning. The notification
+shows the predicted minimum and approximate time to it. Repeated requests
+are still limited to one per 30 minutes, with existing snooze/disable behavior. Its
 calculation does not depend on Home visibility, chart horizon or ML and does
 not include unconfirmed meals. It requires the completed local-treatment
 source cutover and a complete current therapy snapshot; being enabled in
@@ -535,7 +541,25 @@ Settings alone does not prove it is ready to warn. Health-import completion
 can trigger a coalesced retry for the same reading, without a new timer. The Apple Watch
 receives only the ordinary forwarded iPhone notification; it does not compute
 this alert. An accepted notification request proves scheduling, not that the
-person saw or heard it. The descriptive 30-day statistics distinguish planned
+person saw or heard it.
+
+The separate **Åbn beregner** notification action reuses the existing pending
+calculator request, source-ownership checks and Home sheet. It opens a fresh
+calculation; it carries no dose, carbohydrate quantity or treatment-save action.
+The ordinary notification tap retains its snooze selection. Existing open
+drafts are retained. A Low soon warning does not promise an available gram
+estimate: carbohydrate advice keeps its own stricter checks, including recent
+food, the modeled absorption delay and its output limit. No gram suggestion
+is embedded in the notification. There is no new high/correction advisory.
+
+New local evaluation records identify policy `minimum-now30-v2`, window
+boundaries, minimum value and minimum time. The existing `predicted30Mgdl`
+field still means reference + 30; old JSONL records remain readable with absent
+new fields. The 30-day display remains descriptive across versions, not a
+before/after efficacy comparison. More qualifying forecast dips do not prove
+fewer actual lows or better clinical outcomes. Compare missed episodes,
+warning requests without a later recorded low and coverage prospectively;
+physical locked-iPhone/Watch delivery still needs verification. The descriptive 30-day statistics distinguish planned
 warning requests, sustained recorded lows and periods that cannot be judged
 because readings or evaluations are missing. Low episodes require at least
 15 minutes below 3.9 mmol/L, with no inter-reading gap over 5.5 minutes;

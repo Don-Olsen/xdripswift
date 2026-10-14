@@ -3537,6 +3537,20 @@ extension RootApplicationCoordinator: @preconcurrency UNUserNotificationCenterDe
         }
     }
     
+    /// Only the explicit LowSoon action uses calculator navigation. A handled action remains
+    /// handled when local ownership rejects opening, so it cannot fall through into Snooze.
+    @discardableResult
+    static func routeLowSoonCalculatorAction(notificationIdentifier: String,
+                                              actionIdentifier: String,
+                                              acknowledgeAlert: () -> Void,
+                                              openCalculator: () -> Bool) -> Bool {
+        guard AlertManager.opensLowSoonCalculator(notificationIdentifier: notificationIdentifier,
+                                                  actionIdentifier: actionIdentifier) else { return false }
+        acknowledgeAlert()
+        _ = openCalculator()
+        return true
+    }
+
     // called when user clicks a notification
     func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse, withCompletionHandler completionHandler: @escaping () -> Void) {
         // call completionHandler when exiting function
@@ -3544,6 +3558,12 @@ extension RootApplicationCoordinator: @preconcurrency UNUserNotificationCenterDe
             // call completionhandler
             completionHandler()
         }
+
+        if Self.routeLowSoonCalculatorAction(
+            notificationIdentifier: response.notification.request.identifier,
+            actionIdentifier: response.actionIdentifier,
+            acknowledgeAlert: { _ = self.alertManager?.userNotificationCenter(center, didReceive: response) },
+            openCalculator: { QuickActionsManager.shared.handleQuickAction(.penCalculator) }) { return }
 
         if BasalReminderScheduler.shared.handleResponse(response) { return }
         

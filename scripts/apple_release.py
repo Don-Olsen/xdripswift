@@ -326,16 +326,38 @@ class AppleClient:
                     _fail("Apple build platform/version could not be verified as iOS")
                 if version is not None and release["version"] != version:
                     _fail("Apple's version-filtered build response does not match the requested release")
-                # Failed and newly processing builds can have no beta detail.
-                # They still reserve a number; missing beta status never proves
-                # Internal / Testing and must not turn into a blocking 404 here.
-                beta = self._included(page, relations.get("buildBetaDetail", {}))
                 if not isinstance(attributes.get("processingState"), str):
                     _fail("Apple build processing state is missing")
+                beta_relation = relations.get("buildBetaDetail", {})
+                beta = self._included(page, beta_relation)
+                beta_attributes = (beta or {}).get("attributes")
+                beta_state = (beta_attributes.get("internalBuildState")
+                              if isinstance(beta_attributes, dict) else None)
+                # Apple can omit included beta details even for a VALID build.
+                # Failed/processing builds still reserve numbers without this
+                # lookup: their beta detail may not exist yet (HTTP 404).
+                if attributes["processingState"] == "VALID" and not (
+                        isinstance(beta_state, str) and beta_state):
+                    relation = beta_relation.get("data")
+                    expected_beta_id = identifier
+                    if relation is not None:
+                        if (not isinstance(relation, dict) or relation.get("type") != "buildBetaDetails"
+                                or not isinstance(relation.get("id"), str) or not relation["id"]):
+                            _fail("Apple build beta-detail relationship is incomplete")
+                        expected_beta_id = relation["id"]
+                    beta = self._request("/v1/builds/{}/buildBetaDetail".format(identifier)).get("data")
+                    if (not isinstance(beta, dict) or beta.get("type") != "buildBetaDetails"
+                            or beta.get("id") != expected_beta_id):
+                        _fail("Apple build beta-detail identity does not match the requested build")
+                    beta_attributes = beta.get("attributes")
+                    beta_state = (beta_attributes.get("internalBuildState")
+                                  if isinstance(beta_attributes, dict) else None)
+                    if not isinstance(beta_state, str) or not beta_state:
+                        _fail("Apple build beta internal state is missing")
                 result.append({"id": identifier, "version": release["version"],
                                "build": attributes.get("version"),
                                "processingState": attributes["processingState"],
-                               "betaInternalState": (beta or {}).get("attributes", {}).get("internalBuildState"),
+                               "betaInternalState": beta_state,
                                "expired": attributes.get("expired"),
                                "buildAudienceType": attributes.get("buildAudienceType"),
                                "uploadedDate": attributes.get("uploadedDate")})

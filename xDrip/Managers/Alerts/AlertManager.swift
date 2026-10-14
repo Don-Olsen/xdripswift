@@ -8,6 +8,36 @@ import SwiftUI
 ///
 /// has all the logic but should be not or almost not aware of the kind of alerts that exists. The logic that is different per type of alert is defined in type AlertKind.
 public class AlertManager: NSObject {
+    // Low Soon keeps its existing snooze/default-tap behavior. Only this explicit
+    // foreground action opens a fresh calculator; no values or doses travel in the notification.
+    static let lowSoonCalculatorActionIdentifier = "lowSoonOpenCalculator"
+
+    static func opensLowSoonCalculator(notificationIdentifier: String,
+                                       actionIdentifier: String) -> Bool {
+        notificationIdentifier == AlertKind.lowSoon.notificationIdentifier() &&
+            actionIdentifier == lowSoonCalculatorActionIdentifier
+    }
+
+    static func lowSoonNotificationCategory(snoozeAction: UNNotificationAction?)
+        -> UNNotificationCategory {
+        let open = UNNotificationAction(identifier: lowSoonCalculatorActionIdentifier,
+            title: "Åbn beregner", options: [.foreground])
+        return UNNotificationCategory(
+            identifier: snoozeAction == nil ? "lowSoonCalculatorDismiss" : "lowSoonCalculatorSnooze",
+            actions: [open] + (snoozeAction.map { [$0] } ?? []), intentIdentifiers: [],
+            options: [.customDismissAction])
+    }
+
+    static func lowSoonNotificationBody(_ prediction: LowSoonAlertPolicy.ValidatedPrediction,
+                                        usesMgDl: Bool) -> String {
+        let glucoseText = prediction.minimumMgdl.mgDlToMmolAndToString(mgDl: usesMgDl)
+        let unit = usesMgDl ? "mg/dL" : "mmol/L"
+        let minutes = max(0, Int(ceil(prediction.minimumDate.timeIntervalSince(prediction.windowStart) / 60)))
+        let timeText = minutes == 0 ? "nu" : "om \(minutes) min"
+        let insulinText = String(format: "%.1f", locale: Locale.current, prediction.activeInsulinUnits)
+        return "Forventet lavpunkt: ca. \(glucoseText) \(unit) \(timeText) · aktiv insulin \(insulinText) E"
+    }
+
     // MARK: - private properties
   
     /// snoozeActionIdentifier for alert notification
@@ -225,12 +255,15 @@ public class AlertManager: NSObject {
                       at now: Date = .now) {
         let result = outcome.result
         func record(_ status: LowSoonEvaluationRecord.Status, detail: String? = nil,
-                    prediction: Double? = nil) {
+                    prediction: LowSoonAlertPolicy.ValidatedPrediction? = nil) {
             LowSoonEvaluationJournal.shared.enqueue(.init(
                 referenceDate: expectedReferenceDate, computedAt: now,
                 currentMgdl: outcome.referenceGlucoseMgdl,
-                predicted30Mgdl: prediction, iobUnits: outcome.activeInsulinUnits,
-                sensorID: expectedSensorID, status: status, detail: detail
+                predicted30Mgdl: prediction?.predicted30Mgdl, iobUnits: outcome.activeInsulinUnits,
+                sensorID: expectedSensorID, status: status, detail: detail,
+                policyVersion: LowSoonAlertPolicy.version,
+                windowStart: prediction?.windowStart, windowEnd: prediction?.windowEnd,
+                minimumMgdl: prediction?.minimumMgdl, minimumDate: prediction?.minimumDate
             ))
         }
 
@@ -243,44 +276,41 @@ public class AlertManager: NSObject {
             return
         }
 
-        let predicted = validated.predicted30Mgdl
         let kind = AlertKind.lowSoon
         let (entry, _) = alertEntriesAccessor.getCurrentAndNextAlertEntry(
             forAlertKind: kind, forWhen: now, alertTypesAccessor: alertTypesAccessor)
         guard !entry.isDisabled, entry.alertType.enabled else {
-            record(.suppressed, detail: "disabled", prediction: predicted)
+            record(.suppressed, detail: "disabled", prediction: validated)
             return
         }
         guard !(UserDefaults.standard.snoozeAllAlertsUntilDate.map { $0 > now } ?? false),
               !getSnoozeParameters(alertKind: kind).getSnoozeValue().isSnoozed else {
-            record(.suppressed, detail: "snoozed", prediction: predicted)
+            record(.suppressed, detail: "snoozed", prediction: validated)
             return
         }
         // A disabled or snoozed rule is not an evaluated opportunity, even when this particular
         // prediction would have been above the warning threshold. Keep that distinction in the
         // prospective journal so the 30-day false-warning denominator is not diluted.
         guard LowSoonAlertPolicy.condition(currentMgdl: validated.currentMgdl,
-                                           predicted30Mgdl: predicted) else {
-            record(.noWarning, prediction: predicted)
+                                           minimumMgdl: validated.minimumMgdl) else {
+            record(.noWarning, prediction: validated)
             return
         }
         guard LowSoonAlertPolicy.maySchedule(
             lastScheduled: UserDefaults.standard.object(forKey: LowSoonAlertState.lastScheduledDefaultsKey) as? Date,
             at: now
         ) else {
-            record(.suppressed, detail: "thirtyMinuteLimit", prediction: predicted)
+            record(.suppressed, detail: "thirtyMinuteLimit", prediction: validated)
             return
         }
 
-        let usesMgDl = UserDefaults.standard.bloodGlucoseUnitIsMgDl
-        let glucoseText = predicted.mgDlToMmolAndToString(mgDl: usesMgDl)
-        let unit = usesMgDl ? "mg/dL" : "mmol/L"
-        let insulinText = String(format: "%.1f", validated.activeInsulinUnits)
         let content = UNMutableNotificationContent()
         content.title = Texts_Alerts.lowSoonAlertTitle
-        content.body = "Ca. \(glucoseText) \(unit) om 30 min · aktiv insulin \(insulinText) E"
-        content.categoryIdentifier = entry.alertType.snooze
-            ? textOnlySnoozeCategoryIdentifier : dismissCategoryIdentifier
+        content.body = Self.lowSoonNotificationBody(validated,
+            usesMgDl: UserDefaults.standard.bloodGlucoseUnitIsMgDl)
+        content.categoryIdentifier = Self.lowSoonNotificationCategory(snoozeAction:
+            entry.alertType.snooze ? UNNotificationAction(identifier: snoozeActionIdentifier,
+                title: Texts_Alerts.snooze, options: []) : nil).identifier
         applyImmediatePresentation(from: entry.alertType, to: content)
         let request = UNNotificationRequest(identifier: kind.notificationIdentifier(),
                                             content: content, trigger: nil)
@@ -295,13 +325,13 @@ public class AlertManager: NSObject {
                     if (UserDefaults.standard.object(forKey: LowSoonAlertState.lastScheduledDefaultsKey) as? Date) == now {
                         UserDefaults.standard.removeObject(forKey: LowSoonAlertState.lastScheduledDefaultsKey)
                     }
-                    record(.warningSchedulingFailed, detail: "notificationRequestFailed", prediction: predicted)
+                    record(.warningSchedulingFailed, detail: "notificationRequestFailed", prediction: validated)
                     let nsError = error as NSError
                     trace("Low-soon request failed domain=%{public}@ code=%{public}d",
                           log: self.log, category: ConstantsLog.categoryAlertManager,
                           type: .error, nsError.domain, nsError.code)
                 } else {
-                    record(.warningRequested, prediction: predicted)
+                    record(.warningRequested, prediction: validated)
                     trace("Low-soon warning request accepted", log: self.log,
                           category: ConstantsLog.categoryAlertManager, type: .info,
                           troubleshooting: .standard(.alert(kindRawValue: kind.rawValue, activity: .raised)))
@@ -522,6 +552,11 @@ public class AlertManager: NSObject {
                     // save changes in coredata
                     coreDataManager.saveChanges()
                     
+                case Self.lowSoonCalculatorActionIdentifier:
+                    // The coordinator routes the exact Low Soon action to the existing
+                    // calculator. Sound has stopped above; this action does not snooze or log.
+                    break
+
                 case UNNotificationDefaultActionIdentifier:
                     
                     trace("in userNotificationCenter, received actionIdentifier : UNNotificationDefaultActionIdentifier (user clicked the notification which opens the app, but not the snooze action in this notification)", log: log, category: ConstantsLog.categoryAlertManager, type: .info)
@@ -1272,6 +1307,8 @@ public class AlertManager: NSObject {
         mutableExistingCategories.insert(UNNotificationCategory(identifier: textOnlySnoozeCategoryIdentifier, actions: [action], intentIdentifiers: [], options: [.customDismissAction]))
         mutableExistingCategories.insert(generalCategory)
         mutableExistingCategories.insert(dismissCategory)
+        mutableExistingCategories.insert(Self.lowSoonNotificationCategory(snoozeAction: action))
+        mutableExistingCategories.insert(Self.lowSoonNotificationCategory(snoozeAction: nil))
         
         // get UNUserNotificationCenter and set new list of categories
         UNUserNotificationCenter.current().setNotificationCategories(mutableExistingCategories)

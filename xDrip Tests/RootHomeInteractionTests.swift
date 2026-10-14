@@ -9,6 +9,7 @@
 import Combine
 import CoreData
 import SwiftUI
+import UserNotifications
 import XCTest
 @testable import xdrip
 
@@ -560,6 +561,186 @@ final class RootHomeInteractionTests: XCTestCase {
         }
     }
 
+
+    @MainActor
+    func testLowSoonCalculatorRouteLeavesDefaultSnoozeDismissAndOtherAlertsUntouched() throws {
+        let harness = try HostedHomeCalculatorHarness()
+        defer { harness.finish() }
+        let lowSoon = AlertKind.lowSoon.notificationIdentifier()
+        let action = AlertManager.lowSoonCalculatorActionIdentifier
+        for (identifier, actionIdentifier) in [
+            (lowSoon, UNNotificationDefaultActionIdentifier),
+            (lowSoon, UNNotificationDismissActionIdentifier),
+            (lowSoon, "snoozeActionIdentifier"),
+            (lowSoon, "unknownAction"),
+            (AlertKind.low.notificationIdentifier(), action),
+            (AlertKind.high.notificationIdentifier(), action),
+            ("plannedMealReminder", action)
+        ] {
+            XCTAssertFalse(harness.routeNotification(identifier: identifier, actionIdentifier: actionIdentifier))
+            XCTAssertNil(harness.root.penCalculatorQuickActionRequest)
+        }
+        XCTAssertEqual(harness.notificationAcknowledgements, 0,
+            "Unrelated responses must remain on their existing alert path")
+        XCTAssertFalse(harness.core.mainManagedObjectContext.hasChanges)
+    }
+
+    @MainActor
+    func testLowSoonCalculatorRouteAcknowledgesBeforeOpeningAndDoesNotFallThroughIfRejected() {
+        var events: [String] = []
+        XCTAssertTrue(RootApplicationCoordinator.routeLowSoonCalculatorAction(
+            notificationIdentifier: AlertKind.lowSoon.notificationIdentifier(),
+            actionIdentifier: AlertManager.lowSoonCalculatorActionIdentifier,
+            acknowledgeAlert: { events.append("stop alarm") },
+            openCalculator: { events.append("source rejects calculator"); return false }))
+        XCTAssertEqual(events, ["stop alarm", "source rejects calculator"])
+    }
+
+    @MainActor
+    func testHostedLowSoonActionBeforeRootAttachmentSurvivesColdStart() async throws {
+        let harness = try HostedHomeCalculatorHarness(attachRootImmediately: false)
+        defer { harness.finish() }
+        XCTAssertTrue(harness.routeNotification())
+        XCTAssertNil(harness.root.penCalculatorQuickActionRequest,
+            "The manager retains the request until root navigation exists")
+        harness.quickActions.attachRoot(harness.root)
+        let request = try XCTUnwrap(harness.root.penCalculatorQuickActionRequest)
+        let appeared = expectation(description: "Cold LowSoon action opens the real calculator")
+        harness.onConsumption = { _ in appeared.fulfill() }
+
+        await harness.mount(in: self)
+        await fulfillment(of: [appeared], timeout: 2)
+
+        XCTAssertNotNil(harness.host?.presentedViewController)
+        XCTAssertEqual(harness.consumedRequests, [request])
+        XCTAssertNil(harness.root.penCalculatorQuickActionRequest)
+        XCTAssertEqual(harness.notificationAcknowledgements, 1)
+        XCTAssertTrue(try harness.core.mainManagedObjectContext.fetch(TreatmentEntry.fetchRequest()).isEmpty)
+        XCTAssertFalse(harness.core.mainManagedObjectContext.hasChanges)
+    }
+
+    @MainActor
+    func testHostedLowSoonActionWaitsForForegroundAndOtherModalWithoutDiscardingDraft() async throws {
+        let harness = try HostedHomeCalculatorHarness(scenePhase: .inactive, allowsPresentation: false)
+        defer { harness.finish() }
+        await harness.mount(in: self)
+        let modal = UIViewController()
+        let draft = UITextField(frame: CGRect(x: 20, y: 20, width: 200, height: 50))
+        draft.text = "Unfinished entry"
+        modal.view.addSubview(draft)
+        let presented = expectation(description: "An unrelated editor is visible")
+        harness.host?.present(modal, animated: false) { presented.fulfill() }
+        await fulfillment(of: [presented], timeout: 2)
+
+        XCTAssertTrue(harness.routeNotification())
+        let request = try XCTUnwrap(harness.root.penCalculatorQuickActionRequest)
+        await harness.renderPendingChanges()
+        harness.quickActions.reactivatePendingCalculatorQuickAction()
+        harness.inputs.scenePhase = .active
+        await harness.renderPendingChanges()
+        XCTAssertTrue(harness.host?.presentedViewController === modal)
+        XCTAssertNil(modal.presentedViewController)
+        XCTAssertEqual(draft.text, "Unfinished entry")
+        XCTAssertEqual(harness.root.penCalculatorQuickActionRequest, request)
+
+        let dismissed = expectation(description: "The user closes the unrelated modal")
+        modal.dismiss(animated: false) { dismissed.fulfill() }
+        await fulfillment(of: [dismissed], timeout: 2)
+        let appeared = expectation(description: "LowSoon calculator opens after presentation is allowed")
+        harness.onConsumption = { _ in appeared.fulfill() }
+        harness.inputs.allowsPresentation = true
+        await fulfillment(of: [appeared], timeout: 2)
+        XCTAssertNotNil(harness.host?.presentedViewController)
+        XCTAssertEqual(harness.consumedRequests, [request])
+        XCTAssertTrue(try harness.core.mainManagedObjectContext.fetch(TreatmentEntry.fetchRequest()).isEmpty)
+        XCTAssertFalse(harness.core.mainManagedObjectContext.hasChanges)
+    }
+
+    @MainActor
+    func testHostedLowSoonActionReusesVisibleCalculatorAndPreservesManualInput() async throws {
+        let harness = try HostedHomeCalculatorHarness()
+        defer { harness.finish() }
+        await harness.mount(in: self)
+        let appeared = expectation(description: "Warm LowSoon action shows the existing calculator")
+        harness.onConsumption = { _ in appeared.fulfill() }
+        XCTAssertTrue(harness.routeNotification())
+        let firstRequest = try XCTUnwrap(harness.root.penCalculatorQuickActionRequest)
+        XCTAssertTrue(harness.routeNotification())
+        XCTAssertEqual(harness.root.penCalculatorQuickActionRequest, firstRequest)
+        await fulfillment(of: [appeared], timeout: 2)
+        let sheet = try XCTUnwrap(harness.host?.presentedViewController)
+        await harness.renderPendingChanges()
+        sheet.view.layoutIfNeeded()
+        let fields = calculatorTextFields(in: sheet.view)
+        let carbohydrates = try XCTUnwrap(fields.first { $0.placeholder == "0" })
+        let insulin = try XCTUnwrap(fields.first { $0.placeholder == "0,0" })
+        carbohydrates.text = "23,5"
+        carbohydrates.sendActions(for: .editingChanged)
+        insulin.text = "2,75"
+        insulin.sendActions(for: .editingChanged)
+        await harness.renderPendingChanges()
+        XCTAssertEqual(carbohydrates.text, "23,5")
+        XCTAssertEqual(insulin.text, "2,75")
+
+        let reused = expectation(description: "A new LowSoon request reuses the visible sheet")
+        harness.onConsumption = { _ in reused.fulfill() }
+        let previousRevision = harness.root.penCalculatorQuickActionDeliveryRevision
+        XCTAssertTrue(harness.routeNotification())
+        let nextRequest = try XCTUnwrap(harness.root.penCalculatorQuickActionRequest)
+        XCTAssertNotEqual(nextRequest, firstRequest)
+        await fulfillment(of: [reused], timeout: 2)
+        await harness.renderPendingChanges()
+
+        XCTAssertGreaterThan(harness.root.penCalculatorQuickActionDeliveryRevision, previousRevision)
+        XCTAssertTrue(harness.host?.presentedViewController === sheet)
+        XCTAssertNil(sheet.presentedViewController, "The action must not stack another calculator")
+        XCTAssertEqual(carbohydrates.text, "23,5")
+        XCTAssertEqual(insulin.text, "2,75", "Refreshing must preserve manually entered insulin")
+        XCTAssertEqual(harness.consumedRequests, [firstRequest, nextRequest])
+        XCTAssertNil(harness.root.penCalculatorQuickActionRequest)
+        XCTAssertTrue(try harness.core.mainManagedObjectContext.fetch(TreatmentEntry.fetchRequest()).isEmpty)
+        XCTAssertFalse(harness.core.mainManagedObjectContext.hasChanges)
+    }
+
+    @MainActor
+    func testLowSoonCalculatorActionCannotBypassLocalTreatmentOwnership() throws {
+        let harness = try HostedHomeCalculatorHarness()
+        defer { harness.finish() }
+        let defaults = UserDefaults.standard
+        let boundary = defaults.object(forKey: TreatmentSourceCutover.defaultsKey)
+        defaults.removeObject(forKey: TreatmentSourceCutover.defaultsKey)
+        XCTAssertTrue(harness.routeNotification())
+        XCTAssertNil(harness.root.penCalculatorQuickActionRequest)
+        defaults.set(boundary, forKey: TreatmentSourceCutover.defaultsKey)
+        defaults.set(true, forKey: TreatmentSourceCutover.restoreRequiresSourceSetupKey)
+        XCTAssertTrue(harness.routeNotification())
+        XCTAssertNil(harness.root.penCalculatorQuickActionRequest)
+        defaults.set(false, forKey: TreatmentSourceCutover.restoreRequiresSourceSetupKey)
+        // The effective owner depends on service availability: disabled Nightscout and
+        // CareLink outside CareLink follower mode both resolve back to a local owner.
+        // Keep the test host's remote endpoint absent while enabling the policy fixture.
+        defaults.nightscoutUrl = nil
+        for source in [TherapyDataSourceType.nightscout, .careLink] {
+            defaults.nightscoutEnabled = source == .nightscout
+            defaults.isMaster = source != .careLink
+            if source == .careLink { defaults.followerDataSourceType = .careLink }
+            defaults.therapyDataSourceType = source
+            XCTAssertEqual(defaults.dataFlowPolicy.therapyDataSource, source,
+                "The fixture must resolve to the external owner being tested")
+            XCTAssertFalse(TherapyMetricsManager.doseSourceIsReady(defaults.dataFlowPolicy,
+                cutover: TreatmentSourceCutover.current()))
+            XCTAssertTrue(harness.routeNotification())
+            XCTAssertNil(harness.root.penCalculatorQuickActionRequest)
+        }
+        XCTAssertEqual(harness.notificationAcknowledgements, 4)
+        XCTAssertTrue(try harness.core.mainManagedObjectContext.fetch(TreatmentEntry.fetchRequest()).isEmpty)
+        XCTAssertFalse(harness.core.mainManagedObjectContext.hasChanges)
+    }
+
+    @MainActor
+    private func calculatorTextFields(in view: UIView) -> [UITextField] {
+        (view as? UITextField).map { [$0] } ?? view.subviews.flatMap { calculatorTextFields(in: $0) }
+    }
 
     @MainActor
     func testHostedIconRequestBeforeHomeMountPresentsTheRealCalculator() async throws {
@@ -1999,6 +2180,7 @@ private final class HostedHomeCalculatorHarness {
     let miniChartQueue: OperationQueue?
     let miniChart: GlucoseChartStateManager?
     private(set) var consumedRequests: [UUID] = []
+    private(set) var notificationAcknowledgements = 0
     var onConsumption: ((UUID) -> Void)?
     private(set) var host: UIViewController?
     private var window: UIWindow?
@@ -2008,13 +2190,15 @@ private final class HostedHomeCalculatorHarness {
     private let sensorSuite = "HostedHomeCalculator.\(UUID().uuidString)"
 
     init(scenePhase: ScenePhase = .active, allowsPresentation: Bool = true,
-         controlsMiniChart: Bool = false) throws {
+         controlsMiniChart: Bool = false, attachRootImmediately: Bool = true) throws {
         inputs = HostedHomeCalculatorInputs(scenePhase: scenePhase,
                                             allowsPresentation: allowsPresentation)
         let defaults = UserDefaults.standard
         let keys = [UserDefaults.Key.isMaster.rawValue,
+                    UserDefaults.Key.followerDataSourceType.rawValue,
                     UserDefaults.Key.therapyDataSourceType.rawValue,
                     UserDefaults.Key.nightscoutEnabled.rawValue,
+                    UserDefaults.Key.nightscoutUrl.rawValue,
                     UserDefaults.Key.glucoseForecastHorizonMinutes.rawValue,
                     UserDefaults.Key.showMiniChart.rawValue,
                     UserDefaults.Key.miniChartHoursToShow.rawValue,
@@ -2045,7 +2229,7 @@ private final class HostedHomeCalculatorHarness {
         let boundary = TreatmentSourceCutover(cutoff: Date(),
             insulinSourceBundleID: "hosted.test.insulin", carbohydrateSourceBundleID: "hosted.test.carbs")
         defaults.set(try JSONEncoder().encode(boundary), forKey: TreatmentSourceCutover.defaultsKey)
-        quickActions.attachRoot(root)
+        if attachRootImmediately { quickActions.attachRoot(root) }
         if controlsMiniChart {
             defaults.miniChartHoursToShow = ConstantsGlucoseChart.miniChartHoursToShow1
             setMiniChartVisibility(false)
@@ -2082,6 +2266,14 @@ private final class HostedHomeCalculatorHarness {
         // Yield across a display pass; do not call a presentation helper or post a
         // notification. In particular, drain Home's initial onAppear task before a tap.
         try? await Task.sleep(nanoseconds: 150_000_000)
+    }
+
+    func routeNotification(identifier: String = AlertKind.lowSoon.notificationIdentifier(),
+                           actionIdentifier: String = AlertManager.lowSoonCalculatorActionIdentifier) -> Bool {
+        RootApplicationCoordinator.routeLowSoonCalculatorAction(
+            notificationIdentifier: identifier, actionIdentifier: actionIdentifier,
+            acknowledgeAlert: { self.notificationAcknowledgements += 1 },
+            openCalculator: { self.quickActions.handleQuickAction(.penCalculator) })
     }
 
     func requestFromIcon() throws -> UUID {
