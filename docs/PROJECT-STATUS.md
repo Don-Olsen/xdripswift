@@ -1,3 +1,15 @@
+<!-- testflight-7.1.1-4330:start -->
+### TestFlight 7.1.1 (4330)
+
+- Kildecommit og tag: `f386404993bcfc42717879a1a3f29d3986d40aed` / `testflight-7.1.1-4330`.
+- Tests: 1629/1629 bestået; 0 fejlet; 0 skipped. iPhone- og Watch-simulatorbuilds bestod.
+- Apple-status (2026-10-14T09:22:58.389018+00:00): [Internal / Testing](https://appstoreconnect.apple.com/apps/6795645396/testflight/ios/36281652-fb14-4ce9-98fe-1511507d5b5c).
+- Eksisterende intern gruppe: Ole Internal er bekræftet tilknyttet.
+- Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
+<!-- testflight-7.1.1-4330:end -->
+
+De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
+
 ## Lavt om lidt: kommende lavpunkt og Åbn beregner — 14. oktober 2026
 
 På uændret 4329 kontrollerede advarslen kun reference-målingens +30-værdi.
