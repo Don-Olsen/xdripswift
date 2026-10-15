@@ -738,6 +738,175 @@ final class RootHomeInteractionTests: XCTestCase {
     }
 
     @MainActor
+    func testHostedHighSoonDefaultTapBeforeRootAttachmentSurvivesColdStart() async throws {
+        let harness = try HostedHomeCalculatorHarness(attachRootImmediately: false)
+        defer { harness.finish() }
+        XCTAssertTrue(harness.routeHighNotification())
+        XCTAssertNil(harness.root.penCalculatorQuickActionRequest,
+            "A cold default tap stays queued until root navigation exists")
+        harness.quickActions.attachRoot(harness.root)
+        let request = try XCTUnwrap(harness.root.penCalculatorQuickActionRequest)
+        let appeared = expectation(description: "Cold high advisory default tap opens the real calculator")
+        harness.onConsumption = { _ in appeared.fulfill() }
+
+        await harness.mount(in: self)
+        await fulfillment(of: [appeared], timeout: 2)
+
+        XCTAssertNotNil(harness.host?.presentedViewController)
+        XCTAssertEqual(harness.consumedRequests, [request])
+        XCTAssertNil(harness.root.penCalculatorQuickActionRequest)
+        XCTAssertEqual(harness.notificationAcknowledgements, 1)
+        XCTAssertTrue(try harness.core.mainManagedObjectContext.fetch(TreatmentEntry.fetchRequest()).isEmpty)
+        XCTAssertFalse(harness.core.mainManagedObjectContext.hasChanges)
+    }
+
+    @MainActor
+    func testHostedHighSoonExplicitAndRepeatedActionsPreserveVisibleCalculatorFields() async throws {
+        let harness = try HostedHomeCalculatorHarness()
+        defer { harness.finish() }
+        await harness.mount(in: self)
+        let appeared = expectation(description: "Warm high advisory action opens the calculator")
+        harness.onConsumption = { _ in appeared.fulfill() }
+        let action = HighSoonAdvisoryPolicy.openActionIdentifier
+        XCTAssertTrue(harness.routeHighNotification(actionIdentifier: action))
+        let first = try XCTUnwrap(harness.root.penCalculatorQuickActionRequest)
+        XCTAssertTrue(harness.routeHighNotification(actionIdentifier: action))
+        XCTAssertEqual(harness.root.penCalculatorQuickActionRequest, first)
+        await fulfillment(of: [appeared], timeout: 2)
+        let sheet = try XCTUnwrap(harness.host?.presentedViewController)
+        await harness.renderPendingChanges()
+        sheet.view.layoutIfNeeded()
+        let fields = calculatorTextFields(in: sheet.view)
+        let carbohydrates = try XCTUnwrap(fields.first { $0.placeholder == "0" })
+        let insulin = try XCTUnwrap(fields.first { $0.placeholder == "0,0" })
+        carbohydrates.text = "19,5"
+        carbohydrates.sendActions(for: .editingChanged)
+        insulin.text = "1,75"
+        insulin.sendActions(for: .editingChanged)
+        await harness.renderPendingChanges()
+
+        let reused = expectation(description: "High advisory default tap reuses the visible calculator")
+        harness.onConsumption = { _ in reused.fulfill() }
+        let previousRevision = harness.root.penCalculatorQuickActionDeliveryRevision
+        XCTAssertTrue(harness.routeHighNotification())
+        let next = try XCTUnwrap(harness.root.penCalculatorQuickActionRequest)
+        XCTAssertNotEqual(next, first)
+        await fulfillment(of: [reused], timeout: 2)
+        await harness.renderPendingChanges()
+
+        XCTAssertGreaterThan(harness.root.penCalculatorQuickActionDeliveryRevision, previousRevision)
+        XCTAssertTrue(harness.host?.presentedViewController === sheet)
+        XCTAssertNil(sheet.presentedViewController, "Advisory taps must not stack calculators")
+        XCTAssertEqual(carbohydrates.text, "19,5")
+        XCTAssertEqual(insulin.text, "1,75", "A new calculation cannot replace manually entered insulin")
+        XCTAssertEqual(harness.consumedRequests, [first, next])
+        XCTAssertEqual(harness.notificationAcknowledgements, 3)
+        XCTAssertNil(harness.root.penCalculatorQuickActionRequest)
+        XCTAssertTrue(try harness.core.mainManagedObjectContext.fetch(TreatmentEntry.fetchRequest()).isEmpty)
+        XCTAssertFalse(harness.core.mainManagedObjectContext.hasChanges)
+    }
+
+    @MainActor
+    func testHostedHighSoonTapWaitsForForegroundAndModalWithoutDiscardingDraft() async throws {
+        let harness = try HostedHomeCalculatorHarness(scenePhase: .inactive, allowsPresentation: false)
+        defer { harness.finish() }
+        await harness.mount(in: self)
+        let modal = UIViewController()
+        let draft = UITextField(frame: CGRect(x: 20, y: 20, width: 200, height: 50))
+        draft.text = "Pending manual entry"
+        modal.view.addSubview(draft)
+        let presented = expectation(description: "Another editor is visible before the high advisory tap")
+        harness.host?.present(modal, animated: false) { presented.fulfill() }
+        await fulfillment(of: [presented], timeout: 2)
+
+        XCTAssertTrue(harness.routeHighNotification())
+        let request = try XCTUnwrap(harness.root.penCalculatorQuickActionRequest)
+        await harness.renderPendingChanges()
+        harness.quickActions.reactivatePendingCalculatorQuickAction()
+        harness.inputs.scenePhase = .active
+        await harness.renderPendingChanges()
+        XCTAssertTrue(harness.host?.presentedViewController === modal)
+        XCTAssertNil(modal.presentedViewController)
+        XCTAssertEqual(draft.text, "Pending manual entry")
+        XCTAssertEqual(harness.root.penCalculatorQuickActionRequest, request)
+
+        let dismissed = expectation(description: "The other editor finishes closing")
+        modal.dismiss(animated: false) { dismissed.fulfill() }
+        await fulfillment(of: [dismissed], timeout: 2)
+        let appeared = expectation(description: "High advisory opens the calculator when presentation becomes available")
+        harness.onConsumption = { _ in appeared.fulfill() }
+        harness.inputs.allowsPresentation = true
+        await fulfillment(of: [appeared], timeout: 2)
+        XCTAssertNotNil(harness.host?.presentedViewController)
+        XCTAssertEqual(harness.consumedRequests, [request])
+        XCTAssertNil(harness.root.penCalculatorQuickActionRequest)
+        XCTAssertTrue(try harness.core.mainManagedObjectContext.fetch(TreatmentEntry.fetchRequest()).isEmpty)
+        XCTAssertFalse(harness.core.mainManagedObjectContext.hasChanges)
+    }
+
+    @MainActor
+    func testHighSoonRouterRejectsUnrelatedResponsesAndAcknowledgesBeforeOpening() throws {
+        let harness = try HostedHomeCalculatorHarness()
+        defer { harness.finish() }
+        let high = HighSoonAdvisoryPolicy.notificationIdentifier
+        let action = HighSoonAdvisoryPolicy.openActionIdentifier
+        for (identifier, actionIdentifier) in [
+            (high, UNNotificationDismissActionIdentifier),
+            (high, "snoozeActionIdentifier"),
+            (high, AlertManager.lowSoonCalculatorActionIdentifier),
+            (high, "unknownAction"),
+            (high + ".other", action),
+            (AlertKind.high.notificationIdentifier(), UNNotificationDefaultActionIdentifier),
+            (AlertKind.lowSoon.notificationIdentifier(), UNNotificationDefaultActionIdentifier),
+            ("plannedMealReminder", action)
+        ] {
+            XCTAssertFalse(harness.routeHighNotification(identifier: identifier, actionIdentifier: actionIdentifier))
+            XCTAssertNil(harness.root.penCalculatorQuickActionRequest)
+        }
+        XCTAssertEqual(harness.notificationAcknowledgements, 0)
+        var events: [String] = []
+        XCTAssertTrue(RootApplicationCoordinator.routeHighSoonCalculatorAction(
+            notificationIdentifier: high, actionIdentifier: action,
+            acknowledgeAdvisory: { events.append("clear advisory") },
+            openCalculator: { events.append("source rejects calculator"); return false }))
+        XCTAssertEqual(events, ["clear advisory", "source rejects calculator"])
+        XCTAssertFalse(harness.core.mainManagedObjectContext.hasChanges)
+    }
+
+    @MainActor
+    func testHighSoonDefaultAndExplicitActionsCannotBypassLocalTreatmentOwnership() throws {
+        let harness = try HostedHomeCalculatorHarness()
+        defer { harness.finish() }
+        let defaults = UserDefaults.standard
+        let boundary = defaults.object(forKey: TreatmentSourceCutover.defaultsKey)
+        defaults.removeObject(forKey: TreatmentSourceCutover.defaultsKey)
+        XCTAssertTrue(harness.routeHighNotification())
+        XCTAssertNil(harness.root.penCalculatorQuickActionRequest)
+        defaults.set(boundary, forKey: TreatmentSourceCutover.defaultsKey)
+        defaults.set(true, forKey: TreatmentSourceCutover.restoreRequiresSourceSetupKey)
+        XCTAssertTrue(harness.routeHighNotification(actionIdentifier: HighSoonAdvisoryPolicy.openActionIdentifier))
+        XCTAssertNil(harness.root.penCalculatorQuickActionRequest)
+        defaults.set(false, forKey: TreatmentSourceCutover.restoreRequiresSourceSetupKey)
+        defaults.nightscoutUrl = nil
+        for source in [TherapyDataSourceType.nightscout, .careLink] {
+            defaults.nightscoutEnabled = source == .nightscout
+            defaults.isMaster = source != .careLink
+            if source == .careLink { defaults.followerDataSourceType = .careLink }
+            defaults.therapyDataSourceType = source
+            XCTAssertEqual(defaults.dataFlowPolicy.therapyDataSource, source)
+            XCTAssertFalse(TherapyMetricsManager.doseSourceIsReady(defaults.dataFlowPolicy,
+                cutover: TreatmentSourceCutover.current()))
+            for action in [UNNotificationDefaultActionIdentifier, HighSoonAdvisoryPolicy.openActionIdentifier] {
+                XCTAssertTrue(harness.routeHighNotification(actionIdentifier: action))
+                XCTAssertNil(harness.root.penCalculatorQuickActionRequest)
+            }
+        }
+        XCTAssertEqual(harness.notificationAcknowledgements, 6)
+        XCTAssertTrue(try harness.core.mainManagedObjectContext.fetch(TreatmentEntry.fetchRequest()).isEmpty)
+        XCTAssertFalse(harness.core.mainManagedObjectContext.hasChanges)
+    }
+
+    @MainActor
     private func calculatorTextFields(in view: UIView) -> [UITextField] {
         (view as? UITextField).map { [$0] } ?? view.subviews.flatMap { calculatorTextFields(in: $0) }
     }
@@ -2273,6 +2442,14 @@ private final class HostedHomeCalculatorHarness {
         RootApplicationCoordinator.routeLowSoonCalculatorAction(
             notificationIdentifier: identifier, actionIdentifier: actionIdentifier,
             acknowledgeAlert: { self.notificationAcknowledgements += 1 },
+            openCalculator: { self.quickActions.handleQuickAction(.penCalculator) })
+    }
+
+    func routeHighNotification(identifier: String = HighSoonAdvisoryPolicy.notificationIdentifier,
+                               actionIdentifier: String = UNNotificationDefaultActionIdentifier) -> Bool {
+        RootApplicationCoordinator.routeHighSoonCalculatorAction(
+            notificationIdentifier: identifier, actionIdentifier: actionIdentifier,
+            acknowledgeAdvisory: { self.notificationAcknowledgements += 1 },
             openCalculator: { self.quickActions.handleQuickAction(.penCalculator) })
     }
 

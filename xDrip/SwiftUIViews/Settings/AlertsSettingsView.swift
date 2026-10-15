@@ -98,6 +98,7 @@ struct AlertEntryEditRequest {
 
 struct AlertsSettingsView: View {
     @ObservedObject var viewModel: AlertsSettingsViewModel
+    @AppStorage(HighSoonAdvisoryPolicy.enabledKey) private var highSoonAdvisoryEnabled = true
 
     let openAlertEntry: (AlertEntryEditRequest) -> Void
 
@@ -116,6 +117,14 @@ struct AlertsSettingsView: View {
                     }
                 }
             }
+            Section {
+                Toggle("Højt om lidt", isOn: $highSoonAdvisoryEnabled)
+            } footer: {
+                Text("Bruger grænsen og tidsplanen for Høj. Varsler ved en stigende prognose over grænsen inden for 30 minutter, når en bekræftet doseringsprofil giver et positivt, kontrolleret forslag i beregneren. Tryk åbner en ny beregning; beskeden indeholder ingen dosis.")
+            }
+        }
+        .onChange(of: highSoonAdvisoryEnabled) { isEnabled in
+            AlertManager.highSoonSettingDidChange(isEnabled: isEnabled)
         }
         .id(viewModel.reloadToken)
         .settingsListStyle(title: Texts_Alerts.alertsScreenTitle, titleDisplayMode: .inline)

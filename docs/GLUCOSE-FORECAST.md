@@ -550,7 +550,39 @@ The ordinary notification tap retains its snooze selection. Existing open
 drafts are retained. A Low soon warning does not promise an available gram
 estimate: carbohydrate advice keeps its own stricter checks, including recent
 food, the modeled absorption delay and its output limit. No gram suggestion
-is embedded in the notification. There is no new high/correction advisory.
+is embedded in the notification.
+
+**Højt om lidt** is a separate, optional early-high advisory, initially enabled
+under Alerts. It uses the ordinary High alert's current scheduled threshold;
+disabling/snoozing that rule or snoozing all alerts also suppresses this advice.
+Current measured glucose must still be below the threshold, the raw 15-minute
+slope must be positive, and the valid engine curve must exceed the threshold
+within **now through now + 30 minutes**. A low below 4.4 mmol/L in that same
+window suppresses high advice. This does not replace the ordinary measured-high
+alarm or change any low-alarm thresholds.
+
+A forecast crossing is insufficient: the same frozen, complete therapy/glucose
+snapshot must produce a positive, rounded result from the existing confirmed
+pen profile, with zero new carbohydrates, current CGM/trend, existing IOB/COB
+and the calculator's existing CGM-COB estimate/fallback. Its normal 120-minute
+forecast safety check must pass. The separate original 60-minute result is
+retained for Low soon even when a later 120-minute point is invalid. Pure safety
+computation does not queue behind optional Home/ML preparation. Before high
+advice is consumed, captured source/settings, treatment/forecast revisions,
+committed input, confirmed profile and snapshot age (at most 30 seconds) must
+still match. A stale high context skips only high advice and never suppresses
+existing Low soon completion. The next saved CGM reading evaluates again.
+
+The notification includes predicted high value and approximate time, **no dose**.
+Both default tap and “Åbn beregner” use the existing pending Home calculator
+request; they retain open drafts, recheck source ownership and register nothing.
+A fresh calculation is made when opened. Its own persisted 30-minute limit is
+reserved before iOS scheduling and released on a matching scheduling failure.
+Disabling the setting removes only this advisory's pending/delivered requests.
+It uses normal notification sound, not a new critical alarm or override-mute
+path. Delivery depends on iOS notification settings and on the phone receiving
+the CGM readings; Watch only receives normal notification forwarding. A saved
+scheduling request does not establish actual delivery or clinical benefit.
 
 New local evaluation records identify policy `minimum-now30-v2`, window
 boundaries, minimum value and minimum time. The existing `predicted30Mgdl`

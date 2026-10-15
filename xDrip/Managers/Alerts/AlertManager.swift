@@ -38,6 +38,45 @@ public class AlertManager: NSObject {
         return "Forventet lavpunkt: ca. \(glucoseText) \(unit) \(timeText) · aktiv insulin \(insulinText) E"
     }
 
+    /// The advisory has its own category and default-tap route, independent of alarm snoozing.
+    static func opensHighSoonCalculator(notificationIdentifier: String,
+                                        actionIdentifier: String) -> Bool {
+        notificationIdentifier == HighSoonAdvisoryPolicy.notificationIdentifier &&
+            (actionIdentifier == UNNotificationDefaultActionIdentifier ||
+             actionIdentifier == HighSoonAdvisoryPolicy.openActionIdentifier)
+    }
+
+    static func highSoonNotificationCategory() -> UNNotificationCategory {
+        UNNotificationCategory(identifier: HighSoonAdvisoryPolicy.categoryIdentifier,
+            actions: [UNNotificationAction(identifier: HighSoonAdvisoryPolicy.openActionIdentifier,
+                title: "Åbn beregner", options: [.foreground])],
+            intentIdentifiers: [], options: [])
+    }
+
+    static func highSoonNotificationBody(_ prediction: HighSoonAdvisoryPolicy.Prediction,
+                                         usesMgDl: Bool) -> String {
+        let glucoseText = prediction.peakMgdl.mgDlToMmolAndToString(mgDl: usesMgDl)
+        let unit = usesMgDl ? "mg/dL" : "mmol/L"
+        let minutes = max(0, Int(ceil(prediction.peakDate.timeIntervalSince(prediction.windowStart) / 60)))
+        let timeText = minutes == 0 ? "nu" : "om \(minutes) min"
+        return "Forventet højt blodsukker: ca. \(glucoseText) \(unit) \(timeText). Åbn beregner."
+    }
+
+    /// The optional advice owns only this request; disabling it cannot dismiss measured alarms.
+    static func clearHighSoonNotifications(
+        removePending: ([String]) -> Void = { UNUserNotificationCenter.current().removePendingNotificationRequests(withIdentifiers: $0) },
+        removeDelivered: ([String]) -> Void = { UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: $0) }
+    ) {
+        let identifiers = [HighSoonAdvisoryPolicy.notificationIdentifier]
+        removePending(identifiers)
+        removeDelivered(identifiers)
+    }
+
+    static func highSoonSettingDidChange(isEnabled: Bool,
+                                        clearNotifications: () -> Void = { AlertManager.clearHighSoonNotifications() }) {
+        if !isEnabled { clearNotifications() }
+    }
+
     // MARK: - private properties
   
     /// snoozeActionIdentifier for alert notification
@@ -335,6 +374,68 @@ public class AlertManager: NSObject {
                     trace("Low-soon warning request accepted", log: self.log,
                           category: ConstantsLog.categoryAlertManager, type: .info,
                           troubleshooting: .standard(.alert(kindRawValue: kind.rawValue, activity: .raised)))
+                }
+            }
+        }
+    }
+
+    /// Optional forecast advice uses the current ordinary high rule's threshold and schedule.
+    /// It does not create an AlertKind, change measured alarms, or carry a calculated dose.
+    /// The caller supplies the same durable, latest-reading-checked result used by Low Soon.
+    @MainActor
+    func checkHighSoon(_ outcome: GlucoseForecastSafetyOutcome,
+                       expectedReferenceDate: Date, expectedSensorID: String?,
+                       expectedGlucoseMgdl: Double,
+                       at now: Date = .now,
+                       defaults: UserDefaults = .standard,
+                       schedule: ((UNNotificationRequest, @escaping @Sendable (Error?) -> Void) -> Void)? = nil,
+                       clearNotifications: (@MainActor () -> Void)? = nil) {
+        guard HighSoonAdvisoryPolicy.isEnabled(defaults: defaults) else { return }
+        let (entry, _) = alertEntriesAccessor.getCurrentAndNextAlertEntry(
+            forAlertKind: .high, forWhen: now, alertTypesAccessor: alertTypesAccessor)
+        guard !entry.isDisabled, entry.alertType.enabled,
+              !(defaults.snoozeAllAlertsUntilDate.map { $0 > now } ?? false) else { return }
+        let snooze = getSnoozeParameters(alertKind: .high)
+        if snooze.snoozePeriodInMinutes > 0,
+           let until = snooze.snoozeTimeStamp?.addingTimeInterval(Double(snooze.snoozePeriodInMinutes) * 60),
+           until >= now { return }
+        guard let prediction = HighSoonAdvisoryPolicy.prediction(from: outcome,
+            expectedReferenceDate: expectedReferenceDate, expectedSensorID: expectedSensorID,
+            expectedGlucoseMgdl: expectedGlucoseMgdl, highLimitMgdl: Double(entry.value), at: now)
+        else { return }
+        guard HighSoonAdvisoryPolicy.maySchedule(
+            lastScheduled: defaults.object(forKey: HighSoonAdvisoryPolicy.lastScheduledKey) as? Date,
+            at: now) else { return }
+
+        let content = UNMutableNotificationContent()
+        content.title = "Højt om lidt"
+        content.body = Self.highSoonNotificationBody(prediction, usesMgDl: defaults.bloodGlucoseUnitIsMgDl)
+        content.categoryIdentifier = HighSoonAdvisoryPolicy.categoryIdentifier
+        content.sound = .default
+        content.interruptionLevel = .active
+        let request = UNNotificationRequest(identifier: HighSoonAdvisoryPolicy.notificationIdentifier,
+                                            content: content, trigger: nil)
+        let add: (UNNotificationRequest, @escaping @Sendable (Error?) -> Void) -> Void = schedule ?? { [uNUserNotificationCenter] request, completion in
+            uNUserNotificationCenter.add(request, withCompletionHandler: completion)
+        }
+        let clear: @MainActor () -> Void = clearNotifications ?? { Self.clearHighSoonNotifications() }
+        // Reserve before calling iOS, including when two reading callbacks arrive before its reply.
+        defaults.set(now, forKey: HighSoonAdvisoryPolicy.lastScheduledKey)
+        add(request) { [weak self] error in
+            DispatchQueue.main.async { [weak self] in
+                if let error {
+                    if (defaults.object(forKey: HighSoonAdvisoryPolicy.lastScheduledKey) as? Date) == now {
+                        defaults.removeObject(forKey: HighSoonAdvisoryPolicy.lastScheduledKey)
+                    }
+                    if let self {
+                        let nsError = error as NSError
+                        trace("High-soon advisory request failed domain=%{public}@ code=%{public}d",
+                              log: self.log, category: ConstantsLog.categoryAlertManager,
+                              type: .error, nsError.domain, nsError.code)
+                    }
+                } else if !HighSoonAdvisoryPolicy.isEnabled(defaults: defaults) {
+                    // A user may disable advice while the system is still accepting the request.
+                    clear()
                 }
             }
         }
@@ -1309,6 +1410,7 @@ public class AlertManager: NSObject {
         mutableExistingCategories.insert(dismissCategory)
         mutableExistingCategories.insert(Self.lowSoonNotificationCategory(snoozeAction: action))
         mutableExistingCategories.insert(Self.lowSoonNotificationCategory(snoozeAction: nil))
+        mutableExistingCategories.insert(Self.highSoonNotificationCategory())
         
         // get UNUserNotificationCenter and set new list of categories
         UNUserNotificationCenter.current().setNotificationCategories(mutableExistingCategories)

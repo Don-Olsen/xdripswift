@@ -28,6 +28,17 @@ struct GlucoseForecastSafetyOutcome: Sendable {
     let referenceGlucoseMgdl: Double?
     let activeInsulinUnits: Double?
     let slope15MgdlPerMinute: Double?
+    let highAdvisory: HighSoonAdvisoryContext?
+
+    init(result: GlucoseForecastResult, referenceGlucoseMgdl: Double?,
+         activeInsulinUnits: Double?, slope15MgdlPerMinute: Double?,
+         highAdvisory: HighSoonAdvisoryContext? = nil) {
+        self.result = result
+        self.referenceGlucoseMgdl = referenceGlucoseMgdl
+        self.activeInsulinUnits = activeInsulinUnits
+        self.slope15MgdlPerMinute = slope15MgdlPerMinute
+        self.highAdvisory = highAdvisory
+    }
 }
 
 /// Core Data reads run on a serial worker. Home can cancel or supersede its awaiting Task
@@ -64,7 +75,8 @@ final class GlucoseForecastDataAdapter {
 
     /// Unlike Home presentation, this performs no ML inference, logging, planned-food
     /// overlay, cache reuse or training. An incomplete source stays unavailable.
-    func engineOnlyForecast(horizonMinutes: Int = 60, at now: Date = .now)
+    func engineOnlyForecast(horizonMinutes: Int = 60, at now: Date = .now,
+                            includeHighAdvisory: Bool = false)
         async -> GlucoseForecastSafetyOutcome {
         let snapshot = await therapyManager.penDoseSnapshot(at: now)
         switch snapshot {
@@ -74,13 +86,80 @@ final class GlucoseForecastDataAdapter {
                     reason: .dataUnavailable), referenceGlucoseMgdl: nil,
                 activeInsulinUnits: nil, slope15MgdlPerMinute: nil)
         case .success(let input):
-            let result = PenBolusCalculator.safetyForecast(snapshot: input, at: now,
-                defaults: defaults, horizonMinutes: horizonMinutes)
-            return GlucoseForecastSafetyOutcome(result: result,
-                referenceGlucoseMgdl: input.glucose.last?.glucoseMgdl,
-                activeInsulinUnits: result.reason == nil ? input.iobUnits : nil,
-                slope15MgdlPerMinute: Self.rawSlope15(input.glucose))
+            // Preserve Low soon's existing post-read parameter selection. Freeze these
+            // same values for high advice, which also requires matching snapshot provenance.
+            let sourceSignature = Self.presentationInputSignature(horizonMinutes: 120,
+                defaults: defaults, importer: healthImporter)
+            let profile = includeHighAdvisory ? PenDoseProfile.load(defaults: defaults) : nil
+            let sensitivity = defaults.glucoseForecastManualSensitivityMgdlPerUnit
+            let ratio = defaults.glucoseForecastManualCarbRatioGramsPerUnit
+            let forecastRevision = therapyManager.forecastInputChangeRevision
+            let frozenSettingsMatch = sourceSignature == Self.presentationInputSignature(horizonMinutes: 120,
+                defaults: defaults, importer: healthImporter)
+            // Pure value work must not wait behind this adapter's optional Home/ML queue.
+            return await Task.detached(priority: .userInitiated) {
+                Self.engineOnlyOutcome(snapshot: input,
+                    horizonMinutes: horizonMinutes, at: now,
+                    sensitivityMgdlPerUnit: sensitivity,
+                    carbohydrateRatioGramsPerUnit: ratio,
+                    highAdvisoryProfile: frozenSettingsMatch && input.sourceSignature == sourceSignature ? profile : nil,
+                    forecastInputChangeRevision: forecastRevision)
+            }.value
         }
+    }
+
+    /// Pure assembly from one detached, source-validated snapshot. The two-hour correction
+    /// safety check cannot replace the original shorter forecast: a later out-of-range point
+    /// may invalidate two hours while the complete first hour still supports a low warning.
+    static func engineOnlyOutcome(snapshot: PenDoseInputSnapshot, horizonMinutes: Int = 60,
+                                  at now: Date,
+                                  sensitivityMgdlPerUnit: Double?,
+                                  carbohydrateRatioGramsPerUnit: Double?,
+                                  highAdvisoryProfile: PenDoseProfile? = nil,
+                                  forecastInputChangeRevision: Int = 0)
+        -> GlucoseForecastSafetyOutcome {
+        let result = PenBolusCalculator.safetyForecast(snapshot: snapshot, at: now,
+            sensitivityMgdlPerUnit: sensitivityMgdlPerUnit,
+            carbohydrateRatioGramsPerUnit: carbohydrateRatioGramsPerUnit,
+            horizonMinutes: horizonMinutes)
+        let highAdvisory = highAdvisoryProfile.map { profile in
+            let safety = PenBolusCalculator.safetyForecast(snapshot: snapshot, at: now,
+                sensitivityMgdlPerUnit: sensitivityMgdlPerUnit,
+                carbohydrateRatioGramsPerUnit: carbohydrateRatioGramsPerUnit,
+                horizonMinutes: 120)
+            let calculation = PenBolusCalculator.calculate(snapshot: snapshot, profile: profile,
+                glucose: .currentCGM, newCarbs: .unrecorded(grams: 0),
+                safetyForecast: safety, at: now)
+            return HighSoonAdvisoryContext(capturedAt: snapshot.capturedAt,
+                treatmentRevision: snapshot.treatmentRevision,
+                forecastInputChangeRevision: forecastInputChangeRevision,
+                sourceSignature: snapshot.sourceSignature, profile: profile,
+                safetyForecast: safety, calculation: calculation)
+        }
+        return GlucoseForecastSafetyOutcome(result: result,
+            referenceGlucoseMgdl: snapshot.glucose.last?.glucoseMgdl,
+            activeInsulinUnits: result.reason == nil ? snapshot.iobUnits : nil,
+            slope15MgdlPerMinute: rawSlope15(snapshot.glucose), highAdvisory: highAdvisory)
+    }
+
+    /// Recheck provenance immediately before a delayed high advisory is consumed. This never
+    /// reads another dosing snapshot or turns an incomplete source into known zero insulin.
+    func highAdvisoryInputsAreCurrent(_ context: HighSoonAdvisoryContext,
+                                     at now: Date = .now) -> Bool {
+        let age = now.timeIntervalSince(context.capturedAt)
+        let policy = defaults.dataFlowPolicy
+        return age.isFinite && (0...30).contains(age) &&
+            context.treatmentRevision == therapyManager.treatmentChangeRevision &&
+            context.forecastInputChangeRevision == therapyManager.forecastInputChangeRevision &&
+            !therapyManager.hasUncommittedForecastInputChanges &&
+            !healthImporter.localInputIsIncomplete(.insulin) &&
+            !healthImporter.localInputIsIncomplete(.carbohydrates) &&
+            TherapyMetricsManager.doseSourceIsReady(policy,
+                cutover: TreatmentSourceCutover.current(defaults: defaults), defaults: defaults) &&
+            !context.sourceSignature.isEmpty &&
+            context.sourceSignature == Self.presentationInputSignature(horizonMinutes: 120,
+                defaults: defaults, importer: healthImporter) &&
+            context.profile.isConfirmed && context.profile == PenDoseProfile.load(defaults: defaults)
     }
 
     static func rawSlope15(_ glucose: [GlucoseForecastSample]) -> Double? {

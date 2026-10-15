@@ -72,7 +72,7 @@ enum LowSoonAlertPolicy {
             currentMgdl >= currentMinimumMgdl && minimumMgdl < predictedLimitMgdl
     }
 
-    private static func interpolated(_ points: [GlucoseForecastPoint], at date: Date)
+    static func interpolated(_ points: [GlucoseForecastPoint], at date: Date)
         -> GlucoseForecastPoint? {
         if let exact = points.first(where: { $0.date == date }) { return exact }
         guard let rightIndex = points.firstIndex(where: { $0.date > date }), rightIndex > 0 else { return nil }

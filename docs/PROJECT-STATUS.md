@@ -22,6 +22,49 @@ De følgende afsnit bevarer integrations- og testhistorikken før denne udgivels
 
 De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
 
+## Højt om lidt — den manglende høj-varsling efter 4331
+
+Årsagen er dokumenteret i koden og den tidligere status: 4330 indførte kun
+lavpunkt-varsling og åbning af beregneren. Den proaktive høj-varsling fra den
+oprindelige anbefaling var ikke implementeret; 4331 ændrede ikke dette.
+
+Den afgrænsede rettelse tilføjer “Højt om lidt” under Alarmer, slået til fra
+start og muligt at slå fra. Den genbruger Høj-alarmens aktuelle grænse,
+tidsplan og snooze samt den gemte CGM-hændelse og komplette behandlingssnapshot.
+Der varsles kun før den aktuelle værdi når grænsen, ved stigende trend og en
+motorberegnet overskridelse inden for 30 minutter. Den eksisterende beregner
+skal samtidig give et positivt forslag fra bekræftet profil, med eksisterende
+IOB/COB, ingen nye kulhydrater og bestået prognosetjek. Ingen dosis sendes med
+beskeden. Tryk åbner den eksisterende beregner på aktuelle data og gemmer intet.
+
+Den oprindelige lav-varsling bevarer sin separate 60-minutters prognose og
+fuldførelse. Den nye to-timers sikkerhedskontrol kan derfor ikke fjerne et
+gyldigt lav-varsel, blot fordi et senere prognosepunkt er uden for området.
+Uaktuel kilde/revision/profil afviser kun høj-vurderingen. Ingen ændring af
+dosisformel, motormatematik, ML, behandlinger, Sundhed eller Watch/Libre.
+
+Første compileforsøg fandt en manglende typeangivelse i den nye callback.
+Efter rettelsen bestod hele XCTest-suiten 1.683/1.683 og Python-kontrollerne
+(`20261015T071049Z-37392`); den efterfølgende simulatorbygning gik i stå i
+Xcodes SwiftDriver-låse og blev afbrudt. Ny validering på den færdige kode
+registreres nedenfor. To ekstra grænsetests kontrollerer passerede toppe og
+interpolation ved nu+30 minutter; den kommende-lav-test har ens kurver i begge
+horisonter, så den ikke består alene på grund af forskellige input.
+
+Den færdige lokale kørsel `20261015T071754Z-42082` bestod **1.685/1.685 XCTest-tests**,
+0 fejl, 0 skipped, alle Python-kontroller inklusive de syntetiske Watch-tests
+samt både iPhone- og Watch-simulatorbuild. De 42 nye tests dækker beregning,
+varsling og den rigtige Home/beregnerskærm; eksisterende tests er bevaret.
+Slutgennemgangen bevarede desuden lav-varslingens hidtidige valg af
+motorparametre efter den asynkrone snapshot-læsning; høj-vurderingen fryser
+samme værdier og kræver matchende kilde-/indstillingssignatur. Det undgår at
+bruge ældre parametre, hvis indstillinger skifter lige før læsningen starter.
+Releaseproceduren gentester denne færdige kode på det præcise Apple-tildelte
+release-checkpoint; den tidligere lokale kvittering erstatter ikke denne test.
+
+Læsende devicectl fandt både fysisk iPhone og Watch utilgængelige. Faktisk
+levering på låst iPhone/Watch og klinisk nytte er derfor ikke verificeret.
+
 ## Watch-kvittering og måltidspåmindelser efter 4330 — 14. oktober 2026
 
 På Watch blev resultatet af den holdbare kølagring ignoreret i visningen, så

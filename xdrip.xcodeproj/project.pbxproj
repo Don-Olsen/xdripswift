@@ -892,6 +892,10 @@
 		D0D045AD9AE84E90BFAB143D /* CarbohydrateAdviceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1D9A058F13348E5996F928A /* CarbohydrateAdviceTests.swift */; };
 		A6578F46A4174EBAB2638CA4 /* CarbohydrateAdviceJournalTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 708A04FD11E44167BC4CD48E /* CarbohydrateAdviceJournalTests.swift */; };
 		B1008D9B6B3F48CDBB2B7D94 /* CarbohydrateAdviceIntegrationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BFEB545466334C33ACB5FF17 /* CarbohydrateAdviceIntegrationTests.swift */; };
+		C31000013101000100000001 /* HighSoonAdvisory.swift in Sources */ = {isa = PBXBuildFile; fileRef = C31000023101000100000001 /* HighSoonAdvisory.swift */; };
+		C31000013101000100000002 /* HighSoonAdvisoryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C31000023101000100000002 /* HighSoonAdvisoryTests.swift */; };
+		C31000013101000100000003 /* HighSoonNotificationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C31000023101000100000003 /* HighSoonNotificationTests.swift */; };
+		C31000013101000100000004 /* HighSoonSnapshotTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C31000023101000100000004 /* HighSoonSnapshotTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -2159,6 +2163,10 @@
 		C1D9A058F13348E5996F928A /* CarbohydrateAdviceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "xDrip Tests/CarbohydrateAdviceTests.swift"; sourceTree = SOURCE_ROOT; };
 		708A04FD11E44167BC4CD48E /* CarbohydrateAdviceJournalTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "xDrip Tests/CarbohydrateAdviceJournalTests.swift"; sourceTree = SOURCE_ROOT; };
 		BFEB545466334C33ACB5FF17 /* CarbohydrateAdviceIntegrationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "xDrip Tests/CarbohydrateAdviceIntegrationTests.swift"; sourceTree = SOURCE_ROOT; };
+		C31000023101000100000001 /* HighSoonAdvisory.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HighSoonAdvisory.swift; sourceTree = "<group>"; };
+		C31000023101000100000002 /* HighSoonAdvisoryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "xDrip Tests/HighSoonAdvisoryTests.swift"; sourceTree = SOURCE_ROOT; };
+		C31000023101000100000003 /* HighSoonNotificationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "xDrip Tests/HighSoonNotificationTests.swift"; sourceTree = SOURCE_ROOT; };
+		C31000023101000100000004 /* HighSoonSnapshotTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "xDrip Tests/HighSoonSnapshotTests.swift"; sourceTree = SOURCE_ROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -2829,6 +2837,9 @@
 				FC0303000000000000000008 /* GlucoseForecastDataAdapterTests.swift */,
 				FA0310000000000000000012 /* GlucoseForecastLogTests.swift */,
 				C30000023017000100000002 /* LowSoonAlertTests.swift */,
+				C31000023101000100000004 /* HighSoonSnapshotTests.swift */,
+				C31000023101000100000003 /* HighSoonNotificationTests.swift */,
+				C31000023101000100000002 /* HighSoonAdvisoryTests.swift */,
 				C30000023017000100000005 /* LowSoonStatisticsTests.swift */,
 				A33C0F02000000000000000A /* GlucoseForecastMLReplayTests.swift */,
 				A33C0F02000000000000000B /* GlucoseForecastMLTrainerTests.swift */,
@@ -3045,6 +3056,7 @@
 				F821CF49229BF43A005C1E43 /* AlertKind.swift */,
 				F821CF4B229BF43A005C1E43 /* AlertManager.swift */,
 				C30000023017000100000001 /* LowSoonAlert.swift */,
+				C31000023101000100000001 /* HighSoonAdvisory.swift */,
 				C30000023017000100000004 /* LowSoonStatistics.swift */,
 				47976E352BF536BA005E86EC /* AlertSnoozeStatus.swift */,
 				47CD642B2BEBEB0E002BDA68 /* AlertUrgencyType.swift */,
@@ -4675,6 +4687,9 @@
 				FC0303000000000000000004 /* GlucoseForecastDataAdapterTests.swift in Sources */,
 				FA0310000000000000000002 /* GlucoseForecastLogTests.swift in Sources */,
 				C30000013017000100000002 /* LowSoonAlertTests.swift in Sources */,
+				C31000013101000100000004 /* HighSoonSnapshotTests.swift in Sources */,
+				C31000013101000100000003 /* HighSoonNotificationTests.swift in Sources */,
+				C31000013101000100000002 /* HighSoonAdvisoryTests.swift in Sources */,
 				C30000013017000100000005 /* LowSoonStatisticsTests.swift in Sources */,
 				A33C0F01000000000000000A /* GlucoseForecastMLReplayTests.swift in Sources */,
 				A33C0F01000000000000000B /* GlucoseForecastMLTrainerTests.swift in Sources */,
@@ -5079,6 +5094,7 @@
 				F821CF6B229FC22D005C1E43 /* Endpoint.swift in Sources */,
 				F821CF58229BF43A005C1E43 /* AlertManager.swift in Sources */,
 				C30000013017000100000001 /* LowSoonAlert.swift in Sources */,
+				C31000013101000100000001 /* HighSoonAdvisory.swift in Sources */,
 				C30000013017000100000004 /* LowSoonStatistics.swift in Sources */,
 				C30000013017000100000003 /* PenBolusCalculator.swift in Sources */,
 				205DA6CB784044ACB689345A /* CarbohydrateAdviceJournal.swift in Sources */,

@@ -2450,7 +2450,9 @@ struct InitialCalibrationRequestGate {
                 await adapter.monitorTransitionAfterSavedReading(at: .now)
             }
             Task { @MainActor [weak self] in
-                let outcome = await adapter.engineOnlyForecast(horizonMinutes: 60, at: .now)
+                let includeHigh = HighSoonAdvisoryPolicy.isEnabled()
+                let outcome = await adapter.engineOnlyForecast(horizonMinutes: 60, at: .now,
+                    includeHighAdvisory: includeHigh)
                 guard let self else { return }
                 self.lowSoonInFlightID = nil
                 let retry = self.lowSoonRetryAfterFlight
@@ -2469,6 +2471,15 @@ struct InitialCalibrationRequestGate {
                 self.alertManager?.checkLowSoon(outcome,
                     expectedReferenceDate: pending.measuredAt, expectedSensorID: pending.sensorID,
                     expectedGlucoseMgdl: pending.finalValueMgdl)
+                // A stale optional high assessment only skips this advisory. It never
+                // returns early, changes completion or suppresses the existing low warning.
+                if includeHigh, HighSoonAdvisoryPolicy.isEnabled(),
+                   let context = outcome.highAdvisory,
+                   adapter.highAdvisoryInputsAreCurrent(context, at: .now) {
+                    self.alertManager?.checkHighSoon(outcome,
+                        expectedReferenceDate: pending.measuredAt, expectedSensorID: pending.sensorID,
+                        expectedGlucoseMgdl: pending.finalValueMgdl)
+                }
                 let matchesRequestedReading = outcome.result.referenceDate == pending.measuredAt &&
                     outcome.result.referenceSensorID == pending.sensorID
                 if outcome.result.reason != .dataUnavailable &&
@@ -3488,6 +3499,10 @@ extension RootApplicationCoordinator: @preconcurrency CGMTransmitterDelegate {
 extension RootApplicationCoordinator: @preconcurrency UNUserNotificationCenterDelegate {
     // called when notification created while app is in foreground
     func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification, withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        if notification.request.identifier == HighSoonAdvisoryPolicy.notificationIdentifier {
+            completionHandler([.banner, .list, .sound])
+            return
+        }
         if notification.request.identifier == ConstantsNotifications.NotificationIdentifiersForCalibration.dexcomG6InitialCalibrationRequest {
             presentDexcomG6InitialCalibration()
             completionHandler([])
@@ -3551,6 +3566,20 @@ extension RootApplicationCoordinator: @preconcurrency UNUserNotificationCenterDe
         return true
     }
 
+    /// Default tap and the explicit foreground action share the existing cold-start request.
+    /// Notification payloads never contain a dose or a treatment registration operation.
+    @discardableResult
+    static func routeHighSoonCalculatorAction(notificationIdentifier: String,
+                                               actionIdentifier: String,
+                                               acknowledgeAdvisory: () -> Void,
+                                               openCalculator: () -> Bool) -> Bool {
+        guard AlertManager.opensHighSoonCalculator(notificationIdentifier: notificationIdentifier,
+                                                   actionIdentifier: actionIdentifier) else { return false }
+        acknowledgeAdvisory()
+        _ = openCalculator()
+        return true
+    }
+
     // called when user clicks a notification
     func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse, withCompletionHandler completionHandler: @escaping () -> Void) {
         // call completionHandler when exiting function
@@ -3558,6 +3587,15 @@ extension RootApplicationCoordinator: @preconcurrency UNUserNotificationCenterDe
             // call completionhandler
             completionHandler()
         }
+
+        if Self.routeHighSoonCalculatorAction(
+            notificationIdentifier: response.notification.request.identifier,
+            actionIdentifier: response.actionIdentifier,
+            acknowledgeAdvisory: {
+                center.removeDeliveredNotifications(withIdentifiers: [HighSoonAdvisoryPolicy.notificationIdentifier])
+                center.removePendingNotificationRequests(withIdentifiers: [HighSoonAdvisoryPolicy.notificationIdentifier])
+            },
+            openCalculator: { QuickActionsManager.shared.handleQuickAction(.penCalculator) }) { return }
 
         if Self.routeLowSoonCalculatorAction(
             notificationIdentifier: response.notification.request.identifier,
