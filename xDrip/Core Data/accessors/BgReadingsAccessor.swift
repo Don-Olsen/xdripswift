@@ -256,6 +256,57 @@ class BgReadingsAccessor: ObservableObject {
             includingSuppressed: false, ascending: true, offset: offset, context: context)
     }
 
+    /// Normal export needs one value, not a page of sensor/calibration snapshots. Keep
+    /// this read on the existing context, including pending changes, and never cache it
+    /// across HealthKit callbacks. Ambiguous/filtered prefixes use the original pager.
+    func nextHealthKitExportReading(after checkpoint: Date, frequent: Bool) -> HealthKitExportReading? {
+        var result: HealthKitExportReading?
+        let context = coreDataManager.mainManagedObjectContext
+        context.performAndWait {
+            let request: NSFetchRequest<BgReading> = BgReading.fetchRequest()
+            request.sortDescriptors = [NSSortDescriptor(key: #keyPath(BgReading.timeStamp), ascending: true)]
+            request.returnsObjectsAsFaults = false
+            request.fetchLimit = 32
+            request.predicate = NSCompoundPredicate(andPredicateWithSubpredicates: [
+                NSPredicate(format: "timeStamp > %@", NSDate(timeIntervalSince1970: checkpoint.timeIntervalSince1970)),
+                NSPredicate(format: "isSuppressedByFiveMinuteCadence == NO"),
+                NSPredicate(format: "calculatedValue != 0.0 AND (calculatedValue != %f OR (rawData == %f AND ageAdjustedRawValue == 0.0))",
+                    ConstantsCalibrationAlgorithms.bgReadingErrorValue, ConstantsCalibrationAlgorithms.bgReadingErrorValue)
+            ])
+            do {
+                let rows = try context.fetch(request)
+                let candidate = rows.first { $0.isValidForDownstream &&
+                    HealthKitGlucoseBacklog.isEligible($0.timeStamp, after: checkpoint, frequent: frequent) }
+                let hasTimestampTies = Set(rows.map(\.timeStamp)).count != rows.count
+                let touchesBoundary = candidate == nil || candidate?.timeStamp == rows.last?.timeStamp
+                if !hasTimestampTies && !touchesBoundary {
+                    result = candidate.map { HealthKitExportReading(id: $0.id, timeStamp: $0.timeStamp,
+                        value: $0.finalValue, revision: 1) }
+                    return
+                }
+                // Preserve the old page-size-dependent ordering for equal timestamps,
+                // including possible ties beyond the small window, and scan past invalid
+                // pages. Pending deletions can shorten a limited fetch, so a short prefix
+                // alone is not proof of exhaustion. Cadence/checkpoint stay unchanged.
+                let pageSize = 256
+                let legacy = HealthKitGlucoseBacklog.oldestEligible(after: checkpoint,
+                    frequent: frequent, pageSize: pageSize, page: { offset in
+                        let page = self.getOldestBgReadingSnapshotPage(limit: pageSize,
+                            fromDate: checkpoint, offset: offset)
+                        return (page.snapshots, page.scannedCount)
+                    }, time: { $0.timeStamp })
+                result = legacy.map { HealthKitExportReading(id: $0.id, timeStamp: $0.timeStamp,
+                    value: $0.finalValue, revision: 1) }
+            } catch {
+                let fetchError = error as NSError
+                trace("in nextHealthKitExportReading, unable to fetch, domain=%{public}@ code=%{public}ld",
+                    log: self.log, category: ConstantsLog.categoryApplicationDataBgReadings,
+                    type: .error, fetchError.domain, fetchError.code)
+            }
+        }
+        return result
+    }
+
     /// Read only committed rows on a separate coordinator-backed queue. A child of the
     /// main context would still ask the UI queue to fetch the entire backlog.
     func countPendingHealthKitGlucose(after checkpoint: Date, frequent: Bool, pageSize: Int,

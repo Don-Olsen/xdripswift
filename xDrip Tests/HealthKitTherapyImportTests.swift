@@ -170,6 +170,230 @@ final class HealthKitTherapyImportTests: XCTestCase {
         XCTAssertEqual(try persistedReplacementQueue(defaults), queue)
     }
 
+    @MainActor
+    private func exportSQLiteStack() throws -> CoreDataManager {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("HealthExportReader-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        return try CoreDataManager(testModelName: ConstantsCoreData.modelName,
+            persistentStoreURL: directory.appendingPathComponent("history.sqlite"))
+    }
+
+    @MainActor @discardableResult
+    private func exportRow(_ name: String, at date: Date, sensor: Sensor,
+                           context: NSManagedObjectContext) -> BgReading {
+        let row = BgReading(timeStamp: date, sensor: sensor, calibration: nil, rawData: 100,
+            deviceName: "Synthetic export test", nsManagedObjectContext: context)
+        row.id = name
+        row.calculatedValue = 100
+        return row
+    }
+
+    /// The production selection before this optimization, with its original 256-row pages.
+    private func referenceExport(_ accessor: BgReadingsAccessor, after checkpoint: Date,
+                                 frequent: Bool) -> HealthKitExportReading? {
+        let row = HealthKitGlucoseBacklog.oldestEligible(after: checkpoint,
+            frequent: frequent, pageSize: 256, page: { offset in
+                let page = accessor.getOldestBgReadingSnapshotPage(limit: 256,
+                    fromDate: checkpoint, offset: offset)
+                return (page.snapshots, page.scannedCount)
+            }, time: { $0.timeStamp })
+        return row.map { .init(id: $0.id, timeStamp: $0.timeStamp, value: $0.finalValue, revision: 1) }
+    }
+
+    @MainActor
+    func testNextHealthExportBoundsMaterializationAndAvoidsRelatedSnapshots() throws {
+        let core = try exportSQLiteStack()
+        let context = core.mainManagedObjectContext
+        let checkpoint = Date(timeIntervalSince1970: 1_800_000_000)
+        let sensor = Sensor(startDate: checkpoint, nsManagedObjectContext: context)
+        let calibration = Calibration(timeStamp: checkpoint, sensor: sensor, bg: 100,
+            rawValue: 100, adjustedRawValue: 100, sensorConfidence: 1, rawTimeStamp: checkpoint,
+            slope: 1, intercept: 0, distanceFromEstimate: 0, estimateRawAtTimeOfCalibration: 100,
+            slopeConfidence: 1, deviceName: nil, nsManagedObjectContext: context)
+        for index in 1...5000 {
+            exportRow("row-\(index)", at: checkpoint.addingTimeInterval(Double(index) * 60),
+                sensor: sensor, context: context).calibration = calibration
+        }
+        XCTAssertTrue(core.saveChangesSynchronously())
+        context.reset()
+        core.privateManagedObjectContext.performAndWait { core.privateManagedObjectContext.reset() }
+        context.retainsRegisteredObjects = true
+        let accessor = BgReadingsAccessor(coreDataManager: core)
+        let actual = accessor.nextHealthKitExportReading(after: checkpoint, frequent: true)
+        let materialized = context.registeredObjects.filter { $0 is BgReading && !$0.isFault }.count
+        XCTAssertGreaterThan(materialized, 0)
+        XCTAssertLessThanOrEqual(materialized, 32, "Normal export must not materialize 256 full snapshots")
+        XCTAssertFalse(context.registeredObjects.contains {
+            ($0 is Sensor || $0 is Calibration) && !$0.isFault
+        }, "An export value needs neither sensor nor calibration properties")
+        XCTAssertEqual(actual?.id, "row-1")
+        XCTAssertEqual(actual, referenceExport(accessor, after: checkpoint, frequent: true))
+    }
+
+    @MainActor
+    func testNextHealthExportMatchesCadenceAndValidationBoundaries() throws {
+        let core = try exportSQLiteStack()
+        let context = core.mainManagedObjectContext
+        let checkpoint = Date(timeIntervalSince1970: 1_800_000_000.123456)
+        let sensor = Sensor(startDate: checkpoint, nsManagedObjectContext: context)
+        let other = Sensor(startDate: checkpoint, nsManagedObjectContext: context)
+        let offsets: [Double] = [0, 49.999, 50, 50.001, 284.999, 285, 285.001, 360]
+        for (index, offset) in offsets.enumerated() {
+            exportRow("boundary-\(index)", at: checkpoint.addingTimeInterval(offset),
+                sensor: index.isMultiple(of: 2) ? sensor : other, context: context)
+        }
+        for index in 0..<16 {
+            let row = exportRow("validation-\(index)", at: checkpoint.addingTimeInterval(420 + Double(index) * 60),
+                sensor: sensor, context: context)
+            switch index {
+            case 0: row.isSuppressedByFiveMinuteCadence = true
+            case 1: row.calculatedValue = 0
+            case 2: row.calculatedValue = 38; row.ageAdjustedRawValue = 100
+            case 3: row.calculatedValue = 38; row.rawData = 38; row.ageAdjustedRawValue = 0
+            case 4: row.rawData = 0; row.calculatedValue = 39
+            case 5: row.adjustedValue = 110
+            case 6: row.adjustedValue = 110; row.smoothedValue = 120
+            case 7: row.smoothedValue = 0
+            case 8: row.smoothedValue = -1
+            case 9: row.smoothedValue = NSNumber(value: Double.infinity)
+            case 10: row.smoothedValue = NSNumber(value: Double.nan)
+            case 11: row.rawData = .infinity
+            case 12: row.ageAdjustedRawValue = .infinity
+            default: break
+            }
+        }
+        XCTAssertTrue(core.saveChangesSynchronously())
+        let accessor = BgReadingsAccessor(coreDataManager: core)
+        for frequent in [true, false] {
+            var cursor = checkpoint
+            var selected: [HealthKitExportReading] = []
+            while let actual = accessor.nextHealthKitExportReading(after: cursor, frequent: frequent) {
+                XCTAssertEqual(actual, referenceExport(accessor, after: cursor, frequent: frequent))
+                XCTAssertGreaterThan(actual.timeStamp, cursor)
+                selected.append(actual)
+                cursor = actual.timeStamp
+            }
+            XCTAssertNil(referenceExport(accessor, after: cursor, frequent: frequent))
+            XCTAssertEqual(selected.first?.id, frequent ? "boundary-3" : "boundary-6")
+            if frequent {
+                XCTAssertEqual(selected.first { $0.id == "validation-3" }?.value, 38)
+                XCTAssertEqual(selected.first { $0.id == "validation-4" }?.value, 39)
+                XCTAssertEqual(selected.first { $0.id == "validation-5" }?.value, 110)
+                XCTAssertEqual(selected.first { $0.id == "validation-6" }?.value, 120)
+                for index in [0, 1, 2, 7, 8, 9, 10, 11, 12] {
+                    XCTAssertFalse(selected.contains { $0.id == "validation-\(index)" })
+                }
+            }
+        }
+    }
+
+    @MainActor
+    func testNextHealthExportDrains5000RowsWithFailedWriteAndRestart() throws {
+        let core = try exportSQLiteStack()
+        let context = core.mainManagedObjectContext
+        let checkpoint = Date(timeIntervalSince1970: 1_800_000_000)
+        let sensor = Sensor(startDate: checkpoint, nsManagedObjectContext: context)
+        for index in 1...5000 {
+            exportRow("row-\(index)", at: checkpoint.addingTimeInterval(Double(index) * 60),
+                sensor: sensor, context: context)
+        }
+        XCTAssertTrue(core.saveChangesSynchronously())
+        var accessor = BgReadingsAccessor(coreDataManager: core)
+        var state = HealthKitUploadState()
+        state.synchronizeLatestStoredTimeStamp(checkpoint)
+        for index in 1...5000 {
+            let row = try XCTUnwrap(accessor.nextHealthKitExportReading(after: state.latestStoredTimeStamp, frequent: true))
+            XCTAssertEqual(row.id, "row-\(index)")
+            XCTAssertEqual(row.revision, 1)
+            if [2015, 2016, 2017, 5000].contains(index) {
+                XCTAssertEqual(row, referenceExport(accessor, after: state.latestStoredTimeStamp, frequent: true))
+                XCTAssertTrue(state.begin(timeStamp: row.timeStamp))
+                XCTAssertFalse(state.begin(timeStamp: row.timeStamp))
+                _ = state.finish(timeStamp: row.timeStamp, succeeded: false)
+                // A fresh accessor and upload state must resume from the persisted success.
+                let persisted = state.latestStoredTimeStamp
+                state = HealthKitUploadState()
+                state.synchronizeLatestStoredTimeStamp(persisted)
+                accessor = BgReadingsAccessor(coreDataManager: core)
+                XCTAssertEqual(accessor.nextHealthKitExportReading(after: persisted, frequent: true), row)
+            }
+            XCTAssertTrue(state.begin(timeStamp: row.timeStamp))
+            _ = state.finish(timeStamp: row.timeStamp, succeeded: true)
+        }
+        XCTAssertNil(accessor.nextHealthKitExportReading(after: state.latestStoredTimeStamp, frequent: true))
+    }
+
+    @MainActor
+    func testNextHealthExportFilteredPagesAndBoundaryTiesUseOriginalSelection() throws {
+        for invalidPrefix in [31, 300] {
+            let core = try exportSQLiteStack()
+            let context = core.mainManagedObjectContext
+            let checkpoint = Date(timeIntervalSince1970: 1_800_000_000)
+            let sensor = Sensor(startDate: checkpoint, nsManagedObjectContext: context)
+            for index in 1...invalidPrefix {
+                exportRow("invalid-\(index)", at: checkpoint.addingTimeInterval(Double(index) * 60),
+                    sensor: sensor, context: context).smoothedValue = -1
+            }
+            for index in 1...300 {
+                exportRow("tie-\(index)", at: checkpoint.addingTimeInterval(Double(invalidPrefix + 1) * 60),
+                    sensor: sensor, context: context).adjustedValue = NSNumber(value: 100 + index)
+            }
+            exportRow("later", at: checkpoint.addingTimeInterval(Double(invalidPrefix + 2) * 60),
+                sensor: sensor, context: context)
+            XCTAssertTrue(core.saveChangesSynchronously())
+            let accessor = BgReadingsAccessor(coreDataManager: core)
+            for frequent in [true, false] {
+                let actual = try XCTUnwrap(accessor.nextHealthKitExportReading(after: checkpoint, frequent: frequent))
+                XCTAssertEqual(actual, referenceExport(accessor, after: checkpoint, frequent: frequent))
+                XCTAssertTrue(actual.id.hasPrefix("tie-"))
+            }
+        }
+    }
+
+    @MainActor
+    func testNextHealthExportRereadsPendingInsertEditDeletionAndParentChanges() throws {
+        let core = try exportSQLiteStack()
+        let context = core.mainManagedObjectContext
+        let checkpoint = Date(timeIntervalSince1970: 1_800_000_000)
+        let sensor = Sensor(startDate: checkpoint, nsManagedObjectContext: context)
+        var rows: [BgReading] = []
+        for index in 1...80 {
+            rows.append(exportRow("row-\(index)", at: checkpoint.addingTimeInterval(Double(index) * 60),
+                sensor: sensor, context: context))
+        }
+        XCTAssertTrue(core.saveChangesSynchronously())
+        let accessor = BgReadingsAccessor(coreDataManager: core)
+        func check(_ expectedID: String, _ value: Double = 100) throws {
+            let actual = try XCTUnwrap(accessor.nextHealthKitExportReading(after: checkpoint, frequent: true))
+            XCTAssertEqual(actual, referenceExport(accessor, after: checkpoint, frequent: true))
+            XCTAssertEqual(actual.id, expectedID)
+            XCTAssertEqual(actual.value, value)
+        }
+        try check("row-1")
+        rows[0].smoothedValue = 123
+        try check("row-1", 123)
+        rows[0].isSuppressedByFiveMinuteCadence = true
+        try check("row-2")
+        context.delete(rows[1])
+        try check("row-3")
+        rows[2].smoothedValue = -1
+        try check("row-4")
+        rows[79].timeStamp = checkpoint.addingTimeInterval(51)
+        try check("row-80")
+        let inserted = exportRow("pending", at: checkpoint.addingTimeInterval(50.5), sensor: sensor, context: context)
+        try check("pending")
+        context.delete(inserted)
+        // Pending deletions shrink the first fetch. Never assume that is exhaustion.
+        for row in rows[3..<79] { context.delete(row) }
+        try check("row-80")
+        XCTAssertTrue(context.hasChanges, "Selection must not save caller changes")
+        try context.save() // changes are now in the parent, but still not durable
+        try check("row-80")
+        core.privateManagedObjectContext.performAndWait { XCTAssertTrue(core.privateManagedObjectContext.hasChanges) }
+    }
+
     func testGlucoseStatusScanCoalescesRequestsAndRejectsChangedExportInputs() {
         let checkpoint = Date(timeIntervalSince1970: 1_800_000_000)
         let initial = HealthKitGlucoseStatusScan.Input(checkpoint: checkpoint,

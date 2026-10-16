@@ -597,8 +597,8 @@ public class HealthKitManager: NSObject {
         let strictLatestHealthKitStoredTimeStamp = uploadState.latestStoredTimeStamp
         
         let bloodGlucoseUnit = HKUnit(from: "mg/dL")
-        // Scan bounded Core Data pages from the oldest row. Even a page containing only
-        // invalid or cadence-filtered rows cannot hide a valid later reading.
+        // Read only the next export value; the accessor retains the original paged
+        // fallback for invalid prefixes and ambiguous timestamp ordering.
         guard let bgReading = oldestEligibleGlucose(after: strictLatestHealthKitStoredTimeStamp) else { return }
         if HealthKitExportStatusStore.shared.snapshot(.glucose).pendingWrites == 0 {
             // A new reading arrived after a previously empty backlog was counted.
@@ -607,22 +607,16 @@ public class HealthKitManager: NSObject {
         guard uploadState.begin(timeStamp: bgReading.timeStamp) else { return }
 
         saveBgReadingInHealthKit(
-            bgReading: HealthKitExportReading(id: bgReading.id, timeStamp: bgReading.timeStamp, value: bgReading.finalValue, revision: 1),
+            bgReading: bgReading,
             bloodGlucoseType: bloodGlucoseType,
             bloodGlucoseUnit: bloodGlucoseUnit,
             shouldUpdateLatestTimeStamp: true
         )
     }
 
-    private func oldestEligibleGlucose(after checkpoint: Date) -> BgReadingSnapshot? {
-        HealthKitGlucoseBacklog.oldestEligible(after: checkpoint,
-            frequent: UserDefaults.standard.storeFrequentReadingsInHealthKit,
-            pageSize: glucosePageSize,
-            page: { offset in
-                let result = bgReadingsAccessor.getOldestBgReadingSnapshotPage(
-                    limit: glucosePageSize, fromDate: checkpoint, offset: offset)
-                return (result.snapshots, result.scannedCount)
-            }, time: { $0.timeStamp })
+    private func oldestEligibleGlucose(after checkpoint: Date) -> HealthKitExportReading? {
+        bgReadingsAccessor.nextHealthKitExportReading(after: checkpoint,
+            frequent: UserDefaults.standard.storeFrequentReadingsInHealthKit)
     }
 
     private var glucoseStatusInput: HealthKitGlucoseStatusScan.Input {

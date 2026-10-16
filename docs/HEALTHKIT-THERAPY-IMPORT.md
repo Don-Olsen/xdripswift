@@ -126,6 +126,25 @@ Apple does not disclose complete HealthKit read permission to an app. A complete
 permission dialog, a recent sync, or an empty result cannot guarantee that all
 records are available; check the status before relying on a local estimate.
 
+## Glucose export reader optimization (16 October 2026)
+
+The next-glucose lookup first reads at most 32 oldest candidate rows and copies
+only the existing export ID, timestamp, finalValue and revision. It does not
+prefetch sensor or calibration details on that path. Equal timestamps, a
+candidate at the window boundary, or no eligible candidate fall back to the
+original 256-row paged reader. This preserves pending changes, ambiguous tie
+ordering and progress past invalid pages, including when pending deletions
+shorten a fetch. No candidate is cached across asynchronous HealthKit writes.
+
+Validation, cadence, suppression, export settings, sync IDs, revisions,
+checkpoint advancement and retry behavior are unchanged. The pending-count
+worker and historical replacement/deletion queues are unchanged too. The
+optimization does not alter stored readings or add historical Health writes or
+removals. Synthetic SQLite tests compare the exact selected ID/time/value with
+the original reader and check the reduced materialization on a 5,000-row backlog.
+This establishes less database-object work in the tested path, not a measured
+improvement in phone responsiveness or battery life.
+
 ## Physical acceptance checks still required
 
 Automated tests use synthetic samples in isolated stores. They cannot establish

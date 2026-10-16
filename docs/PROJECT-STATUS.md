@@ -1,3 +1,33 @@
+## Afgrænset optimering af Sundhed-eksport — 16. oktober 2026
+
+Efter 4332 hentede det almindelige eksportforløb op til 256 komplette
+BgReadingSnapshots for hver enkelt næste eksport, inklusive sensor- og
+kalibreringskopier. Det nye accessor-opslag læser først højst 32 kandidater
+og kopierer kun ID, tidspunkt, eksisterende finalValue og revision. Ens
+tidsstempler, vinduesgrænser eller manglende kandidat bruger det hidtidige
+256-rækkers gennemløb, så ventende ændringer og filtrerede sider bevarer
+rækkefølgen. Der gemmes ingen kandidat på tværs af asynkrone skriveforsøg.
+
+Produktionsændringen er begrænset til BgReadingsAccessor og HealthKitManager.
+Eksportværdier, kadence, suppression, checkpoint, retries og køerne for
+historiske rettelser/sletninger er uændrede. Prognose, dosisberegning,
+behandlingslagring, alarmer og Watch/Libre er ikke ændret.
+
+Den indledende fulde XCTest-kørsel `20261016T163822Z-47481` bestod
+**1.690/1.690 tests**. Fem nye tests bruger den rigtige SQLite-accessor og
+sammenligner med den tidligere læsning: 5.000 målinger, fejl/genstart omkring
+2015/2016/2017, kadencegrænser, værdifiltrering, ens tidsstempler, ugyldige
+sider og ikke-gemte ændringer i både child- og parent-context. En test
+kontrollerer højst 32 indlæste målingsobjekter uden indlæste sensor- eller
+kalibreringsegenskaber på den normale sti. En uafhængig diffgennemgang fandt
+ingen yderligere rettelsesbehov. Releaseproceduren gentester det præcise
+Apple-tildelte build; denne indledende kvittering erstatter ikke release-testen.
+
+Læsende `xcrun devicectl list devices` fandt den fysiske iPhone og Watch
+utilgængelige. Der er ikke foretaget lokal installation, fysisk Sundhed-test
+eller måling af hastighed/batteri. Det reducerede databasearbejde i den
+syntetiske test er ikke dokumentation for en bestemt gevinst på telefonen.
+
 <!-- testflight-7.1.1-4332:start -->
 ### TestFlight 7.1.1 (4332)
 
