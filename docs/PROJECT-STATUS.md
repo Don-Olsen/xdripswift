@@ -1,3 +1,15 @@
+<!-- testflight-7.1.1-4333:start -->
+### TestFlight 7.1.1 (4333)
+
+- Kildecommit og tag: `9275f12feed8ba43aa896e1bfd5bd2917bc010de` / `testflight-7.1.1-4333`.
+- Tests: 1690/1690 bestået; 0 fejlet; 0 skipped. iPhone- og Watch-simulatorbuilds bestod.
+- Apple-status (2026-10-16T17:03:55.108400+00:00): [Internal / Testing](https://appstoreconnect.apple.com/apps/6795645396/testflight/ios/6c03427d-edc9-4aa3-a7ef-7acb4110df02).
+- Eksisterende intern gruppe: Ole Internal er bekræftet tilknyttet.
+- Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
+<!-- testflight-7.1.1-4333:end -->
+
+De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
+
 ## Afgrænset optimering af Sundhed-eksport — 16. oktober 2026
 
 Efter 4332 hentede det almindelige eksportforløb op til 256 komplette
