@@ -1,3 +1,15 @@
+<!-- testflight-7.1.1-4335:start -->
+### TestFlight 7.1.1 (4335)
+
+- Kildecommit og tag: `bb143ac2b653aae031c6a5bb0900712c481bbf19` / `testflight-7.1.1-4335`.
+- Tests: 1698/1698 bestået; 0 fejlet; 0 skipped. iPhone- og Watch-simulatorbuilds bestod.
+- Apple-status (2026-10-17T21:58:17.780056+00:00): [Internal / Testing](https://appstoreconnect.apple.com/apps/6795645396/testflight/ios/f3d1a00b-fb1d-42fd-9d31-36f0af6d6f7f).
+- Eksisterende intern gruppe: Ole Internal er bekræftet tilknyttet.
+- Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
+<!-- testflight-7.1.1-4335:end -->
+
+De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
+
 ## Lettere klargøring af Watch-grafen efter 4334 — 17. oktober 2026
 
 Telefonens `WatchManager.currentBgReadings` bruger nu en afgrænset accessor,
