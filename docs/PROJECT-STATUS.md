@@ -1,3 +1,50 @@
+## Samlede Home-opdateringer ved tilbagevenden — 17. oktober 2026
+
+Den læsende undersøgelse af 4333 fandt tre direkte fulde Home-opdateringer
+under forgrundshændelsen og fem i den eksisterende forsinkede opdatering.
+Hver fuld opdatering gentog klargøring og synkrone databaseopslag på main.
+Rettelsen samler dem til én fuld opdatering i hvert af de to eksisterende
+trin. Follower-/heartbeat-vedligeholdelse sker før den umiddelbare opdatering;
+sensormetadata og statistik forberedes før den efterfølgende opdatering.
+Grafnulstilling, lette statistikopdateringer, timerintervaller og selvstændige
+statushændelser bevares. Notifikationsnavigation, dosisberegning, behandlinger,
+alarmer, Sundhed og Watch/Libre er uændrede.
+
+Tre nye regressionstests bruger de faktiske coordinator-metoder og kontrollerer
+aktuelle controls, follower-timer, synkroniseringsanmodning, metadata før
+publicering, statistik-loading og gentagne forgrundshændelser. Eksisterende
+Home-, genvejs- og høj/lav-notifikationstests er bevaret. En uafhængig
+diffgennemgang fandt ingen blokerende forhold; `git diff --check` bestod.
+Projektets komplette Python-kontroller inklusive syntetiske Watch- og
+releasekontroller bestod i `20261017T195814Z-10452`. XCTest-resultater fra
+4333 er ikke genbrugt som kvittering for denne ændring.
+
+Den indledende XCTest-start blev afbrudt før testene: Mac'en har Xcode 27.1,
+men `xcodebuild -checkFirstLaunchStatus` returnerer 69. Simulator-wrapperen
+venter på førstegangsopsætning (forventet CoreSimulator 1174.9.2, installeret
+1171.7). Dette var en byggemiljøblokering, ikke en bestået eller fejlet
+XCTest-kørsel. Den fastlåste macOS-godkendelsesproces blev genstartet, og
+brugeren godkendte komponentinstallationen. Xcode 27.1 (`27A9275`) meldte
+`Install Succeeded`; førstegangsstatus er nu 0, og CoreSimulator 1174.9.2
+kan liste de tilgængelige simulatorer. Endelig test- og release-status
+registreres særskilt efter kontrollen af det præcise release-checkpoint.
+
+Den første fulde release-test kørte 1.693 tests og stoppede med tre
+assertionsfejl i den samme nye statistiktest. Testen startede uden tidligere
+statistikværdier, hvor den eksisterende UI-regel netop ikke viser spinner.
+Fixture er rettet til at vise syntetiske færdige statistikker før hver
+opdatering; alle assertions bevares, og produktionskoden er uændret af denne
+testrettelse. Den fejlede kørsel bevares særskilt; den ændrede release-kilde
+skal bestå hele kontrollen på ny.
+
+Læsende enhedskontrol bekræftede iPhone 7.1.1 (4333). Ingen lokal installation
+eller behandlingsregistrering er foretaget. Der var ingen tilgængelig høj/lav-
+notifikation til at gentage brugerens 1–3 sekunders forsinkelse, så forbedret
+åbningstid er ikke fysisk målt. Den reducerede klargøring er dokumenteret i
+koden, ikke bevis for hele den observerede forsinkelses årsag. De særskilte
+navigationskanter ved modalovergange og konkurrerende ventende påmindelser er
+ikke ændret eller fysisk reproduceret i denne afgrænsede optimering.
+
 <!-- testflight-7.1.1-4333:start -->
 ### TestFlight 7.1.1 (4333)
 

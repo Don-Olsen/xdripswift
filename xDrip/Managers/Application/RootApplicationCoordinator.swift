@@ -277,6 +277,14 @@ struct InitialCalibrationRequestGate {
         updateStatistics(overrideApplicationState: true, refreshHomeState: refreshHomeState)
     }
 
+    func refreshHomeOnForegroundForTesting() {
+        refreshHomeOnForeground()
+    }
+
+    func completeForegroundHomeRefreshForTesting() {
+        completeForegroundHomeRefresh(overrideApplicationState: true)
+    }
+
     var hasFollowerConnectionTimerForTesting: Bool { followerConnectionTimer != nil }
     #endif
     
@@ -645,23 +653,16 @@ struct InitialCalibrationRequestGate {
             // so need to donate here
             IntentDonationManager.shared.donate(intent: GlucoseIntent())
             
-            self.updateSnoozeStatus()
-            
-            // update the connection status immediately (this will give the user a visual feedback that the connection was lost in the background if they have disabled keep-alive)
-            self.setFollowerConnectionAndHeartbeatStatus()
-            
+            // The timer-restart callback performs the immediate complete Home refresh,
+            // including snooze and connection status, in one ordered operation.
+
             // Schedule a call to updateLabelsAndChart when the app comes to the foreground, with a delay of 0.5 seconds. Because the application state is not immediately to .active, as a result, updates may not happen - especially the synctreatments may not happen because this may depend on the application state - by making a call just half a second later, when the status is surely = .active, the UI updates will be done correctly.
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                self.updateLabelsAndChart(overrideApplicationState: true)
-                self.updateMiniChart()
-                self.updateDataSourceInfo()
-                // update statistics related outlets
-                self.updateStatistics(animate: true)
+                self.completeForegroundHomeRefresh()
                 // Restart only if the app is still active after this delayed foreground refresh.
                 // A quick return to the background must keep the existing Live Activity alive:
                 // ActivityKit permits updating it there, but rejects creation of its replacement.
                 self.updateLiveActivityAndWidgets(forceRestart: UIApplication.shared.applicationState == .active)
-                self.updatePumpAndAIDStatusViews()
             }
         })
         
@@ -1777,7 +1778,23 @@ struct InitialCalibrationRequestGate {
     }
 
     // MARK: - private helper functions
-    
+
+    /// Keep connection maintenance and the immediate publication together: foreground
+    /// callbacks have no defined order. The complete refresh includes snooze and pump status.
+    private func refreshHomeOnForeground() {
+        maintainFollowerConnectionAndHeartbeatStatus()
+        updateLabelsAndChart(overrideApplicationState: true, forceReset: true)
+    }
+
+    /// Finish the existing post-activation refresh with one complete Home publication.
+    /// Statistics keep their own lightweight loading/result updates.
+    private func completeForegroundHomeRefresh(overrideApplicationState: Bool = false) {
+        updateDataSourceInfo(refreshHomeState: false)
+        updateStatistics(animate: true, overrideApplicationState: overrideApplicationState,
+            refreshHomeState: false)
+        updateLabelsAndChart(overrideApplicationState: true)
+    }
+
     /// creates notification
     private func createNotification(title: String?, body: String?, identifier: String, sound: UNNotificationSound?) {
         // Create Notification Content
@@ -1857,7 +1874,7 @@ struct InitialCalibrationRequestGate {
             
             // Reset the chart when coming to the foreground. Refreshing here also prevents the
             // empty chart that can otherwise occasionally appear after returning to the app.
-            self.updateLabelsAndChart(overrideApplicationState: true, forceReset: true)
+            self.refreshHomeOnForeground()
         })
         
         // when app goes to background
@@ -2523,7 +2540,8 @@ struct InitialCalibrationRequestGate {
         let context = currentStatisticsContext(now: now, calendar: calendar)
         // a new day or changed settings needs fresh statistics. Otherwise, just recheck the emoji.
         if statisticsContext != context {
-            updateStatistics(overrideApplicationState: overrideApplicationState)
+            // updateLabelsAndChart publishes the complete Home state after this returns.
+            updateStatistics(overrideApplicationState: overrideApplicationState, refreshHomeState: false)
         } else {
             rootHomeStateModel.updateStatisticsEasterEgg(days: context.days, now: now, calendar: calendar)
         }
@@ -2647,7 +2665,7 @@ struct InitialCalibrationRequestGate {
     }
     
     /// update the data source information view and also the sensor progress view (if needed)
-    private func updateDataSourceInfo() {
+    private func updateDataSourceInfo(refreshHomeState: Bool = true) {
         // check if there is an active sensor connected via cgmTransmitter in master mode
         // if so, then use this value to override/set the coredata activeSensorStartDate
         if let startDate = activeSensor?.startDate {
@@ -2663,17 +2681,19 @@ struct InitialCalibrationRequestGate {
 
         // The state model owns all visible sensor and data-source formatting. The controller keeps
         // only the source metadata and follower timer maintenance that other app services use.
-        // This call publishes the complete Home state after those updates.
-        setFollowerConnectionAndHeartbeatStatus()
-        return
+        // Independent events still publish immediately; the foreground batch publishes once
+        // after metadata, connection maintenance and statistics have all been updated.
+        maintainFollowerConnectionAndHeartbeatStatus()
+        if refreshHomeState { publishRootHomeState() }
     }
     
     /// this should be called when the data source view is refreshed or when called by the followerConnectionTimer object
     @objc private func setFollowerConnectionAndHeartbeatStatus() {
-        defer {
-            publishRootHomeState()
-        }
+        maintainFollowerConnectionAndHeartbeatStatus()
+        publishRootHomeState()
+    }
 
+    private func maintainFollowerConnectionAndHeartbeatStatus() {
         // if in master mode, hide the connection status and destroy the timer if it was initialized
         // (for example if the user just changed from follower to master)
         if UserDefaults.standard.isMaster {

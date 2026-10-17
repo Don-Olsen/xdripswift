@@ -63,6 +63,125 @@ final class RootHomeInteractionTests: XCTestCase {
     }
 
     @MainActor
+    func testImmediateForegroundRefreshPublishesOnceAndMaintainsFollowerState() {
+        withHomeRefreshDefaults {
+            let model = RootHomeStateModel()
+            let coordinator = RootApplicationCoordinator(homeStateModelForTesting: model)
+            model.refresh(activeSensor: nil, isScreenLocked: false, usesScreenLockNightLayout: false)
+            var publications: [RootHomeState] = []
+            let observation = model.$state.dropFirst().sink { publications.append($0) }
+            defer { observation.cancel() }
+            defer {
+                UserDefaults.standard.isMaster = true
+                coordinator.refreshHomeOnForegroundForTesting()
+            }
+
+            UserDefaults.standard.enableSmoothing = true
+            UserDefaults.standard.isMaster = false
+            coordinator.refreshHomeOnForegroundForTesting()
+
+            XCTAssertEqual(publications.count, 2, "One chart reset and one complete Home refresh")
+            XCTAssertEqual(publications.map(\.chartResetToNowRevision), [1, 1])
+            XCTAssertEqual(publications.map { $0.controls.postProcessingSystemImage },
+                ["dial.low", "dial.low.fill"])
+            XCTAssertEqual(model.state.controls.snoozeSystemImage, "speaker.wave.2")
+            XCTAssertFalse(model.state.controls.sensorButtonEnabled)
+            XCTAssertTrue(coordinator.hasFollowerConnectionTimerForTesting)
+            XCTAssertTrue(UserDefaults.standard.nightscoutSyncRequired)
+            XCTAssertNotNil(UserDefaults.standard.timeStampLatestNightscoutSyncRequest)
+
+            publications.removeAll()
+            UserDefaults.standard.enableSmoothing = false
+            UserDefaults.standard.enableAdjustment = true
+            UserDefaults.standard.isMaster = true
+            coordinator.refreshHomeOnForegroundForTesting()
+
+            XCTAssertEqual(publications.count, 2, "A later foreground event must not be suppressed")
+            XCTAssertEqual(publications.map(\.chartResetToNowRevision), [2, 2])
+            XCTAssertEqual(model.state.controls.postProcessingSystemImage, "dial.medium")
+            XCTAssertTrue(model.state.controls.sensorButtonEnabled)
+            XCTAssertFalse(coordinator.hasFollowerConnectionTimerForTesting)
+        }
+    }
+
+    @MainActor
+    func testCompletedForegroundRefreshPublishesAfterMetadataWithoutRepeatedFullRefreshes() {
+        withHomeRefreshDefaults {
+            let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+            let sensorStart = Date(timeIntervalSince1970: 1_800_000_000)
+            let sensor = Sensor(startDate: sensorStart,
+                nsManagedObjectContext: core.mainManagedObjectContext)
+            let model = RootHomeStateModel()
+            let coordinator = RootApplicationCoordinator(homeStateModelForTesting: model,
+                activeSensorForTesting: sensor)
+            var publications: [RootHomeState] = []
+            var publishedStartDates: [Date?] = []
+            let observation = model.$state.dropFirst().sink {
+                publications.append($0)
+                publishedStartDates.append(UserDefaults.standard.activeSensorStartDate)
+            }
+            defer { observation.cancel() }
+
+            UserDefaults.standard.enableSmoothing = true
+            coordinator.completeForegroundHomeRefreshForTesting()
+            XCTAssertEqual(publications.count, 1, "Hidden statistics need only the complete Home update")
+            XCTAssertEqual(publishedStartDates, [sensorStart])
+            XCTAssertTrue(model.state.controls.postProcessingEnabled)
+            XCTAssertFalse(model.state.visibility.showsStatistics)
+            XCTAssertEqual(model.state.chartResetToNowRevision, 0)
+            XCTAssertTrue(UserDefaults.standard.nightscoutSyncRequired)
+
+            publications.removeAll()
+            publishedStartDates.removeAll()
+            sensor.startDate = sensorStart.addingTimeInterval(60)
+            UserDefaults.standard.enableSmoothing = false
+            coordinator.completeForegroundHomeRefreshForTesting()
+            XCTAssertEqual(publications.count, 1)
+            XCTAssertEqual(publishedStartDates, [sensor.startDate])
+            XCTAssertFalse(model.state.controls.postProcessingEnabled)
+        }
+    }
+
+    @MainActor
+    func testForegroundStatisticsLoadingDoesNotRepeatCompleteHomeRefresh() {
+        withHomeRefreshDefaults {
+            UserDefaults.standard.showStatistics = true
+            let model = RootHomeStateModel()
+            let coordinator = RootApplicationCoordinator(homeStateModelForTesting: model)
+            model.refresh(activeSensor: nil, isScreenLocked: false, usesScreenLockNightLayout: false)
+            let statistics = StatisticsManager.Statistics(lowStatisticValue: 0, highStatisticValue: 0,
+                inRangeStatisticValue: 100, averageStatisticValue: 100, gmiPercentage: 5,
+                cVStatisticValue: 0, lowLimitForTIR: 70, highLimitForTIR: 180, numberOfDaysUsed: 1)
+            // Existing values show a spinner while their replacement is calculated.
+            model.updateStatistics(statistics)
+            var publications: [RootHomeState] = []
+            let observation = model.$state.dropFirst().sink { publications.append($0) }
+            defer { observation.cancel() }
+
+            // The first immediate refresh also initializes the statistics context.
+            UserDefaults.standard.enableSmoothing = true
+            coordinator.refreshHomeOnForegroundForTesting()
+            XCTAssertEqual(publications.count, 3, "Chart reset, statistics loading and one complete Home")
+            XCTAssertEqual(publications.filter { $0.controls.postProcessingEnabled }.count, 1)
+            XCTAssertTrue(model.state.statistics.showsActivityIndicator)
+            XCTAssertTrue(model.state.visibility.showsStatistics)
+
+            // Simulate the immediate request completing before the later refresh.
+            model.updateStatistics(statistics)
+            publications.removeAll()
+            UserDefaults.standard.enableSmoothing = false
+            coordinator.completeForegroundHomeRefreshForTesting()
+            XCTAssertTrue(publications.first?.statistics.showsActivityIndicator == true)
+            XCTAssertEqual(publications.filter { !$0.controls.postProcessingEnabled }.count, 1,
+                "Loading/emoji updates must not repeat the complete controls refresh")
+            XCTAssertFalse(model.state.controls.postProcessingEnabled)
+            XCTAssertTrue(model.state.statistics.showsActivityIndicator)
+            XCTAssertTrue(model.state.visibility.showsStatistics)
+            XCTAssertEqual(model.state.chartResetToNowRevision, 1)
+        }
+    }
+
+    @MainActor
     func testStandaloneSnoozeStatusCallbackStillPublishesImmediately() {
         withHomeRefreshDefaults {
             let model = RootHomeStateModel()
