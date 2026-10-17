@@ -34,6 +34,13 @@ enum LibreWatchStoredReadingPolicy {
     }
 }
 
+/// Only the detached values used by the phone's existing Watch graph payload.
+struct WatchBgReadingSnapshot: Sendable, Equatable {
+    let timeStamp: Date
+    let finalValue: Double
+    let slopeOrdinal: Int
+}
+
 class BgReadingsAccessor: ObservableObject {
 
     // MARK: - Properties
@@ -226,6 +233,36 @@ class BgReadingsAccessor: ObservableObject {
         }
 
         return returnValue
+    }
+
+    /// Matches the Watch graph's full-snapshot selection without materialising sensor or
+    /// calibration relationships. Keep the main context so pending changes remain visible.
+    func getWatchBgReadingSnapshots(fromDate: Date) -> [WatchBgReadingSnapshot] {
+        var result: [WatchBgReadingSnapshot] = []
+        coreDataManager.mainManagedObjectContext.performAndWait {
+            let request: NSFetchRequest<BgReading> = BgReading.fetchRequest()
+            request.sortDescriptors = [NSSortDescriptor(key: #keyPath(BgReading.timeStamp), ascending: false)]
+            request.returnsObjectsAsFaults = false
+            request.includesPropertyValues = true
+            request.predicate = NSPredicate(format:
+                "timeStamp > %@ AND isSuppressedByFiveMinuteCadence == NO AND calculatedValue != 0.0 AND (calculatedValue != %f OR (rawData == %f AND ageAdjustedRawValue == 0.0))",
+                NSDate(timeIntervalSince1970: fromDate.timeIntervalSince1970),
+                ConstantsCalibrationAlgorithms.bgReadingErrorValue,
+                ConstantsCalibrationAlgorithms.bgReadingErrorValue)
+            do {
+                result = try coreDataManager.mainManagedObjectContext.fetch(request).compactMap { reading in
+                    guard reading.isValidForDownstream else { return nil }
+                    return WatchBgReadingSnapshot(timeStamp: reading.timeStamp,
+                        finalValue: reading.finalValue, slopeOrdinal: reading.slopeOrdinal())
+                }
+            } catch {
+                let fetchError = error as NSError
+                trace("in getWatchBgReadingSnapshots, unable to fetch, domain=%{public}@ code=%{public}ld",
+                    log: self.log, category: ConstantsLog.categoryApplicationDataBgReadings,
+                    type: .error, fetchError.domain, fetchError.code)
+            }
+        }
+        return result
     }
 
     /// Snapshot variant that returns value types (thread-safe, no Core Data objects escape)

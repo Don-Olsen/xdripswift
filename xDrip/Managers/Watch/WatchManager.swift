@@ -817,9 +817,9 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
 
         let isMgDl = UserDefaults.standard.bloodGlucoseUnitIsMgDl
 
-        let bgReadingSnapshots = bgReadingsAccessor.getLatestBgReadingSnapshots(limit: nil, fromDate: .now.addingTimeInterval(-3600 * hoursOfBgReadingsToSend), forSensor: nil, ignoreRawData: true, ignoreCalculatedValue: false)
+        let bgReadingSnapshots = bgReadingsAccessor.getWatchBgReadingSnapshots(fromDate: .now.addingTimeInterval(-3600 * hoursOfBgReadingsToSend))
 
-        let slopeOrdinal: Int = !bgReadingSnapshots.isEmpty ? bgReadingSnapshots[0].slopeOrdinal() : 1
+        let slopeOrdinal: Int = !bgReadingSnapshots.isEmpty ? bgReadingSnapshots[0].slopeOrdinal : 1
 
         var previousValueInUserUnit = 0.0
         var actualValueInUserUnit = 0.0

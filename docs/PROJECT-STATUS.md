@@ -1,3 +1,34 @@
+## Lettere klargøring af Watch-grafen efter 4334 — 17. oktober 2026
+
+Telefonens `WatchManager.currentBgReadings` bruger nu en afgrænset accessor,
+der kopierer tidspunkt, eksisterende `finalValue` og trendkode uden at læse
+sensor-/kalibreringsegenskaber for hvert punkt. Det samme 12-timersvindue,
+den eksklusive tidsgrænse, sortering, suppression og downstream-validering
+bevares, inklusive native 38 mg/dL og ugemte ændringer på den eksisterende
+Core Data-kontekst. Den fælles fulde snapshot-accessor er uændret. Watch-
+payload, delta/enheder, cache, opdateringskø og kommunikation er uændrede.
+Produktionsændringen er begrænset til to filer; dosis, prognose/ML, alarmer,
+Sundhed og Libre-forbindelse ændres ikke.
+
+Fem nye regressionstests sammenligner den rigtige lette accessor med den
+hidtidige produktionslæsning på en syntetisk SQLite-database. De dækker
+0/1/2/720 målinger, tidsgrænser, ens tider, gyldighed, udglattede/justerede
+værdier, trendgrænser, suppression, ugemte ændringer og fravær af indlæste
+sensor-/kalibreringsegenskaber. Eksisterende tests bevares. Den uafhængige
+kodegennemgang kontrollerede også identisk konvertering af tidsgrænsen.
+
+De indledende Python-kontroller bestod: 172 tests samt 30 og 24 syntetiske
+Watch-kontroller. Lokal kvittering: `20261017T213344Z-37950` under det
+sædvanlige buildområde uden for Git. Hele XCTest-suiten og begge
+simulatorbuilds køres af releaseproceduren på det præcise Apple-nummererede
+checkpoint; de faktiske resultater og Apple-status registreres i journalen.
+
+Læsende enhedskontrol bekræftede iPhone 7.1.1 (4334) og det forventede
+bundle-ID; uret var utilgængeligt. Ingen lokal installation eller fysisk
+måling af denne ændrings hastighed/batteriforbrug er udført. De automatiske
+tests kontrollerer resultatlighed og det fjernede relationsarbejde, ikke en
+målt gevinst på brugerens telefon eller ur.
+
 <!-- testflight-7.1.1-4334:start -->
 ### TestFlight 7.1.1 (4334)
 

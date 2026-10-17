@@ -1,4 +1,5 @@
 import XCTest
+import CoreData
 @testable import xdrip
 
 /// Uses the production phone service with its real snapshot generation and context merge.
@@ -458,5 +459,196 @@ final class WatchPhoneRefreshServiceTests: XCTestCase {
         h.jobs.removeAll()
         h.service.reachable(); h.advance(0.25)
         XCTAssertEqual(h.pushes.count, 2, "A late ACK must not mark the old content as delivered")
+    }
+}
+
+
+/// Uses the production accessor and a real SQLite store. The lightweight read must
+/// preserve Watch history semantics, including edits not yet committed by its owner.
+@MainActor
+extension WatchPhoneRefreshServiceTests {
+    private func watchHistoryStack() throws -> CoreDataManager {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WatchHistoryReader-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        return try CoreDataManager(testModelName: ConstantsCoreData.modelName,
+            persistentStoreURL: directory.appendingPathComponent("history.sqlite"))
+    }
+
+    @discardableResult
+    private func watchHistoryRow(_ id: String, at date: Date, value: Double = 100,
+                                 sensor: Sensor, context: NSManagedObjectContext) -> BgReading {
+        let row = BgReading(timeStamp: date, sensor: sensor, calibration: nil, rawData: 100,
+            deviceName: "Synthetic Watch history", nsManagedObjectContext: context)
+        row.id = id
+        row.calculatedValue = value
+        return row
+    }
+
+    private func legacyWatchHistory(_ accessor: BgReadingsAccessor, from start: Date)
+        -> [WatchBgReadingSnapshot] {
+        accessor.getLatestBgReadingSnapshots(limit: nil, fromDate: start, forSensor: nil,
+            ignoreRawData: true, ignoreCalculatedValue: false).map {
+                WatchBgReadingSnapshot(timeStamp: $0.timeStamp, finalValue: $0.finalValue,
+                    slopeOrdinal: $0.slopeOrdinal())
+            }
+    }
+
+    func testLightweightWatchHistoryMatchesEmptySingleAndTwoReadings() throws {
+        let core = try watchHistoryStack()
+        let context = core.mainManagedObjectContext
+        let start = Date(timeIntervalSince1970: 1_800_000_000)
+        let sensor = Sensor(startDate: start, nsManagedObjectContext: context)
+        let accessor = BgReadingsAccessor(coreDataManager: core)
+        for count in 0...2 {
+            if count > 0 {
+                watchHistoryRow("small-\(count)", at: start.addingTimeInterval(Double(count) * 60),
+                    value: 100 + Double(count) * 2, sensor: sensor, context: context)
+            }
+            let actual = accessor.getWatchBgReadingSnapshots(fromDate: start)
+            XCTAssertEqual(actual.count, count)
+            XCTAssertEqual(actual, legacyWatchHistory(accessor, from: start))
+            XCTAssertEqual(actual.map(\.finalValue), (1...max(1, count)).prefix(count)
+                .reversed().map { 100 + Double($0) * 2 })
+        }
+        XCTAssertTrue(context.hasChanges, "Reading cannot save pending caller changes")
+    }
+
+    func testLightweightWatchHistoryPreservesBoundaryValidityAndFinalValues() throws {
+        let core = try watchHistoryStack()
+        let context = core.mainManagedObjectContext
+        let start = Date(timeIntervalSince1970: 1_800_000_000.25)
+        let sensor = Sensor(startDate: start, nsManagedObjectContext: context)
+        let other = Sensor(startDate: start.addingTimeInterval(-86400), nsManagedObjectContext: context)
+        watchHistoryRow("outside", at: start.addingTimeInterval(-0.001), sensor: sensor, context: context)
+        watchHistoryRow("boundary", at: start, sensor: sensor, context: context)
+        watchHistoryRow("inside", at: start.addingTimeInterval(0.001), sensor: other, context: context)
+        for index in 0..<13 {
+            let row = watchHistoryRow("validity-\(index)",
+                at: start.addingTimeInterval(Double(index + 1) * 60),
+                sensor: index.isMultiple(of: 2) ? sensor : other, context: context)
+            switch index {
+            case 0: row.isSuppressedByFiveMinuteCadence = true
+            case 1: row.calculatedValue = 0
+            case 2: row.calculatedValue = 38; row.ageAdjustedRawValue = 100
+            case 3: row.calculatedValue = 38; row.rawData = 38; row.ageAdjustedRawValue = 0
+            case 4: row.rawData = 0; row.calculatedValue = 39
+            case 5: row.adjustedValue = 110
+            case 6: row.adjustedValue = 110; row.smoothedValue = 120
+            case 7: row.smoothedValue = 0
+            case 8: row.smoothedValue = -1
+            case 9: row.smoothedValue = NSNumber(value: Double.infinity)
+            case 10: row.smoothedValue = NSNumber(value: Double.nan)
+            case 11: row.rawData = .infinity
+            case 12: row.ageAdjustedRawValue = .infinity
+            default: break
+            }
+        }
+        // Exercise invalid non-finite values as pending changes too: SQLite may
+        // normalize NaN on save, so the caller's unsaved state needs its own check.
+        let accessor = BgReadingsAccessor(coreDataManager: core)
+        let actual = accessor.getWatchBgReadingSnapshots(fromDate: start)
+        XCTAssertEqual(actual, legacyWatchHistory(accessor, from: start))
+        XCTAssertEqual(actual.map(\.finalValue), [120, 110, 39, 38, 100])
+        XCTAssertTrue(actual.allSatisfy { $0.timeStamp > start && $0.finalValue.isFinite })
+        XCTAssertTrue(core.saveChangesSynchronously())
+        XCTAssertEqual(accessor.getWatchBgReadingSnapshots(fromDate: start),
+                       legacyWatchHistory(accessor, from: start))
+    }
+
+    func testLightweightWatchHistoryPreservesAllSlopeBoundariesAndHiddenSlope() throws {
+        let core = try watchHistoryStack()
+        let context = core.mainManagedObjectContext
+        let start = Date(timeIntervalSince1970: 1_800_000_000)
+        let sensor = Sensor(startDate: start, nsManagedObjectContext: context)
+        let slopes: [Double] = [-4, -3.5, -3.499, -2, -1.999, -1, -0.999, 1, 1.001, 2, 2.001, 3.5, 3.501]
+        for (index, slope) in slopes.enumerated() {
+            let row = watchHistoryRow("slope-\(index)", at: start.addingTimeInterval(Double(index + 1) * 60),
+                sensor: sensor, context: context)
+            row.calculatedValueSlope = slope / 60000
+        }
+        let hidden = watchHistoryRow("hidden", at: start.addingTimeInterval(86400),
+            sensor: sensor, context: context)
+        hidden.calculatedValueSlope = 4 / 60000
+        hidden.hideSlope = true
+        let accessor = BgReadingsAccessor(coreDataManager: core)
+        let actual = accessor.getWatchBgReadingSnapshots(fromDate: start)
+        XCTAssertEqual(actual, legacyWatchHistory(accessor, from: start))
+        XCTAssertEqual(actual.first?.slopeOrdinal, 0)
+        XCTAssertEqual(Set(actual.map(\.slopeOrdinal)), Set(0...7))
+    }
+
+    func testLightweightWatchHistoryPreservesTimestampTiesWithoutLoadingRelationships() throws {
+        let core = try watchHistoryStack()
+        let context = core.mainManagedObjectContext
+        let start = Date(timeIntervalSince1970: 1_800_000_000)
+        let sensor = Sensor(startDate: start, nsManagedObjectContext: context)
+        let calibration = Calibration(timeStamp: start, sensor: sensor, bg: 100, rawValue: 100,
+            adjustedRawValue: 100, sensorConfidence: 1, rawTimeStamp: start, slope: 1,
+            intercept: 0, distanceFromEstimate: 0, estimateRawAtTimeOfCalibration: 100,
+            slopeConfidence: 1, deviceName: nil, nsManagedObjectContext: context)
+        for index in 1...720 {
+            // The newest 20 readings share a timestamp but have distinct values;
+            // preserve the existing query order, without a new sort or dedup rule.
+            let seconds = index > 700 ? 720.0 * 60 : Double(index) * 60
+            let row = watchHistoryRow("large-\(index)", at: start.addingTimeInterval(seconds),
+                value: 100 + Double(index) / 10, sensor: sensor, context: context)
+            row.calibration = calibration
+            row.calculatedValueSlope = Double(index % 8 - 4) / 60000
+        }
+        XCTAssertTrue(core.saveChangesSynchronously())
+        context.reset()
+        core.privateManagedObjectContext.performAndWait { core.privateManagedObjectContext.reset() }
+        context.retainsRegisteredObjects = true
+        let accessor = BgReadingsAccessor(coreDataManager: core)
+        let actual = accessor.getWatchBgReadingSnapshots(fromDate: start)
+        XCTAssertEqual(actual.count, 720)
+        XCTAssertEqual(actual.filter { $0.timeStamp == start.addingTimeInterval(720 * 60) }.count, 20)
+        XCTAssertFalse(context.registeredObjects.contains {
+            ($0 is Sensor || $0 is Calibration) && !$0.isFault
+        }, "The Watch history values do not need sensor/calibration properties")
+        XCTAssertEqual(actual, legacyWatchHistory(accessor, from: start))
+        XCTAssertTrue(context.registeredObjects.contains {
+            $0 is Calibration && !$0.isFault
+        }, "The legacy comparator proves this fixture exercises the removed relationship work")
+    }
+
+    func testLightweightWatchHistoryRereadsPendingEditsInsertionsDeletionsAndParentChanges() throws {
+        let core = try watchHistoryStack()
+        let context = core.mainManagedObjectContext
+        let start = Date(timeIntervalSince1970: 1_800_000_000)
+        let sensor = Sensor(startDate: start, nsManagedObjectContext: context)
+        let first = watchHistoryRow("first", at: start.addingTimeInterval(60), sensor: sensor, context: context)
+        let second = watchHistoryRow("second", at: start.addingTimeInterval(120), sensor: sensor, context: context)
+        let third = watchHistoryRow("third", at: start.addingTimeInterval(180), sensor: sensor, context: context)
+        XCTAssertTrue(core.saveChangesSynchronously())
+        let accessor = BgReadingsAccessor(coreDataManager: core)
+        func check(_ values: [Double]) {
+            let actual = accessor.getWatchBgReadingSnapshots(fromDate: start)
+            XCTAssertEqual(actual, legacyWatchHistory(accessor, from: start))
+            XCTAssertEqual(actual.map(\.finalValue), values)
+        }
+        check([100, 100, 100])
+        third.smoothedValue = 123
+        check([123, 100, 100])
+        third.isSuppressedByFiveMinuteCadence = true
+        check([100, 100])
+        context.delete(second)
+        check([100])
+        first.timeStamp = start // a pending timestamp edit crosses the exclusive boundary
+        check([])
+        let inserted = watchHistoryRow("pending", at: start.addingTimeInterval(240),
+            value: 142, sensor: sensor, context: context)
+        check([142])
+        XCTAssertTrue(context.hasChanges)
+        try context.save() // parent-visible changes are intentionally not durable yet
+        core.privateManagedObjectContext.performAndWait {
+            XCTAssertTrue(core.privateManagedObjectContext.hasChanges)
+        }
+        check([142])
+        context.delete(inserted)
+        check([])
+        XCTAssertTrue(context.hasChanges, "The lightweight read cannot flush or undo a deletion")
     }
 }
