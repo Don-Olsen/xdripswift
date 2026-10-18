@@ -360,6 +360,7 @@ final class GlucoseForecastDataAdapterTests: XCTestCase {
         XCTAssertEqual(cancelled.result.reason, .dataUnavailable)
         XCTAssertTrue(cancelled.result.points.isEmpty)
         XCTAssertNil(cancelled.conditionalPlannedPoints)
+        XCTAssertNil(cancelled.logSnapshot)
         XCTAssertEqual(probe.readCount, 0, "Cancelled queued work must never enter Core Data")
         XCTAssertEqual(captured.count, 0, "Cancellation is not prospective failure evidence")
 
@@ -414,6 +415,7 @@ final class GlucoseForecastDataAdapterTests: XCTestCase {
             XCTAssertNil(cancelled.result.referenceDate)
             XCTAssertNil(cancelled.result.mlForecast)
             XCTAssertNil(cancelled.conditionalPlannedPoints)
+            XCTAssertNil(cancelled.logSnapshot)
             XCTAssertEqual(probe.readCount, 1)
             XCTAssertEqual(captured.count, 0,
                 "Neither a successful nor failed read may log a cancelled request")
@@ -436,6 +438,187 @@ final class GlucoseForecastDataAdapterTests: XCTestCase {
         XCTAssertEqual(cancelled.result.reason, .dataUnavailable)
         XCTAssertTrue(cancelled.result.points.isEmpty)
         XCTAssertEqual(captured.count, 0)
+    }
+
+    @MainActor func testPresentationEvidenceCapturesMLOncePerCallEvenWhenEngineCacheIsReused() async throws {
+        for horizon in [60, 120] {
+            let fixture = try makeCancellationFixture()
+            defer { fixture.defaults.removePersistentDomain(forName: fixture.suite) }
+            fixture.defaults.set(referenceDate, forKey: LowSoonAlertState.lastScheduledDefaultsKey)
+            let inference = ForecastAdapterMLCapture()
+            let captured = ForecastAdapterLogCapture()
+            let adapter = GlucoseForecastDataAdapter(coreDataManager: fixture.core,
+                therapyManager: fixture.therapy, defaults: fixture.defaults,
+                healthImporter: fixture.importer, logForecast: captured.append,
+                mlInference: { input, engine, source in
+                    let call = inference.record(input, source: source)
+                    return ForecastAdapterMLCapture.forecast(engine, modelID: "synthetic-model-\(call)")
+                })
+            let first = await adapter.forecastForPresentation(horizonMinutes: horizon, at: referenceDate)
+            let cached = await adapter.forecastForPresentation(horizonMinutes: horizon, at: referenceDate)
+            XCTAssertNil(first.result.reason)
+            XCTAssertNil(cached.result.reason)
+            XCTAssertEqual(inference.count, 2, "Evidence capture must not request an extra ML inference")
+            XCTAssertEqual(captured.count, 1, "A cache hit retains the existing one-time engine baseline")
+            XCTAssertEqual(captured.snapshots.first?.recordType, .forecast)
+            XCTAssertNil(captured.snapshots.first?.presentation)
+            XCTAssertEqual(first.result.points, cached.result.points)
+            for (index, outcome) in [first, cached].enumerated() {
+                let snapshot = try XCTUnwrap(outcome.logSnapshot)
+                let presentation = try XCTUnwrap(snapshot.presentation)
+                XCTAssertEqual(snapshot.recordType, .presentation)
+                XCTAssertEqual(snapshot.horizonMinutes, horizon)
+                XCTAssertEqual(presentation.modelID, "synthetic-model-\(index + 1)")
+                XCTAssertNil(presentation.presentedAt)
+                XCTAssertEqual(snapshot.points.map(\.glucoseMgdl), outcome.result.points.map(\.glucoseMgdl))
+                XCTAssertEqual(presentation.displayedPoints.map(\.glucoseMgdl),
+                    GlucoseForecastMLPresentation.points(in: outcome.result).map(\.glucoseMgdl))
+                XCTAssertEqual(presentation.mlBeforeCapPoints?.first?.glucoseMgdl, 140)
+                XCTAssertEqual(presentation.mlBeforeCapPoints?.last?.glucoseMgdl, 165)
+                XCTAssertEqual(presentation.displayedPoints.last?.glucoseMgdl, 140)
+                XCTAssertEqual(snapshot.inputs?.glucose.count, 7)
+                XCTAssertEqual(snapshot.inputs?.treatments.count, 0)
+                XCTAssertEqual(snapshot.parameters.sensitivityMgdlPerUnit, 36)
+                XCTAssertNotNil(snapshot.confirmingPresentation(of: outcome.result,
+                    at: snapshot.computedAt.addingTimeInterval(1)))
+            }
+            XCTAssertEqual(inference.sources.count, 2)
+            XCTAssertEqual(Set(inference.sources).count, 1)
+            XCTAssertEqual(inference.inputs.map(\.horizonMinutes), [horizon, horizon])
+            XCTAssertEqual(inference.inputs.map(\.now), [referenceDate, referenceDate])
+        }
+    }
+
+    @MainActor func testQueuedSettingsChangeKeepsFrozenInputsAndEngineFallbackEvidence() async throws {
+        let fixture = try makeCancellationFixture()
+        defer { fixture.defaults.removePersistentDomain(forName: fixture.suite) }
+        _ = TreatmentEntry(date: referenceDate.addingTimeInterval(-300), value: 1,
+            treatmentType: .Insulin, nightscoutEventType: nil, enteredBy: "Synthetic",
+            nsManagedObjectContext: fixture.core.mainManagedObjectContext)
+        XCTAssertTrue(fixture.core.saveChangesSynchronously())
+        let originalSettings = TherapyModelSettings(defaults: fixture.defaults)
+        let queued = expectation(description: "Settings were captured before queued work")
+        let releaseWorker = DispatchSemaphore(value: 0)
+        defer { releaseWorker.signal() }
+        let worker = DispatchQueue(label: "test.forecast.frozen-evidence")
+        worker.async { XCTAssertEqual(releaseWorker.wait(timeout: .now() + 5), .success) }
+        let captured = ForecastAdapterLogCapture()
+        let inference = ForecastAdapterMLCapture()
+        let adapter = GlucoseForecastDataAdapter(coreDataManager: fixture.core,
+            therapyManager: fixture.therapy, defaults: fixture.defaults,
+            healthImporter: fixture.importer, logForecast: captured.append,
+            enqueuePresentation: { work in worker.async(execute: work); queued.fulfill() },
+            mlInference: { input, result, source in
+                inference.record(input, source: source)
+                return ForecastAdapterMLCapture.forecast(result)
+            })
+        let date = referenceDate
+        let task = Task { await adapter.forecastForPresentation(horizonMinutes: 60, at: date) }
+        defer { task.cancel() }
+        await fulfillment(of: [queued], timeout: 3)
+        fixture.defaults.glucoseForecastManualSensitivityMgdlPerUnit = 72
+        fixture.defaults.glucoseForecastManualCarbRatioGramsPerUnit = 15
+        releaseWorker.signal()
+        let outcome = await task.value
+        XCTAssertNil(outcome.result.reason)
+        XCTAssertNil(outcome.result.mlForecast, "The changed source signature prevents selecting a different-settings model")
+        XCTAssertEqual(inference.count, 0)
+        let snapshot = try XCTUnwrap(outcome.logSnapshot)
+        let evidence = try XCTUnwrap(snapshot.presentation)
+        XCTAssertEqual(snapshot.parameters.sensitivityMgdlPerUnit, 36)
+        XCTAssertEqual(snapshot.parameters.carbohydrateRatioGramsPerUnit, 10)
+        XCTAssertEqual(snapshot.inputs?.calculationDate, referenceDate)
+        XCTAssertEqual(snapshot.inputs?.treatments.count, 1)
+        XCTAssertEqual(snapshot.inputs?.treatments.first?.amount, 1)
+        XCTAssertNil(evidence.modelID)
+        XCTAssertNil(evidence.mlBeforeCapPoints)
+        XCTAssertEqual(evidence.displayedPoints.map(\.glucoseMgdl), outcome.result.points.map(\.glucoseMgdl))
+        let expected = GlucoseForecastEngine.predict(GlucoseForecastInput(
+            glucose: try XCTUnwrap(adapter.recentGlucose(at: date)),
+            treatments: [TherapyTreatment(date: date.addingTimeInterval(-300), amount: 1, isIOB: true)],
+            settings: originalSettings, sensitivityMgdlPerUnit: 36,
+            carbohydrateRatioGramsPerUnit: 10, horizonMinutes: 60, now: date))
+        XCTAssertEqual(outcome.result.points, expected.points)
+        let bytes = try GlucoseForecastLogSnapshot.encoder().encode(snapshot)
+        fixture.defaults.glucoseForecastManualSensitivityMgdlPerUnit = 90
+        XCTAssertEqual(try GlucoseForecastLogSnapshot.encoder().encode(snapshot), bytes)
+        XCTAssertNotNil(snapshot.confirmingPresentation(of: outcome.result, at: snapshot.computedAt.addingTimeInterval(1)))
+        XCTAssertEqual(captured.count, 1)
+        XCTAssertEqual(captured.snapshots.first?.parameters.sensitivityMgdlPerUnit, 36)
+    }
+
+    @MainActor func testUnavailableOrRejectedMLLeavesNoRawMLInEngineFallbackEvidence() async throws {
+        for invalidKind in ["unavailable", "count", "date"] {
+            let fixture = try makeCancellationFixture()
+            defer { fixture.defaults.removePersistentDomain(forName: fixture.suite) }
+            let captured = ForecastAdapterLogCapture()
+            let inference = ForecastAdapterMLCapture()
+            let adapter = GlucoseForecastDataAdapter(coreDataManager: fixture.core,
+                therapyManager: fixture.therapy, defaults: fixture.defaults,
+                healthImporter: fixture.importer, logForecast: captured.append,
+                mlInference: { input, result, source in
+                    inference.record(input, source: source)
+                    guard invalidKind != "unavailable" else { return nil }
+                    let candidate = ForecastAdapterMLCapture.forecast(result)
+                    var points = candidate.points
+                    if invalidKind == "count" { points.removeLast() }
+                    else { points[1] = .init(date: points[1].date.addingTimeInterval(1), glucoseMgdl: points[1].glucoseMgdl) }
+                    return .init(points: points, band: candidate.band, modelID: candidate.modelID)
+                })
+            let outcome = await adapter.forecastForPresentation(horizonMinutes: 60, at: referenceDate)
+            XCTAssertNil(outcome.result.reason)
+            XCTAssertNil(outcome.result.mlForecast)
+            XCTAssertEqual(inference.count, 1)
+            XCTAssertEqual(captured.count, 1)
+            let snapshot = try XCTUnwrap(outcome.logSnapshot)
+            let evidence = try XCTUnwrap(snapshot.presentation)
+            XCTAssertNil(evidence.modelID)
+            XCTAssertNil(evidence.mlBeforeCapPoints, "An ML candidate rejected by presentation safety was never displayed")
+            XCTAssertEqual(evidence.displayedPoints.map(\.glucoseMgdl), outcome.result.points.map(\.glucoseMgdl))
+            XCTAssertEqual(outcome.result.points.map(\.glucoseMgdl), Array(repeating: 140, count: 13))
+            XCTAssertEqual(snapshot.recordType, .presentation)
+        }
+    }
+
+    @MainActor func testCancellationDuringInferenceReturnsNoPresentationEvidenceAndLiveCacheCanRetry() async throws {
+        let fixture = try makeCancellationFixture()
+        defer { fixture.defaults.removePersistentDomain(forName: fixture.suite) }
+        let entered = expectation(description: "ML inference entered")
+        let releaseInference = DispatchSemaphore(value: 0)
+        defer { releaseInference.signal() }
+        let captured = ForecastAdapterLogCapture()
+        let inference = ForecastAdapterMLCapture()
+        let adapter = GlucoseForecastDataAdapter(coreDataManager: fixture.core,
+            therapyManager: fixture.therapy, defaults: fixture.defaults,
+            healthImporter: fixture.importer, logForecast: captured.append,
+            mlInference: { input, result, source in
+                if inference.record(input, source: source) == 1 {
+                    entered.fulfill()
+                    XCTAssertEqual(releaseInference.wait(timeout: .now() + 5), .success)
+                }
+                return ForecastAdapterMLCapture.forecast(result)
+            })
+        let date = referenceDate
+        let task = Task { await adapter.forecastForPresentation(horizonMinutes: 60, at: date) }
+        defer { task.cancel() }
+        await fulfillment(of: [entered], timeout: 3)
+        task.cancel()
+        releaseInference.signal()
+        let cancelled = await task.value
+        XCTAssertEqual(cancelled.result.reason, .dataUnavailable)
+        XCTAssertTrue(cancelled.result.points.isEmpty)
+        XCTAssertNil(cancelled.result.mlForecast)
+        XCTAssertNil(cancelled.logSnapshot)
+        XCTAssertNil(cancelled.conditionalPlannedPoints)
+        XCTAssertEqual(inference.count, 1)
+        XCTAssertEqual(captured.count, 1, "The engine baseline completed before inference began")
+        XCTAssertTrue(captured.snapshots.allSatisfy { $0.recordType == .forecast && $0.presentation == nil })
+        let live = await adapter.forecastForPresentation(horizonMinutes: 60, at: date)
+        XCTAssertNil(live.result.reason)
+        XCTAssertNotNil(live.logSnapshot)
+        XCTAssertEqual(live.logSnapshot?.presentation?.modelID, "synthetic-model")
+        XCTAssertEqual(inference.count, 2)
+        XCTAssertEqual(captured.count, 1, "Retry reuses the completed engine cache without a second baseline")
     }
 
     @MainActor private func makeCancellationFixture() throws -> (
@@ -514,6 +697,7 @@ private final class ForecastAdapterLogCapture: @unchecked Sendable {
     private let lock = NSLock()
     private var records: [GlucoseForecastLogSnapshot] = []
     var count: Int { lock.lock(); defer { lock.unlock() }; return records.count }
+    var snapshots: [GlucoseForecastLogSnapshot] { lock.lock(); defer { lock.unlock() }; return records }
     func append(_ snapshot: GlucoseForecastLogSnapshot) {
         lock.lock(); defer { lock.unlock() }; records.append(snapshot)
     }
@@ -559,5 +743,28 @@ private final class ForecastAdapterNoHealthQuery: HealthTherapyQuerying {
     func observe(_ kind: HealthTherapyImportKind,
                  onChange: @escaping (@escaping () -> Void) -> Void) {
         XCTFail("Synthetic presentation tests must not observe Health")
+    }
+}
+
+
+private final class ForecastAdapterMLCapture: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recordedInputs = [GlucoseForecastInput]()
+    private var recordedSources = [String]()
+    var count: Int { lock.lock(); defer { lock.unlock() }; return recordedInputs.count }
+    var inputs: [GlucoseForecastInput] { lock.lock(); defer { lock.unlock() }; return recordedInputs }
+    var sources: [String] { lock.lock(); defer { lock.unlock() }; return recordedSources }
+    @discardableResult func record(_ input: GlucoseForecastInput, source: String) -> Int {
+        lock.lock(); defer { lock.unlock() }
+        recordedInputs.append(input); recordedSources.append(source)
+        return recordedInputs.count
+    }
+    static func forecast(_ engine: GlucoseForecastResult, modelID: String = "synthetic-model") -> GlucoseForecastMLForecast {
+        let points = engine.points.enumerated().map { index, point in
+            GlucoseForecastPoint(date: point.date, glucoseMgdl: point.glucoseMgdl + (index == 0 ? 0 : 25))
+        }
+        return .init(points: points, band: points.map {
+            .init(date: $0.date, lowerMgdl: $0.glucoseMgdl - 10, upperMgdl: $0.glucoseMgdl + 10)
+        }, modelID: modelID)
     }
 }

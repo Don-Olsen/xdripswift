@@ -40,12 +40,15 @@ struct RootHomeCompletedForecast {
     let context: RootHomeForecastContext
     /// Separate what-if presentation; never used as a measured or live forecast input.
     let conditionalPlannedPoints: [GlucoseForecastPoint]?
+    let logSnapshot: GlucoseForecastLogSnapshot?
 
     init(result: GlucoseForecastResult, context: RootHomeForecastContext,
-         conditionalPlannedPoints: [GlucoseForecastPoint]? = nil) {
+         conditionalPlannedPoints: [GlucoseForecastPoint]? = nil,
+         logSnapshot: GlucoseForecastLogSnapshot? = nil) {
         self.result = result
         self.context = context
         self.conditionalPlannedPoints = conditionalPlannedPoints
+        self.logSnapshot = logSnapshot
     }
 }
 
@@ -72,7 +75,15 @@ struct RootHomeForecastPresentationState {
     mutating func accept(_ outcome: GlucoseForecastPresentationOutcome,
                          context: RootHomeForecastContext, requestedAt: Date) {
         completed = RootHomeCompletedForecast(result: outcome.result, context: context,
-            conditionalPlannedPoints: outcome.conditionalPlannedPoints)
+            conditionalPlannedPoints: outcome.conditionalPlannedPoints, logSnapshot: outcome.logSnapshot)
+    }
+
+    /// A completed calculation can be hidden by a newer chart, source change or
+    /// scrolling. Only the result currently offered to the chart can be evidence.
+    func logSnapshotForDisplay(_ displayedResult: GlucoseForecastResult?,
+                               isVisible: Bool, at now: Date) -> GlucoseForecastLogSnapshot? {
+        guard isVisible else { return nil }
+        return completed?.logSnapshot?.confirmingPresentation(of: displayedResult, at: now)
     }
 
     func displayableResult(context: RootHomeForecastContext, chartState: GlucoseChartState,
@@ -235,6 +246,7 @@ struct RootHomeView: View {
     @State private var calculatorApplicationIsActive = UIApplication.shared.applicationState == .active
     @State private var healthTherapySelectionSignature = ""
     @State private var forecastPresentation = RootHomeForecastPresentationState()
+    @State private var forecastHomeIsVisible = false
     @State private var forecastDataRevision = 0
     @State private var forecastFreshnessCheckTime = Date()
     @State private var confirmedForecastNonHealthRevision = 0
@@ -354,6 +366,7 @@ struct RootHomeView: View {
         }
         .colorScheme(.dark)
         .onAppear {
+            forecastHomeIsVisible = true
             calculatorApplicationIsActive = UIApplication.shared.applicationState == .active
             forecastFreshnessCheckTime = Date()
             healthTherapySelectionSignature = currentHealthTherapySelectionSignature
@@ -376,6 +389,7 @@ struct RootHomeView: View {
             openPendingCalculatorQuickAction(delivery)
         }
         .onDisappear {
+            forecastHomeIsVisible = false
             scrollCoordinator.stopDeceleration()
             glucoseChartStateManager.cleanUpMemory()
             miniChartStateManager.cleanUpMemory()
@@ -411,6 +425,13 @@ struct RootHomeView: View {
             // Reuse the cached authoritative engine result with the newly activated
             // local model; no glucose or treatment state is changed.
             forecastDataRevision &+= 1
+        }
+        .onChange(of: presentedForecastLog?.deduplicationKey) { key in
+            // Recheck visibility/current data at delivery. A chart can catch up after
+            // the calculation task finishes; no timer or second inference is needed.
+            guard let key, let snapshot = presentedForecastLog,
+                  snapshot.deduplicationKey == key else { return }
+            GlucoseForecastLog.shared.enqueue(snapshot)
         }
         .task(id: forecastRequestKey) {
             let context = forecastContext
@@ -1278,6 +1299,14 @@ struct RootHomeView: View {
                 == TherapyMetricsManager.shared.nonHealthTreatmentChangeRevision,
             at: max(Date(), forecastFreshnessCheckTime)
         )
+    }
+
+    private var presentedForecastLog: GlucoseForecastLogSnapshot? {
+        forecastPresentation.logSnapshotForDisplay(displayableForecastResult,
+            isVisible: forecastHomeIsVisible && scenePhase == .active
+                && scrollCoordinator.isShowingCurrentTimeRange && !state.usesScreenLockNightLayout
+                && !showsExpandedIPadChart,
+            at: Date())
     }
 
     private var displayableConditionalPlannedPoints: [GlucoseForecastPoint]? {

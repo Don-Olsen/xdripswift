@@ -13,11 +13,15 @@ struct GlucoseForecastPresentationOutcome: Sendable {
     let result: GlucoseForecastResult
     /// Separate, hypothetical curve for unconfirmed scheduled food; never an input to ML/alarms.
     let conditionalPlannedPoints: [GlucoseForecastPoint]?
+    /// Frozen on the forecast worker. Only Home may confirm and enqueue its display.
+    let logSnapshot: GlucoseForecastLogSnapshot?
 
     init(result: GlucoseForecastResult,
-         conditionalPlannedPoints: [GlucoseForecastPoint]? = nil) {
+         conditionalPlannedPoints: [GlucoseForecastPoint]? = nil,
+         logSnapshot: GlucoseForecastLogSnapshot? = nil) {
         self.result = result
         self.conditionalPlannedPoints = conditionalPlannedPoints
+        self.logSnapshot = logSnapshot
     }
 }
 
@@ -57,6 +61,7 @@ final class GlucoseForecastDataAdapter {
     /// Injectable dispatch/read boundaries for deterministic cancellation tests.
     private let enqueuePresentation: ((DispatchWorkItem) -> Void)?
     private let presentationGlucoseFetch: GlucoseFetch?
+    private let mlInference: (GlucoseForecastInput, GlucoseForecastResult, String) -> GlucoseForecastMLForecast?
     private let cacheLock = NSLock()
     private var cache: (key: CacheKey, result: GlucoseForecastResult)?
 
@@ -66,7 +71,10 @@ final class GlucoseForecastDataAdapter {
          healthImporter: HealthKitTherapyImportManager = .shared,
          logForecast: @escaping (GlucoseForecastLogSnapshot) -> Void = { GlucoseForecastLog.shared.enqueue($0) },
          enqueuePresentation: ((DispatchWorkItem) -> Void)? = nil,
-         presentationGlucoseFetch: GlucoseFetch? = nil) {
+         presentationGlucoseFetch: GlucoseFetch? = nil,
+         mlInference: @escaping (GlucoseForecastInput, GlucoseForecastResult, String) -> GlucoseForecastMLForecast? = {
+             GlucoseForecastMLManager.shared.infer(input: $0, result: $1, sourceSignature: $2)
+         }) {
         self.coreDataManager = coreDataManager
         self.therapyManager = therapyManager
         self.defaults = defaults
@@ -74,6 +82,7 @@ final class GlucoseForecastDataAdapter {
         self.logForecast = logForecast
         self.enqueuePresentation = enqueuePresentation
         self.presentationGlucoseFetch = presentationGlucoseFetch
+        self.mlInference = mlInference
     }
 
     func forecast(horizonMinutes: Int, at now: Date = .now) async -> GlucoseForecastResult {
@@ -343,10 +352,20 @@ final class GlucoseForecastDataAdapter {
                     carbohydrateRatioGramsPerUnit: ratio, settings: settings)
             }
             guard !isCancelled() else { return Self.cancelledPresentation }
-            let presentedResult = addMLIfUsable(to: result, input: input,
+            let decorated = addMLIfUsable(to: result, input: input,
                 sourceSignature: mlSourceSignature, isCancelled: isCancelled)
             guard !isCancelled() else { return Self.cancelledPresentation }
-            return .init(result: presentedResult, conditionalPlannedPoints: conditional)
+            var evidence: GlucoseForecastLogSnapshot?
+            if decorated.result.reason == nil {
+                do {
+                    evidence = try GlucoseForecastLogSnapshot.make(input: input, result: decorated.result,
+                        context: logContext(horizonMinutes: horizonMinutes, knownReference: knownReference,
+                            settings: settings, treatmentWindowStart: start, treatmentWindowEnd: referenceDate),
+                        capturesPresentation: true, mlBeforeCap: decorated.mlBeforeCap)
+                } catch { GlucoseForecastLog.shared.captureFailure() }
+            }
+            guard !isCancelled() else { return Self.cancelledPresentation }
+            return .init(result: decorated.result, conditionalPlannedPoints: conditional, logSnapshot: evidence)
         }
         let key = CacheKey(glucose: input.glucose.map { Stamp(date: $0.date, value: $0.glucoseMgdl,
                                                             sensorID: $0.sensorID) },
@@ -445,35 +464,35 @@ final class GlucoseForecastDataAdapter {
     private func addMLIfUsable(to engineResult: GlucoseForecastResult,
                                input: GlucoseForecastInput,
                                sourceSignature: String,
-                               isCancelled: () -> Bool) -> GlucoseForecastResult {
+                               isCancelled: () -> Bool)
+        -> (result: GlucoseForecastResult, mlBeforeCap: GlucoseForecastMLForecast?) {
         // A treatment source can change while the serial data read is in flight.
         // Never decorate a result from the old source with a model for the new one.
         guard !isCancelled(), engineResult.reason == nil,
               sourceSignature == Self.presentationInputSignature(horizonMinutes: 120,
                   defaults: defaults, importer: healthImporter),
-              let mlForecast = GlucoseForecastMLManager.shared.infer(input: input,
-                  result: engineResult, sourceSignature: sourceSignature) else {
-            return engineResult
+              let mlForecast = mlInference(input, engineResult, sourceSignature) else {
+            return (engineResult, nil)
         }
-        guard !isCancelled() else { return engineResult }
+        guard !isCancelled() else { return (engineResult, nil) }
         let selectedML = GlucoseForecastMLPresentation.cappedBelowEngine(mlForecast,
             engine: engineResult,
             currentGlucoseMgdl: input.glucose.last?.glucoseMgdl,
             slope15MgdlPerMinute: Self.rawSlope15(input.glucose),
             lowSoonActive: LowSoonAlertState.isActive(at: input.now, defaults: defaults))
-        guard let selectedML, !isCancelled() else { return engineResult }
+        guard let selectedML, !isCancelled() else { return (engineResult, nil) }
         // Record only a model that passed the final presentation guard. Compare the
         // raw old-model curve with the engine, so a display-only low-glucose cap
         // cannot contaminate the model's measured MAE.
         GlucoseForecastMLManager.shared.recordTransitionPair(
             engine: engineResult, modelForecast: mlForecast, input: input,
             sourceSignature: sourceSignature)
-        return GlucoseForecastResult(points: engineResult.points,
+        return (GlucoseForecastResult(points: engineResult.points,
                                      referenceDate: engineResult.referenceDate,
                                      reason: engineResult.reason,
                                      parameterSource: engineResult.parameterSource,
                                      referenceSensorID: engineResult.referenceSensorID,
-                                     mlForecast: selectedML)
+                                     mlForecast: selectedML), mlForecast)
     }
 
     private func record(_ result: GlucoseForecastResult, horizonMinutes: Int,
@@ -484,14 +503,8 @@ final class GlucoseForecastDataAdapter {
                         treatmentWindowEnd: Date? = nil,
                         isCancelled: () -> Bool) -> GlucoseForecastResult {
         guard !isCancelled() else { return result }
-        let sensorID = knownReference?.sensorID
-        let context = GlucoseForecastLogContext(
-            appVersion: appVersion, appBuild: appBuild,
-            sourceIdentity: sensorID.map { "sensor:" + $0 } ?? "unresolved",
-            sensorIdentity: sensorID, knownReference: knownReference,
-            computedAt: Date(), horizonMinutes: horizonMinutes,
-            insulinModel: settings.map { TherapyInsulinPreset.nearest(to: $0.insulinPeak).rawValue },
-            treatmentWindowStart: treatmentWindowStart, treatmentWindowEnd: treatmentWindowEnd)
+        let context = logContext(horizonMinutes: horizonMinutes, knownReference: knownReference,
+            settings: settings, treatmentWindowStart: treatmentWindowStart, treatmentWindowEnd: treatmentWindowEnd)
         do {
             let snapshot = try GlucoseForecastLogSnapshot.make(input: input, result: result, context: context)
             guard !isCancelled() else { return result }
@@ -502,6 +515,19 @@ final class GlucoseForecastDataAdapter {
             GlucoseForecastLog.shared.captureFailure()
         }
         return result
+    }
+
+    private func logContext(horizonMinutes: Int, knownReference: GlucoseForecastSample?,
+                            settings: TherapyModelSettings?, treatmentWindowStart: Date?,
+                            treatmentWindowEnd: Date?) -> GlucoseForecastLogContext {
+        let sensorID = knownReference?.sensorID
+        return GlucoseForecastLogContext(
+            appVersion: appVersion, appBuild: appBuild,
+            sourceIdentity: sensorID.map { "sensor:" + $0 } ?? "unresolved",
+            sensorIdentity: sensorID, knownReference: knownReference,
+            computedAt: Date(), horizonMinutes: horizonMinutes,
+            insulinModel: settings.map { TherapyInsulinPreset.nearest(to: $0.insulinPeak).rawValue },
+            treatmentWindowStart: treatmentWindowStart, treatmentWindowEnd: treatmentWindowEnd)
     }
 
     static func sourceAllowsForecast(_ policy: DataFlowPolicy,

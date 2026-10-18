@@ -375,6 +375,272 @@ final class GlucoseForecastLogTests: XCTestCase {
                        try Data(contentsOf: folder.appendingPathComponent("second.csv")))
     }
 
+    private func presentationFixture(_ value: GlucoseForecastInput? = nil,
+                                     modelID: String? = "synthetic-model-A", correction: Double = 12,
+                                     capped: Bool = true, computedAt: Date? = nil) throws -> (
+        input: GlucoseForecastInput, result: GlucoseForecastResult,
+        raw: GlucoseForecastMLForecast?, snapshot: GlucoseForecastLogSnapshot
+    ) {
+        let value = value ?? input()
+        let calculated = GlucoseForecastEngine.predict(value)
+        let engine = GlucoseForecastResult(points: calculated.points, referenceDate: calculated.referenceDate,
+            reason: calculated.reason, referenceSensorID: "sensor-A")
+        let raw = modelID.map { modelID in
+            let points = engine.points.enumerated().map { index, point in
+                GlucoseForecastPoint(date: point.date, glucoseMgdl: point.glucoseMgdl +
+                    (index == 0 ? 0 : (index == 2 ? -8 : correction)))
+            }
+            return GlucoseForecastMLForecast(points: points, band: points.map {
+                .init(date: $0.date, lowerMgdl: $0.glucoseMgdl - 10, upperMgdl: $0.glucoseMgdl + 10)
+            }, modelID: modelID)
+        }
+        let selected = raw.flatMap {
+            GlucoseForecastMLPresentation.cappedBelowEngine($0, engine: engine,
+                currentGlucoseMgdl: value.glucose.last?.glucoseMgdl,
+                slope15MgdlPerMinute: 0, lowSoonActive: capped)
+        }
+        let result = GlucoseForecastResult(points: engine.points, referenceDate: engine.referenceDate,
+            reason: engine.reason, referenceSensorID: engine.referenceSensorID, mlForecast: selected)
+        let snapshot = try GlucoseForecastLogSnapshot.make(input: value, result: result,
+            context: context(at: computedAt ?? value.now, horizon: value.horizonMinutes,
+                known: value.glucose.last), capturesPresentation: true, mlBeforeCap: raw)
+        return (value, result, raw, snapshot)
+    }
+
+    func testPresentationSnapshotPreservesExactEngineRawAndCappedCurvesForBothHorizons() throws {
+        for horizon in [60, 120] {
+            let fixture = try presentationFixture(input(horizon: horizon))
+            let snapshot = fixture.snapshot
+            let evidence = try XCTUnwrap(snapshot.presentation)
+            XCTAssertEqual(snapshot.schemaVersion, 3)
+            XCTAssertEqual(snapshot.recordType, .presentation)
+            XCTAssertEqual(evidence.modelID, "synthetic-model-A")
+            XCTAssertNil(evidence.presentedAt, "Computing a curve does not prove Home displayed it")
+            XCTAssertEqual(snapshot.points.map(\.glucoseMgdl), fixture.result.points.map(\.glucoseMgdl))
+            XCTAssertEqual(evidence.mlBeforeCapPoints?.map(\.glucoseMgdl), fixture.raw?.points.map(\.glucoseMgdl))
+            XCTAssertEqual(evidence.displayedPoints.map(\.glucoseMgdl),
+                GlucoseForecastMLPresentation.points(in: fixture.result).map(\.glucoseMgdl))
+            XCTAssertEqual(evidence.displayedPoints.map(\.offsetMinutes), Array(stride(from: 0, through: horizon, by: 5)))
+            XCTAssertEqual(evidence.mlBeforeCapPoints?[1].glucoseMgdl, 132)
+            XCTAssertEqual(evidence.displayedPoints[1].glucoseMgdl, 120)
+            XCTAssertEqual(evidence.mlBeforeCapPoints?[2].glucoseMgdl, 112)
+            XCTAssertEqual(evidence.displayedPoints[2].glucoseMgdl, 112)
+            XCTAssertEqual(snapshot.points[2].glucoseMgdl, 120)
+            let confirmed = try XCTUnwrap(snapshot.confirmingPresentation(of: fixture.result,
+                at: now.addingTimeInterval(1.250)))
+            let decoded = try GlucoseForecastLogSnapshot.decoder().decode(GlucoseForecastLogSnapshot.self,
+                from: GlucoseForecastLogSnapshot.encoder().encode(confirmed))
+            XCTAssertEqual(try GlucoseForecastLogSnapshot.encoder().encode(decoded),
+                try GlucoseForecastLogSnapshot.encoder().encode(confirmed))
+            XCTAssertEqual(decoded.presentation?.presentedAt, now.addingTimeInterval(1.250))
+            XCTAssertNil(snapshot.presentation?.presentedAt, "Confirming returns a value copy")
+        }
+    }
+
+    func testPresentationRequiresMatchingConfirmedResultBeforeItCanBeStoredOrExported() throws {
+        let fixture = try presentationFixture()
+        let result = fixture.result
+        let snapshot = fixture.snapshot
+        func changed(points: [GlucoseForecastPoint]? = nil, reference: Date? = nil,
+                     sensor: String = "sensor-A", model: GlucoseForecastMLForecast? = nil) -> GlucoseForecastResult {
+            .init(points: points ?? result.points, referenceDate: reference ?? result.referenceDate,
+                reason: nil, referenceSensorID: sensor, mlForecast: model ?? result.mlForecast)
+        }
+        var changedEngine = result.points
+        changedEngine[1] = .init(date: changedEngine[1].date, glucoseMgdl: changedEngine[1].glucoseMgdl + 1)
+        var changedDisplayed = try XCTUnwrap(result.mlForecast).points
+        changedDisplayed[1] = .init(date: changedDisplayed[1].date, glucoseMgdl: changedDisplayed[1].glucoseMgdl + 1)
+        let selected = try XCTUnwrap(result.mlForecast)
+        let otherModel = GlucoseForecastMLForecast(points: selected.points, band: selected.band, modelID: "model-B")
+        let otherDisplay = GlucoseForecastMLForecast(points: changedDisplayed, band: selected.band, modelID: selected.modelID)
+        for mismatch in [changed(points: changedEngine), changed(reference: now.addingTimeInterval(1)),
+                         changed(sensor: "sensor-B"), changed(model: otherModel), changed(model: otherDisplay)] {
+            XCTAssertNil(snapshot.confirmingPresentation(of: mismatch, at: now.addingTimeInterval(2)))
+        }
+        XCTAssertNil(snapshot.confirmingPresentation(of: nil, at: now.addingTimeInterval(2)))
+        XCTAssertNil(snapshot.confirmingPresentation(of: result, at: now.addingTimeInterval(-1)))
+        XCTAssertNil(snapshot.confirmingPresentation(of: result, at: Date(timeIntervalSince1970: .nan)))
+        XCTAssertThrowsError(try GlucoseForecastCSV.rows(snapshot))
+        var failures = [GlucoseForecastLogFailure]()
+        let logger = log(diagnostic: { failures.append($0) })
+        logger.enqueue(snapshot); logger.waitUntilIdle()
+        XCTAssertTrue(try records().isEmpty)
+        XCTAssertEqual(failures, [.invalidSnapshot])
+        let confirmed = try XCTUnwrap(snapshot.confirmingPresentation(of: result, at: now.addingTimeInterval(2)))
+        logger.enqueue(confirmed); logger.waitUntilIdle()
+        XCTAssertEqual(try records().count, 1, "Rejected drafts must not reserve the deduplication key")
+    }
+
+    func testInvalidOrMismatchedMLCannotProducePresentationEvidence() throws {
+        let fixture = try presentationFixture()
+        let raw = try XCTUnwrap(fixture.raw)
+        let context = context(known: fixture.input.glucose.last)
+        func make(_ raw: GlucoseForecastMLForecast?, result: GlucoseForecastResult? = nil) throws {
+            _ = try GlucoseForecastLogSnapshot.make(input: fixture.input, result: result ?? fixture.result,
+                context: context, capturesPresentation: true, mlBeforeCap: raw)
+        }
+        XCTAssertThrowsError(try make(nil))
+        XCTAssertThrowsError(try make(.init(points: raw.points, band: raw.band, modelID: "other-model")))
+        XCTAssertThrowsError(try make(.init(points: Array(raw.points.dropLast()), band: raw.band, modelID: raw.modelID)))
+        for invalid in [Double.nan, .infinity, 0, 1000] {
+            var points = raw.points
+            points[1] = .init(date: points[1].date, glucoseMgdl: invalid)
+            XCTAssertThrowsError(try make(.init(points: points, band: raw.band, modelID: raw.modelID)))
+        }
+        var wrongAnchor = raw.points
+        wrongAnchor[0] = .init(date: wrongAnchor[0].date, glucoseMgdl: 121)
+        XCTAssertThrowsError(try make(.init(points: wrongAnchor, band: raw.band, modelID: raw.modelID)))
+        var wrongTime = raw.points
+        wrongTime[1] = .init(date: wrongTime[1].date.addingTimeInterval(1), glucoseMgdl: wrongTime[1].glucoseMgdl)
+        XCTAssertThrowsError(try make(.init(points: wrongTime, band: raw.band, modelID: raw.modelID)))
+        let engineOnly = GlucoseForecastResult(points: fixture.result.points, referenceDate: now,
+            reason: nil, referenceSensorID: "sensor-A")
+        XCTAssertThrowsError(try make(raw, result: engineOnly))
+        let unavailable = GlucoseForecastResult(points: [], referenceDate: nil, reason: .dataUnavailable)
+        XCTAssertThrowsError(try make(nil, result: unavailable))
+        var arbitraryDisplay = try XCTUnwrap(fixture.result.mlForecast).points
+        arbitraryDisplay[1] = .init(date: arbitraryDisplay[1].date, glucoseMgdl: 119)
+        let arbitrary = GlucoseForecastResult(points: fixture.result.points, referenceDate: now,
+            reason: nil, referenceSensorID: "sensor-A", mlForecast: .init(points: arbitraryDisplay,
+                band: raw.band, modelID: raw.modelID))
+        XCTAssertThrowsError(try make(raw, result: arbitrary), "A display point must be raw ML or the actual engine cap")
+    }
+
+    func testFirstPresentationSurvivesChangedInputsRestartAndMidnightOnReferenceDay() throws {
+        let reference = try XCTUnwrap(GlucoseForecastLogSnapshot.parseDate("2027-01-15T23:59:30.125Z"))
+        let first = try presentationFixture(input(at: reference), computedAt: reference.addingTimeInterval(45))
+        let firstSaved = try XCTUnwrap(first.snapshot.confirmingPresentation(of: first.result,
+            at: reference.addingTimeInterval(46)))
+        let logger = log(at: reference.addingTimeInterval(60))
+        logger.enqueue(firstSaved); logger.enqueue(firstSaved); logger.waitUntilIdle()
+        let file = try XCTUnwrap(dailyFiles().first)
+        XCTAssertEqual(file.lastPathComponent, "2027-01-15.jsonl")
+        let originalBytes = try Data(contentsOf: file)
+        let changed = try presentationFixture(input(at: reference, sensitivity: 55), correction: 20,
+            computedAt: reference.addingTimeInterval(90))
+        XCTAssertNotEqual(first.snapshot.inputFingerprint, changed.snapshot.inputFingerprint)
+        let restarted = log(at: reference.addingTimeInterval(120))
+        restarted.enqueue(try XCTUnwrap(changed.snapshot.confirmingPresentation(of: changed.result,
+            at: reference.addingTimeInterval(91))))
+        restarted.waitUntilIdle()
+        XCTAssertEqual(try records().count, 1)
+        XCTAssertEqual(try Data(contentsOf: file), originalBytes)
+        XCTAssertEqual(try records().first?.presentation?.mlBeforeCapPoints?[1].glucoseMgdl, 132)
+        XCTAssertEqual(try records().first?.presentation?.presentedAt, reference.addingTimeInterval(46))
+    }
+
+    func testPresentationDedupSeparatesModelsHorizonsEngineOnlyAndLegacyEngineRecords() throws {
+        let logger = log()
+        logger.enqueue(try snapshot())
+        for (horizon, model) in [(60, "synthetic-model-A" as String?), (60, "synthetic-model-B"),
+                                  (120, "synthetic-model-A"), (60, nil)] {
+            let fixture = try presentationFixture(input(horizon: horizon), modelID: model)
+            let confirmed = try XCTUnwrap(fixture.snapshot.confirmingPresentation(of: fixture.result,
+                at: now.addingTimeInterval(1)))
+            logger.enqueue(confirmed); logger.enqueue(confirmed)
+        }
+        logger.waitUntilIdle()
+        let saved = try records()
+        XCTAssertEqual(saved.count, 5)
+        XCTAssertEqual(saved.filter { $0.recordType == .forecast }.count, 1)
+        XCTAssertEqual(saved.filter { $0.recordType == .presentation && $0.horizonMinutes == 60 }.count, 3)
+        let noML = try XCTUnwrap(saved.first { $0.recordType == .presentation && $0.presentation?.modelID == nil })
+        XCTAssertNil(noML.presentation?.mlBeforeCapPoints)
+        XCTAssertEqual(noML.presentation?.displayedPoints.map(\.glucoseMgdl), noML.points.map(\.glucoseMgdl))
+    }
+
+    func testLegacyJSONWithoutPresentationDecodesWithoutInventingDisplayedEvidence() throws {
+        let legacy = try snapshot()
+        let encoded = try GlucoseForecastLogSnapshot.encoder().encode(legacy)
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        XCTAssertNil(object["presentation"])
+        for schema in [1, 2] {
+            object["schemaVersion"] = schema
+            let decoded = try GlucoseForecastLogSnapshot.decoder().decode(GlucoseForecastLogSnapshot.self,
+                from: JSONSerialization.data(withJSONObject: object))
+            XCTAssertEqual(decoded.schemaVersion, schema)
+            XCTAssertEqual(decoded.recordType, .forecast)
+            XCTAssertNil(decoded.presentation)
+            XCTAssertEqual(decoded.points.map(\.glucoseMgdl), legacy.points.map(\.glucoseMgdl))
+            let rows = parseCSV(try GlucoseForecastCSV.rows(decoded).joined())
+            for row in rows {
+                for name in ["model_id", "ml_prediction_mgdl", "displayed_prediction_mgdl", "low_glucose_cap_applied", "presented_at_utc"] {
+                    XCTAssertEqual(row[try XCTUnwrap(GlucoseForecastCSV.columns.firstIndex(of: name))], "")
+                }
+            }
+        }
+    }
+
+    func testPresentationCSVPreservesRawDisplayedModelCapAndFractionalUTCTimestamps() throws {
+        let logger = log()
+        let model = "synthetic,\"model\"\nÆ"
+        for horizon in [60, 120] {
+            let fixture = try presentationFixture(input(horizon: horizon), modelID: model)
+            logger.enqueue(try XCTUnwrap(fixture.snapshot.confirmingPresentation(of: fixture.result,
+                at: now.addingTimeInterval(1.250))))
+        }
+        let fallback = try presentationFixture(modelID: nil)
+        logger.enqueue(try XCTUnwrap(fallback.snapshot.confirmingPresentation(of: fallback.result,
+            at: now.addingTimeInterval(2))))
+        logger.waitUntilIdle()
+        let destination = folder.appendingPathComponent("presentation.csv")
+        try logger.exportCSVForTesting(to: destination)
+        // Synthetic cross-language fixture for the Python evaluator integration check.
+        let integrationCopy = FileManager.default.temporaryDirectory.appendingPathComponent("forecast-evidence-integration.csv")
+        try Data(contentsOf: destination).write(to: integrationCopy)
+        let rows = parseCSV(try String(contentsOf: destination, encoding: .utf8))
+        XCTAssertEqual(rows.first, GlucoseForecastCSV.columns)
+        XCTAssertEqual(rows.count, 1 + 13 + 25 + 13)
+        XCTAssertTrue(rows.allSatisfy { $0.count == GlucoseForecastCSV.columns.count })
+        func cell(_ row: [String], _ name: String) -> String { row[GlucoseForecastCSV.columns.firstIndex(of: name)!] }
+        for row in rows.dropFirst() {
+            let offset = try XCTUnwrap(Int(cell(row, "offset_minutes")))
+            XCTAssertEqual(cell(row, "schema_version"), "3")
+            XCTAssertEqual(cell(row, "record_type"), "presentation")
+            XCTAssertEqual(cell(row, "prediction_mgdl"), "120.0")
+            if cell(row, "model_id").isEmpty {
+                XCTAssertEqual(cell(row, "ml_prediction_mgdl"), "", "Absent ML must remain missing, not become zero")
+                XCTAssertEqual(cell(row, "low_glucose_cap_applied"), "")
+                XCTAssertEqual(cell(row, "displayed_prediction_mgdl"), "120.0")
+                XCTAssertEqual(cell(row, "presented_at_utc"), "2027-01-15T08:00:02.125Z")
+            } else {
+                XCTAssertEqual(cell(row, "model_id"), model)
+                XCTAssertEqual(cell(row, "presented_at_utc"), "2027-01-15T08:00:01.375Z")
+                let capped = offset > 0 && offset != 10
+                XCTAssertEqual(cell(row, "ml_prediction_mgdl"), offset == 0 ? "120.0" : (capped ? "132.0" : "112.0"))
+                XCTAssertEqual(cell(row, "displayed_prediction_mgdl"), offset == 0 || capped ? "120.0" : "112.0")
+                XCTAssertEqual(cell(row, "low_glucose_cap_applied"), capped ? "true" : "false")
+            }
+        }
+    }
+
+    func testPresentationWriteFailureCanRetrySameEvidenceWithoutChangingForecast() throws {
+        let fixture = try presentationFixture()
+        let confirmed = try XCTUnwrap(fixture.snapshot.confirmingPresentation(of: fixture.result,
+            at: now.addingTimeInterval(1)))
+        let blocked = folder.appendingPathComponent("retry-directory")
+        try Data("blocked".utf8).write(to: blocked)
+        var failures = [GlucoseForecastLogFailure]()
+        let logger = GlucoseForecastLog(directory: blocked, clock: { self.now }, diagnostic: { failures.append($0) })
+        let points = fixture.result.points
+        let displayed = GlucoseForecastMLPresentation.points(in: fixture.result)
+        logger.enqueue(confirmed); logger.enqueue(confirmed); logger.waitUntilIdle()
+        XCTAssertEqual(failures, [.io])
+        XCTAssertEqual(fixture.result.points, points)
+        XCTAssertEqual(GlucoseForecastMLPresentation.points(in: fixture.result), displayed)
+        try FileManager.default.removeItem(at: blocked)
+        logger.enqueue(confirmed); logger.enqueue(confirmed); logger.waitUntilIdle()
+        let file = blocked.appendingPathComponent("2027-01-15.jsonl")
+        let lines = try Data(contentsOf: file).split(separator: 10)
+        XCTAssertEqual(lines.count, 1)
+        let saved = try GlucoseForecastLogSnapshot.decoder().decode(GlucoseForecastLogSnapshot.self,
+            from: Data(try XCTUnwrap(lines.first)))
+        XCTAssertEqual(try GlucoseForecastLogSnapshot.encoder().encode(saved),
+            try GlucoseForecastLogSnapshot.encoder().encode(confirmed))
+        XCTAssertEqual(fixture.result.points, points)
+        XCTAssertEqual(GlucoseForecastMLPresentation.points(in: fixture.result), displayed)
+    }
+
     /// Independent RFC-4180 reader for checking the writer, including quoted newlines.
     private func parseCSV(_ text: String) -> [[String]] {
         var rows = [[String]](), row = [String](), value = "", quoted = false

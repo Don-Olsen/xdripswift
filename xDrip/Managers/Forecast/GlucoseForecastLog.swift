@@ -30,8 +30,16 @@ struct GlucoseForecastLogContext: Sendable {
 /// Value-only snapshot, constructed at completion. File writing never reads defaults,
 /// Core Data or mutable forecast state. JSON dates and the fingerprint use UTC.
 struct GlucoseForecastLogSnapshot: Codable, Sendable {
-    enum RecordType: String, Codable, Sendable { case forecast, unavailable }
+    enum RecordType: String, Codable, Sendable { case forecast, unavailable, presentation }
     struct Point: Codable, Sendable { let offsetMinutes: Int; let glucoseMgdl: Double }
+    /// Inference output already includes the existing correction clamp. Only the
+    /// low-glucose presentation cap separates mlBeforeCapPoints from displayedPoints.
+    struct Presentation: Codable, Sendable {
+        let modelID: String?
+        let mlBeforeCapPoints: [Point]?
+        let displayedPoints: [Point]
+        let presentedAt: Date?
+    }
     struct Sample: Codable, Sendable { let date: Date; let glucoseMgdl: Double; let sensorIdentity: String? }
     struct Treatment: Codable, Sendable {
         let date: Date
@@ -80,9 +88,12 @@ struct GlucoseForecastLogSnapshot: Codable, Sendable {
     let treatmentSummary: TreatmentSummary
     let inputs: Inputs?
     let inputFingerprint: String?
+    private(set) var presentation: Presentation?
 
     static func make(input: GlucoseForecastInput?, result: GlucoseForecastResult,
-                     context: GlucoseForecastLogContext) throws -> Self {
+                     context: GlucoseForecastLogContext,
+                     capturesPresentation: Bool = false,
+                     mlBeforeCap: GlucoseForecastMLForecast? = nil) throws -> Self {
         let config = GlucoseForecastEngine.configuration
         let referenceDate = result.referenceDate ?? context.knownReference?.date
         let referenceSample = context.knownReference ?? input?.glucose.last(where: { $0.date == referenceDate })
@@ -100,6 +111,39 @@ struct GlucoseForecastLogSnapshot: Codable, Sendable {
                       point.glucoseMgdl.isFinite &&
                       abs(point.date.timeIntervalSince(referenceDate) - Double(index) * config.integrationStepMinutes * 60) < 0.001
                   }) else { throw GlucoseForecastLogFailure.invalidSnapshot }
+        }
+        var presentation: Presentation?
+        if capturesPresentation {
+            guard valid, let referenceDate else { throw GlucoseForecastLogFailure.invalidSnapshot }
+            let displayed = GlucoseForecastMLPresentation.points(in: result)
+            func validPoints(_ points: [GlucoseForecastPoint]) -> Bool {
+                points.count == result.points.count && points.enumerated().allSatisfy { index, point in
+                    point.glucoseMgdl.isFinite &&
+                    (config.minimumGlucoseMgdl...config.maximumGlucoseMgdl).contains(point.glucoseMgdl) &&
+                    abs(point.date.timeIntervalSince(referenceDate) - Double(index) * config.integrationStepMinutes * 60) < 0.001
+                }
+            }
+            guard validPoints(displayed) else { throw GlucoseForecastLogFailure.invalidSnapshot }
+            if let selected = result.mlForecast {
+                guard let mlBeforeCap, !selected.modelID.isEmpty,
+                      selected.modelID == mlBeforeCap.modelID,
+                      validPoints(mlBeforeCap.points),
+                      mlBeforeCap.points.first?.glucoseMgdl == result.points.first?.glucoseMgdl,
+                      displayed.first?.glucoseMgdl == result.points.first?.glucoseMgdl,
+                      zip(mlBeforeCap.points, displayed).enumerated().allSatisfy({ index, pair in
+                          pair.1.glucoseMgdl == pair.0.glucoseMgdl ||
+                          pair.1.glucoseMgdl == min(pair.0.glucoseMgdl, result.points[index].glucoseMgdl)
+                      }) else { throw GlucoseForecastLogFailure.invalidSnapshot }
+            } else if mlBeforeCap != nil {
+                throw GlucoseForecastLogFailure.invalidSnapshot
+            }
+            func copies(_ points: [GlucoseForecastPoint]) -> [Point] {
+                points.enumerated().map { Point(offsetMinutes: $0.offset * Int(config.integrationStepMinutes),
+                    glucoseMgdl: $0.element.glucoseMgdl) }
+            }
+            presentation = Presentation(modelID: result.mlForecast?.modelID,
+                mlBeforeCapPoints: mlBeforeCap.map { copies($0.points) },
+                displayedPoints: copies(displayed), presentedAt: nil)
         }
         // Invalid/unavailable inputs must remain diagnosable as missing fields, not
         // become zero or make JSON serialization fail on NaN/infinity.
@@ -150,8 +194,8 @@ struct GlucoseForecastLogSnapshot: Codable, Sendable {
         }
         let fingerprint = try inputs.map { try digest(Fingerprint(source: context.sourceIdentity,
             sensor: sensorIdentity, horizon: context.horizonMinutes, inputs: $0, parameters: parameters, constants: config)) }
-        return Self(schemaVersion: 2, engineVersion: GlucoseForecastEngine.engineVersion,
-            recordType: valid ? .forecast : .unavailable,
+        return Self(schemaVersion: capturesPresentation ? 3 : 2, engineVersion: GlucoseForecastEngine.engineVersion,
+            recordType: capturesPresentation ? .presentation : (valid ? .forecast : .unavailable),
             appVersion: context.appVersion, appBuild: context.appBuild,
             sourceIdentity: context.sourceIdentity, sensorIdentity: sensorIdentity,
             referenceIdentity: referenceIdentity, referenceDate: referenceDate,
@@ -161,7 +205,29 @@ struct GlucoseForecastLogSnapshot: Codable, Sendable {
                 Point(offsetMinutes: $0.offset * Int(config.integrationStepMinutes), glucoseMgdl: $0.element.glucoseMgdl)
             } : [], reason: valid ? nil : (result.reason?.rawValue ?? "dataUnavailable"),
             parameters: parameters, constants: config, treatmentSummary: summary,
-            inputs: inputs, inputFingerprint: fingerprint)
+            inputs: inputs, inputFingerprint: fingerprint, presentation: presentation)
+    }
+
+    /// A cheap value-copy at the UI boundary. The caller supplies the SAME result
+    /// passed through Home's chart/source/freshness gates, never newly read settings.
+    func confirmingPresentation(of result: GlucoseForecastResult?, at date: Date) -> Self? {
+        guard recordType == .presentation, let presentation, let result,
+              result.reason == nil, result.referenceDate == referenceDate,
+              result.referenceSensorID == sensorIdentity,
+              result.mlForecast?.modelID == presentation.modelID,
+              date.timeIntervalSince1970.isFinite, date >= computedAt,
+              result.points.count == points.count,
+              zip(result.points, points).allSatisfy({ $0.glucoseMgdl == $1.glucoseMgdl }),
+              GlucoseForecastMLPresentation.points(in: result).count == presentation.displayedPoints.count,
+              zip(GlucoseForecastMLPresentation.points(in: result), presentation.displayedPoints)
+                .allSatisfy({ $0.glucoseMgdl == $1.glucoseMgdl &&
+                    $0.date == referenceDate?.addingTimeInterval(Double($1.offsetMinutes * 60)) })
+        else { return nil }
+        var copy = self
+        copy.presentation = Presentation(modelID: presentation.modelID,
+            mlBeforeCapPoints: presentation.mlBeforeCapPoints,
+            displayedPoints: presentation.displayedPoints, presentedAt: date)
+        return copy
     }
 
     private static func digest<T: Encodable>(_ value: T) throws -> String {
@@ -212,6 +278,9 @@ struct GlucoseForecastLogSnapshot: Codable, Sendable {
         let base = [recordType.rawValue, sourceIdentity, sensorIdentity ?? "", referenceIdentity ?? "none",
                     String(horizonMinutes), engineVersion].joined(separator: "|")
         if recordType == .forecast { return base }
+        if recordType == .presentation {
+            return base + "|" + (presentation?.modelID.map { "model:" + $0 } ?? "engineOnly")
+        }
         // Repeated identical failures are retained at most once per ten-minute UTC bucket.
         return base + "|" + (reason ?? "") + "|" + String(Int(computedAt.timeIntervalSince1970 / 600))
     }
@@ -332,10 +401,13 @@ final class GlucoseForecastLog: @unchecked Sendable {
     }
 
     private func append(_ snapshot: GlucoseForecastLogSnapshot) throws {
+        if snapshot.recordType == .presentation, snapshot.presentation?.presentedAt == nil {
+            throw GlucoseForecastLogFailure.invalidSnapshot
+        }
         try prepare()
         // Reference-day partitioning makes valid dedup stable even when computedAt crosses
         // midnight/restarts. Failures with no usable reference are partitioned by attempt day.
-        let partitionDate = snapshot.recordType == .forecast ? snapshot.referenceDate ?? snapshot.computedAt : snapshot.computedAt
+        let partitionDate = snapshot.recordType != .unavailable ? snapshot.referenceDate ?? snapshot.computedAt : snapshot.computedAt
         guard partitionDate >= earliestDay(clock()) else { return }
         let name = Self.day(partitionDate) + ".jsonl"
         let url = directory.appendingPathComponent(name)
@@ -446,12 +518,16 @@ enum GlucoseForecastCSV {
         "horizon_minutes", "reference_glucose_mgdl", "offset_minutes", "prediction_mgdl", "reason",
         "isf_mgdl_per_unit", "carb_ratio_grams_per_unit", "insulin_model", "insulin_peak_minutes",
         "insulin_duration_minutes", "carb_duration_minutes", "treatment_window_start_utc", "treatment_window_end_utc",
-        "bolus_count", "bolus_units", "carb_count", "carb_grams", "input_fingerprint", "engine_constants_json"]
+        "bolus_count", "bolus_units", "carb_count", "carb_grams", "input_fingerprint", "engine_constants_json",
+        "model_id", "ml_prediction_mgdl", "displayed_prediction_mgdl", "low_glucose_cap_applied", "presented_at_utc"]
 
     static func rows(_ snapshot: GlucoseForecastLogSnapshot) throws -> [String] {
         func number(_ value: Double?) -> String { value.flatMap { $0.isFinite ? String($0) : nil } ?? "" }
         func integer(_ value: Int?) -> String { value.map(String.init) ?? "" }
         func date(_ value: Date?) -> String { value.map(GlucoseForecastLogSnapshot.isoDate) ?? "" }
+        if snapshot.recordType == .presentation, snapshot.presentation?.presentedAt == nil {
+            throw GlucoseForecastLogFailure.invalidSnapshot
+        }
         let parameters = snapshot.parameters; let summary = snapshot.treatmentSummary
         let constants = String(decoding: try GlucoseForecastLogSnapshot.encoder().encode(snapshot.constants), as: UTF8.self)
         // Only offset and prediction vary between a snapshot's rows. Format and escape
@@ -466,9 +542,15 @@ enum GlucoseForecastCSV {
             date(summary.windowStart), date(summary.windowEnd), integer(summary.bolusCount), number(summary.bolusUnits),
             integer(summary.carbohydrateCount), number(summary.carbohydrateGrams), snapshot.inputFingerprint ?? "", constants]
             .map(escape).joined(separator: ",")
-        let points: [GlucoseForecastLogSnapshot.Point?] = snapshot.recordType == .forecast ? snapshot.points.map { Optional($0) } : [nil]
+        let points: [GlucoseForecastLogSnapshot.Point?] = snapshot.recordType != .unavailable ? snapshot.points.map { Optional($0) } : [nil]
         return points.map { point in
-            prefix + "," + escape(integer(point?.offsetMinutes)) + "," + escape(number(point?.glucoseMgdl)) + "," + suffix + "\r\n"
+            let presentation = snapshot.presentation
+            let raw = presentation?.mlBeforeCapPoints?.first { $0.offsetMinutes == point?.offsetMinutes }?.glucoseMgdl
+            let displayed = presentation?.displayedPoints.first { $0.offsetMinutes == point?.offsetMinutes }?.glucoseMgdl
+            let cap = raw.flatMap { raw in displayed.map { $0 != raw ? "true" : "false" } } ?? ""
+            let extra = [presentation?.modelID ?? "", number(raw), number(displayed), cap,
+                date(presentation?.presentedAt)].map(escape).joined(separator: ",")
+            return prefix + "," + escape(integer(point?.offsetMinutes)) + "," + escape(number(point?.glucoseMgdl)) + "," + suffix + "," + extra + "\r\n"
         }
     }
 

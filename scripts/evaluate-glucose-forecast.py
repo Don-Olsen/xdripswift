@@ -2,7 +2,7 @@
 """Offline prospective forecast evaluation. Never downloads data or changes app data.
 
 Inputs (UTF-8 CSV, RFC 4180 quoting):
-  forecast: xDrip Home Screen > Export forecast log, schema_version=1.
+  forecast: xDrip Home Screen > Export forecast log, schema_version=1, 2 or 3.
   glucose: date_utc,glucose_mgdl,source_identity,sensor_identity
 Timestamps must be ISO 8601 UTC (Z or +00:00); glucose must be mg/dL.
 Source and sensor identities must match the forecast export exactly. Blank sensor
@@ -14,7 +14,10 @@ within +/-150 seconds of target. Equal-distance ties use the earlier reading.
 No interpolation. Actuals outside 20..600 mg/dL or nonfinite are excluded and
 reported. Conflicting actual values at one source/sensor/time are all excluded.
 Target and matched actual must both be strictly after computedAt; otherwise the
-point is reported as retrospective, never scored as a future forecast.
+point is reported as retrospective, never scored as a future forecast. Presentation
+records additionally require target and actual to be strictly after presentedAt.
+Engine, ML before the display cap, displayed and unchanged-reference errors use
+the SAME matched ML-available pairs; engine fallback is reported separately.
 
 Positive bias means overprediction; a large error is >=3 mmol/L (using the
 app's conversion 18.01801801801802 mg/dL per mmol/L). Separate results by engine,
@@ -45,6 +48,12 @@ FORECAST_FIELDS = {
     "reference_identity", "reference_date_utc", "computed_at_utc", "horizon_minutes",
     "reference_glucose_mgdl", "offset_minutes", "prediction_mgdl", "reason",
 }
+PRESENTATION_FIELDS = {
+    "model_id", "ml_prediction_mgdl", "displayed_prediction_mgdl",
+    "low_glucose_cap_applied", "presented_at_utc",
+}
+POINT_FIELDS = {"offset_minutes", "prediction_mgdl", "ml_prediction_mgdl",
+                "displayed_prediction_mgdl", "low_glucose_cap_applied"}
 GLUCOSE_FIELDS = {"date_utc", "glucose_mgdl", "source_identity", "sensor_identity"}
 
 
@@ -104,13 +113,40 @@ class Forecast:
     points: dict[int, float] = field(default_factory=dict)
 
 
+@dataclass
+class Presentation(Forecast):
+    model: str | None = None
+    presented: datetime | None = None
+    ml_points: dict[int, float] = field(default_factory=dict)
+    displayed_points: dict[int, float] = field(default_factory=dict)
+    capped_points: dict[int, bool] = field(default_factory=dict)
+    metadata: tuple = ()
+
+
+def glucose_number(value: str, field_name: str) -> float:
+    result = number(value, field_name)
+    if not 20 <= result <= 600:
+        raise InputError(f"{field_name} outside 20..600 mg/dL")
+    return result
+
+
 def read_forecasts(handle: TextIO):
     forecasts: dict[tuple, Forecast] = {}
+    presentations: dict[tuple, Presentation] = {}
     unavailable: dict[tuple, dict] = {}
-    duplicate_point_rows = 0
+    duplicate_point_rows = duplicate_presentation_rows = 0
     for row in rows(handle, FORECAST_FIELDS):
-        if row["schema_version"] != "1":
+        schema = row["schema_version"]
+        if schema not in ("1", "2", "3"):
             raise InputError("Unsupported forecast schema_version")
+        is_presentation = row["record_type"] == "presentation"
+        if is_presentation:
+            if schema != "3":
+                raise InputError("Presentation records require schema_version 3")
+            if not PRESENTATION_FIELDS.issubset(row):
+                raise InputError("Presentation record is missing presentation CSV columns")
+        elif any(row.get(name, "") for name in PRESENTATION_FIELDS):
+            raise InputError("Only presentation records may contain presentation fields")
         engine = row["engine_version"]
         if not engine:
             raise InputError("engine_version is missing")
@@ -126,7 +162,7 @@ def read_forecasts(handle: TextIO):
             unavailable[key] = {"engine": engine, "horizon": horizon, "reason": row["reason"],
                                 "computed": computed, "reference": reference}
             continue
-        if row["record_type"] != "forecast":
+        if row["record_type"] not in ("forecast", "presentation"):
             raise InputError("Unknown record_type")
         if horizon not in (60, 120):
             raise InputError("Valid forecast horizon_minutes must be 60 or 120")
@@ -134,13 +170,49 @@ def read_forecasts(handle: TextIO):
             raise InputError("Forecast needs reference identity/date and no unavailable reason")
         if reference > computed:
             raise InputError("Forecast reference date cannot be after computed_at_utc")
-        glucose = number(row["reference_glucose_mgdl"], "reference_glucose_mgdl")
-        prediction = number(row["prediction_mgdl"], "prediction_mgdl")
-        if not 20 <= glucose <= 600 or not 20 <= prediction <= 600:
-            raise InputError("Forecast glucose outside 20..600 mg/dL")
+        glucose = glucose_number(row["reference_glucose_mgdl"], "reference_glucose_mgdl")
+        prediction = glucose_number(row["prediction_mgdl"], "prediction_mgdl")
         offset = integer(row["offset_minutes"], "offset_minutes")
         if offset < 0 or offset > horizon or offset % 5:
             raise InputError("Prediction offset must be a five-minute point within its horizon")
+        if is_presentation:
+            presented = utc(row["presented_at_utc"], "presented_at_utc")
+            if presented < computed:
+                raise InputError("presented_at_utc cannot be before computed_at_utc")
+            model = row["model_id"] or None
+            displayed = glucose_number(row["displayed_prediction_mgdl"], "displayed_prediction_mgdl")
+            ml = capped = None
+            if model is not None:
+                ml = glucose_number(row["ml_prediction_mgdl"], "ml_prediction_mgdl")
+                if row["low_glucose_cap_applied"] not in ("true", "false"):
+                    raise InputError("ML presentation needs an explicit true/false low_glucose_cap_applied")
+                capped = row["low_glucose_cap_applied"] == "true"
+                if (capped and not displayed == prediction < ml) or (not capped and displayed != ml):
+                    raise InputError("Inconsistent displayed prediction and low-glucose cap fields")
+            elif row["ml_prediction_mgdl"] or row["low_glucose_cap_applied"] or displayed != prediction:
+                raise InputError("Engine fallback requires blank model/ML/cap and displayed equal to engine")
+            key = (engine, horizon, identity, source, sensor, model)
+            metadata = tuple(sorted((name, value) for name, value in row.items() if name not in POINT_FIELDS))
+            previous = presentations.get(key)
+            if previous is None:
+                previous = Presentation(engine, horizon, identity, source, sensor, reference, computed, glucose,
+                                        model=model, presented=presented, metadata=metadata)
+                presentations[key] = previous
+            elif previous.metadata != metadata:
+                raise InputError("Conflicting immutable presentation metadata for one reference/source/sensor/horizon/engine/model")
+            if offset in previous.points:
+                if (previous.points[offset], previous.ml_points.get(offset), previous.displayed_points[offset],
+                        previous.capped_points.get(offset)) != (prediction, ml, displayed, capped):
+                    raise InputError("Conflicting presentation points for one immutable record")
+                duplicate_presentation_rows += 1
+            previous.points[offset] = prediction
+            previous.displayed_points[offset] = displayed
+            if ml is not None:
+                previous.ml_points[offset] = ml
+                previous.capped_points[offset] = capped
+            continue
+        # Preserve legacy forecast identity/conflict handling independently of
+        # presentation records: their engine values may come from a later calculation.
         key = (engine, horizon, identity)
         candidate = Forecast(engine, horizon, identity, source, sensor, reference, computed, glucose)
         previous = forecasts.get(key)
@@ -155,10 +227,15 @@ def read_forecasts(handle: TextIO):
                 raise InputError("Conflicting forecast points for one immutable record")
             duplicate_point_rows += 1
         previous.points[offset] = prediction
-    for forecast in forecasts.values():
+    for forecast in [*forecasts.values(), *presentations.values()]:
         if 0 not in forecast.points or forecast.points[0] != forecast.glucose:
             raise InputError("Forecast offset zero must match reference_glucose_mgdl")
-    return list(forecasts.values()), list(unavailable.values()), duplicate_point_rows
+        if isinstance(forecast, Presentation) and (
+                forecast.displayed_points[0] != forecast.glucose or
+                (forecast.model is not None and forecast.ml_points[0] != forecast.glucose)):
+            raise InputError("Presentation ML/displayed offset zero must match reference_glucose_mgdl")
+    return (list(forecasts.values()), list(unavailable.values()), list(presentations.values()),
+            duplicate_point_rows, duplicate_presentation_rows)
 
 
 def read_glucose(handle: TextIO):
@@ -222,8 +299,112 @@ def error_metrics(errors: list[float]):
             "large_error_count": large, "large_error_percent": large / count * 100 if count else None}
 
 
+def time_span(values: list[datetime]):
+    return {"first_utc": min(values).isoformat() if values else None,
+            "last_utc": max(values).isoformat() if values else None,
+            "utc_dates": len({value.date() for value in values})}
+
+
+def evaluate_presentations(presentations: list[Presentation], actuals):
+    """Evaluate each immutable model cohort without selecting different variant pairs."""
+    results, availability = [], []
+    configurations = sorted({(x.engine, x.horizon, x.model) for x in presentations},
+                            key=lambda item: (item[0], item[1], item[2] is not None, item[2] or ""))
+    for engine, horizon, model in configurations:
+        records = [x for x in presentations if (x.engine, x.horizon, x.model) == (engine, horizon, model)]
+        group = {"engine_version": engine, "horizon_minutes": horizon, "model_id": model}
+        ml_available = sum(bool(x.ml_points) for x in records)
+        availability.append({**group, "presentation_records": len(records),
+                             "ml_available_records": ml_available,
+                             "ml_unavailable_records": len(records) - ml_available,
+                             "ml_unavailable_reason": "not_recorded" if ml_available < len(records) else None,
+                             "reference_period": time_span([x.reference for x in records]),
+                             "computed_period": time_span([x.computed for x in records]),
+                             "presented_period": time_span([x.presented for x in records])})
+        for offset in EVALUATION_OFFSETS:
+            if offset > horizon:
+                continue
+            counts = {"presentation_records": len(records), "missing_prediction_point": 0,
+                      "target_not_after_computed_at": 0, "target_not_after_presented_at": 0,
+                      "missing_source_or_sensor_identity": 0, "missing_followup_measurement": 0,
+                      "matched_actual_not_after_computed_at": 0, "matched_actual_not_after_presented_at": 0,
+                      "ml_available_points": 0, "ml_unavailable_points": 0,
+                      "low_glucose_cap_applied_points": 0, "low_glucose_cap_applied_comparable_pairs": 0}
+            errors = {name: [] for name in ("engine", "ml", "displayed", "unchanged_reference")}
+            fallback_errors = {name: [] for name in ("engine", "displayed", "unchanged_reference")}
+            target_computed, target_presented, actual_computed, actual_presented = [], [], [], []
+            match_offsets, matched_dates, references, presented_dates = [], [], [], []
+            fallback_dates, fallback_actual_computed, fallback_actual_presented = [], [], []
+            for record in records:
+                if offset not in record.points:
+                    counts["missing_prediction_point"] += 1
+                    continue
+                has_ml = offset in record.ml_points
+                counts["ml_available_points" if has_ml else "ml_unavailable_points"] += 1
+                capped = record.capped_points.get(offset, False)
+                counts["low_glucose_cap_applied_points"] += int(capped)
+                try:
+                    target = record.reference + timedelta(minutes=offset)
+                except OverflowError as exc:
+                    raise InputError("Forecast target date is outside the supported date range") from exc
+                if target <= record.computed:
+                    counts["target_not_after_computed_at"] += 1
+                    continue
+                if target <= record.presented:
+                    counts["target_not_after_presented_at"] += 1
+                    continue
+                if not record.source or not record.sensor:
+                    counts["missing_source_or_sensor_identity"] += 1
+                    continue
+                actual = nearest(actuals, record.source, record.sensor, target)
+                if actual is None:
+                    counts["missing_followup_measurement"] += 1
+                    continue
+                if actual[0] <= record.computed:
+                    counts["matched_actual_not_after_computed_at"] += 1
+                    continue
+                if actual[0] <= record.presented:
+                    counts["matched_actual_not_after_presented_at"] += 1
+                    continue
+                compared = errors if has_ml else fallback_errors
+                compared["engine"].append(record.points[offset] - actual[1])
+                compared["displayed"].append(record.displayed_points[offset] - actual[1])
+                compared["unchanged_reference"].append(record.glucose - actual[1])
+                if not has_ml:
+                    fallback_dates.append(actual[0])
+                    fallback_actual_computed.append((actual[0] - record.computed).total_seconds() / 60)
+                    fallback_actual_presented.append((actual[0] - record.presented).total_seconds() / 60)
+                    continue
+                compared["ml"].append(record.ml_points[offset] - actual[1])
+                counts["low_glucose_cap_applied_comparable_pairs"] += int(capped)
+                target_computed.append((target - record.computed).total_seconds() / 60)
+                target_presented.append((target - record.presented).total_seconds() / 60)
+                actual_computed.append((actual[0] - record.computed).total_seconds() / 60)
+                actual_presented.append((actual[0] - record.presented).total_seconds() / 60)
+                match_offsets.append((actual[0] - target).total_seconds())
+                matched_dates.append(actual[0]); references.append(record.reference); presented_dates.append(record.presented)
+            results.append({**group, "offset_minutes": offset, **counts,
+                            "comparable_presentations": len(errors["ml"]),
+                            **{name: error_metrics(values) for name, values in errors.items()},
+                            "target_lead_minutes_from_computed_at": distribution(target_computed),
+                            "target_lead_minutes_from_presented_at": distribution(target_presented),
+                            "actual_lead_minutes_from_computed_at": distribution(actual_computed),
+                            "actual_lead_minutes_from_presented_at": distribution(actual_presented),
+                            "matched_actual_offset_seconds_from_target": distribution(match_offsets),
+                            "matched_actual_period": time_span(matched_dates),
+                            "comparable_reference_period": time_span(references),
+                            "comparable_presented_period": time_span(presented_dates),
+                            "engine_fallback": {
+                                "comparable_presentations": len(fallback_errors["engine"]),
+                                **{name: error_metrics(values) for name, values in fallback_errors.items()},
+                                "matched_actual_period": time_span(fallback_dates),
+                                "actual_lead_minutes_from_computed_at": distribution(fallback_actual_computed),
+                                "actual_lead_minutes_from_presented_at": distribution(fallback_actual_presented)}})
+    return results, availability
+
+
 def evaluate(forecast_handle: TextIO, glucose_handle: TextIO):
-    forecasts, unavailable, duplicate_rows = read_forecasts(forecast_handle)
+    forecasts, unavailable, presentations, duplicate_rows, duplicate_presentation_rows = read_forecasts(forecast_handle)
     actuals, actual_counts = read_glucose(glucose_handle)
     configurations = sorted({(x.engine, x.horizon) for x in forecasts} |
                             {(x["engine"], x["horizon"]) for x in unavailable})
@@ -282,18 +463,28 @@ def evaluate(forecast_handle: TextIO, glucose_handle: TextIO):
                             "forecast": error_metrics(errors), "unchanged_reference": error_metrics(baseline_errors),
                             "actual_lead_minutes_from_computed_at": distribution(leads),
                             "matched_actual_offset_seconds_from_target": distribution(match_offsets)})
-    times = [x.computed for x in forecasts] + [x["computed"] for x in unavailable]
-    return {"report_schema_version": 1, "match_tolerance_seconds": MATCH_TOLERANCE_SECONDS,
+    presentation_results, presentation_availability = evaluate_presentations(presentations, actuals)
+    times = [x.computed for x in forecasts + presentations] + [x["computed"] for x in unavailable]
+    return {"report_schema_version": 2, "match_tolerance_seconds": MATCH_TOLERANCE_SECONDS,
             "match_tie_rule": "earlier valid reading", "mgdl_per_mmoll": MGDL_PER_MMOLL,
             "large_absolute_error_threshold_mmoll": LARGE_ERROR_MMOLL,
             "bias_definition": "forecast minus actual; positive means overprediction",
+            "legacy_actual_lead_definition": "In results, actual_lead_minutes_from_computed_at is target minus computed_at; presentation_results separates target and matched-actual leads.",
             "duplicate_forecast_point_rows_ignored": duplicate_rows,
+            "duplicate_presentation_point_rows_ignored": duplicate_presentation_rows,
             "glucose_input": actual_counts, "availability": availability, "results": results,
+            "presentation_availability": presentation_availability,
+            "presentation_results": presentation_results,
             "logged_time_span": {"first_computed_at_utc": min(times).isoformat() if times else None,
                                  "last_computed_at_utc": max(times).isoformat() if times else None,
                                  "utc_dates_with_records": len({x.date() for x in times})},
             "limitations": [
                 "Availability counts retained first-valid and throttled unavailable records, not every calculation attempt.",
+                "Presentation comparisons use only ML-available pairs; engine fallback is counted and scored separately.",
+                "ML means the existing correction-guarded centre before the low-glucose display cap, not raw model output.",
+                "Presentation timestamps record acceptance for Home chart rendering, not proof that a person saw the chart.",
+                "ML-unavailable records do not identify why ML was unavailable; absence is never treated as zero error.",
+                "Legacy engine forecasts do not establish that their predictions were displayed or that ML was available.",
                 "Home-driven forecasts do not establish continuous 24-hour calculation or logging coverage.",
                 "No interpolation, sensor mixing, parameter optimization, or dose recommendation is performed.",
                 "Later meals, insulin, exercise and treatment corrections are not identified by these two CSV inputs.",

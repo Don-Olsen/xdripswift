@@ -2941,3 +2941,109 @@ final class RootHomeNumberFormattingTests: XCTestCase {
         XCTAssertEqual(text("home_insulinUnit", table: "HomeView"), "E")
     }
 }
+
+
+extension RootHomeInteractionTests {
+    private func displayEvidenceFixture(at date: Date, modelID: String? = nil) throws ->
+        (RootHomeForecastContext, GlucoseForecastPresentationOutcome, GlucoseChartState) {
+        let context = forecastContext()
+        let input = GlucoseForecastInput(glucose: stride(from: -30, through: 0, by: 5).map {
+            GlucoseForecastSample(date: date.addingTimeInterval(Double($0 * 60)),
+                glucoseMgdl: 120, sensorID: "sensor-a")
+        }, treatments: [], settings: TherapyModelSettings(), sensitivityMgdlPerUnit: 40,
+            carbohydrateRatioGramsPerUnit: 10, horizonMinutes: 60, now: date)
+        let engine = GlucoseForecastEngine.predict(input)
+        let ml = modelID.map { id in
+            let points = engine.points.enumerated().map {
+                GlucoseForecastPoint(date: $0.element.date,
+                    glucoseMgdl: $0.element.glucoseMgdl + ($0.offset == 0 ? 0 : 10))
+            }
+            return GlucoseForecastMLForecast(points: points, band: points.map {
+                GlucoseForecastMLBandPoint(date: $0.date, lowerMgdl: $0.glucoseMgdl - 15,
+                    upperMgdl: $0.glucoseMgdl + 15)
+            }, modelID: id)
+        }
+        let result = GlucoseForecastResult(points: engine.points, referenceDate: engine.referenceDate,
+            reason: engine.reason, referenceSensorID: "sensor-a", mlForecast: ml)
+        let snapshot = try GlucoseForecastLogSnapshot.make(input: input, result: result,
+            context: .init(appVersion: "synthetic", appBuild: "test", sourceIdentity: "sensor:sensor-a",
+                sensorIdentity: "sensor-a", knownReference: input.glucose.last,
+                computedAt: date.addingTimeInterval(1), horizonMinutes: 60),
+            capturesPresentation: true, mlBeforeCap: ml)
+        var chart = GlucoseChartState.empty(startDate: date.addingTimeInterval(-3600), endDate: date)
+        chart.newestBgReadingDate = date
+        chart.newestBgReadingSensorID = "sensor-a"
+        chart.newestBgReadingIsValidForDownstream = true
+        return (context, .init(result: result, logSnapshot: snapshot), chart)
+    }
+
+    func testForecastEvidenceWaitsForChartAndKeepsCalculationTimeBeforeDisplay() throws {
+        let date = Date(timeIntervalSince1970: 1_800_000_000)
+        let (context, outcome, currentChart) = try displayEvidenceFixture(at: date, modelID: "model-a")
+        var presentation = RootHomeForecastPresentationState()
+        presentation.accept(outcome, context: context, requestedAt: date)
+        var chart = currentChart
+        chart.newestBgReadingDate = date.addingTimeInterval(-60)
+        let hidden = presentation.displayableResult(context: context, chartState: chart,
+            at: date.addingTimeInterval(2))
+        XCTAssertNil(presentation.logSnapshotForDisplay(hidden, isVisible: true, at: date.addingTimeInterval(2)))
+        let displayed = presentation.displayableResult(context: context, chartState: currentChart,
+            at: date.addingTimeInterval(3))
+        let record = try XCTUnwrap(presentation.logSnapshotForDisplay(displayed,
+            isVisible: true, at: date.addingTimeInterval(3)))
+        XCTAssertEqual(record.recordType, .presentation)
+        XCTAssertEqual(record.computedAt, date.addingTimeInterval(1))
+        XCTAssertEqual(record.presentation?.presentedAt, date.addingTimeInterval(3))
+        XCTAssertEqual(record.presentation?.displayedPoints.map(\.glucoseMgdl),
+            GlucoseForecastMLPresentation.points(in: outcome.result).map(\.glucoseMgdl))
+        XCTAssertEqual(record.presentation?.modelID, "model-a")
+        XCTAssertNil(outcome.logSnapshot?.presentation?.presentedAt)
+    }
+
+    func testForecastEvidenceRespectsVisibilitySourceFreshnessAndInputGates() throws {
+        let date = Date(timeIntervalSince1970: 1_800_000_000)
+        let (context, outcome, chart) = try displayEvidenceFixture(at: date)
+        var presentation = RootHomeForecastPresentationState()
+        presentation.accept(outcome, context: context, requestedAt: date)
+        let now = date.addingTimeInterval(2)
+        XCTAssertNil(presentation.logSnapshotForDisplay(outcome.result, isVisible: false, at: now))
+        var changedContext = context
+        changedContext.therapyRevision += 1
+        var changedSensor = chart
+        changedSensor.newestBgReadingSensorID = "sensor-b"
+        let rejected = [
+            presentation.displayableResult(context: changedContext, chartState: chart, at: now),
+            presentation.displayableResult(context: context, chartState: changedSensor, at: now),
+            presentation.displayableResult(context: context, chartState: chart, currentInputsAvailable: false, at: now),
+            presentation.displayableResult(context: context, chartState: chart,
+                at: date.addingTimeInterval(GlucoseForecastEngine.maximumGlucoseAge + 1)),
+            nil // Original-readings-only and historical range offer no forecast to the chart.
+        ]
+        for result in rejected {
+            XCTAssertNil(presentation.logSnapshotForDisplay(result, isVisible: true, at: now))
+        }
+        let record = try XCTUnwrap(presentation.logSnapshotForDisplay(outcome.result, isVisible: true, at: now))
+        XCTAssertNil(record.presentation?.modelID)
+        XCTAssertNil(record.presentation?.mlBeforeCapPoints)
+        XCTAssertEqual(record.presentation?.displayedPoints.map(\.glucoseMgdl), record.points.map(\.glucoseMgdl))
+    }
+
+    func testForecastEvidenceCannotMixReplacedModelOrNewerCalculationWithOldDisplay() throws {
+        let date = Date(timeIntervalSince1970: 1_800_000_000)
+        let (context, first, _) = try displayEvidenceFixture(at: date, modelID: "model-a")
+        let (_, replacement, _) = try displayEvidenceFixture(at: date, modelID: "model-b")
+        var presentation = RootHomeForecastPresentationState()
+        presentation.accept(first, context: context, requestedAt: date)
+        let firstRecord = try XCTUnwrap(presentation.logSnapshotForDisplay(first.result, isVisible: true,
+            at: date.addingTimeInterval(2)))
+        presentation.accept(replacement, context: context, requestedAt: date)
+        XCTAssertNil(presentation.logSnapshotForDisplay(first.result, isVisible: true, at: date.addingTimeInterval(2)))
+        let next = try XCTUnwrap(presentation.logSnapshotForDisplay(replacement.result, isVisible: true,
+            at: date.addingTimeInterval(2)))
+        XCTAssertNotEqual(firstRecord.deduplicationKey, next.deduplicationKey)
+        let (_, newer, _) = try displayEvidenceFixture(at: date.addingTimeInterval(60), modelID: "model-b")
+        presentation.accept(newer, context: context, requestedAt: date.addingTimeInterval(60))
+        XCTAssertNil(presentation.logSnapshotForDisplay(replacement.result, isVisible: true,
+            at: date.addingTimeInterval(62)))
+    }
+}

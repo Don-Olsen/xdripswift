@@ -61,7 +61,25 @@ def glucose(minute, value, source="local", sensor="sensor-a"):
 
 
 def run(predictions, actuals):
-    return E.evaluate(csv_input(predictions, E.FORECAST_FIELDS), csv_input(actuals, E.GLUCOSE_FIELDS))
+    headers = E.FORECAST_FIELDS | set().union(*(row.keys() for row in predictions))
+    return E.evaluate(csv_input(predictions, headers), csv_input(actuals, E.GLUCOSE_FIELDS))
+
+
+def presentation(model="model-a", presented=None, ml_values=None, capped=(), **kwargs):
+    predictions = forecast(**kwargs)
+    values = {30: 140, 60: 150, 120: 160} if ml_values is None else ml_values
+    for row in predictions:
+        row.update({name: "" for name in E.PRESENTATION_FIELDS})
+        offset = int(row["offset_minutes"])
+        engine = float(row["prediction_mgdl"])
+        row.update(schema_version="3", record_type="presentation", model_id=model or "",
+                   presented_at_utc=timestamp(presented) if presented is not None else row["computed_at_utc"],
+                   displayed_prediction_mgdl=str(engine))
+        if model is not None:
+            ml = values.get(offset, engine)
+            row.update(ml_prediction_mgdl=str(ml), low_glucose_cap_applied="true" if offset in capped else "false",
+                       displayed_prediction_mgdl=str(engine if offset in capped else ml))
+    return predictions
 
 
 class ForecastEvaluatorTests(unittest.TestCase):
@@ -199,7 +217,7 @@ class ForecastEvaluatorTests(unittest.TestCase):
         self.assertEqual(E.utc("2026-10-03T12:00:00.123Z", "test").microsecond, 123000)
 
     def test_rejects_ambiguous_times_schema_types_and_range(self):
-        for change in [{"computed_at_utc": "2026-10-03T12:00:00"}, {"schema_version": "2"},
+        for change in [{"computed_at_utc": "2026-10-03T12:00:00"}, {"schema_version": "99"},
                        {"record_type": "unknown"}, {"prediction_mgdl": "nan"},
                        {"offset_minutes": "2.5"}, {"prediction_mgdl": "601"}]:
             predictions = forecast()
@@ -230,6 +248,247 @@ class ForecastEvaluatorTests(unittest.TestCase):
                                     capture_output=True, text=True, check=False)
             self.assertEqual(result.returncode, 2)
             self.assertEqual(actual_path.read_bytes(), before)
+
+
+class PresentationEvaluatorTests(unittest.TestCase):
+    def test_schema_two_current_exports_and_mixed_legacy_versions(self):
+        v2 = forecast(identity="schema2")
+        for row in v2:
+            row["schema_version"] = "2"
+        unavailable_v2 = unavailable()
+        unavailable_v2["schema_version"] = "2"
+        report = run(forecast() + v2 + [unavailable_v2] + presentation(), [glucose(30, 135)])
+        self.assertEqual(report["availability"][0]["valid_logged_records"], 2)
+        self.assertEqual(report["availability"][0]["unavailable_logged_records"], 1)
+        self.assertEqual(report["results"][0]["forecast"]["count"], 2)
+        self.assertEqual(report["presentation_results"][0]["comparable_presentations"], 1)
+        self.assertEqual(report["report_schema_version"], 2)
+
+    def test_known_answers_capped_and_uncapped_at_each_offset(self):
+        report = run(presentation(computed=2, presented=4, capped=(30, 120)),
+                     [glucose(30, 135), glucose(60, 145), glucose(120, 155)])
+        for result, offset, displayed_bias, capped in zip(report["presentation_results"],
+                                                        (30, 60, 120), (-5, 5, -5), (1, 0, 1)):
+            self.assertEqual(result["offset_minutes"], offset)
+            self.assertEqual(result["engine"]["bias_mgdl"], -5)
+            self.assertEqual(result["ml"]["bias_mgdl"], 5)
+            self.assertEqual(result["displayed"]["bias_mgdl"], displayed_bias)
+            for name in ("engine", "ml", "displayed", "unchanged_reference"):
+                self.assertEqual(result[name]["count"], 1)
+            self.assertEqual(result["low_glucose_cap_applied_points"], capped)
+            self.assertEqual(result["low_glucose_cap_applied_comparable_pairs"], capped)
+            self.assertEqual(result["actual_lead_minutes_from_computed_at"]["mean"], offset - 2)
+            self.assertEqual(result["actual_lead_minutes_from_presented_at"]["mean"], offset - 4)
+            self.assertEqual(result["matched_actual_period"]["utc_dates"], 1)
+        self.assertEqual(report["availability"], [])
+        self.assertEqual(report["results"], [])
+        self.assertEqual(report["presentation_results"][0]["unchanged_reference"]["bias_mgdl"], -15)
+        self.assertEqual(report["presentation_results"][2]["unchanged_reference"]["bias_mgdl"], -35)
+
+    def test_engine_fallback_is_separate_and_never_zero_ml_error(self):
+        report = run(presentation(model=None) + presentation(), [glucose(30, 135)])
+        fallback, available = report["presentation_availability"]
+        self.assertIsNone(fallback["model_id"])
+        self.assertEqual(fallback["ml_unavailable_records"], 1)
+        self.assertEqual(fallback["ml_unavailable_reason"], "not_recorded")
+        self.assertEqual(available["ml_available_records"], 1)
+        result = report["presentation_results"][0]
+        self.assertEqual(result["ml_unavailable_points"], 1)
+        self.assertEqual(result["comparable_presentations"], 0)
+        self.assertEqual(result["engine_fallback"]["comparable_presentations"], 1)
+        self.assertEqual(result["engine_fallback"]["engine"]["mae_mgdl"], 5)
+        self.assertEqual(result["engine_fallback"]["displayed"]["mae_mgdl"], 5)
+        for name in ("engine", "ml", "displayed", "unchanged_reference"):
+            self.assertEqual(result[name]["count"], 0)
+            self.assertIsNone(result[name]["mae_mgdl"])
+        self.assertEqual(report["presentation_results"][3]["comparable_presentations"], 1)
+
+    def test_model_horizon_engine_and_reference_namespaces_are_separate(self):
+        predictions = (presentation(model="a", horizon=60) + presentation(model="a") +
+                       presentation(model="b", ml_values={30: 135}) + presentation(model="a", engine="older"))
+        report = run(predictions, [glucose(30, 135), glucose(60, 145), glucose(120, 155)])
+        self.assertEqual(len(report["presentation_availability"]), 4)
+        self.assertEqual(len(report["presentation_results"]), 11)
+        self.assertTrue(all(item["presentation_records"] == 1 for item in report["presentation_results"]))
+        b = next(item for item in report["presentation_results"] if item["model_id"] == "b")
+        self.assertEqual(b["ml"]["mae_mgdl"], 0)
+        a = next(item for item in report["presentation_results"] if item["model_id"] == "a" and item["engine_version"] == "v2")
+        self.assertEqual(a["ml"]["mae_mgdl"], 5)
+
+    def test_all_variants_use_the_same_pairs_and_same_calculation_engine(self):
+        good = presentation(identity="good", values={30: 130}, ml_values={30: 140})
+        missing_actual = presentation(identity="missing", reference=10, values={30: 500}, ml_values={30: 510})
+        missing_point = [row for row in presentation(identity="missing-point", reference=20)
+                         if row["offset_minutes"] != "30"]
+        report = run(forecast(values={30: 400}) + good + missing_actual + missing_point,
+                     [glucose(30, 135), glucose(50, 599)])
+        result = report["presentation_results"][0]
+        self.assertEqual(result["presentation_records"], 3)
+        self.assertEqual(result["missing_followup_measurement"], 1)
+        self.assertEqual(result["missing_prediction_point"], 1)
+        for name in ("engine", "ml", "displayed", "unchanged_reference"):
+            self.assertEqual(result[name]["count"], 1)
+        self.assertEqual(result["engine"]["mae_mgdl"], 5)
+        self.assertEqual(result["ml"]["mae_mgdl"], 5)
+        self.assertEqual(result["unchanged_reference"]["mae_mgdl"], 15)
+        self.assertEqual(report["results"][0]["forecast"]["mae_mgdl"], 265)
+        self.assertEqual(report["availability"][0]["valid_logged_records"], 1)
+
+    def test_shown_late_is_retrospective_and_cap_counts_remain_visible(self):
+        report = run(presentation(presented=30, capped=(30,)), [glucose(30, 135), glucose(60, 145)])
+        result = report["presentation_results"][0]
+        self.assertEqual(result["target_not_after_presented_at"], 1)
+        self.assertEqual(result["comparable_presentations"], 0)
+        self.assertIsNone(result["ml"]["mae_mgdl"])
+        self.assertEqual(result["low_glucose_cap_applied_points"], 1)
+        self.assertEqual(result["low_glucose_cap_applied_comparable_pairs"], 0)
+        self.assertEqual(report["presentation_results"][1]["comparable_presentations"], 1)
+
+    def test_matched_actual_must_be_strictly_future_at_computation_and_presentation(self):
+        for computed, presented, failure in [(29, 29, "matched_actual_not_after_computed_at"),
+                                             (0, 29, "matched_actual_not_after_presented_at")]:
+            with self.subTest(failure=failure):
+                result = run(presentation(computed=computed, presented=presented),
+                             [glucose(29, 135)])["presentation_results"][0]
+                self.assertEqual(result[failure], 1)
+                self.assertEqual(result["comparable_presentations"], 0)
+        result = run(presentation(computed=30, presented=31), [glucose(30, 135)])["presentation_results"][0]
+        self.assertEqual(result["target_not_after_computed_at"], 1)
+
+    def test_target_and_actual_leads_are_distinct_for_off_target_matches(self):
+        result = run(presentation(computed=4, presented=7), [glucose(29, 135)])["presentation_results"][0]
+        self.assertEqual(result["target_lead_minutes_from_computed_at"]["mean"], 26)
+        self.assertEqual(result["target_lead_minutes_from_presented_at"]["mean"], 23)
+        self.assertEqual(result["actual_lead_minutes_from_computed_at"]["mean"], 25)
+        self.assertEqual(result["actual_lead_minutes_from_presented_at"]["mean"], 22)
+
+    def test_presentation_matching_preserves_tolerance_and_earlier_tie(self):
+        results = run(presentation(), [glucose(27.5, 135), glucose(32.5, 599), glucose(62.5, 145),
+                                       glucose(122.501, 155)])["presentation_results"]
+        self.assertEqual(results[0]["ml"]["mae_mgdl"], 5)
+        self.assertEqual(results[0]["matched_actual_offset_seconds_from_target"]["mean"], -150)
+        self.assertEqual(results[1]["comparable_presentations"], 1)
+        self.assertEqual(results[2]["missing_followup_measurement"], 1)
+        self.assertIsNone(results[2]["engine"]["mae_mgdl"])
+
+    def test_presentation_source_sensor_matching_and_deduplication_scope(self):
+        predictions = (presentation() + presentation(sensor="sensor-b") + presentation(source="remote"))
+        report = run(predictions, [glucose(30, 135), glucose(30, 140, sensor="sensor-b")])
+        result = report["presentation_results"][0]
+        self.assertEqual(result["presentation_records"], 3)
+        self.assertEqual(result["comparable_presentations"], 2)
+        self.assertEqual(result["missing_followup_measurement"], 1)
+        self.assertEqual(result["ml"]["mae_mgdl"], 2.5)
+        blank = run(presentation(sensor=""), [glucose(30, 135)])["presentation_results"][0]
+        self.assertEqual(blank["missing_source_or_sensor_identity"], 1)
+
+    def test_duplicate_presentation_exports_do_not_double_count(self):
+        original = presentation()
+        report = run(original + original + forecast() + forecast(), [glucose(30, 135)])
+        self.assertEqual(report["duplicate_presentation_point_rows_ignored"], len(original))
+        self.assertEqual(report["duplicate_forecast_point_rows_ignored"], len(original))
+        self.assertEqual(report["presentation_results"][0]["comparable_presentations"], 1)
+        self.assertEqual(report["results"][0]["comparable_forecasts"], 1)
+
+    def test_rejects_missing_ml_model_display_cap_and_inconsistent_caps(self):
+        changes = [{"ml_prediction_mgdl": ""}, {"model_id": ""}, {"displayed_prediction_mgdl": ""},
+                   {"low_glucose_cap_applied": ""}, {"low_glucose_cap_applied": "yes"},
+                   {"low_glucose_cap_applied": "true"}, {"displayed_prediction_mgdl": "130"},
+                   {"ml_prediction_mgdl": "nan"}, {"ml_prediction_mgdl": "601"},
+                   {"displayed_prediction_mgdl": "19"}, {"presented_at_utc": ""},
+                   {"presented_at_utc": timestamp(-1)}, {"schema_version": "2"}]
+        for change in changes:
+            with self.subTest(change=change):
+                predictions = presentation()
+                predictions[0].update(change)
+                with self.assertRaises(E.InputError):
+                    run(predictions, [])
+        predictions = presentation(capped=(30,))
+        predictions[6]["displayed_prediction_mgdl"] = "129"
+        with self.assertRaises(E.InputError):
+            run(predictions, [])
+
+    def test_presentation_reference_point_must_be_unchanged_in_every_variant(self):
+        for capped in ((), (0,)):
+            with self.subTest(capped=capped):
+                predictions = presentation(ml_values={0: 121}, capped=capped)
+                with self.assertRaisesRegex(E.InputError, "offset zero"):
+                    run(predictions, [])
+
+    def test_global_time_span_includes_presentation_only_exports(self):
+        report = run(presentation(computed=3, presented=4), [])
+        self.assertEqual(report["logged_time_span"]["first_computed_at_utc"], E.utc(timestamp(3), "test").isoformat())
+        self.assertEqual(report["logged_time_span"]["utc_dates_with_records"], 1)
+        self.assertEqual(report["availability"], [])
+        self.assertEqual(report["results"], [])
+
+    def test_rejects_inconsistent_fallback_and_fields_on_legacy(self):
+        for change in [{"ml_prediction_mgdl": "120"}, {"low_glucose_cap_applied": "false"},
+                       {"displayed_prediction_mgdl": "121"}]:
+            with self.subTest(change=change):
+                predictions = presentation(model=None)
+                predictions[0].update(change)
+                with self.assertRaises(E.InputError):
+                    run(predictions, [])
+        predictions = forecast()
+        predictions[0]["model_id"] = "unexpected-model"
+        with self.assertRaises(E.InputError):
+            run(predictions, [])
+
+    def test_rejects_conflicting_immutable_presentation_metadata_and_points(self):
+        for changed in [presentation(computed=1), presentation(presented=1),
+                        presentation(values={30: 131}), presentation(ml_values={30: 141})]:
+            with self.assertRaises(E.InputError):
+                run(presentation() + changed, [])
+        predictions = presentation()
+        for row in predictions:
+            row["app_build"] = "4340"
+        predictions[3]["app_build"] = "4341"
+        with self.assertRaisesRegex(E.InputError, "metadata"):
+            run(predictions, [])
+
+    def test_rejects_schema_three_presentation_with_old_header(self):
+        predictions = forecast()
+        for row in predictions:
+            row.update(schema_version="3", record_type="presentation")
+        with self.assertRaisesRegex(E.InputError, "columns"):
+            run(predictions, [])
+
+    def test_model_identity_unicode_quoting_and_nulls_survive_json(self):
+        model = 'ML, "model"\næøå'
+        report = run(presentation(model=model) + presentation(model=None), [])
+        self.assertEqual(report["presentation_availability"][1]["model_id"], model)
+        result = report["presentation_results"][3]
+        self.assertEqual(result["missing_followup_measurement"], 1)
+        self.assertIsNone(result["ml"]["mae_mgdl"])
+        self.assertIsNone(result["matched_actual_period"]["first_utc"])
+        self.assertEqual(json.loads(json.dumps(report, allow_nan=False, ensure_ascii=False)), report)
+
+    def test_periods_report_only_retained_and_comparable_records(self):
+        report = run(presentation(identity="first") + presentation(identity="next-day", reference=1440),
+                     [glucose(30, 135)])
+        availability = report["presentation_availability"][0]
+        self.assertEqual(availability["computed_period"]["utc_dates"], 2)
+        self.assertEqual(availability["presented_period"]["utc_dates"], 2)
+        result = report["presentation_results"][0]
+        self.assertEqual(result["comparable_presented_period"]["utc_dates"], 1)
+        self.assertEqual(result["matched_actual_period"]["utc_dates"], 1)
+        self.assertEqual(result["missing_followup_measurement"], 1)
+
+    def test_cli_reads_schema_three_and_writes_null_metrics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            forecast_path = directory / "forecast.csv"
+            actual_path = directory / "actual.csv"
+            forecast_path.write_text(csv_input(presentation(model=None), E.FORECAST_FIELDS | E.PRESENTATION_FIELDS).getvalue(),
+                                     encoding="utf-8")
+            actual_path.write_text(csv_input([glucose(30, 135)], E.GLUCOSE_FIELDS).getvalue(), encoding="utf-8")
+            result = subprocess.run([sys.executable, "-B", str(Path(E.__file__)), "--forecast-csv", str(forecast_path),
+                                     "--glucose-csv", str(actual_path)], capture_output=True, text=True, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            report = json.loads(result.stdout)
+            self.assertIsNone(report["presentation_results"][0]["ml"]["mae_mgdl"])
+            self.assertEqual(report["presentation_results"][0]["engine_fallback"]["engine"]["mae_mgdl"], 5)
 
 
 if __name__ == "__main__":

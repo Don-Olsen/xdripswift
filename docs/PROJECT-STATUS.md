@@ -1,3 +1,52 @@
+## Fremadrettet måling af den viste ML-prognose — 18. oktober 2026
+
+Gennemgangen bekræftede, at den almindelige prognoselog kun gemte motoren
+før ML, og at analyseværktøjet afviste appens aktuelle schema-2-eksport.
+Den eksisterende overgangskontrol af en tidligere model ved +60 minutter
+løste ikke den generelle måling af det, Home viser.
+
+Motorloggen bevares. Samme JSONL-log og CSV-eksport får en særskilt,
+bagudkompatibel visningspost med motor, ML før lav-glukosebegrænsningen,
+den endelige kurve, model-ID og beregnings-/visningstid. ML-værdien har
+allerede passeret den eksisterende ±27 mg/dL-korrektionsgrænse; den er ikke
+modellens ubegrænsede output. Snapshot og indstillinger fryses i adapterens
+arbejdskø uden ekstra inference. Home publicerer kun den samme prognose,
+som passerer dets aktuelle kilde-, friskheds- og grafkontroller. Skjulte,
+afløste eller annullerede resultater tæller ikke som vist. Visningstid betyder
+godkendt til Home-tegning, ikke bevis for brugerens blik eller fysisk rendering.
+
+Første post pr. reference/horisont/motor/model bevares over genstart.
+Manglende ML har tomme ML-/modelfelter og en separat motorreservegruppe;
+en senere gyldig model blokeres ikke. 60-minutters visning opfinder ikke
++120-data. Der tilføjes ingen polling, baggrundsberegning eller transmission.
+Motor, aktiv model, træning, lav-glukosebegrænsning, dosis og alarmer er uændrede.
+
+Analyseværktøjet læser schema 1/2/3 og sammenligner motor, ML, vist kurve og
+uændret glukose på identiske reference-/facitpar, særskilt pr. model og horisont.
+Mål og matchet måling skal være senere end både beregning og visning. MAE,
+signeret fejl, fejl mindst 3 mmol/L, antal, perioder og manglende efterfølgende
+målinger rapporteres; gammel motorlog blandes ikke ind som ML-resultater.
+
+Indledende fuld XCTest: **1750/1750 bestået, ingen fejl** i
+`20261018T115736Z-52690`. Der er 15 nye XCTest-tests for den faktiske adapter,
+log/CSV og Homes visningsstate samt 38 beståede evaluator-Python-tests.
+En faktisk Swift-genereret CSV med syntetiske data er kørt gennem evaluatorens
+CLI: fem parrede ML-horisonttilfælde og to motorreservetilfælde gav præcist det
+forventede resultat, inklusive escaped model-ID og millisekunder. Ingen
+eksisterende sikkerhedstest er fjernet eller svækket. Den uafhængige gennemgang
+fandt ingen blokerende fejl. Releaseproceduren gentester det endelige checkpoint;
+faktiske releasekontroller og Apple-status registreres i releaseafsnittet.
+
+Den læsende enhedskontrol fandt fysisk iPhone og Watch som utilgængelige.
+Ingen lokal installation, fysisk eksport-/visningsprøve, batteri-/CPU-måling
+eller dokumenteret præcisionsforbedring er udført. Nye Home-tests kontrollerer
+visningsstate/gates, ikke en fysisk skærmoptagelse eller den komplette SwiftUI
+onChange-levering. Eksportér via Indstillinger → Home Screen → Eksportér
+prognoselog efter cirka 14 brugbare dage; faktisk glukose med samme
+sensor-/kildeidentiteter skal også foreligge til den lokale sammenligning.
+Home-brug er ikke døgnkontinuerlig dækning, og 14 dage garanterer ikke nok
+sammenlignelige par. Format og begrænsninger er dokumenteret i GLUCOSE-FORECAST.md.
+
 <!-- testflight-7.1.1-4339:start -->
 ### TestFlight 7.1.1 (4339)
 

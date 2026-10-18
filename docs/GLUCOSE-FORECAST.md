@@ -722,7 +722,7 @@ in PROJECT-STATUS.md; physical notification-to-editor latency remains unverified
 
 ## Prospective evidence log and export
 
-A completed Home calculation supplies an immutable value snapshot to a separate serial IO worker. It never sends Core Data objects between queues or rereads settings while writing. Rendering does not wait for disk IO. The Home evidence log adds no timer or continuous background calculation; the separate “Low soon” event-driven calculation is described above. Off means no Home forecast attempt is logged; cache hits do not create records.
+A completed Home calculation supplies an immutable value snapshot to a separate serial IO worker. It never sends Core Data objects between queues or rereads settings while writing. Rendering does not wait for disk IO. The Home evidence log adds no timer or continuous background calculation; the separate “Low soon” event-driven calculation is described above. Off means no Home forecast attempt is logged. Cache hits do not duplicate the engine record; a newly selected ML model can supply its own first presentation record.
 
 Daily JSON Lines files live in **Application Support/GlucoseForecastLog**. The first valid result for each source/reference identity, configured horizon and engine version is retained unchanged, including across restarts and later setting changes. The UI still recomputes normally when its inputs change. Unavailable results have a separate record type and reason; they cannot block a later valid result. Identical failures are throttled to one per reference/reason/horizon/engine in a ten-minute UTC bucket. Unknown reference dates stay null, and unknown parameters/treatment counts are not zero.
 
@@ -734,15 +734,37 @@ Files use iOS `completeUntilFirstUserAuthentication` protection and are explicit
 
 Use **Settings → Home Screen → Eksportér prognoselog / Export forecast log**. Export streams a separate UTF-8 CSV copy to the system share sheet. It does not rename JSONL. Source files stay local; a destination is selected by the user. Temporary CSV copies older than 24 hours are pruned on the next explicit export, not by a new timer.
 
-### CSV schema 1
+### Engine schemas 1/2 and presentation schema 3
 
-The stable header is:
+The original `forecast`/`unavailable` records remain intact. A separate
+`presentation` record in the **same log** captures engine points, the ML centre
+before the low-glucose display cap, and the centre accepted for Home rendering.
+Here “before cap” already includes the existing ±27 mg/dL correction clamp and
+ML validity checks; it is not unrestricted regressor output. No additional
+inference, forecast, polling or background task is introduced.
+
+Inputs/settings and `computedAt` are frozen by the adapter after inference.
+Home adds `presentedAt` only when that same result passes the current
+source/input/freshness/chart-tail gates and the current Home chart is visible.
+Cancelled, hidden and superseded results are not presented evidence. Delayed
+chart catch-up can publish the frozen result later without recomputation. This
+records acceptance for rendering, not proof that a person looked at the screen.
+The first presentation per source/sensor/reference/horizon/engine/model is
+immutable, including across restart; engine fallback has a distinct identity
+and cannot block later ML evidence. Later setting changes still update the UI.
+
+Missing ML has blank model, ML and cap fields, with the engine as the displayed
+value. It is never substituted into ML accuracy statistics. Old records remain
+readable, but cannot retrospectively establish what ML displayed. The selected
+60-minute horizon supplies no invented +120 prediction.
+
+The existing columns are retained, with five presentation columns appended:
 
 ```csv
-schema_version,record_type,engine_version,app_version,app_build,source_identity,sensor_identity,reference_identity,reference_date_utc,computed_at_utc,horizon_minutes,reference_glucose_mgdl,offset_minutes,prediction_mgdl,reason,isf_mgdl_per_unit,carb_ratio_grams_per_unit,insulin_model,insulin_peak_minutes,insulin_duration_minutes,carb_duration_minutes,treatment_window_start_utc,treatment_window_end_utc,bolus_count,bolus_units,carb_count,carb_grams,input_fingerprint,engine_constants_json
+schema_version,record_type,engine_version,app_version,app_build,source_identity,sensor_identity,reference_identity,reference_date_utc,computed_at_utc,horizon_minutes,reference_glucose_mgdl,offset_minutes,prediction_mgdl,reason,isf_mgdl_per_unit,carb_ratio_grams_per_unit,insulin_model,insulin_peak_minutes,insulin_duration_minutes,carb_duration_minutes,treatment_window_start_utc,treatment_window_end_utc,bolus_count,bolus_units,carb_count,carb_grams,input_fingerprint,engine_constants_json,model_id,ml_prediction_mgdl,displayed_prediction_mgdl,low_glucose_cap_applied,presented_at_utc
 ```
 
-A valid forecast has one row per point, including offset zero, with repeated snapshot metadata. `horizon_minutes` is the configured 60/120-minute horizon; `offset_minutes` is that row's displacement from `reference_date_utc`. Unavailable records have one row with a reason and blank point fields. Missing values are empty cells, never substituted zero. Dates are ISO 8601 UTC with millisecond precision and `Z`; numeric values use a decimal point independent of device locale. Commas, quotes and CR/LF are quoted/escaped, with CRLF row endings. Constants are a properly escaped JSON cell. JSONL additionally retains the detailed input samples/treatments; the CSV carries their fingerprint and summaries.
+`prediction_mgdl` always means the engine. `ml_prediction_mgdl` is the pre-display-cap ML centre, `displayed_prediction_mgdl` the final centre, and `low_glucose_cap_applied` is true only at points the cap changed (false for unchanged ML, blank when ML is unavailable). A valid forecast/presentation has one row per point, including offset zero, with repeated snapshot metadata. `horizon_minutes` is the configured 60/120-minute horizon; `offset_minutes` is that row's displacement from `reference_date_utc`. Unavailable records have one row with a reason and blank point fields. Missing values are empty cells, never substituted zero. Dates are ISO 8601 UTC with millisecond precision and `Z`; numeric values use a decimal point independent of device locale. Commas, quotes and CR/LF are quoted/escaped, with CRLF row endings. Constants are a properly escaped JSON cell. JSONL additionally retains the detailed input samples/treatments; the CSV carries their fingerprint and summaries.
 
 ## Local evaluation
 
@@ -764,9 +786,29 @@ All actuals are measured glucose in mg/dL, with explicit UTC times and the exact
 
 The evaluator assesses +30, +60 and +120 separately, grouped by engine version and configured horizon. Target time is **referenceDate + offset**, not computedAt + offset. It reports the actual remaining lead time from `computedAt`, and excludes points whose target or matched actual was already past at completion. Matching is nearest valid measured glucose within ±150 seconds; ties use the earlier measurement. There is no interpolation and no matching across sensor identities. Forecast and unchanged-reference baseline use exactly the same matched pair.
 
+The evaluator now accepts engine schemas 1 **and 2**, fixing the rejection of
+current schema-2 exports, and accepts schema-3 presentation rows. Report schema
+2 retains legacy engine results and adds `presentation_results` grouped by
+model ID, engine version and configured horizon. At each evaluated offset,
+engine, pre-cap ML, displayed and unchanged-reference metrics use exactly the
+same ML-available reference/actual pairs. Engine-only fallback is counted and
+scored separately. Model groups are not pooled into a ranking.
+
+For presentations, both the scheduled target and matched actual must be strictly
+after **both** `computedAt` and `presentedAt`. The report gives target and actual
+lead times from each timestamp, periods/counts, cap counts and missing follow-up
+reasons. Conflicting immutable metadata or inconsistent cap/value fields are
+rejected. No later result can replace a previously recorded prediction.
+
 Reports include comparable counts, MAE, signed bias (positive means overprediction), errors at least 3 mmol/L, matching/lead-time distributions, missing reference/sensor information, missing subsequent measurements, missing forecast points and unavailable reasons. Conversion follows the app's existing 18.01801801801802 mg/dL per mmol/L. Units are explicit. The tool does not tune personal settings or suggest doses.
 
 **Availability is limited to retained records:** first-valid deduplication and error throttling mean the CSV cannot count every Home calculation attempt. It reports valid versus unavailable retained records, not a percentage of all daily sensor minutes. Home-based logging does not establish continuous full-day coverage. It cannot identify later meals/insulin without separate event data, so prospective accuracy must be interpreted with that limitation.
+
+After roughly 14 usable days, export through the same Home Screen settings
+entry and retain an actual-glucose CSV for the same dates and sensor/source
+identities. Run the command above locally. Fourteen calendar days alone do not
+guarantee sufficient matched examples, particularly with little Home usage or
+model changes. The export does not itself fetch future glucose or upload data.
 
 ## Evidence for this candidate
 
