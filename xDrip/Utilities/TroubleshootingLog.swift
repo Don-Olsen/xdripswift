@@ -1181,10 +1181,14 @@ final class TroubleshootingLogStore {
         case loggedOut
     }
 
-    /// Both cache fields are queue-confined. Accessing them anywhere except `queue` would reintroduce
+    /// These cache fields are queue-confined. Accessing them anywhere except `queue` would reintroduce
     /// races between Bluetooth callbacks, network completions and UI lifecycle tracing.
     private var cachedEntries: [TroubleshootingLogEntry]?
     private var cachedByteCount = 0
+    /// Queue-confined encoded rows are bounded by the retained history. A UUID can survive a
+    /// recovery transformation, so reuse requires the complete immutable entry to match as well.
+    private var encodedLines: [UUID: (entry: TroubleshootingLogEntry, data: Data)] = [:]
+    private let entryEncoder: (TroubleshootingLogEntry) throws -> Data
     /// A failed append or rewrite leaves the current-session cache useful but means the next
     /// successful storage opportunity must replace the whole file rather than append to stale data.
     private var persistenceNeedsRewrite = false
@@ -1206,12 +1210,18 @@ final class TroubleshootingLogStore {
         retentionPeriod: TimeInterval = TroubleshootingLogStore.retentionPeriod,
         maximumEntryCount: Int = TroubleshootingLogStore.maximumEntryCount,
         maximumFileSize: Int = TroubleshootingLogStore.maximumFileSize,
+        entryEncoder: ((TroubleshootingLogEntry) throws -> Data)? = nil,
         now: @escaping () -> Date = Date.init
     ) {
         self.fileURL = fileURL
         self.retentionPeriod = retentionPeriod
         self.maximumEntryCount = maximumEntryCount
         self.maximumFileSize = maximumFileSize
+        self.entryEncoder = entryEncoder ?? { entry in
+            let encoder = JSONEncoder()
+            encoder.dateEncodingStrategy = .iso8601
+            return try encoder.encode(entry)
+        }
         self.now = now
     }
 
@@ -1288,7 +1298,7 @@ final class TroubleshootingLogStore {
         let appendedEntryWithoutTransformation = pruned.count == previousEntries.count + 1
             && Array(pruned.dropLast()) == previousEntries
             && pruned.last == entry
-        let encodedLine = encodeLine(entry)
+        let encodedLine = appendedEntryWithoutTransformation ? encodeLine(entry) : nil
 
         // The cheap append path is safe only when policy accepted exactly the supplied entry. A
         // recovery can replace a generic success, and retention can remove older entries. Both cases
@@ -1385,7 +1395,11 @@ final class TroubleshootingLogStore {
             sizeLimitedReversed.append(entry)
             byteCount += line.count
         }
-        return sizeLimitedReversed.reversed()
+        let retainedEntries = Array(sizeLimitedReversed.reversed())
+        let retainedIDs = Set(retainedEntries.map(\.id))
+        // Include the early size-limit break: a rejected candidate must not outlive the history.
+        encodedLines = encodedLines.filter { retainedIDs.contains($0.key) }
+        return retainedEntries
     }
 
     /// Repairs histories written before derived rows received independent UUIDs.
@@ -1852,12 +1866,12 @@ final class TroubleshootingLogStore {
     private func encodeLine(_ entry: TroubleshootingLogEntry) -> Data? {
         // One JSON object per line lets reload salvage every complete record if the process is
         // suspended during an append. ISO-8601 avoids locale-dependent persistence.
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        guard var data = try? encoder.encode(entry) else { return nil }
+        if let cached = encodedLines[entry.id], cached.entry == entry { return cached.data }
+        guard var data = try? entryEncoder(entry) else { return nil }
         // Force a single-byte newline. An untyped integer literal can select Data's generic append
         // overload and write the integer's trailing null byte, corrupting the next JSON record.
         data.append(UInt8(0x0A))
+        encodedLines[entry.id] = (entry, data)
         return data
     }
 

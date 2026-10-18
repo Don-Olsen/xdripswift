@@ -2638,3 +2638,261 @@ extension TroubleshootingLogTests {
         XCTAssertEqual(request.trigger, "storedReadingRSSI")
     }
 }
+
+extension TroubleshootingLogTests {
+    func testActivityEncodingReusesThousandRetainedRowsAcrossRoutineNoiseAndSnapshots() throws {
+        var encodingCounts = [UUID: Int]()
+        let fixture = makeActivityEncodingStore(entryEncoder: { entry in
+            encodingCounts[entry.id, default: 0] += 1
+            return try JSONEncoder.troubleshooting.encode(entry)
+        })
+        defer { removeFixture(fixture.directory) }
+
+        let entries = (0 ..< 1_000).map { index in
+            TroubleshootingLogEntry.standard(.heartbeatReceived,
+                timestamp: referenceDate.addingTimeInterval(TimeInterval(index - 1_000)))
+        }
+        for (index, entry) in entries.enumerated() {
+            fixture.store.record(entry)
+            fixture.store.record(.detailed(
+                .follower(source: .nightscout, activity: .downloadStarted),
+                timestamp: entry.timestamp))
+            if index % 100 == 99 {
+                XCTAssertEqual(fixture.store.snapshot().count, index + 1)
+            }
+        }
+
+        let snapshot = fixture.store.snapshot()
+        XCTAssertEqual(snapshot, Array(entries.reversed()))
+        XCTAssertEqual(encodingCounts.count, entries.count,
+            "Discarded routine candidates must not enter the encoding cache")
+        XCTAssertTrue(encodingCounts.values.allSatisfy { $0 == 1 },
+            "Appending, pruning and snapshots must reuse each unchanged retained row")
+        for _ in 0 ..< 4 { XCTAssertEqual(fixture.store.snapshot(), snapshot) }
+        XCTAssertTrue(encodingCounts.values.allSatisfy { $0 == 1 })
+        let data = try Data(contentsOf: fixture.fileURL)
+        XCTAssertEqual(try activityDecodedLines(data), entries)
+        XCTAssertEqual(data.count, try entries.reduce(0) {
+            $0 + (try JSONEncoder.troubleshooting.encode($1).count) + 1
+        })
+    }
+
+    func testActivityEncodingRequiresMatchingContentWhenBackfillReusesUUID() throws {
+        var encodedEntries = [TroubleshootingLogEntry]()
+        let fixture = makeActivityEncodingStore(entryEncoder: { entry in
+            encodedEntries.append(entry)
+            return try JSONEncoder.troubleshooting.encode(entry)
+        })
+        defer { removeFixture(fixture.directory) }
+        let started = TroubleshootingLogEntry.detailed(
+            .integration(name: .nightscoutBackfill, activity: .started), timestamp: referenceDate)
+        let succeeded = started.replacingKind(
+            .integration(name: .nightscoutBackfill, activity: .succeeded(itemCount: 7)))
+
+        fixture.store.record(started)
+        XCTAssertEqual(fixture.store.snapshot(), [started])
+        XCTAssertEqual(encodedEntries, [started])
+        fixture.store.record(succeeded)
+        // Filtering removes the old start before duplicate-ID repair. This is a real retained
+        // entry whose UUID is unchanged while its payload changes, not a newly assigned identity.
+        XCTAssertEqual(fixture.store.snapshot(), [succeeded])
+        XCTAssertEqual(encodedEntries, [started, succeeded])
+        XCTAssertEqual(try activityDecodedLines(Data(contentsOf: fixture.fileURL)), [succeeded])
+        XCTAssertEqual(fixture.store.snapshot(), [succeeded])
+        XCTAssertEqual(encodedEntries, [started, succeeded])
+    }
+
+    func testActivityEncodingEvictsCountPrunedRowsBeforeIdenticalEntryReturns() {
+        var encodingCounts = [UUID: Int]()
+        let fixture = makeActivityEncodingStore(maximumEntryCount: 2, entryEncoder: { entry in
+            encodingCounts[entry.id, default: 0] += 1
+            return try JSONEncoder.troubleshooting.encode(entry)
+        })
+        defer { removeFixture(fixture.directory) }
+        let entries = (0 ..< 3).map { index in
+            TroubleshootingLogEntry.standard(.heartbeatReceived,
+                timestamp: referenceDate.addingTimeInterval(TimeInterval(index)))
+        }
+        entries.forEach(fixture.store.record)
+        XCTAssertEqual(fixture.store.snapshot(), [entries[2], entries[1]])
+        XCTAssertEqual(encodingCounts, Dictionary(uniqueKeysWithValues: entries.map { ($0.id, 1) }))
+
+        fixture.store.record(entries[0])
+        XCTAssertEqual(fixture.store.snapshot(), [entries[2], entries[0]])
+        XCTAssertEqual(encodingCounts[entries[0].id], 2,
+            "An identical row returning after count eviction must be encoded again")
+        XCTAssertEqual(encodingCounts[entries[1].id], 1)
+        XCTAssertEqual(encodingCounts[entries[2].id], 1)
+    }
+
+    func testActivityEncodingEvictsAgePrunedRowsBeforeIdenticalEntryReturns() {
+        var clock = referenceDate
+        var encodingCount = 0
+        let fixture = makeActivityEncodingStore(retentionPeriod: 10, entryEncoder: { entry in
+            encodingCount += 1
+            return try JSONEncoder.troubleshooting.encode(entry)
+        }, now: { clock })
+        defer { removeFixture(fixture.directory) }
+        let entry = TroubleshootingLogEntry.standard(.heartbeatReceived, timestamp: referenceDate)
+        fixture.store.record(entry)
+        XCTAssertEqual(fixture.store.snapshot(), [entry])
+        XCTAssertEqual(encodingCount, 1)
+
+        clock = referenceDate.addingTimeInterval(11)
+        XCTAssertTrue(fixture.store.snapshot().isEmpty)
+        XCTAssertEqual(encodingCount, 1, "Expiry must not encode a discarded row")
+        // Rewind the injected clock so the exact same immutable value is eligible again. A changed
+        // timestamp would test content invalidation rather than prove eviction of the old bytes.
+        clock = referenceDate
+        fixture.store.record(entry)
+        XCTAssertEqual(fixture.store.snapshot(), [entry])
+        XCTAssertEqual(encodingCount, 2)
+    }
+
+    func testActivityEncodingEarlyByteLimitBreakEvictsRejectedAndUnvisitedRows() throws {
+        let small = TroubleshootingLogEntry.standard(.heartbeatReceived, timestamp: referenceDate)
+        let oversized = TroubleshootingLogEntry.standard(
+            .glucoseAccepted(mgDl: 123, source: .dexcomG6, measuredAt: referenceDate),
+            timestamp: referenceDate.addingTimeInterval(1))
+        // The newest JSON payload fits, but its required newline puts the complete line over cap.
+        let cap = try JSONEncoder.troubleshooting.encode(oversized).count
+        XCTAssertLessThan(try JSONEncoder.troubleshooting.encode(small).count + 1, cap)
+        var encodingCounts = [UUID: Int]()
+        let fixture = makeActivityEncodingStore(maximumFileSize: cap, entryEncoder: { entry in
+            encodingCounts[entry.id, default: 0] += 1
+            return try JSONEncoder.troubleshooting.encode(entry)
+        })
+        defer { removeFixture(fixture.directory) }
+
+        for expectedCount in 1 ... 2 {
+            fixture.store.record(small)
+            XCTAssertEqual(fixture.store.snapshot(), [small])
+            XCTAssertEqual(encodingCounts[small.id], expectedCount)
+            fixture.store.record(oversized)
+            XCTAssertTrue(fixture.store.snapshot().isEmpty)
+            XCTAssertEqual(encodingCounts[oversized.id], expectedCount,
+                "The candidate rejected at the early break must not remain cached")
+            XCTAssertEqual(encodingCounts[small.id], expectedCount,
+                "Older rows beyond the early break are not re-encoded and must be evicted too")
+            XCTAssertTrue(try Data(contentsOf: fixture.fileURL).isEmpty)
+        }
+    }
+
+    func testActivityEncodingFailureIsRetriedInsteadOfCached() throws {
+        var attempts = 0
+        let fixture = makeActivityEncodingStore(entryEncoder: { entry in
+            attempts += 1
+            if attempts == 1 { throw ActivityLogEncodingCacheTestError.injected }
+            return try JSONEncoder.troubleshooting.encode(entry)
+        })
+        defer { removeFixture(fixture.directory) }
+        let entry = TroubleshootingLogEntry.standard(.heartbeatReceived, timestamp: referenceDate)
+        fixture.store.record(entry)
+        XCTAssertTrue(fixture.store.snapshot().isEmpty)
+        XCTAssertEqual(attempts, 1)
+        fixture.store.record(entry)
+        XCTAssertEqual(fixture.store.snapshot(), [entry])
+        XCTAssertEqual(attempts, 2)
+        XCTAssertEqual(try activityDecodedLines(Data(contentsOf: fixture.fileURL)), [entry])
+        XCTAssertEqual(fixture.store.snapshot(), [entry])
+        XCTAssertEqual(attempts, 2, "Only successful encoding may be reused")
+    }
+
+    func testActivityEncodingPreservesExactNewlineInclusiveByteLimit() throws {
+        let entries = (0 ..< 2).map { index in
+            TroubleshootingLogEntry.standard(.heartbeatReceived,
+                timestamp: referenceDate.addingTimeInterval(TimeInterval(index)))
+        }
+        let lineSizes = try entries.map { try JSONEncoder.troubleshooting.encode($0).count + 1 }
+        let exactCap = lineSizes.reduce(0, +)
+        for cap in [exactCap, exactCap - 1] {
+            var encodingCounts = [UUID: Int]()
+            let fixture = makeActivityEncodingStore(maximumFileSize: cap, entryEncoder: { entry in
+                encodingCounts[entry.id, default: 0] += 1
+                return try JSONEncoder.troubleshooting.encode(entry)
+            })
+            defer { removeFixture(fixture.directory) }
+            entries.forEach(fixture.store.record)
+            let expected = cap == exactCap ? entries : [entries[1]]
+            XCTAssertEqual(fixture.store.snapshot(), Array(expected.reversed()))
+            XCTAssertEqual(encodingCounts, Dictionary(uniqueKeysWithValues: entries.map { ($0.id, 1) }))
+            let data = try Data(contentsOf: fixture.fileURL)
+            XCTAssertEqual(try activityDecodedLines(data), expected)
+            XCTAssertEqual(data.count, cap == exactCap ? exactCap : lineSizes[1])
+            XCTAssertLessThanOrEqual(data.count, cap)
+            XCTAssertEqual(data.last, UInt8(0x0A))
+            XCTAssertFalse(data.contains(0), "Line termination must remain a single newline byte")
+        }
+    }
+
+    func testActivityEncodingSurvivesDiskFailureThenRepairsMalformedRestartWithoutReencoding() throws {
+        var encodingCounts = [UUID: Int]()
+        let fixture = makeActivityEncodingStore(entryEncoder: { entry in
+            encodingCounts[entry.id, default: 0] += 1
+            return try JSONEncoder.troubleshooting.encode(entry)
+        })
+        defer { removeFixture(fixture.directory) }
+        let entries = (0 ..< 2).map { index in
+            TroubleshootingLogEntry.standard(.heartbeatReceived,
+                timestamp: referenceDate.addingTimeInterval(TimeInterval(index)))
+        }
+        fixture.store.record(entries[0])
+        XCTAssertEqual(fixture.store.snapshot(), [entries[0]])
+        try FileManager.default.removeItem(at: fixture.fileURL)
+        try FileManager.default.createDirectory(at: fixture.fileURL, withIntermediateDirectories: true)
+        fixture.store.record(entries[1])
+        XCTAssertEqual(fixture.store.snapshot(), Array(entries.reversed()),
+            "A failed append and rewrite must retain the current session history")
+        XCTAssertEqual(encodingCounts, Dictionary(uniqueKeysWithValues: entries.map { ($0.id, 1) }))
+        try FileManager.default.removeItem(at: fixture.fileURL)
+        XCTAssertEqual(fixture.store.snapshot(), Array(entries.reversed()))
+        XCTAssertEqual(encodingCounts, Dictionary(uniqueKeysWithValues: entries.map { ($0.id, 1) }),
+            "Successful row bytes must survive disk failure and the later full rewrite")
+        let persisted = try Data(contentsOf: fixture.fileURL)
+        XCTAssertEqual(try activityDecodedLines(persisted), entries)
+
+        var damaged = persisted
+        damaged.append(Data("{\"interrupted\":\n".utf8))
+        try damaged.write(to: fixture.fileURL)
+        var restartEncodingCounts = [UUID: Int]()
+        let restarted = TroubleshootingLogStore(fileURL: fixture.fileURL, entryEncoder: { entry in
+            restartEncodingCounts[entry.id, default: 0] += 1
+            return try JSONEncoder.troubleshooting.encode(entry)
+        }, now: { self.referenceDate })
+        let restored = restarted.snapshot()
+        XCTAssertEqual(restored, Array(entries.reversed()))
+        XCTAssertEqual(restartEncodingCounts, Dictionary(uniqueKeysWithValues: entries.map { ($0.id, 1) }),
+            "Decode-time pruning and malformed-line rewrite must share successful encodings")
+        XCTAssertEqual(try activityDecodedLines(Data(contentsOf: fixture.fileURL)), entries)
+        XCTAssertEqual(restarted.snapshot(), restored)
+        XCTAssertEqual(restartEncodingCounts, Dictionary(uniqueKeysWithValues: entries.map { ($0.id, 1) }))
+        let ordinaryRestart = TroubleshootingLogStore(fileURL: fixture.fileURL, now: { self.referenceDate })
+        XCTAssertEqual(makeReport(entries: ordinaryRestart.snapshot()).reportText,
+            makeReport(entries: restored).reportText)
+    }
+
+    private func makeActivityEncodingStore(
+        retentionPeriod: TimeInterval = TroubleshootingLogStore.retentionPeriod,
+        maximumEntryCount: Int = TroubleshootingLogStore.maximumEntryCount,
+        maximumFileSize: Int = TroubleshootingLogStore.maximumFileSize,
+        entryEncoder: @escaping (TroubleshootingLogEntry) throws -> Data,
+        now: (() -> Date)? = nil
+    ) -> (store: TroubleshootingLogStore, directory: URL, fileURL: URL) {
+        let fixture = makeStore()
+        let store = TroubleshootingLogStore(fileURL: fixture.fileURL,
+            retentionPeriod: retentionPeriod, maximumEntryCount: maximumEntryCount,
+            maximumFileSize: maximumFileSize, entryEncoder: entryEncoder,
+            now: now ?? { self.referenceDate })
+        return (store, fixture.directory, fixture.fileURL)
+    }
+
+    private func activityDecodedLines(_ data: Data) throws -> [TroubleshootingLogEntry] {
+        try data.split(separator: 0x0A).map {
+            try JSONDecoder.troubleshooting.decode(TroubleshootingLogEntry.self, from: Data($0))
+        }
+    }
+}
+
+private enum ActivityLogEncodingCacheTestError: Error {
+    case injected
+}

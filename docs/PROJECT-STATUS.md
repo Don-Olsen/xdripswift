@@ -1,3 +1,39 @@
+## Genbrug af kodede aktivitetslogposter — 18. oktober 2026
+
+Aktivitetsloggen genkodede tidligere alle bevarede poster til JSON ved hver
+størrelseskontrol, også når en ny rutinehændelse blev frasorteret. Nu genbruges
+den færdige kodning på loggens eksisterende serielle arbejdskø. Et cachehit
+kræver både samme UUID og identisk fuldt indhold; en færdig backfill kan
+bevare sit ID, men skal stadig erstatte sin tidligere startpost korrekt.
+
+Cachen følger de faktisk bevarede poster efter alders-, antal- og bytegrænser,
+også når en for stor ny post afbryder gennemgangen. Fejlede kodninger caches
+ikke. Gyldige bytes kan genbruges efter en diskfejl, mens de eksisterende
+lagringsgenforsøg fortsat afgør, om en post er varigt gemt. Filformat,
+linjeskift, ISO-datoer, filtrering, rækkefølge, 24 timers opbevaring,
+5.000-poster-/2-MiB-grænser og Watch-kvitteringer er bevaret. Cachede bytes
+fylder højst den bevarede historiks kodning efter oprydning, med yderligere
+hukommelsesforbrug til dictionary og værdikopier.
+
+Produktionsændringen er begrænset til TroubleshootingLog.swift. Otte nye
+tests bruger den rigtige logkomponent og tæller faktiske kodninger. De dækker
+1.000 poster med efterfølgende rutinehændelser/snapshots, samme ID med ændret
+indhold, alders-/antal-/byteoprydning, præcis bytegrænse inklusive linjeskift,
+fejlet kodning, diskfejl, genforsøg og genstart med en afbrudt JSON-linje.
+Afkodet indhold og den menneskeligt læsbare rapport sammenlignes også.
+Eksisterende tests er ikke fjernet eller svækket.
+
+Indledende fuld XCTest bestod med **1735/1735, 0 fejl og 0 skipped** i
+`20261018T104900Z-36891`. Den uafhængige kodegennemgang fandt ingen blokering.
+Releaseproceduren vælger nummer hos Apple og gentester det præcise checkpoint;
+faktisk test-/build- og Apple-status registreres i releaseafsnittet.
+
+Den læsende enhedskontrol fandt både fysisk iPhone og Watch som utilgængelige.
+Der er ingen lokal installation eller fysisk ydelsesmåling. Testen beviser
+færre JSON-kodninger, ikke en målt CPU-, batteri- eller visningsgevinst på
+brugerens enheder. Dosis, målinger, alarmer, prognose/ML, HealthKit og
+Libre-/Watch-kommunikation er uændrede.
+
 <!-- testflight-7.1.1-4338:start -->
 ### TestFlight 7.1.1 (4338)
 
