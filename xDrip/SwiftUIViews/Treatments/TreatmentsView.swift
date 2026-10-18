@@ -25,6 +25,9 @@ struct TreatmentsView: View {
     @State private var openingMealReminder: (uuid: String, pizza: Bool)?
     @State private var editorIsVisible = false
     @State private var calculatorIsVisible = false
+    // Dismissing a read-error notice must not immediately recreate the same notice.
+    @State private var unavailableMealUUID: String?
+    @State private var basalReadFailed = false
 
     // MARK: - initialization
 
@@ -67,6 +70,8 @@ struct TreatmentsView: View {
                 editorIsVisible = true
                 if case .edit(let meal) = editorState {
                     acknowledgeMealPresentation(uuid: meal.localTreatmentUUID, pizza: false)
+                } else if case .basal = editorState {
+                    _ = BasalReminderScheduler.consumePendingOpen()
                 }
             }
             .onDisappear { editorIsVisible = false }
@@ -94,21 +99,32 @@ struct TreatmentsView: View {
         }
         .onDisappear { isVisible = false }
         .onChange(of: scenePhase) { phase in
-            if phase == .active { openPendingReminders() }
+            if phase == .active {
+                unavailableMealUUID = nil
+                basalReadFailed = false
+                openPendingReminders(phase: phase)
+            }
         }
         .onReceive(NotificationCenter.default.publisher(for: PlannedMealReminder.openRequested)) { _ in
+            unavailableMealUUID = nil
             openPendingReminders()
         }
         .onReceive(NotificationCenter.default.publisher(for: PizzaSplitReminder.openRequested)) { _ in
+            unavailableMealUUID = nil
             openPendingReminders()
         }
         .onReceive(NotificationCenter.default.publisher(for: BasalReminderScheduler.openRequested)) { _ in
+            basalReadFailed = false
             openPendingReminders()
         }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
+            unavailableMealUUID = nil
+            basalReadFailed = false
             openPendingReminders()
         }
         .onReceive(NotificationCenter.default.publisher(for: TherapyMetricsManager.changed)) { _ in
+            unavailableMealUUID = nil
+            basalReadFailed = false
             openPendingReminders()
         }
         .onReceive(NotificationCenter.default.publisher(for: MealPlanReminderCoordinator.presentationDidDismiss)) { _ in
@@ -148,8 +164,10 @@ struct TreatmentsView: View {
         MealPlanReminderCoordinator.presentationFinished()
     }
 
-    private func openPendingReminders() {
-        guard isVisible, scenePhase == .active else { return }
+    private func openPendingReminders(phase: ScenePhase? = nil) {
+        guard isVisible, (phase ?? scenePhase) == .active else { return }
+        // Install the dismissal observation before checking our SwiftUI modal bindings.
+        let hasPresentedController = MealPlanReminderCoordinator.hasPresentedController
         // Repeated taps for an already open destination leave its draft untouched.
         if editorIsVisible, let uuid = PlannedMealReminder.pendingOpenUUID,
            case .edit(let meal) = treatmentEditorState, meal.localTreatmentUUID == uuid {
@@ -159,11 +177,16 @@ struct TreatmentsView: View {
            calculatorReminderMealUUID == uuid {
             PizzaSplitReminder.clearPendingOpenUUID(uuid)
         }
+        if editorIsVisible, case .basal = treatmentEditorState {
+            _ = BasalReminderScheduler.consumePendingOpen()
+        }
         guard treatmentEditorState == nil, !showsPenCalculator,
-              mealNotice == nil, basalNotice == nil else { return }
+              mealNotice == nil, basalNotice == nil, !hasPresentedController else { return }
         if let uuid = PlannedMealReminder.pendingOpenUUID {
+            guard uuid != unavailableMealUUID else { return }
             openMealReminder(uuid: uuid, pizza: false)
         } else if let uuid = PizzaSplitReminder.pendingOpenUUID {
+            guard uuid != unavailableMealUUID else { return }
             openMealReminder(uuid: uuid, pizza: true)
         } else {
             openRequestedBasal()
@@ -186,6 +209,7 @@ struct TreatmentsView: View {
                 case .notice(let message):
                     mealNotice = message
                 case .unavailable:
+                    unavailableMealUUID = uuid
                     mealNotice = "Måltidsstatus kunne ikke læses. Påmindelsen er bevaret; prøv igen, når appen er klar."
                 }
             }, consume: { handledUUID in
@@ -195,13 +219,14 @@ struct TreatmentsView: View {
     }
 
     private func openRequestedBasal() {
-        guard BasalReminderScheduler.hasPendingOpen,
+        guard BasalReminderScheduler.hasPendingOpen, !basalReadFailed,
               treatmentEditorState == nil, !showsPenCalculator else { return }
         guard BasalReminderScheduler.prepareDraftPrefill(coreDataManager: viewModel.coreDataManager) else {
+            basalReadFailed = true
             basalNotice = "Seneste registrerede basal kunne ikke læses. Prøv igen."
             return
         }
-        guard BasalReminderScheduler.consumePendingOpen() else { return }
+        // Keep the durable request until the actual editor appears.
         treatmentEditorState = .basal
     }
 }

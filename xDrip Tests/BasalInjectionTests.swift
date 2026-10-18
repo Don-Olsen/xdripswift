@@ -2109,3 +2109,318 @@ final class MealReminderNavigationTests: XCTestCase {
         XCTAssertEqual(TreatmentEntryAccessor(coreDataManager: core).getLatestTreatments(howOld: nil).count, 1)
     }
 }
+
+/// Real root/tab/sheet regression: only the scene phase and synthetic database are injected.
+/// No manual Treatments tap or artificial dismissal notification may rescue the route.
+final class ReminderRootPresentationTests: XCTestCase {
+    @MainActor func testPlannedTapBeforeActivationOpensFromHomeWithoutAnotherEvent() async throws {
+        let h = try ReminderRootHarness(phase: .inactive)
+        defer { h.finish() }
+        let uuid = try h.makePlan()
+        h.configure()
+        await h.mount(in: self)
+        PlannedMealReminder.recordTap(uuid: uuid)
+        await h.render()
+        XCTAssertEqual(h.selectedTab, 0)
+        XCTAssertNil(h.host?.presentedViewController)
+        XCTAssertEqual(PlannedMealReminder.pendingOpenUUID, uuid)
+        h.phase.value = .active
+        await assertMealPresented(h, uuid: uuid)
+        XCTAssertEqual(h.selectedTab, 1)
+        XCTAssertEqual(h.treatmentCount, 1)
+    }
+
+    @MainActor func testColdRequestWaitsForDependenciesThenOpensExactlyOnce() async throws {
+        let h = try ReminderRootHarness(phase: .inactive)
+        defer { h.finish() }
+        let uuid = try h.makePlan()
+        await h.mount(in: self)
+        PlannedMealReminder.recordTap(uuid: uuid)
+        h.phase.value = .active
+        await h.render()
+        XCTAssertNil(h.host?.presentedViewController)
+        XCTAssertEqual(PlannedMealReminder.pendingOpenUUID, uuid)
+        h.configure()
+        await assertMealPresented(h, uuid: uuid)
+        let sheet = try XCTUnwrap(h.host?.presentedViewController)
+        for _ in 0..<3 { PlannedMealReminder.recordTap(uuid: uuid) }
+        await h.render()
+        XCTAssertTrue(h.host?.presentedViewController === sheet)
+        XCTAssertNil(sheet.presentedViewController)
+        XCTAssertNil(PlannedMealReminder.pendingOpenUUID)
+        XCTAssertEqual(h.treatmentCount, 1)
+    }
+
+    @MainActor func testAlreadySelectedTreatmentsUsesNewActivationPhase() async throws {
+        let h = try ReminderRootHarness(phase: .inactive, treatmentsOnly: true)
+        defer { h.finish() }
+        let uuid = try h.makePlan()
+        await h.mount(in: self)
+        PlannedMealReminder.recordTap(uuid: uuid)
+        await h.render()
+        XCTAssertNil(h.host?.presentedViewController)
+        h.phase.value = .active
+        await assertMealPresented(h, uuid: uuid)
+        XCTAssertEqual(h.treatmentCount, 1)
+    }
+
+    @MainActor func testWarmTapWaitsForAnimatedModalRemovalWithoutSyntheticRetry() async throws {
+        let h = try ReminderRootHarness()
+        defer { h.finish() }
+        let uuid = try h.makePlan()
+        h.configure()
+        await h.mount(in: self)
+        let blocker = UIViewController()
+        blocker.modalPresentationStyle = .pageSheet
+        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+            h.host!.present(blocker, animated: true) { c.resume() }
+        }
+        PlannedMealReminder.recordTap(uuid: uuid)
+        await h.render()
+        XCTAssertTrue(h.host?.presentedViewController === blocker)
+        XCTAssertEqual(h.selectedTab, 0)
+        XCTAssertEqual(PlannedMealReminder.pendingOpenUUID, uuid)
+        // No call to presentationFinished: production must observe actual UIKit removal.
+        blocker.dismiss(animated: true)
+        await assertMealPresented(h, uuid: uuid)
+        XCTAssertFalse(h.host?.presentedViewController === blocker)
+        XCTAssertEqual(h.treatmentCount, 1)
+    }
+
+    @MainActor func testRootAlertDismissalResumesPendingMealAfterAnimation() async throws {
+        let h = try ReminderRootHarness()
+        defer { h.finish() }
+        let uuid = try h.makePlan()
+        h.configure()
+        await h.mount(in: self)
+        h.root.presentAlert(title: "Synthetic blocking alert", message: "No health data")
+        await wait { h.host?.presentedViewController != nil }
+        let blocker = try XCTUnwrap(h.host?.presentedViewController)
+        PlannedMealReminder.recordTap(uuid: uuid)
+        await h.render()
+        XCTAssertEqual(PlannedMealReminder.pendingOpenUUID, uuid)
+        // Like the alert's button, dismiss UIKit and update the SwiftUI binding. Clearing
+        // only the model in a hosted test does not simulate the user's alert dismissal.
+        blocker.dismiss(animated: true) { h.root.updatePresentedAlert(nil) }
+        await assertMealPresented(h, uuid: uuid)
+        XCTAssertFalse(h.host?.presentedViewController === blocker)
+        XCTAssertEqual(h.treatmentCount, 1)
+    }
+
+    @MainActor func testRepeatedBasalTapKeepsDraftAndDoesNotReopenAfterClosing() async throws {
+        let h = try ReminderRootHarness(phase: .inactive)
+        defer { h.finish() }
+        h.configure()
+        await h.mount(in: self)
+        BasalReminderScheduler.recordTap()
+        await h.render()
+        XCTAssertEqual(h.selectedTab, 0)
+        XCTAssertTrue(BasalReminderScheduler.hasPendingOpen)
+        h.phase.value = .active
+        await wait { h.host?.presentedViewController != nil && !BasalReminderScheduler.hasPendingOpen }
+        let sheet = try XCTUnwrap(h.host?.presentedViewController)
+        let field = try XCTUnwrap(ReminderRootHarness.descendants(sheet.view).compactMap { $0 as? UITextField }.first)
+        field.text = "17"
+        field.sendActions(for: .editingChanged)
+        for _ in 0..<3 { BasalReminderScheduler.recordTap() }
+        await h.render()
+        XCTAssertTrue(h.host?.presentedViewController === sheet)
+        XCTAssertEqual(field.text, "17")
+        XCTAssertFalse(BasalReminderScheduler.hasPendingOpen)
+        sheet.dismiss(animated: true)
+        await wait { h.host?.presentedViewController == nil }
+        await h.render()
+        XCTAssertNil(h.host?.presentedViewController)
+        XCTAssertFalse(BasalReminderScheduler.hasPendingOpen)
+        XCTAssertEqual(h.treatmentCount, 0)
+    }
+
+    @MainActor func testDifferentMealWaitsForOpenDraftAndLateAcknowledgementCannotLoseIt() async throws {
+        let h = try ReminderRootHarness()
+        defer { h.finish() }
+        let first = try h.makePlan()
+        let second = try h.makePlan()
+        h.configure()
+        await h.mount(in: self)
+        PlannedMealReminder.recordTap(uuid: first)
+        await assertMealPresented(h, uuid: first)
+        let sheet = try XCTUnwrap(h.host?.presentedViewController)
+        PlannedMealReminder.recordTap(uuid: second)
+        await h.render()
+        XCTAssertTrue(h.host?.presentedViewController === sheet)
+        XCTAssertEqual(PlannedMealReminder.pendingOpenUUID, second)
+        sheet.dismiss(animated: true)
+        await assertMealPresented(h, uuid: second)
+        XCTAssertFalse(h.host?.presentedViewController === sheet)
+        XCTAssertEqual(h.treatmentCount, 2)
+    }
+
+    @MainActor private func assertMealPresented(_ h: ReminderRootHarness, uuid: String,
+                                               file: StaticString = #filePath, line: UInt = #line) async {
+        await wait(file: file, line: line) {
+            h.host?.presentedViewController != nil && PlannedMealReminder.pendingOpenUUID == nil
+        }
+        let rows = try? MealPlanReminderCoordinator.storedTreatments(coreDataManager: h.core, uuids: [uuid])
+        XCTAssertTrue(rows?.first?.isPlannedMeal == true, "Opening never confirms eating", file: file, line: line)
+    }
+
+    @MainActor private func wait(file: StaticString = #filePath, line: UInt = #line,
+                                _ condition: @escaping () -> Bool) async {
+        let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in condition() }, object: nil)
+        await fulfillment(of: [ready], timeout: 4)
+        XCTAssertTrue(condition(), file: file, line: line)
+    }
+}
+
+@MainActor private final class ReminderRootPhase: ObservableObject {
+    @Published var value: ScenePhase
+    init(_ value: ScenePhase) { self.value = value }
+}
+
+@MainActor private final class ReminderRootHarness {
+    let root = RootTabStateModel()
+    let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+    let home = RootHomeStateModel()
+    let phase: ReminderRootPhase
+    let coordinator: RootApplicationCoordinator
+    let treatmentsOnly: Bool
+    private(set) var host: UIViewController?
+    private var window: UIWindow?
+    private weak var previousWindow: UIWindow?
+    private var plans: [String] = []
+    private let savedDefaults: [(String, Any?)]
+    private let sensorSuite = "ReminderRootHarness.\(UUID().uuidString)"
+    private var sensorDefaults: UserDefaults?
+
+    init(phase: ScenePhase = .active, treatmentsOnly: Bool = false) throws {
+        self.phase = ReminderRootPhase(phase)
+        self.treatmentsOnly = treatmentsOnly
+        coordinator = RootApplicationCoordinator(homeStateModelForTesting: home)
+        let defaults = UserDefaults.standard
+        let keys = ["plannedMealPendingOpenUUID", "pizzaSplitPendingOpenUUID", "basalReminderPendingOpen",
+            UserDefaults.Key.nightscoutEnabled.rawValue, UserDefaults.Key.isMaster.rawValue,
+            UserDefaults.Key.therapyDataSourceType.rawValue, UserDefaults.Key.glucoseForecastHorizonMinutes.rawValue,
+            UserDefaults.Key.lastBasalInjectionUnits.rawValue, UserDefaults.Key.lastBasalInjectionInsulinDescription.rawValue,
+            TreatmentSourceCutover.defaultsKey, TreatmentSourceCutover.restoreRequiresSourceSetupKey]
+        savedDefaults = keys.map { ($0, defaults.object(forKey: $0)) }
+        for key in keys.prefix(3) { defaults.removeObject(forKey: key) }
+        defaults.nightscoutEnabled = false
+        defaults.isMaster = true
+        defaults.therapyDataSourceType = .none
+        defaults.set(0, forKey: UserDefaults.Key.glucoseForecastHorizonMinutes.rawValue)
+        defaults.set(false, forKey: TreatmentSourceCutover.restoreRequiresSourceSetupKey)
+        defaults.set(try JSONEncoder().encode(TreatmentSourceCutover(cutoff: Date().addingTimeInterval(-86400),
+            insulinSourceBundleID: "synthetic.insulin", carbohydrateSourceBundleID: "synthetic.carbs")),
+            forKey: TreatmentSourceCutover.defaultsKey)
+    }
+
+    func configure() {
+        let readings = BgReadingsAccessor(coreDataManager: core)
+        let sound = SoundPlayer()
+        let defaults = UserDefaults(suiteName: sensorSuite)!
+        sensorDefaults = defaults
+        let health = SensorHealthIssueManager(userDefaults: defaults)
+        let nightscout = NightscoutSyncManager(coreDataManager: core, messageHandler: nil, observesSettings: false)
+        // Empty synthetic database: this manager has no peripherals and cannot start a sensor.
+        let bluetooth = BluetoothPeripheralManager(coreDataManager: core, cgmTransmitterDelegate: coordinator,
+            messageHandler: { _, _ in }, heartBeatFunction: nil, cgmTransmitterInfoChanged: {})
+        root.configure(coreDataManager: core, statisticsManager: StatisticsManager(coreDataManager: core),
+            bgReadingsAccessor: readings, calibrationsAccessor: CalibrationsAccessor(coreDataManager: core),
+            treatmentEntryAccessor: TreatmentEntryAccessor(coreDataManager: core),
+            alertManager: AlertManager(coreDataManager: core, soundPlayer: sound),
+            bgPostProcessingManager: BgPostProcessingManager(coreDataManager: core, nightscoutSyncManager: nil, healthKitManager: nil),
+            sensorNoiseManager: SensorNoiseManager(coreDataManager: core, bgReadingsAccessor: readings, sensorHealthIssueManager: health),
+            sensorHealthIssueManager: health, bluetoothPeripheralManager: bluetooth, soundPlayer: sound,
+            nightscoutSyncManager: nightscout, rootHomeStateModel: home, rootHomeActions: RootHomeActions(),
+            activeSensorProvider: { nil }, transmitterProvider: { nil }, startSensor: { _ in }, stopSensor: {},
+            submitCalibration: { _ in nil }, updateScreenLock: { _, _ in false },
+            selectedFollowerActions: .none, sensorProvider: coordinator)
+    }
+
+    func makePlan() throws -> String {
+        let entry = TreatmentEntry(date: Date().addingTimeInterval(15 * 60), value: 45,
+            treatmentType: .Carbs, nightscoutEventType: nil, enteredBy: "Synthetic reminder routing",
+            nsManagedObjectContext: core.mainManagedObjectContext)
+        let uuid = UUID().uuidString
+        entry.localTreatmentUUID = uuid
+        entry.plannedMealStateRaw = TreatmentMealState.planned.rawValue
+        entry.mealKindRaw = TreatmentMealKind.normal.rawValue
+        try core.mainManagedObjectContext.obtainPermanentIDs(for: [entry])
+        XCTAssertTrue(core.saveChangesSynchronously())
+        plans.append(uuid)
+        return uuid
+    }
+
+    func mount(in test: XCTestCase) async {
+        let appeared = XCTestExpectation(description: "Root mounted")
+        let controller = UIHostingController(rootView: ReminderRootContent(harness: self,
+            onAppear: { appeared.fulfill() }))
+        host = controller
+        guard let scene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene })
+            .first(where: { $0.activationState == .foregroundActive }) else {
+            XCTFail("Hosted navigation requires active XCTest scene")
+            return
+        }
+        previousWindow = scene.windows.first(where: \.isKeyWindow)
+        let window = UIWindow(windowScene: scene)
+        self.window = window
+        window.rootViewController = controller
+        window.makeKeyAndVisible()
+        await test.fulfillment(of: [appeared], timeout: 3)
+        await render()
+    }
+
+    func render() async { try? await Task.sleep(nanoseconds: 200_000_000) }
+    var treatmentCount: Int { TreatmentEntryAccessor(coreDataManager: core).getLatestTreatments(howOld: nil).count }
+    var selectedTab: Int? {
+        func find(_ c: UIViewController) -> UITabBarController? {
+            if let tabs = c as? UITabBarController { return tabs }
+            return c.children.compactMap(find).first
+        }
+        return host.flatMap(find)?.selectedIndex
+    }
+    static func descendants(_ view: UIView) -> [UIView] { [view] + view.subviews.flatMap(descendants) }
+
+    func finish() {
+        host?.dismiss(animated: false)
+        window?.isHidden = true
+        window?.rootViewController = nil
+        host = nil
+        previousWindow?.makeKeyAndVisible()
+        for uuid in plans {
+            PlannedMealReminder.cancel(uuid: uuid)
+            PizzaSplitReminder.cancel(uuid: uuid)
+            try? MealPlanMetadataStore.shared.remove(uuid: uuid)
+        }
+        let ns = UserDefaults.Key.nightscoutEnabled.rawValue
+        for (key, value) in savedDefaults.filter({ $0.0 != ns }) + savedDefaults.filter({ $0.0 == ns }) {
+            if let value { UserDefaults.standard.set(value, forKey: key) }
+            else { UserDefaults.standard.removeObject(forKey: key) }
+        }
+        sensorDefaults?.removePersistentDomain(forName: sensorSuite)
+    }
+}
+
+@MainActor private struct ReminderRootContent: View {
+    let harness: ReminderRootHarness
+    @ObservedObject var phase: ReminderRootPhase
+    let onAppear: () -> Void
+    init(harness: ReminderRootHarness, onAppear: @escaping () -> Void) {
+        self.harness = harness
+        phase = harness.phase
+        self.onAppear = onAppear
+    }
+    var body: some View {
+        Group {
+            if harness.treatmentsOnly {
+                TreatmentsView(coreDataManager: harness.core)
+            } else {
+                RootTabView(stateModel: harness.root, applicationCoordinator: harness.coordinator,
+                    tabTitles: RootTabTitles(home: "Home", treatments: "Treatments", statistics: "Statistics",
+                        devices: "Devices", settings: "Settings"))
+            }
+        }
+        .environment(\.scenePhase, phase.value)
+        .onAppear(perform: onAppear)
+    }
+}

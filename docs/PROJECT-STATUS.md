@@ -10,6 +10,52 @@
 
 De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
 
+## Påmindelse åbner Treatments efter aktivering — 18. oktober 2026
+
+Brugerens symptom på 4335 var, at et tryk på en planlagt måltidspåmindelse
+åbnede Home, mens det krævede et manuelt tryk på Treatments at vise måltidet.
+Den gamle et-arguments `onChange(of: scenePhase)` sendte ikke den nye fase
+videre til rootens åbnefunktion. Funktionen kunne derfor stadig se den gamle
+inaktive scene og lade den holdbare anmodning vente uden et nyt åbningssignal.
+En negativ kontrol, hvor kun den hidtidige faseoverførsel blev genindsat,
+genskabte netop den fastlåste Home-rute i den nye test. Det er en reproduceret
+kodefejl; brugerens præcise fysiske ventetid er ikke målt i denne opgave.
+
+Rettelsen sender den nye fase direkte videre i RootTabView og TreatmentsView.
+En lille, passiv UIKit-visning i en blokerende præsentations container melder
+via den eksisterende dismiss-hændelse, når containeren faktisk er fjernet.
+Dermed kan også dialoger og delingsark frigive en ventende påmindelse efter
+afsluttet animation. Ingen timer, polling, tvungen lukning af en kladde eller
+ændring af præsentationsdelegater. Læsefejl beholder anmodningen, men lukning
+af fejlbeskeden starter ikke straks den samme fejlbesked igen.
+
+Basal bruger samme readiness-/modalbeskyttelse. En basal-anmodning kvitteres
+først, når editoren faktisk vises; gentagne tryk bevarer en åben kladde og
+åbner den ikke igen efter lukning. Dosisberegning, lagring, påmindelsesindhold,
+HealthKit, prognose/ML, alarmer, Watch/Libre og app-ikonets genvej er uændrede.
+Den bredere behandling af historik og metadata er ikke ombygget.
+
+Syv nye tests hoster de faktiske RootTabView/TreatmentsView og deres sheets
+med en syntetisk database. De dækker inaktiv → aktiv fra Home, forsinkede
+afhængigheder, allerede valgt Treatments, native modal og root-dialog med
+animeret lukning, gentagne basaltryk med indtastet kladde samt en ny måltids-
+anmodning under en eksisterende editor. De kontrollerer også, at åbning ikke
+registrerer eller bekræfter behandlinger. De eksisterende tests er bevaret.
+
+Indledende fuld XCTest: **1705/1705 bestået, 0 fejl og 0 skipped** i lokal
+kvittering `20261018T061344Z-72534`. Python-kontrollerne bestod (172 tests
+samt 30 og 24 syntetiske Watch-kontroller) i `20261018T061636Z-72961`. Den negative
+kontrol i `20261018T061510Z-72769` fejlede som forventet i to scenarier;
+rettelsen blev derefter genindsat. Releaseproceduren vælger Apple-nummer og
+kører alle obligatoriske tests og simulatorbuilds på det præcise checkpoint;
+den faktiske releasekvittering registreres særskilt ovenfor.
+
+Læsende enhedskontrol bekræftede den tilsluttede iPhone med 7.1.1 (4335) og
+`com.GFZ896KN66.xdripswift`. Ingen lokal installation eller afbrydelse af CGM.
+Den nye versions åbning fra en fysisk notifikation, låseskærm og koldstart
+skal fortsat prøves efter TestFlight-installation. Simulator-tests beviser
+hverken notifikationslevering eller en bestemt fysisk åbningstid.
+
 ## Lettere klargøring af Watch-grafen efter 4334 — 17. oktober 2026
 
 Telefonens `WatchManager.currentBgReadings` bruger nu en afgrænset accessor,

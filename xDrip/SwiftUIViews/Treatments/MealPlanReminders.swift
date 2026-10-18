@@ -133,6 +133,32 @@ struct MealPlanMetadata: Codable, Equatable {
     }
 }
 
+/// A passive, noninteractive view reports completion of an already blocking presentation.
+/// No polling or fixed delay: retry once after UIKit removes the view from its window.
+@MainActor private final class MealReminderDismissalObserver: UIView {
+    private var wasInWindow = false
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        isUserInteractionEnabled = false
+        isAccessibilityElement = false
+        accessibilityElementsHidden = true
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if window != nil {
+            wasInWindow = true
+        } else if wasInWindow {
+            wasInWindow = false
+            // Finish the current UIKit removal before asking the existing owners to retry.
+            DispatchQueue.main.async { MealPlanReminderCoordinator.presentationFinished() }
+        }
+    }
+}
+
 /// A successful fresh-store read is required before metadata cleanup or notification updates.
 @MainActor enum MealPlanReminderCoordinator {
     /// Existing pending reminder identities are retried when a blocking presentation ends.
@@ -143,9 +169,17 @@ struct MealPlanMetadata: Codable, Equatable {
     }
 
     static var hasPresentedController: Bool {
-        UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
-            .first { $0.activationState == .foregroundActive }?
-            .keyWindow?.rootViewController?.presentedViewController != nil
+        guard let controller = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene })
+            .first(where: { $0.activationState == .foregroundActive })?
+            .keyWindow?.rootViewController?.presentedViewController else { return false }
+        // A binding can clear before UIKit finishes dismissing, and system share/alert views
+        // do not all have a SwiftUI onDismiss. Observe the presentation container's removal;
+        // never insert UIKit children into a SwiftUI-owned hosting view or replace its delegate.
+        if let container = controller.presentationController?.containerView,
+           !container.subviews.contains(where: { $0 is MealReminderDismissalObserver }) {
+            container.addSubview(MealReminderDismissalObserver(frame: .zero))
+        }
+        return true
     }
 
     /// Delivery consumes only a handled destination. A blocked presentation/read can be retried

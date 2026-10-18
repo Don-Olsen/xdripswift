@@ -415,10 +415,9 @@ struct RootTabView: View {
                 selectedTab = .settings
             } else if stateModel.penCalculatorQuickActionRequest != nil {
                 selectHomeForCalculatorQuickAction()
-            } else if PlannedMealReminder.pendingOpenUUID != nil || PizzaSplitReminder.pendingOpenUUID != nil {
+            } else if PlannedMealReminder.pendingOpenUUID != nil || PizzaSplitReminder.pendingOpenUUID != nil ||
+                        BasalReminderScheduler.hasPendingOpen {
                 selectTreatmentsForMealReminder()
-            } else if BasalReminderScheduler.hasPendingOpen {
-                selectedTab = .treatments
             }
             updateSupportedOrientations(for: selectedTab)
         }
@@ -433,10 +432,8 @@ struct RootTabView: View {
             if scenePhase == .active {
                 updateSupportedOrientations(for: selectedTab)
                 selectHomeForCalculatorQuickAction()
-                selectTreatmentsForMealReminder()
-                if BasalReminderScheduler.hasPendingOpen {
-                    selectedTab = .treatments
-                }
+                // Legacy onChange captures the prior view; pass the new phase through.
+                selectTreatmentsForMealReminder(phase: scenePhase)
             }
         }
         .onChange(of: stateModel.penCalculatorQuickActionRequest) { request in
@@ -486,7 +483,7 @@ struct RootTabView: View {
             selectTreatmentsForMealReminder()
         }
         .onReceive(NotificationCenter.default.publisher(for: BasalReminderScheduler.openRequested)) { _ in
-            selectedTab = .treatments
+            selectTreatmentsForMealReminder()
         }
         .alert(
             item: Binding(
@@ -671,14 +668,17 @@ struct RootTabView: View {
         }
     }
 
-    private func selectTreatmentsForMealReminder() {
-        guard PlannedMealReminder.pendingOpenUUID != nil || PizzaSplitReminder.pendingOpenUUID != nil,
-              scenePhase == .active, stateModel.dependencies != nil,
+    private func selectTreatmentsForMealReminder(phase: ScenePhase? = nil) {
+        guard PlannedMealReminder.pendingOpenUUID != nil || PizzaSplitReminder.pendingOpenUUID != nil ||
+                BasalReminderScheduler.hasPendingOpen else { return }
+        // Observe the actual blocking presentation even while a SwiftUI alert binding is set.
+        let hasPresentedController = MealPlanReminderCoordinator.hasPresentedController
+        guard (phase ?? scenePhase) == .active, stateModel.dependencies != nil,
               stateModel.alertRequest == nil, stateModel.pickerData == nil,
               stateModel.textInputRequest == nil, !stateModel.isPreparingIncomingBackup,
               stateModel.incomingBackupRequest == nil else { return }
         // Keep any active editor's inputs. Its existing dismiss event retries the durable request.
-        guard !MealPlanReminderCoordinator.hasPresentedController else { return }
+        guard !hasPresentedController else { return }
         selectedTab = .treatments
     }
 

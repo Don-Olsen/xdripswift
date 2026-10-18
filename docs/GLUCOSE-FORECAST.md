@@ -687,6 +687,21 @@ Automated validation and release evidence are recorded in PROJECT-STATUS.md.
 Actual notification delivery and the new Watch interaction still require physical
 follow-up; no local installation was performed as part of this change.
 
+### Foreground reminder routing after 4335
+
+Root and Treatments now pass the newly active scene phase directly into the
+existing pending-request handlers. Pending planned-meal, pizza and basal taps
+wait for real UI readiness, then use the existing Treatments presentation.
+A passive observer on an already blocking UIKit presentation container retries
+the existing request after actual removal; it adds no polling, timer, forced
+dismissal or replacement presentation delegate. Read-error notices do not
+immediately loop when closed. Basal acknowledges only actual editor appearance,
+and repeated taps preserve the visible draft without reopening it on dismissal.
+No treatment is written or marked eaten merely by navigation. Calculator rules,
+notification scheduling/content and sensor/alert paths remain unchanged.
+Hosted root/sheet regression tests and the negative reproduction are documented
+in PROJECT-STATUS.md; physical notification-to-editor latency remains unverified.
+
 ## Prospective evidence log and export
 
 A completed Home calculation supplies an immutable value snapshot to a separate serial IO worker. It never sends Core Data objects between queues or rereads settings while writing. Rendering does not wait for disk IO. The Home evidence log adds no timer or continuous background calculation; the separate “Low soon” event-driven calculation is described above. Off means no Home forecast attempt is logged; cache hits do not create records.
