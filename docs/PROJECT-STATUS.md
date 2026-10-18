@@ -1,3 +1,15 @@
+<!-- testflight-7.1.1-4340:start -->
+### TestFlight 7.1.1 (4340)
+
+- Kildecommit og tag: `b0c345e322b142cde571e8b7b16a1c22ae34d8e9` / `testflight-7.1.1-4340`.
+- Tests: 1750/1750 bestået; 0 fejlet; 0 skipped. iPhone- og Watch-simulatorbuilds bestod.
+- Apple-status (2026-10-18T12:23:21.592003+00:00): [Internal / Testing](https://appstoreconnect.apple.com/apps/6795645396/testflight/ios/bb390bf7-ab6b-4f8d-89ae-981095266a84).
+- Eksisterende intern gruppe: Ole Internal er bekræftet tilknyttet.
+- Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
+<!-- testflight-7.1.1-4340:end -->
+
+De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
+
 ## Fremadrettet måling af den viste ML-prognose — 18. oktober 2026
 
 Gennemgangen bekræftede, at den almindelige prognoselog kun gemte motoren
