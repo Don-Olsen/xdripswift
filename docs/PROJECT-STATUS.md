@@ -1,3 +1,35 @@
+## Samlet adgang til penindstillinger og tydelig prognosesektion — 18. oktober 2026
+
+Indstillinger → Generelt → Behandling og pen samler nu adgangen til den
+allerede eksisterende doseringsprofil med pizza- og basalpåmindelser samt
+indstillingen for hurtige kulhydrater. Hurtige kulhydrater er flyttet fra
+Home-indstillinger med uændret række-ID, validering og gemt værdi. De
+eksisterende genveje fra Behandlinger og beregneren er bevaret. Insulin- og
+kulhydratkurverne har egne overskrifter; ekstern ejerskabskontrol er uændret.
+Home-indstillinger har en særskilt prognosesektion med de samme fem rækker,
+synlighedsregler og handlinger. Teksten adskiller prognoseparametre fra
+penprofilen. Ingen ændring af beregninger, behandlinger, sensorer, alarmer,
+Watch, HealthKit eller model/træning. Ingen nye faner eller Home-kort.
+
+Indledende fuld XCTest: **1764/1764 bestået, 0 fejl**, i
+`20261018T170259Z-6623`. Tre nye tests kontrollerer de faktiske
+indstillingsprovidere og handlinger: prognosens gruppering og skift mellem
+fra/60/120 uden profilændring, behandlingsindgang uden præferenceskrivning,
+samt flyttet kulhydrateditor med komma, decimalpræcision og uændret validering.
+To eksisterende forventninger er tilpasset den tilsigtede flytning af
+kulhydratrækken og de nye sektionsoverskrifter; ejerskabs- og sikkerhedskrav
+er bevaret. Dansk/engelsk strengkontrol og diffkontrol bestod.
+Releaseproceduren gentester det valgte buildnummer og registrerer de faktiske
+releasekontroller og Apple-status i releaseafsnittet.
+
+Læsende enhedskontrol fandt iPhone med 7.1.1 (4341); Watch var utilgængeligt.
+Der er ikke installeret lokalt eller ændret brugerdata på telefonen.
+Simulatorens grafiske app kunne ikke åbnes gennem UI-værktøjet; der er derfor
+ikke taget nye skærmbilleder eller udført manuel navigation/stor-tekst-kontrol.
+De automatiske tests er ikke dokumentation for fysisk brugerfladeadfærd.
+Layoutet genbruger de eksisterende liste-/profilvisninger med ombrydning på
+den nye profilrække. Ingen målt hastigheds- eller batterigevinst påstås.
+
 <!-- testflight-7.1.1-4341:start -->
 ### TestFlight 7.1.1 (4341)
 

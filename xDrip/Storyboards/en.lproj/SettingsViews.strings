@@ -466,12 +466,12 @@
 
 "therapy.showIOBCOB" = "IOB/COB";
 
-"therapy.treatmentSettings" = "Treatments";
+"therapy.treatmentSettings" = "Treatment and pen";
 
 "therapy.settingsHelp" = "Used to estimate remaining insulin and carbs from your recorded treatments.";
 
-"therapy.settingsLocal" = "These settings are used to estimate IOB and COB from recorded treatments only when the values are not supplied by an AID system.";
-"therapy.settingsExternal" = "These options are disabled because IOB and COB are provided by your %@-based AID system.";
+"therapy.settingsLocal" = "The curve settings are used to estimate IOB and COB locally when the values are not supplied by an AID system.";
+"therapy.settingsExternal" = "The curve settings are disabled because IOB and COB are provided by your %@-based AID system.";
 "therapy.settingsMixed" = "IOB is provided by %@, so Insulin Type is automatic. Carb Duration is used to estimate COB locally from recorded meals.";
 "therapy.insulinModel" = "%@ insulin model selected. Duration of Insulin Action (DIA): %@. Insulin Peak Time: %@.";
 "therapy.carbFast" = "Faster carbohydrate absorption. Includes a 10-minute delay before absorption begins.";
@@ -609,3 +609,10 @@
 "forecast.plannedConditional" = "If eaten · conditional engine estimate";
 "forecast.futureValues" = "Estimated values";
 "forecast.parametersLabel" = "Calculation inputs";
+
+/* Treatment and pen navigation, separate forecast section. */
+"settingsviews_penProfileAndRemindersTitle" = "Dose profile and reminders";
+"settingsviews_treatmentRegistrationSectionTitle" = "Logging and pen";
+"settingsviews_insulinCurveSectionTitle" = "Insulin curve · IOB";
+"settingsviews_carbohydrateCurveSectionTitle" = "Carbohydrate absorption · COB";
+"settingsviews_forecastSettingsSectionFooter" = "These parameters belong to the forecast. Dose profile settings are separate, under Treatment and pen.";

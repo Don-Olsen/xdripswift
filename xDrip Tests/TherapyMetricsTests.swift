@@ -306,11 +306,121 @@ final class TherapyMetricsTests: XCTestCase {
             let chartChildren = rows.filter { ["homeScreen.showIOBCOB", "homeScreen.renderBasalDownwards"].contains($0.id) }
             XCTAssertEqual(chartChildren.count, 2)
             XCTAssertTrue(chartChildren.allSatisfy { $0.isVisible == enabled })
-            XCTAssertTrue(rows.contains { $0.id == "homeScreen.quickCarbohydrateGrams" && $0.isVisible },
-                          "Local quick-carbohydrate setup is independent of chart visibility")
+            XCTAssertFalse(rows.contains { $0.id == "homeScreen.quickCarbohydrateGrams" })
+            let registration = TreatmentSettingsViewModel(group: .registration).settingsRows(sectionID: 2)
+            XCTAssertTrue(registration.contains { $0.id == "homeScreen.quickCarbohydrateGrams" && $0.isVisible },
+                          "Quick-carbohydrate setup moved to Treatment and pen and remains independent of chart visibility")
             XCTAssertTrue(defaults.showTherapySummary)
             XCTAssertTrue(defaults.showIOBCOB)
         }
+    }
+
+
+    @MainActor
+    func testHomeForecastSectionKeepsActionsVisibilityAndExistingSettings() throws {
+        let defaults = UserDefaults.standard
+        let oldHorizon = defaults.glucoseForecastHorizonMinutes
+        defer { defaults.glucoseForecastHorizonMinutes = oldHorizon }
+        let beforeProfile = defaults.data(forKey: PenDoseProfile.storageKey)
+        let beforeSensitivity = defaults.glucoseForecastManualSensitivityMgdlPerUnit
+        let beforeRatio = defaults.glucoseForecastManualCarbRatioGramsPerUnit
+        let presenter = SettingsActionPresenter(router: SettingsRouter())
+        let generalRows = SettingsViewGroupedSettingsViewModel.glucoseDisplay().settingsRows(sectionID: 0)
+        let home = try XCTUnwrap(generalRows.first { $0.id == "glucoseDisplay.homeScreen" })
+        guard case let .settingsScreen(makeHome)? = home.action else {
+            return XCTFail("Home must retain the existing Settings navigation")
+        }
+        let sections = makeHome().makeSections(presenter)
+        let forecast = try XCTUnwrap(sections.map { $0.section() }.first {
+            $0.rows.contains { $0.id == "homeScreen.glucoseForecastHorizon" }
+        })
+        XCTAssertEqual(forecast.title, GlucoseForecastTexts.title)
+        XCTAssertEqual(forecast.rows.count, 5)
+        XCTAssertTrue(forecast.rows.allSatisfy { !$0.id.contains("showSensorNoise") })
+        let graph = SettingsViewHomeScreenSettingsViewModel(rowGroup: .mainChart).settingsRows(sectionID: 0)
+        XCTAssertFalse(graph.contains { $0.id.contains("Forecast") || $0.id.contains("forecast") })
+        let allRows = sections.flatMap { $0.section().rows }
+        XCTAssertEqual(Set(allRows.map(\.id)).count, allRows.count)
+        for row in forecast.rows where ["homeScreen.glucoseForecastSensitivity", "homeScreen.glucoseForecastCarbRatio"].contains(row.id) {
+            guard case .textEntry? = row.action else { return XCTFail("Keep the existing parameter editor") }
+        }
+        guard case .forecastMLTraining? = forecast.rows.first(where: { $0.id == "homeScreen.forecastMLTraining" })?.action,
+              case .forecastLogExport? = forecast.rows.first(where: { $0.id == "homeScreen.forecastLogExport" })?.action,
+              case let .menu(options, select)? = forecast.rows.first?.control else {
+            return XCTFail("Forecast destinations and horizon picker must remain intact")
+        }
+        let choose = try XCTUnwrap(select)
+        for (index, minutes) in [0, 60, 120].enumerated() {
+            choose(index)
+            XCTAssertEqual(defaults.glucoseForecastHorizonMinutes, minutes)
+            XCTAssertTrue(options()[index].isSelected)
+            let fresh = SettingsViewHomeScreenSettingsViewModel(rowGroup: .forecast).settingsRows(sectionID: 0)
+            XCTAssertTrue(fresh.filter { ["homeScreen.glucoseForecastSensitivity", "homeScreen.glucoseForecastCarbRatio"].contains($0.id) }
+                .allSatisfy { $0.isVisible == (minutes != 0) })
+            XCTAssertTrue(fresh.filter { ["homeScreen.forecastMLTraining", "homeScreen.forecastLogExport"].contains($0.id) }
+                .allSatisfy(\.isVisible), "Turning off drawing must not hide the existing model/export access")
+        }
+        XCTAssertEqual(defaults.data(forKey: PenDoseProfile.storageKey), beforeProfile)
+        XCTAssertEqual(defaults.glucoseForecastManualSensitivityMgdlPerUnit, beforeSensitivity)
+        XCTAssertEqual(defaults.glucoseForecastManualCarbRatioGramsPerUnit, beforeRatio)
+    }
+
+    @MainActor
+    func testTreatmentHubRetainsModelOwnershipAndOpeningDoesNotWritePreferences() throws {
+        let defaults = UserDefaults.standard
+        let keys = [PenDoseProfile.storageKey, "localInsulinPeak", "localInsulinDuration", "localCarbDuration",
+                    UserDefaults.Key.quickCarbohydrateGrams.rawValue, PizzaSplitSettings.enabledKey,
+                    PizzaSplitSettings.percentageKey, PizzaSplitSettings.reminderKey]
+        let previous = keys.map { defaults.object(forKey: $0) as? NSObject }
+        let presenter = SettingsActionPresenter(router: SettingsRouter())
+        let generalRows = SettingsViewGroupedSettingsViewModel.glucoseDisplay().settingsRows(sectionID: 0)
+        let entry = try XCTUnwrap(generalRows.first { $0.id == "general.treatmentSettings" })
+        XCTAssertEqual(entry.title, TherapyTexts.text("treatmentSettings"))
+        guard case let .settingsScreen(makeScreen)? = entry.action else {
+            return XCTFail("Keep the existing treatment navigation")
+        }
+        let sections = makeScreen().makeSections(presenter).map { $0.section() }
+        XCTAssertEqual(sections.count, 3)
+        XCTAssertTrue(sections.allSatisfy { !($0.title ?? "").isEmpty })
+        let profile = try XCTUnwrap(sections[0].rows.first { $0.id == "treatments.penProfile" })
+        guard case let .custom(content)? = profile.control else {
+            return XCTFail("The profile must reuse the existing screen")
+        }
+        _ = content()
+        XCTAssertNil(profile.action, "Opening the profile must not run a save action")
+        XCTAssertEqual(sections[0].rows.map(\.id), ["treatments.penProfile", "homeScreen.quickCarbohydrateGrams"])
+        XCTAssertEqual(sections[1].rows.map(\.id), ["treatments.insulinType"])
+        XCTAssertEqual(sections[2].rows.map(\.id), ["treatments.carbDuration"])
+        XCTAssertEqual(keys.map { defaults.object(forKey: $0) as? NSObject }, previous)
+    }
+
+    func testMovedQuickCarbsEditorKeepsValidationAndExactSavedAmount() throws {
+        let defaults = UserDefaults.standard
+        let oldAmount = defaults.object(forKey: UserDefaults.Key.quickCarbohydrateGrams.rawValue)
+        let oldChart = defaults.showTreatmentsOnChart
+        defer {
+            defaults.set(oldAmount, forKey: UserDefaults.Key.quickCarbohydrateGrams.rawValue)
+            defaults.showTreatmentsOnChart = oldChart
+        }
+        defaults.showTreatmentsOnChart = false
+        defaults.quickCarbohydrateGrams = 12.5
+        let model = TreatmentSettingsViewModel(group: .registration)
+        let row = try XCTUnwrap(model.settingsRows(sectionID: 0).first { $0.id == "homeScreen.quickCarbohydrateGrams" })
+        XCTAssertTrue(row.isVisible)
+        XCTAssertTrue(row.isEnabled)
+        guard case let .textEntry(makeEditor)? = row.action else { return XCTFail("Missing existing editor") }
+        let editor = makeEditor()
+        let validate = try XCTUnwrap(editor.validator)
+        for invalid in ["-1", "NaN", "infinity", "abc"] {
+            XCTAssertNotNil(validate(invalid))
+        }
+        XCTAssertNil(validate("15,25"))
+        editor.action("15,25")
+        XCTAssertEqual(defaults.quickCarbohydrateGrams, 15.25)
+        XCTAssertTrue(try XCTUnwrap(model.settingsRows(sectionID: 0).first { $0.id == row.id }?.detail).contains("15"))
+        XCTAssertNil(validate(""))
+        editor.action("")
+        XCTAssertNil(defaults.quickCarbohydrateGrams)
     }
 
     func testPumpCageRequiresSiteChangeButNotFreshDeviceStatus() {
@@ -892,7 +1002,7 @@ final class TherapyMetricsTests: XCTestCase {
             for (group, external) in [(TreatmentSettingsViewModel.Group.insulin, source.externalIOBSource), (.carbs, source.externalCOBSource)] {
                 let model = TreatmentSettingsViewModel(group: group, policyProvider: { source })
                 let row = try XCTUnwrap(model.settingsRows(sectionID: 0).first)
-                XCTAssertNil(model.sectionTitle())
+                XCTAssertFalse(try XCTUnwrap(model.sectionTitle()).isEmpty)
                 XCTAssertEqual(row.isEnabled, external == nil)
                 if external != nil {
                     XCTAssertEqual(row.detail, TherapyTexts.text("automatic"))

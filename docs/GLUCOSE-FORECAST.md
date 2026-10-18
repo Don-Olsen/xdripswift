@@ -933,3 +933,14 @@ explicitly manual or confirmed untrended glucose input. An actual read error
 returns a specific Danish unavailable reason; successful missing history still
 permits the existing explicit manual calculation with valid therapy inputs.
 Engine mathematics, ML features, dose formula and safety limits are unchanged.
+
+## Indstillingsnavigation — 18. oktober 2026
+
+Home-indstillinger har nu en særskilt sektion for blodsukkerprognosen med
+horisont, prognosens ISF/kulhydratfaktor, personlig model og eksport. Rækkerne
+bevarer deres eksisterende værdier, handlinger og synlighed, også når
+prognosevisning er slået fra. Behandling og pen giver samlet adgang til den
+eksisterende doseringsprofil/påmindelser, hurtige kulhydrater og de lokale
+behandlingskurver. Penprofilen og prognosens manuelle parametre er fortsat
+adskilte. Ingen prognose-, dosis- eller modelberegning er ændret.
+Test- og fysisk kontrolstatus står i PROJECT-STATUS.md.

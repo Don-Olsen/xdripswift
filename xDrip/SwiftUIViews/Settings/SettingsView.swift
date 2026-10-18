@@ -627,6 +627,7 @@ struct SettingsViewGroupedSettingsViewModel: SettingsViewModelProtocol, Settings
                                 [
                                     SettingsViewHomeScreenSettingsViewModel(rowGroup: .layout),
                                     SettingsViewHomeScreenSettingsViewModel(rowGroup: .mainChart),
+                                    SettingsViewHomeScreenSettingsViewModel(rowGroup: .forecast),
                                     SettingsViewHomeScreenSettingsViewModel(rowGroup: .treatments),
                                     SettingsViewHomeScreenSettingsViewModel(rowGroup: .screenLockLink)
                                 ]

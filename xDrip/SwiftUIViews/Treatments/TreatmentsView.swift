@@ -406,7 +406,7 @@ struct TreatmentsListView: View {
         }
         .buttonStyle(.plain)
         .disabled(amount == nil)
-        .accessibilityHint(amount == nil ? "Vælg først antal gram under Hjemskærm-indstillinger" : "Åbner en forudfyldt registrering, som du kan kontrollere før gemning")
+        .accessibilityHint(amount == nil ? "Vælg først antal gram under Indstillinger → Behandling og pen" : "Åbner en forudfyldt registrering, som du kan kontrollere før gemning")
     }
 
     private var penCalculatorButton: some View {

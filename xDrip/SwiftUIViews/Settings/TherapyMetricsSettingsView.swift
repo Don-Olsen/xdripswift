@@ -24,14 +24,14 @@ struct TreatmentSettingsView: View {
 }
 
 struct TreatmentSettingsViewModel: SettingsNativeSectionProvider {
-    enum Group { case insulin, carbs }
+    enum Group { case registration, insulin, carbs }
     let group: Group
     var policyProvider: () -> DataFlowPolicy = { UserDefaults.standard.dataFlowPolicy }
 
     static var screen: SettingsScreen {
         SettingsScreen(title: TherapyTexts.text("treatmentSettings"),
                        introduction: { TreatmentSettingsViewModel(group: .insulin).introduction }, onlineHelpTopic: .treatments,
-                       providers: { [.insulin, .carbs].map { TreatmentSettingsViewModel(group: $0) } })
+                       providers: { [.registration, .insulin, .carbs].map { TreatmentSettingsViewModel(group: $0) } })
     }
 
     private var policy: DataFlowPolicy { policyProvider() }
@@ -46,6 +46,20 @@ struct TreatmentSettingsViewModel: SettingsNativeSectionProvider {
     }
 
     func settingsRows(sectionID: Int) -> [SettingsRow] {
+        if group == .registration {
+            return [
+                SettingsRow(id: "treatments.penProfile", title: Texts_SettingsView.penProfileAndRemindersTitle,
+                    control: .custom(content: {
+                        AnyView(NavigationLink {
+                            PenDoseSettingsView()
+                        } label: {
+                            Text(Texts_SettingsView.penProfileAndRemindersTitle)
+                                .fixedSize(horizontal: false, vertical: true)
+                        })
+                    })),
+                quickCarbohydrateAmountRow()
+            ]
+        }
         let isInsulin = group == .insulin
         if (isInsulin ? policy.externalIOBSource : policy.externalCOBSource) != nil {
             return [SettingsRow(id: isInsulin ? "treatments.insulinType" : "treatments.carbDuration",
@@ -82,6 +96,29 @@ struct TreatmentSettingsViewModel: SettingsNativeSectionProvider {
         return rows
     }
 
+    private func quickCarbohydrateAmountRow() -> SettingsRow {
+        let defaults = UserDefaults.standard
+        let title = "🍭 Hurtige kulhydrater"
+        let saved = defaults.quickCarbohydrateGrams
+        return SettingsRow(
+            id: "homeScreen.quickCarbohydrateGrams", title: title,
+            detail: saved.map { GlucoseForecastSettingsInput.displayNumber($0) + " g" } ?? "Ikke indstillet",
+            accessory: .disclosure, reloadScope: .all,
+            action: .textEntry {
+                SettingsTextEntryContent(
+                    title: title,
+                    message: "Vælg det antal gram, hurtigknappen skal registrere. Tomt felt slår knappen fra.",
+                    keyboardType: .decimalPad,
+                    text: saved.map(GlucoseForecastSettingsInput.displayNumber), placeholder: nil,
+                    fieldTitle: "Kulhydrater", unitText: "g",
+                    actionTitle: Texts_Common.Ok, cancelTitle: Texts_Common.Cancel,
+                    action: { input in defaults.quickCarbohydrateGrams = GlucoseForecastSettingsInput.positiveNumber(input) },
+                    cancel: nil, validator: { input in GlucoseForecastSettingsInput.validationMessage(input) }
+                )
+            }
+        )
+    }
+
     private func providerName(_ source: TherapyMetricSource) -> String {
         source == .careLink ? "CareLink" : policy.nightscoutFollowType.description
     }
@@ -90,10 +127,18 @@ struct TreatmentSettingsViewModel: SettingsNativeSectionProvider {
         DateComponentsFormatter.localizedString(from: DateComponents(hour: Int(minutes / 60)), unitsStyle: .full) ?? ""
     }
 
-    func sectionTitle() -> String? { nil }
+    func sectionTitle() -> String? {
+        switch group {
+        case .registration: return Texts_SettingsView.treatmentRegistrationSectionTitle
+        case .insulin: return Texts_SettingsView.insulinCurveSectionTitle
+        case .carbs: return Texts_SettingsView.carbohydrateCurveSectionTitle
+        }
+    }
     func sectionFooter() -> String? {
         let settings = TherapyModelSettings(defaults: .standard)
         switch group {
+        case .registration:
+            return nil
         case .insulin:
             guard policy.externalIOBSource == nil else { return nil }
             return String(format: TherapyTexts.text("insulinModel"),

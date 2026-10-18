@@ -495,12 +495,12 @@
 
 "therapy.showIOBCOB" = "IOB/COB";
 
-"therapy.treatmentSettings" = "Behandlinger";
+"therapy.treatmentSettings" = "Behandling og pen";
 
 "therapy.settingsHelp" = "Bruges til at estimere resterende insulin og kulhydrater fra dine registrerede behandlinger.";
 
-"therapy.settingsLocal" = "Disse indstillinger estimerer IOB og COB fra registrerede behandlinger, kun når værdierne ikke leveres af et AID-system.";
-"therapy.settingsExternal" = "Disse muligheder er deaktiveret, fordi dit %@-baserede AID-system leverer IOB og COB.";
+"therapy.settingsLocal" = "Kurveindstillingerne bruges til lokal beregning af IOB og COB, når værdierne ikke leveres af et AID-system.";
+"therapy.settingsExternal" = "Kurveindstillingerne er deaktiveret, fordi dit %@-baserede AID-system leverer IOB og COB.";
 "therapy.settingsMixed" = "%@ leverer IOB, så insulintypen er automatisk. Kulhydratvarigheden bruges til at estimere COB lokalt fra registrerede måltider.";
 "therapy.insulinModel" = "Insulinmodel %@ valgt. Insulinens virkningsvarighed (DIA): %@. Tid til maksimal insulinvirkning: %@.";
 "therapy.carbFast" = "Hurtigere kulhydratoptagelse. Inkluderer 10 minutters forsinkelse før optagelsen begynder.";
@@ -639,3 +639,10 @@
 "forecast.plannedConditional" = "Hvis spist · betinget motorprognose";
 "forecast.futureValues" = "Forventede værdier";
 "forecast.parametersLabel" = "Beregningsgrundlag";
+
+/* Treatment and pen navigation, separate forecast section. */
+"settingsviews_penProfileAndRemindersTitle" = "Doseringsprofil og påmindelser";
+"settingsviews_treatmentRegistrationSectionTitle" = "Registrering og pen";
+"settingsviews_insulinCurveSectionTitle" = "Insulinkurve · IOB";
+"settingsviews_carbohydrateCurveSectionTitle" = "Kulhydratoptagelse · COB";
+"settingsviews_forecastSettingsSectionFooter" = "Disse parametre hører til prognosen. Doseringsprofilen indstilles særskilt under Behandling og pen.";

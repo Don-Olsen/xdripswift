@@ -10,6 +10,26 @@ class Texts_SettingsView {
         return NSLocalizedString("settingsviews_valueIsRequired", tableName: filename, bundle: Bundle.main, value: "⚠️ Required", comment: "this setting is required")
     }()
     
+    static let penProfileAndRemindersTitle: String = {
+        NSLocalizedString("settingsviews_penProfileAndRemindersTitle", tableName: filename, bundle: Bundle.main, value: "Dose profile and reminders", comment: "Profile, pizza split and basal reminder settings link")
+    }()
+
+    static let treatmentRegistrationSectionTitle: String = {
+        NSLocalizedString("settingsviews_treatmentRegistrationSectionTitle", tableName: filename, bundle: Bundle.main, value: "Logging and pen", comment: "Treatment registration settings section")
+    }()
+
+    static let insulinCurveSectionTitle: String = {
+        NSLocalizedString("settingsviews_insulinCurveSectionTitle", tableName: filename, bundle: Bundle.main, value: "Insulin curve · IOB", comment: "Local insulin curve settings section")
+    }()
+
+    static let carbohydrateCurveSectionTitle: String = {
+        NSLocalizedString("settingsviews_carbohydrateCurveSectionTitle", tableName: filename, bundle: Bundle.main, value: "Carbohydrate absorption · COB", comment: "Local carb absorption settings section")
+    }()
+
+    static let forecastSettingsSectionFooter: String = {
+        NSLocalizedString("settingsviews_forecastSettingsSectionFooter", tableName: filename, bundle: Bundle.main, value: "These parameters belong to the forecast. Dose profile settings are separate, under Treatment and pen.", comment: "Separates forecast parameters from dose profile settings")
+    }()
+
     // MARK: - Title of the first settings screen
     
     static let screenTitle: String = {

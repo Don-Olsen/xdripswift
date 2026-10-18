@@ -131,6 +131,7 @@ enum SettingsViewHomeScreenSettingsRowGroup {
     case homeScreen
     case layout
     case mainChart
+    case forecast
     case treatments
     case screenLockLink
     case screenLock
@@ -213,7 +214,10 @@ class SettingsViewHomeScreenSettingsViewModel: NSObject, SettingsViewModelProtoc
             mainChartHoursRow,
             nativeSettingsRow(id: "homeScreen.allowScreenRotation", index: Setting.allowScreenRotation.rawValue, sectionID: sectionID),
             nativeSettingsRow(id: "homeScreen.showOriginalBGReadings", index: Setting.showOriginalBGReadings.rawValue, sectionID: sectionID),
-            nativeSettingsRow(id: "homeScreen.showSensorNoise", index: Setting.showSensorNoise.rawValue, sectionID: sectionID),
+            nativeSettingsRow(id: "homeScreen.showSensorNoise", index: Setting.showSensorNoise.rawValue, sectionID: sectionID)
+        ]
+
+        let forecastRows = [
             SettingsRow(id: "homeScreen.glucoseForecastHorizon", title: GlucoseForecastTexts.title,
                         control: .menu(options: {
                             let chosen = UserDefaults.standard.glucoseForecastHorizonMinutes
@@ -239,7 +243,6 @@ class SettingsViewHomeScreenSettingsViewModel: NSObject, SettingsViewModelProtoc
         // Treatments gates basal and curves without changing their saved preferences.
         let treatmentRows = [
             SettingsRow(id: "homeScreen.showTreatments", title: Texts_SettingsView.settingsviews_showTreatments, control: .toggle(isOn: { UserDefaults.standard.showTreatmentsOnChart }, setIsOn: { UserDefaults.standard.showTreatmentsOnChart = $0 }), reloadScope: .all),
-            quickCarbohydrateAmountRow(),
             SettingsRow(id: "homeScreen.showIOBCOB", title: TherapyTexts.text("curves"), control: .toggle(isOn: { UserDefaults.standard.showIOBCOB }, setIsOn: { UserDefaults.standard.showIOBCOB = $0 }), isVisible: UserDefaults.standard.showTreatmentsOnChart),
             SettingsRow(id: "homeScreen.renderBasalDownwards", title: Texts_SettingsView.basalPosition, control: .menu(
                 options: {
@@ -276,13 +279,15 @@ class SettingsViewHomeScreenSettingsViewModel: NSObject, SettingsViewModelProtoc
 
         switch rowGroup {
         case .all:
-            return layoutRows + mainChartRows + treatmentRows + screenLockLinkRows + glucoseRangeRows
+            return layoutRows + mainChartRows + forecastRows + treatmentRows + screenLockLinkRows + glucoseRangeRows
         case .homeScreen:
-            return layoutRows + mainChartRows + treatmentRows + screenLockLinkRows
+            return layoutRows + mainChartRows + forecastRows + treatmentRows + screenLockLinkRows
         case .layout:
             return layoutRows
         case .mainChart:
             return mainChartRows
+        case .forecast:
+            return forecastRows
         case .treatments:
             return treatmentRows
         case .screenLockLink:
@@ -340,29 +345,6 @@ class SettingsViewHomeScreenSettingsViewModel: NSObject, SettingsViewModelProtoc
                     fieldTitle: Texts_Common.enterValue, unitText: "g/U",
                     actionTitle: Texts_Common.Ok, cancelTitle: Texts_Common.Cancel,
                     action: { input in defaults.glucoseForecastManualCarbRatioGramsPerUnit = GlucoseForecastSettingsInput.positiveNumber(input) },
-                    cancel: nil, validator: { input in GlucoseForecastSettingsInput.validationMessage(input) }
-                )
-            }
-        )
-    }
-
-    private func quickCarbohydrateAmountRow() -> SettingsRow {
-        let defaults = UserDefaults.standard
-        let title = "🍭 Hurtige kulhydrater"
-        let saved = defaults.quickCarbohydrateGrams
-        return SettingsRow(
-            id: "homeScreen.quickCarbohydrateGrams", title: title,
-            detail: saved.map { GlucoseForecastSettingsInput.displayNumber($0) + " g" } ?? "Ikke indstillet",
-            accessory: .disclosure, reloadScope: .all,
-            action: .textEntry {
-                SettingsTextEntryContent(
-                    title: title,
-                    message: "Vælg det antal gram, hurtigknappen skal registrere. Tomt felt slår knappen fra.",
-                    keyboardType: .decimalPad,
-                    text: saved.map(GlucoseForecastSettingsInput.displayNumber), placeholder: nil,
-                    fieldTitle: "Kulhydrater", unitText: "g",
-                    actionTitle: Texts_Common.Ok, cancelTitle: Texts_Common.Cancel,
-                    action: { input in defaults.quickCarbohydrateGrams = GlucoseForecastSettingsInput.positiveNumber(input) },
                     cancel: nil, validator: { input in GlucoseForecastSettingsInput.validationMessage(input) }
                 )
             }
@@ -550,6 +532,7 @@ class SettingsViewHomeScreenSettingsViewModel: NSObject, SettingsViewModelProtoc
         switch rowGroup {
         case .layout: icon = "rectangle.3.group"
         case .mainChart: icon = "chart.xyaxis.line"
+        case .forecast: icon = "chart.line.uptrend.xyaxis"
         default: icon = nil
         }
         return SettingsSection(title: sectionTitle(), iconSymbolName: icon, footer: settingsSectionFooter(), rows: settingsRows(sectionID: sectionID))
@@ -561,6 +544,8 @@ class SettingsViewHomeScreenSettingsViewModel: NSObject, SettingsViewModelProtoc
             return Texts_SettingsView.homeScreenLayoutSectionTitle
         case .mainChart:
             return Texts_SettingsView.homeScreenChartDisplaySectionTitle
+        case .forecast:
+            return GlucoseForecastTexts.title
         case .treatments, .screenLock, .screenLockLink:
             return nil
         case .glucoseRanges:
@@ -574,6 +559,8 @@ class SettingsViewHomeScreenSettingsViewModel: NSObject, SettingsViewModelProtoc
         switch rowGroup {
         case .layout:
             return Texts_SettingsView.homeScreenSensorLifetimeSectionFooter
+        case .forecast:
+            return Texts_SettingsView.forecastSettingsSectionFooter
         case .screenLock:
             return Texts_SettingsView.homeScreenScreenLockSectionFooter
         case .glucoseRanges:
