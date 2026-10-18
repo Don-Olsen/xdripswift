@@ -257,10 +257,17 @@ struct InitialCalibrationRequestGate {
     }
 
     #if DEBUG
+    private var therapySnapshotForTesting: (() -> TherapyMetricsSnapshot)?
+    private var widgetPublicationForTesting: ((Bool, TherapyMetricsSnapshot) -> Void)?
+
     /// Exercises presentation callbacks with synthetic state without starting app services.
-    init(homeStateModelForTesting: RootHomeStateModel, activeSensorForTesting: Sensor? = nil) {
+    init(homeStateModelForTesting: RootHomeStateModel, activeSensorForTesting: Sensor? = nil,
+         therapySnapshotForTesting: (() -> TherapyMetricsSnapshot)? = nil,
+         widgetPublicationForTesting: ((Bool, TherapyMetricsSnapshot) -> Void)? = nil) {
         rootHomeStateModel = homeStateModelForTesting
         activeSensor = activeSensorForTesting
+        self.therapySnapshotForTesting = therapySnapshotForTesting
+        self.widgetPublicationForTesting = widgetPublicationForTesting
         hasStarted = true
         super.init()
     }
@@ -2288,8 +2295,11 @@ struct InitialCalibrationRequestGate {
     }
     
     @objc private func handleBgPostProcessingDidUpdate() {
-        // The full Home refresh already includes the post-processing status.
-        updateLabelsAndChart(overrideApplicationState: true, forceReset: true)
+        // Keep the therapy/Watch publication, but publish widgets only once after this
+        // event's complete Home refresh. Otherwise a due therapy update repeats the
+        // same glucose fetch, encoding and WidgetKit reload immediately below.
+        refreshLabelsAndChart(overrideApplicationState: true, forceReset: true,
+                              publishesTherapyWidgets: false)
         watchManager?.updateWatchApp(forceComplicationUpdate: true)
         updateLiveActivityAndWidgets(forceRestart: false)
     }
@@ -2301,8 +2311,15 @@ struct InitialCalibrationRequestGate {
     /// - parameters:
     ///     - overrideApplicationState : if true, then update will be done even if state is not .active
     ///     - forceReset : if true, then force the update to be done even if the main chart is panned back in time (used for the double tap gesture). This will also rescale the chart y-axis.
-    private func publishTherapyMetricsIfNeeded() {
-        let snapshot = TherapyMetricsManager.shared.snapshot()
+    private func currentTherapyMetricsSnapshot() -> TherapyMetricsSnapshot {
+        #if DEBUG
+        if let therapySnapshotForTesting { return therapySnapshotForTesting() }
+        #endif
+        return TherapyMetricsManager.shared.snapshot()
+    }
+
+    private func publishTherapyMetricsIfNeeded(publishesWidgets: Bool = true) {
+        let snapshot = currentTherapyMetricsSnapshot()
         let hasLocalMetrics = (snapshot.iob.source == .local && snapshot.iob.isVisible()) || (snapshot.cob.source == .local && snapshot.cob.isVisible())
         guard hasLocalMetrics || lastTherapyPublication != nil else { return }
         // Coalesce changing amounts too. Source/availability transitions remain immediate.
@@ -2328,12 +2345,20 @@ struct InitialCalibrationRequestGate {
         lastTherapyPublication = hasLocalMetrics ? snapshot : nil
         lastTherapyPublicationAt = .now
         watchManager?.updateTherapyMetrics(snapshot)
-        updateLiveActivityAndWidgets(forceRestart: false, therapyMetrics: snapshot)
+        if publishesWidgets {
+            updateLiveActivityAndWidgets(forceRestart: false, therapyMetrics: snapshot)
+        }
     }
 
     @objc private func updateLabelsAndChart(overrideApplicationState: Bool = false, forceReset: Bool = false) {
+        refreshLabelsAndChart(overrideApplicationState: overrideApplicationState,
+                              forceReset: forceReset, publishesTherapyWidgets: true)
+    }
+
+    private func refreshLabelsAndChart(overrideApplicationState: Bool, forceReset: Bool,
+                                       publishesTherapyWidgets: Bool) {
         setNightscoutSyncRequiredToTrue(forceNow: false)
-        publishTherapyMetricsIfNeeded()
+        publishTherapyMetricsIfNeeded(publishesWidgets: publishesTherapyWidgets)
         
         guard UIApplication.shared.applicationState == .active || overrideApplicationState else {
             // Keep the existing background Home update without refreshing it again in the foreground.
@@ -2939,6 +2964,12 @@ struct InitialCalibrationRequestGate {
     /// check if the conditions are correct to start a live activity, update it, or end it
     /// also update the widget data stored in user defaults
     private func updateLiveActivityAndWidgets(forceRestart: Bool, therapyMetrics: TherapyMetricsSnapshot? = nil, sensorStartDate: Date? = nil) {
+        #if DEBUG
+        if let widgetPublicationForTesting {
+            widgetPublicationForTesting(forceRestart, therapyMetrics ?? currentTherapyMetricsSnapshot())
+            return
+        }
+        #endif
         let sensorWarmupEndDate = liveActivitySensorWarmupEndDate(sensorStartDate: sensorStartDate)
         let keepAliveDisabledMessage = !UserDefaults.standard.isMaster && UserDefaults.standard.followerBackgroundKeepAliveType == .disabled
             ? "\(Texts_SettingsView.labelfollowerKeepAliveType) \(Texts_SettingsView.followerKeepAliveTypeDisabled)"

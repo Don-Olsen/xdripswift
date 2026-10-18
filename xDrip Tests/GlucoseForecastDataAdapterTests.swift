@@ -325,6 +325,146 @@ final class GlucoseForecastDataAdapterTests: XCTestCase {
         XCTAssertEqual(captured.count, 1)
     }
 
+    @MainActor func testCancelledQueuedPresentationSkipsReadsAndLogThenLiveRequestStillCalculates() async throws {
+        let fixture = try makeCancellationFixture()
+        defer { fixture.defaults.removePersistentDomain(forName: fixture.suite) }
+        let queued = expectation(description: "Presentation is queued behind existing work")
+        let completed = expectation(description: "Cancelled continuation resumes")
+        let releaseWorker = DispatchSemaphore(value: 0)
+        defer { releaseWorker.signal() }
+        let worker = DispatchQueue(label: "test.forecast.queued-cancellation")
+        worker.async { XCTAssertEqual(releaseWorker.wait(timeout: .now() + 5), .success) }
+        let probe = ForecastAdapterCancellationProbe()
+        let captured = ForecastAdapterLogCapture()
+        let adapter = GlucoseForecastDataAdapter(coreDataManager: fixture.core,
+            therapyManager: fixture.therapy, defaults: fixture.defaults,
+            healthImporter: fixture.importer, logForecast: captured.append,
+            enqueuePresentation: { work in
+                worker.async(execute: work)
+                if probe.didEnqueue() == 1 { queued.fulfill() }
+            }, presentationGlucoseFetch: { context, request in
+                probe.didRead()
+                return try context.fetch(request)
+            })
+        let date = referenceDate
+        let task = Task {
+            probe.store(await adapter.forecastForPresentation(horizonMinutes: 60, at: date))
+            completed.fulfill()
+        }
+        defer { task.cancel() }
+        await fulfillment(of: [queued], timeout: 3)
+        task.cancel()
+        releaseWorker.signal()
+        await fulfillment(of: [completed], timeout: 3)
+        let cancelled = try XCTUnwrap(probe.outcome)
+        XCTAssertEqual(cancelled.result.reason, .dataUnavailable)
+        XCTAssertTrue(cancelled.result.points.isEmpty)
+        XCTAssertNil(cancelled.conditionalPlannedPoints)
+        XCTAssertEqual(probe.readCount, 0, "Cancelled queued work must never enter Core Data")
+        XCTAssertEqual(captured.count, 0, "Cancellation is not prospective failure evidence")
+
+        let live = await adapter.forecastForPresentation(horizonMinutes: 60, at: date)
+        let expected = GlucoseForecastEngine.predict(GlucoseForecastInput(
+            glucose: try XCTUnwrap(adapter.recentGlucose(at: date)), treatments: [],
+            settings: TherapyModelSettings(defaults: fixture.defaults),
+            sensitivityMgdlPerUnit: 36, carbohydrateRatioGramsPerUnit: 10,
+            horizonMinutes: 60, now: date))
+        XCTAssertNil(live.result.reason)
+        XCTAssertEqual(live.result.points, expected.points)
+        XCTAssertEqual(probe.readCount, 1)
+        XCTAssertEqual(captured.count, 1)
+        let cached = await adapter.forecastForPresentation(horizonMinutes: 60, at: date)
+        XCTAssertEqual(cached.result.points, live.result.points)
+        XCTAssertEqual(captured.count, 1, "A completed request keeps the existing log/cache behavior")
+    }
+
+    @MainActor func testCancellationDuringGlucoseReadDiscardsSuccessfulAndFailedReadsWithoutLogging() async throws {
+        for failRead in [false, true] {
+            let fixture = try makeCancellationFixture()
+            defer { fixture.defaults.removePersistentDomain(forName: fixture.suite) }
+            let reading = expectation(description: "Glucose fetch has started")
+            let completed = expectation(description: "In-flight cancelled continuation resumes")
+            let releaseRead = DispatchSemaphore(value: 0)
+            defer { releaseRead.signal() }
+            let probe = ForecastAdapterCancellationProbe()
+            let captured = ForecastAdapterLogCapture()
+            let adapter = GlucoseForecastDataAdapter(coreDataManager: fixture.core,
+                therapyManager: fixture.therapy, defaults: fixture.defaults,
+                healthImporter: fixture.importer, logForecast: captured.append,
+                presentationGlucoseFetch: { context, request in
+                    probe.didRead()
+                    reading.fulfill()
+                    XCTAssertEqual(releaseRead.wait(timeout: .now() + 5), .success)
+                    if failRead { throw ForecastAdapterSyntheticReadError.unavailable }
+                    return try context.fetch(request)
+                })
+            let date = referenceDate
+            let task = Task {
+                probe.store(await adapter.forecastForPresentation(horizonMinutes: 60, at: date))
+                completed.fulfill()
+            }
+            defer { task.cancel() }
+            await fulfillment(of: [reading], timeout: 3)
+            task.cancel()
+            releaseRead.signal()
+            await fulfillment(of: [completed], timeout: 3)
+            let cancelled = try XCTUnwrap(probe.outcome)
+            XCTAssertEqual(cancelled.result.reason, .dataUnavailable)
+            XCTAssertTrue(cancelled.result.points.isEmpty)
+            XCTAssertNil(cancelled.result.referenceDate)
+            XCTAssertNil(cancelled.result.mlForecast)
+            XCTAssertNil(cancelled.conditionalPlannedPoints)
+            XCTAssertEqual(probe.readCount, 1)
+            XCTAssertEqual(captured.count, 0,
+                "Neither a successful nor failed read may log a cancelled request")
+        }
+    }
+
+    @MainActor func testAlreadyCancelledPresentationDoesNotQueueOrLogInvalidInput() async throws {
+        let fixture = try makeCancellationFixture()
+        defer { fixture.defaults.removePersistentDomain(forName: fixture.suite) }
+        let captured = ForecastAdapterLogCapture()
+        let adapter = GlucoseForecastDataAdapter(coreDataManager: fixture.core,
+            therapyManager: fixture.therapy, defaults: fixture.defaults,
+            healthImporter: fixture.importer, logForecast: captured.append,
+            enqueuePresentation: { _ in XCTFail("An already cancelled request must not queue work") })
+        let task = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            return await adapter.forecastForPresentation(horizonMinutes: 35)
+        }
+        let cancelled = await task.value
+        XCTAssertEqual(cancelled.result.reason, .dataUnavailable)
+        XCTAssertTrue(cancelled.result.points.isEmpty)
+        XCTAssertEqual(captured.count, 0)
+    }
+
+    @MainActor private func makeCancellationFixture() throws -> (
+        suite: String, defaults: UserDefaults, core: CoreDataManager,
+        therapy: TherapyMetricsManager, importer: HealthKitTherapyImportManager
+    ) {
+        let suite = "ForecastAdapterCancellation-" + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defaults.isMaster = true
+        defaults.therapyDataSourceType = .none
+        defaults.nightscoutEnabled = false
+        defaults.glucoseForecastManualSensitivityMgdlPerUnit = 36
+        defaults.glucoseForecastManualCarbRatioGramsPerUnit = 10
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let sensor = Sensor(startDate: referenceDate.addingTimeInterval(-3600),
+                            nsManagedObjectContext: core.mainManagedObjectContext)
+        for minute in stride(from: -30, through: 0, by: 5) {
+            let reading = BgReading(timeStamp: referenceDate.addingTimeInterval(Double(minute * 60)),
+                sensor: sensor, calibration: nil, rawData: 140,
+                deviceName: "Synthetic", nsManagedObjectContext: core.mainManagedObjectContext)
+            reading.calculatedValue = 140
+        }
+        XCTAssertTrue(core.saveChangesSynchronously())
+        let therapy = TherapyMetricsManager()
+        therapy.configure(coreDataManager: core, externalStatus: { nil })
+        let importer = HealthKitTherapyImportManager(query: ForecastAdapterNoHealthQuery(), defaults: defaults)
+        return (suite, defaults, core, therapy, importer)
+    }
+
     @MainActor func testCompletedCalculationLogsOncePerCacheAndSettingsStillRefreshUI() async throws {
         let suite = "ForecastAdapterLogging-" + UUID().uuidString
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
@@ -376,5 +516,48 @@ private final class ForecastAdapterLogCapture: @unchecked Sendable {
     var count: Int { lock.lock(); defer { lock.unlock() }; return records.count }
     func append(_ snapshot: GlucoseForecastLogSnapshot) {
         lock.lock(); defer { lock.unlock() }; records.append(snapshot)
+    }
+}
+
+private enum ForecastAdapterSyntheticReadError: Error { case unavailable }
+
+private final class ForecastAdapterCancellationProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var enqueued = 0
+    private var reads = 0
+    private var result: GlucoseForecastPresentationOutcome?
+
+    var readCount: Int { lock.lock(); defer { lock.unlock() }; return reads }
+    var outcome: GlucoseForecastPresentationOutcome? { lock.lock(); defer { lock.unlock() }; return result }
+    func didEnqueue() -> Int {
+        lock.lock(); defer { lock.unlock() }
+        enqueued += 1
+        return enqueued
+    }
+    func didRead() { lock.lock(); defer { lock.unlock() }; reads += 1 }
+    func store(_ outcome: GlucoseForecastPresentationOutcome) {
+        lock.lock(); defer { lock.unlock() }; result = outcome
+    }
+}
+
+private final class ForecastAdapterNoHealthQuery: HealthTherapyQuerying {
+    func requestReadAuthorization(for kind: HealthTherapyImportKind,
+                                  completion: @escaping (Error?) -> Void) {
+        XCTFail("Synthetic presentation tests must not request Health authorization")
+        completion(ForecastAdapterSyntheticReadError.unavailable)
+    }
+    func discoverSources(for kind: HealthTherapyImportKind,
+                         completion: @escaping ([HealthTherapyImportSource], Error?) -> Void) {
+        XCTFail("Synthetic presentation tests must not read Health sources")
+        completion([], ForecastAdapterSyntheticReadError.unavailable)
+    }
+    func page(for kind: HealthTherapyImportKind, since: Date, anchor: Data?, limit: Int,
+              completion: @escaping (Result<HealthTherapyImportPage, Error>) -> Void) {
+        XCTFail("Synthetic presentation tests must not read Health samples")
+        completion(.failure(ForecastAdapterSyntheticReadError.unavailable))
+    }
+    func observe(_ kind: HealthTherapyImportKind,
+                 onChange: @escaping (@escaping () -> Void) -> Void) {
+        XCTFail("Synthetic presentation tests must not observe Health")
     }
 }

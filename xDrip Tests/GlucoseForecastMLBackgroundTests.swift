@@ -12,6 +12,33 @@ final class GlucoseForecastMLBackgroundTests: XCTestCase {
         func set(_ newValue: Value) { lock.lock(); value = newValue; lock.unlock() }
     }
 
+    /// Pause the first real lock holder, and observe each contender before it
+    /// blocks. This gives the tests a deterministic contention boundary.
+    private final class GatedLock: NSLock, @unchecked Sendable {
+        private let requested: XCTestExpectation
+        private let acquired: XCTestExpectation
+        private let resumeGate = DispatchSemaphore(value: 0)
+        private var pauseFirstHolder = true
+
+        init(requested: XCTestExpectation, acquired: XCTestExpectation) {
+            self.requested = requested
+            self.acquired = acquired
+            super.init()
+        }
+
+        override func lock() {
+            requested.fulfill()
+            super.lock()
+            if pauseFirstHolder {
+                pauseFirstHolder = false
+                acquired.fulfill()
+                resumeGate.wait()
+            }
+        }
+
+        func resume() { resumeGate.signal() }
+    }
+
     private actor ReadinessGate {
         private var opened = false
         private var waiter: CheckedContinuation<Void, Never>?
@@ -231,6 +258,117 @@ final class GlucoseForecastMLBackgroundTests: XCTestCase {
         XCTAssertEqual(completedRestart.nextAutomaticAttempt(
             context: context(source: "new-source"), at: afterRetry.addingTimeInterval(3600)),
             afterRetry.addingTimeInterval(3600))
+    }
+
+    func testBlockedHistoryKeepsCooldownIOIndependentAndSnapshotOperationsSerialized() throws {
+        let initialStore = temporaryStore()
+        defer { try? FileManager.default.removeItem(at: initialStore.directory) }
+        let older = snapshot()
+        let newer = snapshot()
+        let source = context()
+        let now = clock
+        try initialStore.save(older)
+
+        let requested = expectation(description: "save, load and remove request the history lock")
+        requested.expectedFulfillmentCount = 3
+        let acquired = expectation(description: "replacement holds the history lock")
+        let snapshotLock = GatedLock(requested: requested, acquired: acquired)
+        let store = GlucoseForecastMLPreparedHistoryStore(directory: initialStore.directory,
+                                                          snapshotLock: snapshotLock)
+        let finished = expectation(description: "all file operations finish after release")
+        finished.expectedFulfillmentCount = 4
+        let metadataFinished = expectation(description: "cooldown IO finishes while history is held")
+        let saved = LockedValue(false)
+        let loaded = LockedValue(false)
+        let removed = LockedValue(false)
+        defer { snapshotLock.resume() }
+
+        DispatchQueue.global().async {
+            defer { saved.set(true); finished.fulfill() }
+            do { try store.save(newer) } catch { XCTFail("Snapshot save failed: \(error)") }
+        }
+        wait(for: [acquired], timeout: 3)
+        DispatchQueue.global().async {
+            XCTAssertEqual(store.load(context: source, at: now)?.id, newer.id)
+            loaded.set(true)
+            finished.fulfill()
+        }
+        DispatchQueue.global().async {
+            store.remove(id: older.id)
+            removed.set(true)
+            finished.fulfill()
+        }
+        DispatchQueue.global().async {
+            defer { metadataFinished.fulfill(); finished.fulfill() }
+            do {
+                XCTAssertEqual(store.nextAutomaticAttempt(context: source, at: now), now)
+                XCTAssertEqual(store.nextPreparationDate(context: source, at: now), now)
+                try store.recordAttempt(context: source, at: now, completed: false)
+                XCTAssertEqual(store.nextAutomaticAttempt(context: source, at: now),
+                               now.addingTimeInterval(24 * 3600))
+                XCTAssertEqual(store.nextPreparationDate(context: source, at: now),
+                               now.addingTimeInterval(24 * 3600))
+                try store.recordAttempt(context: source, at: now, completed: true)
+                let restarted = GlucoseForecastMLPreparedHistoryStore(directory: store.directory)
+                XCTAssertEqual(restarted.nextAutomaticAttempt(context: source, at: now),
+                               now.addingTimeInterval(GlucoseForecastMLChronology.modelAgeLimit))
+                XCTAssertEqual(restarted.nextPreparationDate(context: source, at: now),
+                               now.addingTimeInterval(GlucoseForecastMLChronology.modelAgeLimit - 24 * 3600))
+            } catch { XCTFail("Cooldown write failed: \(error)") }
+        }
+        wait(for: [requested, metadataFinished], timeout: 3)
+        // All three history calls have reached the held lock. No sleep or
+        // scheduler-speed assumption is needed to assert they cannot finish.
+        XCTAssertFalse(saved.get())
+        XCTAssertFalse(loaded.get())
+        XCTAssertFalse(removed.get())
+        snapshotLock.resume()
+        wait(for: [finished], timeout: 3)
+        XCTAssertEqual(initialStore.load(context: source, at: now)?.id, newer.id)
+    }
+
+    func testCooldownReadersWaitForTheSameFileWriteAndObserveCompletedCadence() throws {
+        let initialStore = temporaryStore()
+        defer { try? FileManager.default.removeItem(at: initialStore.directory) }
+        let source = context()
+        let now = clock
+        try initialStore.recordAttempt(context: source, at: now, completed: false)
+
+        let requested = expectation(description: "writer and both cooldown readers request the attempt lock")
+        requested.expectedFulfillmentCount = 3
+        let acquired = expectation(description: "completed attempt holds its file lock")
+        let attemptLock = GatedLock(requested: requested, acquired: acquired)
+        let store = GlucoseForecastMLPreparedHistoryStore(directory: initialStore.directory,
+                                                          attemptLock: attemptLock)
+        let finished = expectation(description: "cooldown operations finish after release")
+        finished.expectedFulfillmentCount = 3
+        let attemptDate = LockedValue<Date?>(nil)
+        let preparationDate = LockedValue<Date?>(nil)
+        defer { attemptLock.resume() }
+
+        DispatchQueue.global().async {
+            defer { finished.fulfill() }
+            do { try store.recordAttempt(context: source, at: now, completed: true) }
+            catch { XCTFail("Cooldown write failed: \(error)") }
+        }
+        wait(for: [acquired], timeout: 3)
+        DispatchQueue.global().async {
+            attemptDate.set(store.nextAutomaticAttempt(context: source, at: now))
+            finished.fulfill()
+        }
+        DispatchQueue.global().async {
+            preparationDate.set(store.nextPreparationDate(context: source, at: now))
+            finished.fulfill()
+        }
+        wait(for: [requested], timeout: 3)
+        XCTAssertNil(attemptDate.get())
+        XCTAssertNil(preparationDate.get())
+        attemptLock.resume()
+        wait(for: [finished], timeout: 3)
+        XCTAssertEqual(attemptDate.get(), now.addingTimeInterval(GlucoseForecastMLChronology.modelAgeLimit))
+        XCTAssertEqual(preparationDate.get(),
+                       now.addingTimeInterval(GlucoseForecastMLChronology.modelAgeLimit - 24 * 3600))
+        XCTAssertEqual(initialStore.nextAutomaticAttempt(context: source, at: now), attemptDate.get())
     }
 
     func testPreparedFilesAreExcludedFromBackupAndProtected() throws {

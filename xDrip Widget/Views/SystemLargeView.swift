@@ -13,9 +13,9 @@ extension XDripWidget.EntryView {
     var systemLargeView: some View {
         VStack(spacing: 0) {
             HStack(alignment: .center) {
-                Text("\(entry.widgetState.bgValueStringInUserChosenUnit()) \(entry.widgetState.trendArrow())")
+                Text("\(entry.widgetState.bgValueStringInUserChosenUnit(at: entry.date)) \(entry.widgetState.trendArrow(at: entry.date))")
                     .font(.largeTitle).fontWeight(.bold)
-                    .foregroundStyle(entry.widgetState.bgTextColor())
+                    .foregroundStyle(entry.widgetState.bgTextColor(at: entry.date))
                     .scaledToFill()
                     .minimumScaleFactor(0.5)
                     .lineLimit(1)
@@ -24,9 +24,9 @@ extension XDripWidget.EntryView {
                 
                 HStack(alignment: .center, spacing: 10) {
                     HStack(alignment: .firstTextBaseline, spacing: 4) {
-                        Text(entry.widgetState.deltaChangeStringInUserChosenUnit())
+                        Text(entry.widgetState.deltaChangeStringInUserChosenUnit(at: entry.date))
                             .font(.title).fontWeight(.semibold)
-                            .foregroundStyle(entry.widgetState.deltaChangeTextColor())
+                            .foregroundStyle(entry.widgetState.deltaChangeTextColor(at: entry.date))
                             .lineLimit(1)
                         Text(entry.widgetState.bgUnitString)
                             .font(.title)
@@ -43,7 +43,7 @@ extension XDripWidget.EntryView {
             }
             .padding(.bottom, 6)
             
-            GlucoseChartView(glucoseChartType: .widgetSystemLarge, bgReadingValues: entry.widgetState.bgReadingValues, bgReadingDates: entry.widgetState.bgReadingDates, isMgDl: entry.widgetState.isMgDl, urgentLowLimitInMgDl: entry.widgetState.urgentLowLimitInMgDl, lowLimitInMgDl: entry.widgetState.lowLimitInMgDl, highLimitInMgDl: entry.widgetState.highLimitInMgDl, urgentHighLimitInMgDl: entry.widgetState.urgentHighLimitInMgDl, liveActivityType: nil, hoursToShowScalingHours: nil, glucoseCircleDiameterScalingHours: nil, overrideChartHeight: nil, overrideChartWidth: nil, highContrast: nil)
+            GlucoseChartView(glucoseChartType: .widgetSystemLarge, bgReadingValues: entry.widgetState.bgReadingValues, bgReadingDates: entry.widgetState.bgReadingDates, explicitVisibleEndDate: entry.date, isMgDl: entry.widgetState.isMgDl, urgentLowLimitInMgDl: entry.widgetState.urgentLowLimitInMgDl, lowLimitInMgDl: entry.widgetState.lowLimitInMgDl, highLimitInMgDl: entry.widgetState.highLimitInMgDl, urgentHighLimitInMgDl: entry.widgetState.urgentHighLimitInMgDl, liveActivityType: nil, hoursToShowScalingHours: nil, glucoseCircleDiameterScalingHours: nil, overrideChartHeight: nil, overrideChartWidth: nil, highContrast: nil)
             
             HStack(alignment: .center) {
                 // if we're in follower mode and a patient name exists, let's use it with preference over the data source

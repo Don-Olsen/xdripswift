@@ -101,34 +101,40 @@ final class GlucoseForecastMLPreparedHistoryStore: @unchecked Sendable {
         let attemptedAt: Date
         let completedAt: Date?
     }
-    private let lock = NSLock()
+    // Keep each file's operations serialized without making foreground cooldown
+    // checks wait for history encoding, decoding or validation.
+    private let snapshotLock: NSLock
+    private let attemptLock: NSLock
     let directory: URL
     init(directory: URL = FileManager.default.urls(for: .applicationSupportDirectory,
                                                    in: .userDomainMask)[0]
-        .appendingPathComponent("GlucoseForecastML/prepared", isDirectory: true)) {
+        .appendingPathComponent("GlucoseForecastML/prepared", isDirectory: true),
+         snapshotLock: NSLock = NSLock(), attemptLock: NSLock = NSLock()) {
         self.directory = directory
+        self.snapshotLock = snapshotLock
+        self.attemptLock = attemptLock
     }
     private var snapshotURL: URL { directory.appendingPathComponent("history.json") }
     private var attemptURL: URL { directory.appendingPathComponent("automatic-attempt.json") }
 
     func save(_ snapshot: GlucoseForecastMLPreparedHistory) throws {
-        lock.lock(); defer { lock.unlock() }
+        snapshotLock.lock(); defer { snapshotLock.unlock() }
         try write(snapshot, to: snapshotURL)
     }
     func load(context: GlucoseForecastMLContext, at now: Date) -> GlucoseForecastMLPreparedHistory? {
-        lock.lock(); defer { lock.unlock() }
+        snapshotLock.lock(); defer { snapshotLock.unlock() }
         guard let snapshot: GlucoseForecastMLPreparedHistory = read(snapshotURL),
               snapshot.isUsable(context: context, at: now) else { return nil }
         return snapshot
     }
     func remove(id: UUID) {
-        lock.lock(); defer { lock.unlock() }
+        snapshotLock.lock(); defer { snapshotLock.unlock() }
         guard let snapshot: GlucoseForecastMLPreparedHistory = read(snapshotURL),
               snapshot.id == id else { return }
         try? FileManager.default.removeItem(at: snapshotURL)
     }
     func nextAutomaticAttempt(context: GlucoseForecastMLContext, at now: Date) -> Date {
-        lock.lock(); defer { lock.unlock() }
+        attemptLock.lock(); defer { attemptLock.unlock() }
         guard let attempt: AutomaticAttempt = read(attemptURL), attempt.context == context else { return now }
         return max(now, attempt.completedAt.map {
             $0.addingTimeInterval(GlucoseForecastMLChronology.modelAgeLimit)
@@ -137,14 +143,14 @@ final class GlucoseForecastMLPreparedHistoryStore: @unchecked Sendable {
     /// A completed weekly attempt can prepare tomorrow's due input one day early;
     /// failed preparation gets the full durable 24-hour retry delay.
     func nextPreparationDate(context: GlucoseForecastMLContext, at now: Date) -> Date {
-        lock.lock(); defer { lock.unlock() }
+        attemptLock.lock(); defer { attemptLock.unlock() }
         guard let attempt: AutomaticAttempt = read(attemptURL), attempt.context == context else { return now }
         return max(now, attempt.completedAt.map {
             $0.addingTimeInterval(GlucoseForecastMLChronology.modelAgeLimit - 24 * 3600)
         } ?? attempt.attemptedAt.addingTimeInterval(24 * 3600))
     }
     func recordAttempt(context: GlucoseForecastMLContext, at date: Date, completed: Bool) throws {
-        lock.lock(); defer { lock.unlock() }
+        attemptLock.lock(); defer { attemptLock.unlock() }
         try write(AutomaticAttempt(context: context, attemptedAt: date,
                                    completedAt: completed ? date : nil), to: attemptURL)
     }

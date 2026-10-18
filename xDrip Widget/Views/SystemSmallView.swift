@@ -15,9 +15,9 @@ extension XDripWidget.EntryView {
             if isNotBeingUsedInStandByMode {
                 // this is the standard widget view
                 HStack(alignment: .center) {
-                    Text("\(entry.widgetState.bgValueStringInUserChosenUnit())\(entry.widgetState.trendArrow())")
+                    Text("\(entry.widgetState.bgValueStringInUserChosenUnit(at: entry.date))\(entry.widgetState.trendArrow(at: entry.date))")
                         .font(.title).fontWeight(.bold)
-                        .foregroundStyle(entry.widgetState.bgTextColor())
+                        .foregroundStyle(entry.widgetState.bgTextColor(at: entry.date))
                         .lineLimit(1)
                         .minimumScaleFactor(0.5)
                     
@@ -28,9 +28,9 @@ extension XDripWidget.EntryView {
                             .font(.body).bold()
                             .foregroundStyle(deviceStatusColor)
                     } else {
-                        Text(entry.widgetState.deltaChangeStringInUserChosenUnit())
+                        Text(entry.widgetState.deltaChangeStringInUserChosenUnit(at: entry.date))
                             .font(.title2).fontWeight(.semibold)
-                            .foregroundStyle(entry.widgetState.deltaChangeTextColor())
+                            .foregroundStyle(entry.widgetState.deltaChangeTextColor(at: entry.date))
                             .lineLimit(1)
                             .minimumScaleFactor(0.5)
                     }
@@ -38,7 +38,7 @@ extension XDripWidget.EntryView {
                 .padding(.top, -6)
                 .padding(.bottom, 6)
                 
-                GlucoseChartView(glucoseChartType: .widgetSystemSmall, bgReadingValues: entry.widgetState.bgReadingValues, bgReadingDates: entry.widgetState.bgReadingDates, isMgDl: entry.widgetState.isMgDl, urgentLowLimitInMgDl: entry.widgetState.urgentLowLimitInMgDl, lowLimitInMgDl: entry.widgetState.lowLimitInMgDl, highLimitInMgDl: entry.widgetState.highLimitInMgDl, urgentHighLimitInMgDl: entry.widgetState.urgentHighLimitInMgDl, liveActivityType: nil, hoursToShowScalingHours: nil, glucoseCircleDiameterScalingHours: nil, overrideChartHeight: nil, overrideChartWidth: nil, highContrast: nil)
+                GlucoseChartView(glucoseChartType: .widgetSystemSmall, bgReadingValues: entry.widgetState.bgReadingValues, bgReadingDates: entry.widgetState.bgReadingDates, explicitVisibleEndDate: entry.date, isMgDl: entry.widgetState.isMgDl, urgentLowLimitInMgDl: entry.widgetState.urgentLowLimitInMgDl, lowLimitInMgDl: entry.widgetState.lowLimitInMgDl, highLimitInMgDl: entry.widgetState.highLimitInMgDl, urgentHighLimitInMgDl: entry.widgetState.urgentHighLimitInMgDl, liveActivityType: nil, hoursToShowScalingHours: nil, glucoseCircleDiameterScalingHours: nil, overrideChartHeight: nil, overrideChartWidth: nil, highContrast: nil)
                 
                 HStack(alignment: .center) {
                     Text(entry.widgetState.dataSourceDescription)
@@ -62,9 +62,9 @@ extension XDripWidget.EntryView {
                 if !entry.widgetState.forceStandByBigNumbers {
                     // this is the standard standby view
                     HStack(alignment: .center) {
-                        Text("\(entry.widgetState.bgValueStringInUserChosenUnit())\(entry.widgetState.trendArrow())")
+                        Text("\(entry.widgetState.bgValueStringInUserChosenUnit(at: entry.date))\(entry.widgetState.trendArrow(at: entry.date))")
                             .font(.largeTitle).fontWeight(.bold)
-                            .foregroundStyle(isAtNight() ? .white : entry.widgetState.bgTextColor())
+                            .foregroundStyle(isAtNight() ? .white : entry.widgetState.bgTextColor(at: entry.date))
                             .lineLimit(1)
                             .minimumScaleFactor(0.5)
                         
@@ -75,9 +75,9 @@ extension XDripWidget.EntryView {
                                 .font(.title3).bold()
                                 .foregroundStyle(isAtNight() ? .white : deviceStatusColor)
                         } else {
-                            Text(entry.widgetState.deltaChangeStringInUserChosenUnit())
+                            Text(entry.widgetState.deltaChangeStringInUserChosenUnit(at: entry.date))
                                 .font(.title2).fontWeight(.bold)
-                                .foregroundStyle(isAtNight() ? .white : entry.widgetState.deltaChangeTextColor())
+                                .foregroundStyle(isAtNight() ? .white : entry.widgetState.deltaChangeTextColor(at: entry.date))
                                 .lineLimit(1)
                                 .minimumScaleFactor(0.5)
                         }
@@ -85,27 +85,27 @@ extension XDripWidget.EntryView {
                     .padding(.top, 0)
                     .padding(.bottom, 2)
                     
-                    GlucoseChartView(glucoseChartType: .widgetSystemSmallStandBy, bgReadingValues: entry.widgetState.bgReadingValues, bgReadingDates: entry.widgetState.bgReadingDates, isMgDl: entry.widgetState.isMgDl, urgentLowLimitInMgDl: entry.widgetState.urgentLowLimitInMgDl, lowLimitInMgDl: entry.widgetState.lowLimitInMgDl, highLimitInMgDl: entry.widgetState.highLimitInMgDl, urgentHighLimitInMgDl: entry.widgetState.urgentHighLimitInMgDl, liveActivityType: nil, hoursToShowScalingHours: nil, glucoseCircleDiameterScalingHours: nil, overrideChartHeight: nil, overrideChartWidth: nil, highContrast: isAtNight())
+                    GlucoseChartView(glucoseChartType: .widgetSystemSmallStandBy, bgReadingValues: entry.widgetState.bgReadingValues, bgReadingDates: entry.widgetState.bgReadingDates, explicitVisibleEndDate: entry.date, isMgDl: entry.widgetState.isMgDl, urgentLowLimitInMgDl: entry.widgetState.urgentLowLimitInMgDl, lowLimitInMgDl: entry.widgetState.lowLimitInMgDl, highLimitInMgDl: entry.widgetState.highLimitInMgDl, urgentHighLimitInMgDl: entry.widgetState.urgentHighLimitInMgDl, liveActivityType: nil, hoursToShowScalingHours: nil, glucoseCircleDiameterScalingHours: nil, overrideChartHeight: nil, overrideChartWidth: nil, highContrast: isAtNight())
                     
                 } else {
                     // this is the "big number" standby view
                     VStack(alignment: .center, spacing: -10) {
-                        Text(entry.widgetState.bgValueStringInUserChosenUnit())
+                        Text(entry.widgetState.bgValueStringInUserChosenUnit(at: entry.date))
                             .font(.system(size: 200)).fontWeight(.bold)
-                            .foregroundStyle(isAtNight() ? .white : entry.widgetState.bgTextColor())
+                            .foregroundStyle(isAtNight() ? .white : entry.widgetState.bgTextColor(at: entry.date))
                             .lineLimit(1)
                             .minimumScaleFactor(0.2)
                         
                         HStack(alignment: .center) {
-                            Text(entry.widgetState.trendArrow())
+                            Text(entry.widgetState.trendArrow(at: entry.date))
                                 .font(.largeTitle).fontWeight(.bold)
-                                .foregroundStyle(isAtNight() ? .white : entry.widgetState.bgTextColor())
+                                .foregroundStyle(isAtNight() ? .white : entry.widgetState.bgTextColor(at: entry.date))
                             
                             Spacer()
                             
-                            Text(entry.widgetState.deltaChangeStringInUserChosenUnit())
+                            Text(entry.widgetState.deltaChangeStringInUserChosenUnit(at: entry.date))
                                 .font(.largeTitle).fontWeight(.bold)
-                                .foregroundStyle(isAtNight() ? .white : entry.widgetState.deltaChangeTextColor())
+                                .foregroundStyle(isAtNight() ? .white : entry.widgetState.deltaChangeTextColor(at: entry.date))
                             
                             if let deviceStatusIconImage = entry.widgetState.deviceStatusIconImage(), let deviceStatusColor = entry.widgetState.deviceStatusColor() {
                                 Spacer()

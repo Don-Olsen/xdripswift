@@ -4,6 +4,24 @@ The iPhone Home chart can show a separate, dotted estimate for the next 60 minut
 
 Forecast points are never saved as BG readings or sent to Nightscout, Apple Health or Watch. From the post-4294 local-treatment change, the existing engine can also supply a separate bolus safety check and the new optional “Low soon” warning. Neither use writes forecast points as measurements, and ML never supplies the safety check or warning. Watch sensor ownership, Bluetooth recovery and workout runtime are unchanged. These checks use new glucose events, without polling or a keepalive timer.
 
+## Presentation cancellation and prepared-history locking (18 October 2026)
+
+Home presentation requests carry Swift task cancellation into the existing serial
+GCD worker through a request-local token. Superseded work checks the token at
+read/calculation/inference boundaries and before logging; cancellation is not
+recorded as an unavailable-data attempt. Every queued request still resumes its
+continuation once. An already executing database fetch or Core ML call finishes
+before the next check; Home retains its existing generation/cancellation guard.
+A cancelled, unlogged engine result is not added to the presentation cache.
+
+The prepared-history store serializes its history file independently of its tiny
+automatic-attempt file. Foreground cooldown checks therefore do not wait behind
+history encoding, decoding or validation. Each file retains atomic writes and its
+existing protection, backup, compatibility and cadence rules. Engine mathematics,
+model training/approval and safety-forecast callers are unchanged. Deterministic
+regression tests cover cancellation and file-lock contention; physical latency
+and battery gains have not been measured.
+
 ## Preventive carbohydrate help in the iPhone calculator (after 4321)
 
 The iPhone pen calculator can show a separate **Forebyggende kulhydrathjælp**

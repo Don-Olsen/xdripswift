@@ -1,3 +1,44 @@
+## Fire afgrænsede rettelser efter 4336 — 18. oktober 2026
+
+- iPhone-widgettens rigtige snapshots læser nu gemte data. Eksempeldata bruges
+  kun til forhåndsvisning; manglende/ulæselige data giver en tom tilstand.
+  Tidslinjen indeholder de eksisterende 7- og 20-minutters friskhedsgrænser
+  sammen med IOB/COB-frister. Visningen bruger postens tidspunkt, så en
+  forberedt fremtidig post har korrekt alder; udløbet glukose giver ingen
+  numerisk målerindikator. WidgetKit bestemmer den faktiske levering.
+- ML-historikfilen og den lille fil for automatiske træningsforsøg har hver
+  sin lås. Der er fortsat serialisering og atomiske skrivninger pr. fil,
+  men forgrundens fristopslag venter ikke på stor historikbehandling.
+- En aflyst Home-prognose får et reelt stopsignal på den eksisterende
+  arbejdskø. Den fortsætter ikke til næste fase eller fejlregistreres som
+  manglende data. Igangværende database-/ML-kald afbrydes ikke midt i kaldet;
+  de eksisterende visningskontroller afviser stadig forældede resultater.
+- Efter glukoseefterbehandling gennemløbes widget-/Live Activity-publiceringen
+  én gang. Den indre publicering springes over netop i dette forløb;
+  Watch-opdateringer, almindelige Home-opdateringer og udskudt publicering
+  af ændrede behandlingsværdier bevares.
+
+Der er tilføjet 15 målrettede XCTest-tests på de faktiske produktionsstier.
+De bruger syntetiske data og kontrollerede kø-/låsegrænser. Første indledende
+build fandt en manglende farveressource i widgettens nye testtarget; dette er
+rettet i testopsætningen. Den indledende fulde suite i
+`20261018T072340Z-94068` bestod med **1720/1720 tests, 0 fejl og 0 skipped**.
+Python-kontrollerne samt de syntetiske Watch-kontroller bestod. Releaseproceduren
+vælger nummer hos Apple og gentester det præcise checkpoint; dens kvittering og
+Apple-status registreres særskilt. Ingen eksisterende test er fjernet eller
+svækket. Testkørslen har fortsat SwiftUI-frameadvarsler i eksisterende hostede
+visningstests og en QoS-advarsel i TroubleshootingLogTests; disse er ikke
+beskrevet som løst af denne ændring.
+
+Dosisregler, prognosemotorens matematik, ML-træningskrav, alarmer, HealthKit,
+Libre/Watch-forbindelse og behandlinger er uændrede. Den bredere omlægning af
+behandlingslisten er ikke del af rettelsen. Læsende enhedsoversigt fandt
+telefonen, men versionsopslaget fejlede med timeout og ved gentagelse
+CoreDevice 4016 (enhedstjenester utilgængelige); uret var utilgængeligt.
+Ingen lokal installation, fysisk funktionsprøve eller målt hastigheds-/
+batterigevinst. Widgettens reelle opdatering på låst telefon og StandBy skal
+fortsat kontrolleres efter TestFlight-installation.
+
 <!-- testflight-7.1.1-4336:start -->
 ### TestFlight 7.1.1 (4336)
 

@@ -10,6 +10,10 @@ import Foundation
 import WidgetKit
 import SwiftUI
 
+#if XDRIP_WIDGET_TESTS
+@testable import xdrip
+#endif
+
 extension XDripWidget {
     struct Entry: TimelineEntry {
         var date: Date = .now
@@ -70,10 +74,21 @@ extension XDripWidget.Entry {
             self.bgUnitString = self.isMgDl ? Texts_Common.mgdl : Texts_Common.mmol
         }
         
+        func hasFreshGlucose(at date: Date) -> Bool {
+            guard let bgReadingDate, bgValueInMgDl != nil else { return false }
+            return bgReadingDate > date.addingTimeInterval(-ConstantsWidgetExtension.bgReadingDateStaleInMinutes)
+        }
+
+        func bgValueForDisplay(at date: Date) -> Double? {
+            guard let bgReadingDate,
+                  bgReadingDate > date.addingTimeInterval(-ConstantsWidgetExtension.bgReadingDateVeryStaleInMinutes) else { return nil }
+            return bgValueInMgDl
+        }
+
         /// returns blood glucose value as a string in the user-defined measurement unit. Will check and display also high, low and error texts as required.
         /// - Returns: a String with the formatted value/unit or error text
-        func bgValueStringInUserChosenUnit() -> String {
-            if let bgReadingDate = bgReadingDate, bgReadingDate > Date().addingTimeInterval(-ConstantsWidgetExtension.bgReadingDateVeryStaleInMinutes), let bgValueInMgDl = bgValueInMgDl {
+        func bgValueStringInUserChosenUnit(at date: Date) -> String {
+            if let bgValueInMgDl = bgValueForDisplay(at: date) {
                 var returnValue: String
                 
                 if bgValueInMgDl >= 400 {
@@ -112,8 +127,8 @@ extension XDripWidget.Entry {
         
         /// Blood glucose color dependant on the user defined limit values and based upon the time since the last reading
         /// - Returns: a Color either red, yellow or green
-        func bgTextColor() -> Color {
-            if let bgReadingDate = bgReadingDate, bgReadingDate > Date().addingTimeInterval(-ConstantsWidgetExtension.bgReadingDateStaleInMinutes), let bgValueInMgDl = bgValueInMgDl {
+        func bgTextColor(at date: Date) -> Color {
+            if hasFreshGlucose(at: date), let bgValueInMgDl = bgValueInMgDl {
                 if bgValueInMgDl >= urgentHighLimitInMgDl || bgValueInMgDl <= urgentLowLimitInMgDl {
                     return .red
                 } else if bgValueInMgDl >= highLimitInMgDl || bgValueInMgDl <= lowLimitInMgDl {
@@ -128,8 +143,8 @@ extension XDripWidget.Entry {
         
         /// Delta text color dependant on the time since the last reading
         /// - Returns: a Color either red, yellow or green
-        func deltaChangeTextColor() -> Color {
-            if let bgReadingDate = bgReadingDate, bgReadingDate > Date().addingTimeInterval(-ConstantsWidgetExtension.bgReadingDateStaleInMinutes) {
+        func deltaChangeTextColor(at date: Date) -> Color {
+            if hasFreshGlucose(at: date) {
                 return .colorPrimary
             } else {
                 return .colorTertiary
@@ -137,15 +152,16 @@ extension XDripWidget.Entry {
         }
         
         /// used to return values and colors used by a SwiftUI gauge view
-        /// - Returns: minValue/maxValue - used to define the limits of the gauge. nilValue - used if there is currently no data present (basically puts the gauge at the 50% mark). gaugeGradient - the color ranges used
-        func gaugeModel() -> (minValue: Double, maxValue: Double, nilValue: Double, gaugeColor: Color, gaugeGradient: Gradient) {
+        /// - Returns: minValue/maxValue define the gauge limits; a nil value hides the gauge when glucose is unavailable or expired.
+        func gaugeModel(at date: Date) -> (minValue: Double, maxValue: Double, value: Double?, gaugeColor: Color, gaugeGradient: Gradient) {
             
             var minValue: Double = lowLimitInMgDl
             var maxValue: Double = highLimitInMgDl
             var gaugeColor: Color = .green
             var colorArray = [Color]()
                     
-            if let bgValueInMgDl = bgValueInMgDl {
+            let value = bgValueForDisplay(at: date)
+            if let bgValueInMgDl = value {
                 if bgValueInMgDl >= urgentHighLimitInMgDl {
                     maxValue = ConstantsCalibrationAlgorithms.maximumBgReadingCalculatedValue
                     gaugeColor = .red
@@ -180,16 +196,17 @@ extension XDripWidget.Entry {
                 }
             }
             
-            // calculate a nil value to show on the gauge (as it can't display nil). This should basically just peg the gauge indicator in the middle of the current range
-            let nilValue =  minValue + ((maxValue - minValue) / 2)
-            
-            return (minValue, maxValue, nilValue, gaugeColor, Gradient(colors: colorArray))
+            if !hasFreshGlucose(at: date) {
+                gaugeColor = .colorTertiary
+                colorArray = [.colorTertiary, .colorTertiary]
+            }
+            return (minValue, maxValue, value, gaugeColor, Gradient(colors: colorArray))
         }
         
         /// convert the optional delta change int (in mg/dL) to a formatted change value in the user chosen unit making sure all zero values are shown as a positive change to follow Nightscout convention
         /// - Returns: a string holding the formatted delta change value (i.e. +0.4 or -6)
-        func deltaChangeStringInUserChosenUnit() -> String {
-            if let deltaValueInUserUnit = deltaValueInUserUnit, let bgReadingDate = bgReadingDate, bgReadingDate > Date().addingTimeInterval(-ConstantsWidgetExtension.bgReadingDateVeryStaleInMinutes) {
+        func deltaChangeStringInUserChosenUnit(at date: Date) -> String {
+            if let deltaValueInUserUnit = deltaValueInUserUnit, bgValueForDisplay(at: date) != nil {
                 let deltaSign: String = deltaValueInUserUnit > 0 ? "+" : ""
                 let deltaValueAsString = isMgDl ? deltaValueInUserUnit.mgDlToMmolAndToString(mgDl: isMgDl) : deltaValueInUserUnit.mmolToString()
                 
@@ -204,8 +221,8 @@ extension XDripWidget.Entry {
         
         ///  returns a string holding the trend arrow
         /// - Returns: trend arrow string (i.e.  "↑")
-        func trendArrow() -> String {
-            if let bgReadingDate = bgReadingDate, bgReadingDate > Date().addingTimeInterval(-ConstantsWidgetExtension.bgReadingDateVeryStaleInMinutes) {
+        func trendArrow(at date: Date) -> String {
+            if bgValueForDisplay(at: date) != nil {
                 switch slopeOrdinal {
                 case 7:
                     return "\u{2193}\u{2193}" // ↓↓
@@ -245,7 +262,9 @@ extension XDripWidget.Entry {
 // MARK: - Data
 
 extension XDripWidget.Entry {
-    static var placeholder: Self {
-        .init(date: .now, widgetState: WidgetState(bgReadingValues: ConstantsWidgetExtension.bgReadingValuesPlaceholderData, bgReadingDates: ConstantsWidgetExtension.bgReadingDatesPlaceholderData(), isMgDl: true, slopeOrdinal: 4, deltaValueInUserUnit: 0, urgentLowLimitInMgDl: 70, lowLimitInMgDl: 90, highLimitInMgDl: 140, urgentHighLimitInMgDl: 180, dataSourceDescription: "Dexcom G6", followerPatientName: nil))
+    static var placeholder: Self { placeholder(at: .now) }
+
+    static func placeholder(at date: Date) -> Self {
+        .init(date: date, widgetState: WidgetState(bgReadingValues: ConstantsWidgetExtension.bgReadingValuesPlaceholderData, bgReadingDates: ConstantsWidgetExtension.bgReadingDatesPlaceholderData(at: date), isMgDl: true, slopeOrdinal: 4, deltaValueInUserUnit: 0, urgentLowLimitInMgDl: 70, lowLimitInMgDl: 90, highLimitInMgDl: 140, urgentHighLimitInMgDl: 180, dataSourceDescription: "Dexcom G6", followerPatientName: nil))
     }
 }

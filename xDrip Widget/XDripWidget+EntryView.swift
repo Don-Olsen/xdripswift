@@ -24,7 +24,7 @@ extension XDripWidget {
         // to display the widget in high-contrast mode
         // will only be used in conjunction with isNotInStandByMode
         func isAtNight() -> Bool {
-            if let currentHour = Calendar.current.dateComponents([.hour], from: Date()).hour, currentHour > ConstantsWidgetExtension.nightModeFromHour || currentHour < ConstantsWidgetExtension.nightModeUntilHour {
+            if let currentHour = Calendar.current.dateComponents([.hour], from: entry.date).hour, currentHour > ConstantsWidgetExtension.nightModeFromHour || currentHour < ConstantsWidgetExtension.nightModeUntilHour {
                 return entry.widgetState.allowStandByHighContrast
             } else {
                 return false

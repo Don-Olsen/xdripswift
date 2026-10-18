@@ -236,6 +236,84 @@ final class RootHomeInteractionTests: XCTestCase {
     }
 
     @MainActor
+    func testPostProcessingPublishesWidgetsOnceWhenLocalTherapyPublicationIsDue() {
+        withHomeRefreshDefaults {
+            let now = Date()
+            func metric(_ value: Double) -> TherapyMetricState {
+                TherapyMetricState(amount: value, source: .local, referenceDate: now,
+                    expiresAt: now.addingTimeInterval(17 * 60),
+                    visibilityDeadline: now.addingTimeInterval(4 * 3600), reason: nil)
+            }
+            var snapshot = TherapyMetricsSnapshot(iob: metric(2), cob: metric(20))
+            var publications: [(Bool, TherapyMetricsSnapshot)] = []
+            let model = RootHomeStateModel()
+            let coordinator = RootApplicationCoordinator(homeStateModelForTesting: model,
+                therapySnapshotForTesting: { snapshot },
+                widgetPublicationForTesting: { publications.append(($0, $1)) })
+
+            coordinator.handleBgPostProcessingDidUpdateForTesting()
+            XCTAssertEqual(publications.count, 1,
+                "Due therapy and post-processing must share one widget publication")
+            XCTAssertEqual(publications.first?.0, false)
+            XCTAssertEqual(publications.first?.1, snapshot)
+            XCTAssertEqual(model.state.chartResetToNowRevision, 1)
+
+            // The ordinary therapy throttle must not suppress the glucose event's publication.
+            publications.removeAll()
+            snapshot.iob.amount = 1.75
+            snapshot.cob.amount = 18
+            coordinator.handleBgPostProcessingDidUpdateForTesting()
+            XCTAssertEqual(publications.count, 1)
+            XCTAssertEqual(publications.first?.1, snapshot)
+            XCTAssertEqual(model.state.chartResetToNowRevision, 2)
+
+            // Availability changes remain immediate, with unknown distinct from known zero.
+            publications.removeAll()
+            snapshot.iob.amount = nil
+            snapshot.iob.reason = .readFailed
+            snapshot.cob.amount = 0
+            coordinator.handleBgPostProcessingDidUpdateForTesting()
+            XCTAssertEqual(publications.count, 1)
+            XCTAssertEqual(publications.first?.1, snapshot)
+            XCTAssertNil(publications.first?.1.iob.amount)
+            XCTAssertEqual(publications.first?.1.cob.amount, 0)
+        }
+    }
+
+    @MainActor
+    func testPostProcessingStillPublishesWidgetsWithoutLocalTherapy() {
+        withHomeRefreshDefaults {
+            let snapshot = TherapyMetricsSnapshot.external(nil)
+            var publications: [TherapyMetricsSnapshot] = []
+            let coordinator = RootApplicationCoordinator(homeStateModelForTesting: RootHomeStateModel(),
+                therapySnapshotForTesting: { snapshot },
+                widgetPublicationForTesting: { _, snapshot in publications.append(snapshot) })
+            coordinator.handleBgPostProcessingDidUpdateForTesting()
+            coordinator.handleBgPostProcessingDidUpdateForTesting()
+            XCTAssertEqual(publications, [snapshot, snapshot],
+                "Each separate glucose event must publish even without locally owned IOB/COB")
+        }
+    }
+
+    @MainActor
+    func testStandaloneHomeRefreshStillPublishesDueTherapyToWidgets() {
+        withHomeRefreshDefaults {
+            let now = Date()
+            let zero = TherapyMetricState(amount: 0, source: .local, referenceDate: now,
+                expiresAt: now.addingTimeInterval(17 * 60),
+                visibilityDeadline: now.addingTimeInterval(4 * 3600), reason: nil)
+            let snapshot = TherapyMetricsSnapshot(iob: zero, cob: zero)
+            var publications: [TherapyMetricsSnapshot] = []
+            let coordinator = RootApplicationCoordinator(homeStateModelForTesting: RootHomeStateModel(),
+                therapySnapshotForTesting: { snapshot },
+                widgetPublicationForTesting: { _, snapshot in publications.append(snapshot) })
+            coordinator.refreshHomeOnForegroundForTesting()
+            XCTAssertEqual(publications, [snapshot],
+                "Only the post-processing event defers its nested widget update")
+        }
+    }
+
+    @MainActor
     func testStandalonePostProcessingSettingChangeStillRefreshesHomeImmediately() {
         withHomeRefreshDefaults {
             let model = RootHomeStateModel()

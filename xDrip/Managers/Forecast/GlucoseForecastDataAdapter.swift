@@ -54,6 +54,9 @@ final class GlucoseForecastDataAdapter {
     private let appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown"
     private let appBuild = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown"
     private let worker = DispatchQueue(label: "glucose.forecast.inputs", qos: .utility)
+    /// Injectable dispatch/read boundaries for deterministic cancellation tests.
+    private let enqueuePresentation: ((DispatchWorkItem) -> Void)?
+    private let presentationGlucoseFetch: GlucoseFetch?
     private let cacheLock = NSLock()
     private var cache: (key: CacheKey, result: GlucoseForecastResult)?
 
@@ -61,12 +64,16 @@ final class GlucoseForecastDataAdapter {
          therapyManager: TherapyMetricsManager = .shared,
          defaults: UserDefaults = .standard,
          healthImporter: HealthKitTherapyImportManager = .shared,
-         logForecast: @escaping (GlucoseForecastLogSnapshot) -> Void = { GlucoseForecastLog.shared.enqueue($0) }) {
+         logForecast: @escaping (GlucoseForecastLogSnapshot) -> Void = { GlucoseForecastLog.shared.enqueue($0) },
+         enqueuePresentation: ((DispatchWorkItem) -> Void)? = nil,
+         presentationGlucoseFetch: GlucoseFetch? = nil) {
         self.coreDataManager = coreDataManager
         self.therapyManager = therapyManager
         self.defaults = defaults
         self.healthImporter = healthImporter
         self.logForecast = logForecast
+        self.enqueuePresentation = enqueuePresentation
+        self.presentationGlucoseFetch = presentationGlucoseFetch
     }
 
     func forecast(horizonMinutes: Int, at now: Date = .now) async -> GlucoseForecastResult {
@@ -196,9 +203,10 @@ final class GlucoseForecastDataAdapter {
 
     func forecastForPresentation(horizonMinutes: Int, at now: Date = .now) async -> GlucoseForecastPresentationOutcome {
         // Disabling the feature is not a failed calculation attempt.
-        if horizonMinutes == 0 { return .init(result: Self.unavailable(.dataUnavailable)) }
+        if horizonMinutes == 0 || Task.isCancelled { return Self.cancelledPresentation }
         func unavailable(_ reason: GlucoseForecastUnavailableReason) -> GlucoseForecastPresentationOutcome {
-            .init(result: record(Self.unavailable(reason), horizonMinutes: horizonMinutes))
+            .init(result: record(Self.unavailable(reason), horizonMinutes: horizonMinutes,
+                                 isCancelled: { Task.isCancelled }))
         }
         let inputSignature = Self.presentationInputSignature(horizonMinutes: horizonMinutes,
                                                             defaults: defaults, importer: healthImporter)
@@ -230,33 +238,48 @@ final class GlucoseForecastDataAdapter {
         let manualRatio = defaults.glucoseForecastManualCarbRatioGramsPerUnit
         let parameters = Self.manualParameters(sensitivity: manualSensitivity, ratio: manualRatio)
         if case .failure(let reason) = parameters { return unavailable(reason) }
-        return await withCheckedContinuation { continuation in
-            worker.async(execute: DispatchWorkItem { [self] in
-                continuation.resume(returning: buildForecast(
-                    horizonMinutes: horizonMinutes,
-                    at: now,
-                    policy: policy,
-                    settings: settings,
-                    manualSensitivity: manualSensitivity,
-                    manualRatio: manualRatio,
-                    inputSignature: inputSignature,
-                    mlSourceSignature: mlSourceSignature
-                ))
-            })
+        let cancellation = GlucoseForecastPresentationCancellation()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                // Never cancel the work item itself: even a superseded queued request
+                // must run its cancellation check and resume this continuation once.
+                let work = DispatchWorkItem { [self] in
+                    continuation.resume(returning: buildForecast(
+                        horizonMinutes: horizonMinutes,
+                        at: now,
+                        policy: policy,
+                        settings: settings,
+                        manualSensitivity: manualSensitivity,
+                        manualRatio: manualRatio,
+                        inputSignature: inputSignature,
+                        mlSourceSignature: mlSourceSignature,
+                        isCancelled: { cancellation.isCancelled }
+                    ))
+                }
+                if let enqueuePresentation { enqueuePresentation(work) }
+                else { worker.async(execute: work) }
+            }
+        } onCancel: {
+            cancellation.cancel()
         }
     }
 
     private func buildForecast(horizonMinutes: Int, at now: Date, policy: DataFlowPolicy,
                                settings: TherapyModelSettings, manualSensitivity: Double?,
                                manualRatio: Double?, inputSignature: String,
-                               mlSourceSignature: String) -> GlucoseForecastPresentationOutcome {
+                               mlSourceSignature: String,
+                               isCancelled: () -> Bool) -> GlucoseForecastPresentationOutcome {
         var knownReference: GlucoseForecastSample?
         func unavailable(_ reason: GlucoseForecastUnavailableReason) -> GlucoseForecastPresentationOutcome {
-            .init(result: record(Self.unavailable(reason), horizonMinutes: horizonMinutes,
-                                 knownReference: knownReference, settings: settings))
+            guard !isCancelled() else { return Self.cancelledPresentation }
+            return .init(result: record(Self.unavailable(reason), horizonMinutes: horizonMinutes,
+                                       knownReference: knownReference, settings: settings,
+                                       isCancelled: isCancelled))
         }
-        guard !Task.isCancelled else { return unavailable(.dataUnavailable) }
-        guard let glucose = recentGlucose(at: now) else { return unavailable(.dataUnavailable) }
+        guard !isCancelled() else { return Self.cancelledPresentation }
+        guard let glucose = recentGlucose(at: now, fetch: presentationGlucoseFetch,
+                                         isCancelled: isCancelled) else { return unavailable(.dataUnavailable) }
+        guard !isCancelled() else { return Self.cancelledPresentation }
         knownReference = glucose.last
         guard let referenceDate = glucose.last?.date else { return unavailable(.missingGlucose) }
         let importer = healthImporter
@@ -274,9 +297,11 @@ final class GlucoseForecastDataAdapter {
         // CGM value so a newly recorded bolus or meal cannot be silently ignored. Wait for a
         // fresh CGM anchor rather than predicting from a pre-treatment measurement.
         let start = referenceDate.addingTimeInterval(-max(settings.insulinDuration, settings.carbDuration) * 60)
+        guard !isCancelled() else { return Self.cancelledPresentation }
         guard let fetchedTreatments = therapyManager.treatments(from: start, to: now,
                                                                 policy: policy, settings: settings)
         else { return unavailable(.dataUnavailable) }
+        guard !isCancelled() else { return Self.cancelledPresentation }
         guard !Self.hasTreatmentAfterReading(fetchedTreatments, referenceDate: referenceDate,
                                              calculationDate: now) else {
             return unavailable(.awaitingNextReading)
@@ -305,18 +330,23 @@ final class GlucoseForecastDataAdapter {
             horizonMinutes: horizonMinutes,
             now: now
         )
+        guard !isCancelled() else { return Self.cancelledPresentation }
         let plannedMeals = futurePlannedMeals(from: referenceDate,
-            through: referenceDate.addingTimeInterval(60 * 60))
+            through: referenceDate.addingTimeInterval(60 * 60), isCancelled: isCancelled)
+        guard !isCancelled() else { return Self.cancelledPresentation }
         func presentation(_ result: GlucoseForecastResult) -> GlucoseForecastPresentationOutcome {
+            guard !isCancelled() else { return Self.cancelledPresentation }
             let conditional = plannedMeals.flatMap { meals -> [GlucoseForecastPoint]? in
                 guard !meals.isEmpty else { return nil }
                 return GlucoseForecastEngine.conditionalPlannedCarbohydratePoints(
                     base: result, planned: meals, sensitivityMgdlPerUnit: sensitivity,
                     carbohydrateRatioGramsPerUnit: ratio, settings: settings)
             }
-            return .init(result: addMLIfUsable(to: result, input: input,
-                sourceSignature: mlSourceSignature),
-                conditionalPlannedPoints: conditional)
+            guard !isCancelled() else { return Self.cancelledPresentation }
+            let presentedResult = addMLIfUsable(to: result, input: input,
+                sourceSignature: mlSourceSignature, isCancelled: isCancelled)
+            guard !isCancelled() else { return Self.cancelledPresentation }
+            return .init(result: presentedResult, conditionalPlannedPoints: conditional)
         }
         let key = CacheKey(glucose: input.glucose.map { Stamp(date: $0.date, value: $0.glucoseMgdl,
                                                             sensorID: $0.sensorID) },
@@ -336,6 +366,7 @@ final class GlucoseForecastDataAdapter {
         cacheLock.lock()
         let cached = cache?.key == key ? cache?.result : nil
         cacheLock.unlock()
+        guard !isCancelled() else { return Self.cancelledPresentation }
         if let cached {
             if cached.reason == nil {
                 GlucoseForecastMLTrainingCoordinator.shared.scheduleIfNeeded(
@@ -345,8 +376,9 @@ final class GlucoseForecastDataAdapter {
             }
             return presentation(cached)
         }
-        guard !Task.isCancelled else { return unavailable(.dataUnavailable) }
+        guard !isCancelled() else { return Self.cancelledPresentation }
         let calculated = GlucoseForecastEngine.predict(input)
+        guard !isCancelled() else { return Self.cancelledPresentation }
         let engineResult = GlucoseForecastResult(points: calculated.points,
                                                  referenceDate: calculated.referenceDate,
                                                  reason: calculated.reason,
@@ -355,11 +387,9 @@ final class GlucoseForecastDataAdapter {
         guard !therapyManager.hasUncommittedForecastInputChanges else {
             return unavailable(.dataUnavailable)
         }
-        cacheLock.lock()
-        cache = (key, engineResult)
-        cacheLock.unlock()
         // Replay and Create ML run on independent low-priority workers only after
         // the unchanged forecast engine has accepted the current sensor inputs.
+        guard !isCancelled() else { return Self.cancelledPresentation }
         if engineResult.reason == nil {
             GlucoseForecastMLTrainingCoordinator.shared.scheduleIfNeeded(
                 coreDataManager: coreDataManager, policy: policy, settings: settings,
@@ -370,23 +400,36 @@ final class GlucoseForecastDataAdapter {
         // engine result can be re-presented with a newly validated local ML model.
         let recordedEngineResult = record(engineResult, horizonMinutes: horizonMinutes,
             input: input, knownReference: knownReference, settings: settings,
-            treatmentWindowStart: start, treatmentWindowEnd: referenceDate)
+            treatmentWindowStart: start, treatmentWindowEnd: referenceDate,
+            isCancelled: isCancelled)
+        guard !isCancelled() else { return Self.cancelledPresentation }
+        // A request cancelled before logging must not suppress a later live attempt
+        // by leaving an unrecorded engine result in the cache.
+        cacheLock.lock()
+        cache = (key, engineResult)
+        cacheLock.unlock()
         return presentation(recordedEngineResult)
     }
 
-    private func futurePlannedMeals(from start: Date, through end: Date) -> [TherapyTreatment]? {
+    private func futurePlannedMeals(from start: Date, through end: Date,
+                                    isCancelled: () -> Bool) -> [TherapyTreatment]? {
+        guard !isCancelled() else { return nil }
         let context = NSManagedObjectContext(concurrencyType: .privateQueueConcurrencyType)
         context.persistentStoreCoordinator =
             coreDataManager.privateManagedObjectContext.persistentStoreCoordinator
         var result: [TherapyTreatment]?
         context.performAndWait {
+            guard !isCancelled() else { return }
+            defer { context.reset() }
             let request: NSFetchRequest<TreatmentEntry> = TreatmentEntry.fetchRequest()
             request.predicate = NSPredicate(format:
                 "date >= %@ AND date <= %@ AND treatmentType == %d AND plannedMealStateRaw == %@ AND (treatmentdeleted == NO OR treatmentdeleted == nil)",
                 start as NSDate, end as NSDate, TreatmentType.Carbs.rawValue,
                 TreatmentMealState.planned.rawValue)
             do {
-                result = try context.fetch(request).compactMap { entry in
+                let entries = try context.fetch(request)
+                guard !isCancelled() else { return }
+                result = entries.compactMap { entry in
                     guard entry.localTreatmentUUID?.isEmpty == false,
                           entry.hasValidMealMetadata, entry.value.isFinite,
                           entry.value > 0 else { return nil }
@@ -395,29 +438,30 @@ final class GlucoseForecastDataAdapter {
                         carbohydrateDurationMinutes: entry.effectiveCarbohydrateDurationMinutes)
                 }
             } catch { result = nil }
-            context.reset()
         }
         return result
     }
 
     private func addMLIfUsable(to engineResult: GlucoseForecastResult,
                                input: GlucoseForecastInput,
-                               sourceSignature: String) -> GlucoseForecastResult {
+                               sourceSignature: String,
+                               isCancelled: () -> Bool) -> GlucoseForecastResult {
         // A treatment source can change while the serial data read is in flight.
         // Never decorate a result from the old source with a model for the new one.
-        guard engineResult.reason == nil,
+        guard !isCancelled(), engineResult.reason == nil,
               sourceSignature == Self.presentationInputSignature(horizonMinutes: 120,
                   defaults: defaults, importer: healthImporter),
               let mlForecast = GlucoseForecastMLManager.shared.infer(input: input,
                   result: engineResult, sourceSignature: sourceSignature) else {
             return engineResult
         }
+        guard !isCancelled() else { return engineResult }
         let selectedML = GlucoseForecastMLPresentation.cappedBelowEngine(mlForecast,
             engine: engineResult,
             currentGlucoseMgdl: input.glucose.last?.glucoseMgdl,
             slope15MgdlPerMinute: Self.rawSlope15(input.glucose),
             lowSoonActive: LowSoonAlertState.isActive(at: input.now, defaults: defaults))
-        guard let selectedML else { return engineResult }
+        guard let selectedML, !isCancelled() else { return engineResult }
         // Record only a model that passed the final presentation guard. Compare the
         // raw old-model curve with the engine, so a display-only low-glucose cap
         // cannot contaminate the model's measured MAE.
@@ -437,7 +481,9 @@ final class GlucoseForecastDataAdapter {
                         knownReference: GlucoseForecastSample? = nil,
                         settings: TherapyModelSettings? = nil,
                         treatmentWindowStart: Date? = nil,
-                        treatmentWindowEnd: Date? = nil) -> GlucoseForecastResult {
+                        treatmentWindowEnd: Date? = nil,
+                        isCancelled: () -> Bool) -> GlucoseForecastResult {
+        guard !isCancelled() else { return result }
         let sensorID = knownReference?.sensorID
         let context = GlucoseForecastLogContext(
             appVersion: appVersion, appBuild: appBuild,
@@ -447,8 +493,11 @@ final class GlucoseForecastDataAdapter {
             insulinModel: settings.map { TherapyInsulinPreset.nearest(to: $0.insulinPeak).rawValue },
             treatmentWindowStart: treatmentWindowStart, treatmentWindowEnd: treatmentWindowEnd)
         do {
-            logForecast(try GlucoseForecastLogSnapshot.make(input: input, result: result, context: context))
+            let snapshot = try GlucoseForecastLogSnapshot.make(input: input, result: result, context: context)
+            guard !isCancelled() else { return result }
+            logForecast(snapshot)
         } catch {
+            guard !isCancelled() else { return result }
             // Deliberately excludes inputs, paths and the error's potentially sensitive text.
             GlucoseForecastLog.shared.captureFailure()
         }
@@ -490,10 +539,12 @@ final class GlucoseForecastDataAdapter {
     /// Read the same downstream-valid final glucose value used by the Home graph. A fresh
     /// sensor's history is never spliced to an older sensor just to manufacture momentum.
     /// A successful empty/filtered selection is []; nil means the store could not be read.
-    func recentGlucose(at now: Date, fetch: GlucoseFetch? = nil) -> [GlucoseForecastSample]? {
+    func recentGlucose(at now: Date, fetch: GlucoseFetch? = nil,
+                       isCancelled: () -> Bool = { false }) -> [GlucoseForecastSample]? {
         let context = coreDataManager.privateManagedObjectContext
         var result: [GlucoseForecastSample]?
         context.performAndWait {
+            guard !isCancelled() else { return }
             let request: NSFetchRequest<BgReading> = BgReading.fetchRequest()
             request.predicate = NSPredicate(
                 format: "timeStamp >= %@ AND timeStamp <= %@",
@@ -506,6 +557,7 @@ final class GlucoseForecastDataAdapter {
             request.relationshipKeyPathsForPrefetching = ["sensor"]
             do {
                 let fetched = try fetch?(context, request) ?? context.fetch(request)
+                guard !isCancelled() else { return }
                 let observations = fetched.map { reading in
                     GlucoseForecastGlucoseObservation(date: reading.timeStamp,
                         glucoseMgdl: reading.finalValue, sensorID: reading.sensor?.id,
@@ -559,6 +611,11 @@ final class GlucoseForecastDataAdapter {
         return .success((sensitivity, ratio))
     }
 
+    /// Cancellation is a control-flow outcome, never a failed prospective forecast attempt.
+    private static var cancelledPresentation: GlucoseForecastPresentationOutcome {
+        .init(result: unavailable(.dataUnavailable))
+    }
+
     private static func unavailable(_ reason: GlucoseForecastUnavailableReason) -> GlucoseForecastResult {
         GlucoseForecastResult(points: [], referenceDate: nil, reason: reason)
     }
@@ -582,5 +639,20 @@ final class GlucoseForecastDataAdapter {
         let sensitivity: Double
         let ratio: Double
         let treatmentRevision: Int
+    }
+}
+
+/// A Swift task's cancellation flag is not inherited by the serial GCD worker.
+private final class GlucoseForecastPresentationCancellation: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+
+    var isCancelled: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return cancelled
+    }
+
+    func cancel() {
+        lock.lock(); cancelled = true; lock.unlock()
     }
 }
