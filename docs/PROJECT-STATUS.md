@@ -1,3 +1,15 @@
+<!-- testflight-7.1.1-4339:start -->
+### TestFlight 7.1.1 (4339)
+
+- Kildecommit og tag: `18efbfc337fcb95566792e34e7c717bcde0a609d` / `testflight-7.1.1-4339`.
+- Tests: 1735/1735 bestået; 0 fejlet; 0 skipped. iPhone- og Watch-simulatorbuilds bestod.
+- Apple-status (2026-10-18T11:12:42.262496+00:00): [Internal / Testing](https://appstoreconnect.apple.com/apps/6795645396/testflight/ios/9b97a7ae-b0c6-4b48-b520-b458561e0c3e).
+- Eksisterende intern gruppe: Ole Internal er bekræftet tilknyttet.
+- Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
+<!-- testflight-7.1.1-4339:end -->
+
+De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
+
 ## Genbrug af kodede aktivitetslogposter — 18. oktober 2026
 
 Aktivitetsloggen genkodede tidligere alle bevarede poster til JSON ved hver
