@@ -295,16 +295,28 @@ struct MealPlanMetadata: Codable, Equatable {
                         confirmedAt: Date? = nil, now: Date = .now,
                         store: MealPlanMetadataStore? = nil,
                         onIssue: ((String) -> Void)? = nil) -> String? {
-        let store = store ?? .shared
+        refresh(coreDataManager: coreDataManager, mealUUID: mealUUID,
+                confirmedAt: confirmedAt, now: now, store: store ?? .shared,
+                onIssue: onIssue, metadata: nil) {
+            try storedTreatments(coreDataManager: coreDataManager, uuids: $0)
+        }
+    }
+
+    /// Reconciliation supplies one fresh, value-only snapshot for this synchronous pass.
+    /// Standalone refreshes and asynchronous notification guards still read the store afresh.
+    private static func refresh(coreDataManager: CoreDataManager, mealUUID: String,
+        confirmedAt: Date? = nil, now: Date, store: MealPlanMetadataStore,
+        onIssue: ((String) -> Void)?, metadata: MealPlanMetadata?,
+        readTreatments: ([String]) throws -> [StoredTreatment]) -> String? {
         do {
-            let rows = try storedTreatments(coreDataManager: coreDataManager, uuids: [mealUUID])
+            let rows = try readTreatments([mealUUID])
             guard let meal = rows.first(where: { $0.uuid == mealUUID && $0.type == .Carbs && !$0.deleted }) else {
                 PlannedMealReminder.cancel(uuid: mealUUID)
                 PizzaSplitReminder.cancel(uuid: mealUUID)
                 try store.remove(uuid: mealUUID)
                 return nil
             }
-            var metadata = try store.metadata(for: mealUUID) ?? MealPlanMetadata(
+            var metadata = try metadata ?? store.metadata(for: mealUUID) ?? MealPlanMetadata(
                 mealUUID: mealUUID, bolusUUID: nil, loggedAt: meal.date,
                 plannedAt: meal.isPlannedMeal ? meal.date : nil, grams: meal.value,
                 pizzaSettings: nil, mealKind: meal.mealKind)
@@ -313,7 +325,7 @@ struct MealPlanMetadata: Codable, Equatable {
             let savedMealAmountChanged = metadata.lastStoredMealGrams != nil &&
                 metadata.lastStoredMealGrams != meal.value
             let linkedBolus = try metadata.bolusUUID.flatMap { bolusUUID -> StoredTreatment? in
-                try storedTreatments(coreDataManager: coreDataManager, uuids: [bolusUUID])
+                try readTreatments([bolusUUID])
                     .first(where: { $0.uuid == bolusUUID && $0.type == .Insulin && !$0.deleted && $0.value > 0 })
             }
             if metadata.bolusUUID != nil && linkedBolus == nil { metadata.bolusUUID = nil }
@@ -414,7 +426,8 @@ struct MealPlanMetadata: Codable, Equatable {
     }
 
     static func reconcile(coreDataManager: CoreDataManager, journal: PenDoseLogJournal? = nil,
-                          store: MealPlanMetadataStore? = nil,
+                          store: MealPlanMetadataStore? = nil, now: Date = .now,
+                          readTreatments: (([String]) throws -> [StoredTreatment])? = nil,
                           onIssue: ((String) -> Void)? = nil) {
         let journal = journal ?? .shared
         let store = store ?? .shared
@@ -422,12 +435,33 @@ struct MealPlanMetadata: Codable, Equatable {
             onIssue?("Måltidsplanernes metadata kunne ikke læses.")
             return
         }
+        guard !metadata.isEmpty else { return }
+        let rows: [StoredTreatment]
+        do {
+            let uuids = Array(Set(metadata.flatMap { [$0.mealUUID] + ($0.bolusUUID.map { [$0] } ?? []) }))
+            rows = try readTreatments?(uuids) ?? storedTreatments(coreDataManager: coreDataManager, uuids: uuids)
+        } catch {
+            // A failed read is not evidence of deletion. Keep all metadata and requests.
+            onIssue?("Påmindelserne kunne ikke afstemmes. Kontrollér måltidsplanen.")
+            return
+        }
+        let rowsByUUID = Dictionary(grouping: rows, by: \.uuid)
+        let journalIsReady = journal.recoveryState(coreDataManager: coreDataManager) == .ready
         for item in metadata {
+            let mealRows = rowsByUUID[item.mealUUID] ?? []
+            let bolusRows = item.bolusUUID.flatMap { rowsByUUID[$0] } ?? []
+            let hasMeal = mealRows.contains(where: { $0.type == .Carbs && !$0.deleted })
+            let needsBolus = mealRows.contains(where: { $0.isPlannedMeal || $0.isConfirmedMeal })
+            guard mealRows.count <= 1 && (!needsBolus || bolusRows.count <= 1) else {
+                // Ambiguous identities must never select an arbitrary row or erase a plan.
+                onIssue?("Påmindelserne kunne ikke afstemmes. Kontrollér måltidsplanen.")
+                continue
+            }
             // An unacknowledged operation can still become durable after this read.
-            if journal.recoveryState(coreDataManager: coreDataManager) != .ready,
-               status(coreDataManager: coreDataManager, uuid: item.mealUUID) == .deleted { continue }
+            if !journalIsReady && !hasMeal { continue }
             if let warning = refresh(coreDataManager: coreDataManager, mealUUID: item.mealUUID,
-                                     store: store, onIssue: onIssue) { onIssue?(warning) }
+                now: now, store: store, onIssue: onIssue, metadata: item,
+                readTreatments: { $0.flatMap { rowsByUUID[$0] ?? [] } }) { onIssue?(warning) }
         }
     }
 }

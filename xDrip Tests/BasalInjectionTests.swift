@@ -2424,3 +2424,272 @@ final class ReminderRootPresentationTests: XCTestCase {
         .onAppear(perform: onAppear)
     }
 }
+
+extension BasalInjectionTests {
+    @MainActor private func reminderEntry(_ core: CoreDataManager, uuid: String = UUID().uuidString,
+        type: TreatmentType = .Carbs, value: Double = 30, date: Date,
+        state: TreatmentMealState? = nil, kind: TreatmentMealKind = .normal,
+        deleted: Bool = false) -> TreatmentEntry {
+        let entry = TreatmentEntry(date: date, value: value, treatmentType: type,
+            nightscoutEventType: nil, enteredBy: "xDrip4iOS",
+            nsManagedObjectContext: core.mainManagedObjectContext)
+        entry.localTreatmentUUID = uuid
+        entry.plannedMealStateRaw = state?.rawValue
+        entry.mealKindRaw = kind.rawValue
+        entry.treatmentdeleted = deleted
+        return entry
+    }
+
+    @MainActor func testMealReconcileReadsOneUniqueUUIDBatchForZeroOneAndHundredMeals() throws {
+        let now = Date(timeIntervalSince1970: 1_788_804_000)
+        for count in [0, 1, 100] {
+            let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let store = MealPlanMetadataStore(directory: directory)
+            let journal = PenDoseLogJournal(directory: directory)
+            var expected: [MealPlanMetadata] = []
+            let sharedBolus = UUID().uuidString
+            if count > 0 {
+                _ = reminderEntry(core, uuid: sharedBolus, type: .Insulin, value: 2, date: now)
+            }
+            for index in 0..<count {
+                let meal = reminderEntry(core, date: now.addingTimeInterval(Double(-index * 60)))
+                let metadata = MealPlanMetadata(mealUUID: meal.localTreatmentUUID!, bolusUUID: sharedBolus,
+                    loggedAt: meal.date, plannedAt: nil, grams: meal.value,
+                    pizzaSettings: nil, mealKind: .normal)
+                try store.stage(metadata)
+                expected.append(metadata)
+            }
+            XCTAssertTrue(core.saveChangesSynchronously())
+            var reads = 0
+            var fetchedUUIDs: [String] = []
+            MealPlanReminderCoordinator.reconcile(coreDataManager: core, journal: journal,
+                store: store, now: now, readTreatments: { uuids in
+                    reads += 1
+                    fetchedUUIDs = uuids
+                    return try MealPlanReminderCoordinator.storedTreatments(coreDataManager: core, uuids: uuids)
+                }, onIssue: { XCTFail($0) })
+            XCTAssertEqual(reads, count == 0 ? 0 : 1)
+            XCTAssertEqual(fetchedUUIDs.count, Set(fetchedUUIDs).count)
+            XCTAssertEqual(Set(fetchedUUIDs), Set(expected.flatMap { [$0.mealUUID, sharedBolus] }))
+            XCTAssertEqual(Set(try store.allMetadata().map(\.mealUUID)), Set(expected.map(\.mealUUID)))
+            for metadata in expected { XCTAssertEqual(try store.metadata(for: metadata.mealUUID), metadata) }
+            XCTAssertEqual(TreatmentEntryAccessor(coreDataManager: core).getLatestTreatments(howOld: nil).count,
+                           count == 0 ? 0 : count + 1)
+        }
+    }
+
+    @MainActor func testMealReconcileBatchMatchesFreshRefreshForEditsDeletionAndReminderTimes() throws {
+        let now = Date(timeIntervalSince1970: 1_788_804_000)
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let batch = MealPlanMetadataStore(directory: directory.appendingPathComponent("batch"))
+        let original = MealPlanMetadataStore(directory: directory.appendingPathComponent("original"))
+        let journal = PenDoseLogJournal(directory: directory)
+        let pizza = PizzaSplitSettings(isEnabled: true, percentageNow: 70, reminderMinutes: 90)
+        let bolus = reminderEntry(core, type: .Insulin, value: 3, date: now)
+        var metadata: [MealPlanMetadata] = []
+        for index in 0..<8 {
+            let uuid = UUID().uuidString
+            let state: TreatmentMealState? = index == 0 || index == 5 ? .planned :
+                (index == 3 ? .cancelled : nil)
+            let meal = reminderEntry(core, uuid: uuid, date: now.addingTimeInterval(15 * 60),
+                state: state, kind: index == 1 ? .slow : .normal, deleted: index == 2)
+            var item = MealPlanMetadata(mealUUID: uuid,
+                bolusUUID: index >= 5 ? UUID().uuidString : bolus.localTreatmentUUID,
+                loggedAt: now, plannedAt: state == .planned ? meal.date : nil,
+                grams: meal.value, pizzaSettings: pizza, mealKind: meal.mealKind)
+            if index == 1 {
+                item.pizzaReminderAt = now.addingTimeInterval(80 * 60)
+                meal.date = now.addingTimeInterval(-10 * 60)
+                meal.value = 45
+            }
+            if index == 4 { core.mainManagedObjectContext.delete(meal) }
+            if index == 6 {
+                _ = reminderEntry(core, uuid: item.bolusUUID!, type: .Insulin,
+                    value: 3, date: now, deleted: true)
+            }
+            if index == 7 {
+                _ = reminderEntry(core, uuid: item.bolusUUID!, type: .Insulin, value: 0, date: now)
+            }
+            try batch.stage(item)
+            try original.stage(item)
+            metadata.append(item)
+        }
+        XCTAssertTrue(core.saveChangesSynchronously())
+        defer {
+            for item in metadata {
+                PlannedMealReminder.cancel(uuid: item.mealUUID)
+                PizzaSplitReminder.cancel(uuid: item.mealUUID)
+            }
+        }
+        for item in metadata {
+            XCTAssertNil(MealPlanReminderCoordinator.refresh(coreDataManager: core,
+                mealUUID: item.mealUUID, now: now, store: original))
+        }
+        MealPlanReminderCoordinator.reconcile(coreDataManager: core, journal: journal,
+            store: batch, now: now)
+        for item in metadata {
+            XCTAssertEqual(try batch.metadata(for: item.mealUUID), try original.metadata(for: item.mealUUID))
+        }
+        XCTAssertEqual(try batch.metadata(for: metadata[0].mealUUID)?.followupAt,
+                       now.addingTimeInterval(30 * 60))
+        XCTAssertEqual(try batch.metadata(for: metadata[1].mealUUID)?.pizzaReminderAt,
+                       now.addingTimeInterval(80 * 60))
+        for index in [2, 3, 4] { XCTAssertNil(try batch.metadata(for: metadata[index].mealUUID)) }
+        for index in [5, 6, 7] { XCTAssertNil(try batch.metadata(for: metadata[index].mealUUID)?.bolusUUID) }
+        XCTAssertNil(try batch.metadata(for: metadata[5].mealUUID)?.followupAt)
+    }
+
+    @MainActor func testMealReconcileReadFailuresPreserveAllMetadata() throws {
+        let now = Date(timeIntervalSince1970: 1_788_804_000)
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = MealPlanMetadataStore(directory: directory)
+        let journal = PenDoseLogJournal(directory: directory)
+        let item = MealPlanMetadata(mealUUID: UUID().uuidString, bolusUUID: UUID().uuidString,
+            loggedAt: now, plannedAt: now.addingTimeInterval(900), grams: 30,
+            pizzaSettings: nil, mealKind: .normal)
+        try store.stage(item)
+        var issues: [String] = []
+        MealPlanReminderCoordinator.reconcile(coreDataManager: core, journal: journal,
+            store: store, now: now, readTreatments: { _ in
+                throw NSError(domain: "MealReconcileTests", code: 1)
+            }, onIssue: { issues.append($0) })
+        XCTAssertEqual(issues.count, 1)
+        XCTAssertEqual(try store.metadata(for: item.mealUUID), item)
+        try core.disconnectPersistentStoresForTesting()
+        MealPlanReminderCoordinator.reconcile(coreDataManager: core, journal: journal,
+            store: store, now: now, onIssue: { issues.append($0) })
+        XCTAssertEqual(issues.count, 2)
+        XCTAssertEqual(try store.metadata(for: item.mealUUID), item)
+    }
+
+    @MainActor func testMealReconcilePendingJournalPreservesMissingAndUncommittedMealsAcrossRestart() throws {
+        let now = Date(timeIntervalSince1970: 1_788_804_000)
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = MealPlanMetadataStore(directory: directory)
+        let first = PenDoseLogJournal(directory: directory, processToken: "first")
+        let operation = PenDoseLogOperation()
+        let item = MealPlanMetadata(mealUUID: operation.mealUUID, bolusUUID: nil,
+            loggedAt: now, plannedAt: now.addingTimeInterval(-60), grams: 30,
+            pizzaSettings: nil, mealKind: .normal)
+        try store.stage(item)
+        XCTAssertTrue(first.begin(operation, expectsBolus: false, expectsMeal: true))
+        let unsaved = reminderEntry(core, uuid: operation.mealUUID, value: 45, date: now, state: .planned)
+        let restarted = PenDoseLogJournal(directory: directory, processToken: "second")
+        for journal in [first, restarted] {
+            MealPlanReminderCoordinator.reconcile(coreDataManager: core, journal: journal,
+                store: store, now: now, onIssue: { XCTFail($0) })
+            XCTAssertEqual(try store.metadata(for: item.mealUUID), item,
+                "An uncommitted row is not deletion evidence, including after restart")
+        }
+        XCTAssertTrue(core.saveChangesSynchronously())
+        MealPlanReminderCoordinator.reconcile(coreDataManager: core, journal: restarted,
+            store: store, now: now, onIssue: { XCTFail($0) })
+        XCTAssertEqual(try store.metadata(for: item.mealUUID)?.lastStoredMealGrams, 45)
+        XCTAssertTrue(restarted.complete())
+        unsaved.treatmentdeleted = true
+        XCTAssertTrue(core.saveChangesSynchronously())
+        MealPlanReminderCoordinator.reconcile(coreDataManager: core, journal: restarted,
+            store: store, now: now, onIssue: { XCTFail($0) })
+        XCTAssertNil(try store.metadata(for: item.mealUUID))
+    }
+
+    @MainActor func testMealReconcileDoesNotRetainSnapshotsOrReadUnsavedEdits() throws {
+        let now = Date(timeIntervalSince1970: 1_788_804_000)
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = MealPlanMetadataStore(directory: directory)
+        let journal = PenDoseLogJournal(directory: directory)
+        let bolus = reminderEntry(core, type: .Insulin, value: 2, date: now)
+        let meal = reminderEntry(core, date: now, state: .planned)
+        let item = MealPlanMetadata(mealUUID: meal.localTreatmentUUID!, bolusUUID: bolus.localTreatmentUUID,
+            loggedAt: now, plannedAt: now, grams: 30, pizzaSettings: nil, mealKind: .normal)
+        try store.stage(item)
+        XCTAssertTrue(core.saveChangesSynchronously())
+        meal.value = 45
+        meal.date = now.addingTimeInterval(-60)
+        bolus.treatmentdeleted = true
+        MealPlanReminderCoordinator.reconcile(coreDataManager: core, journal: journal, store: store, now: now)
+        XCTAssertEqual(try store.metadata(for: item.mealUUID), item,
+            "Only durable treatment values may affect reminders")
+        XCTAssertTrue(core.saveChangesSynchronously())
+        MealPlanReminderCoordinator.reconcile(coreDataManager: core, journal: journal, store: store, now: now)
+        let updated = try XCTUnwrap(store.metadata(for: item.mealUUID))
+        XCTAssertEqual(updated.lastStoredMealGrams, 45)
+        XCTAssertEqual(updated.lastStoredMealDate, meal.date)
+        XCTAssertNil(updated.bolusUUID)
+        XCTAssertNil(updated.followupAt)
+        meal.treatmentdeleted = true
+        XCTAssertTrue(core.saveChangesSynchronously())
+        MealPlanReminderCoordinator.reconcile(coreDataManager: core, journal: journal, store: store, now: now)
+        XCTAssertNil(try store.metadata(for: item.mealUUID))
+    }
+
+    @MainActor func testMealReconcileAmbiguousMealAndBolusUUIDsPreservePlans() throws {
+        let now = Date(timeIntervalSince1970: 1_788_804_000)
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = MealPlanMetadataStore(directory: directory)
+        let journal = PenDoseLogJournal(directory: directory)
+        var items: [MealPlanMetadata] = []
+        for duplicateMeal in [true, false] {
+            let mealUUID = UUID().uuidString
+            let bolusUUID = UUID().uuidString
+            _ = reminderEntry(core, uuid: mealUUID, date: now)
+            _ = reminderEntry(core, uuid: bolusUUID, type: .Insulin, value: 2, date: now)
+            _ = reminderEntry(core, uuid: duplicateMeal ? mealUUID : bolusUUID,
+                type: duplicateMeal ? .Carbs : .Insulin, value: 10, date: now, deleted: true)
+            let item = MealPlanMetadata(mealUUID: mealUUID, bolusUUID: bolusUUID,
+                loggedAt: now, plannedAt: now, grams: 30, pizzaSettings: nil, mealKind: .normal)
+            try store.stage(item)
+            items.append(item)
+        }
+        XCTAssertTrue(core.saveChangesSynchronously())
+        var issues: [String] = []
+        MealPlanReminderCoordinator.reconcile(coreDataManager: core, journal: journal,
+            store: store, now: now, onIssue: { issues.append($0) })
+        XCTAssertEqual(issues.count, 2)
+        for item in items { XCTAssertEqual(try store.metadata(for: item.mealUUID), item) }
+    }
+}
+
+extension BasalInjectionTests {
+    @MainActor func testMealReconcileCleansInactiveMealDespiteAmbiguousLinkedBolus() throws {
+        let now = Date(timeIntervalSince1970: 1_788_804_000)
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = MealPlanMetadataStore(directory: directory)
+        let journal = PenDoseLogJournal(directory: directory)
+        var uuids: [String] = []
+        for state in 0..<3 {
+            let mealUUID = UUID().uuidString
+            let bolusUUID = UUID().uuidString
+            if state > 0 {
+                _ = reminderEntry(core, uuid: mealUUID, date: now,
+                    state: state == 2 ? .cancelled : nil, deleted: state == 1)
+            }
+            for value in [1.0, 2.0] {
+                _ = reminderEntry(core, uuid: bolusUUID, type: .Insulin, value: value, date: now)
+            }
+            try store.stage(MealPlanMetadata(mealUUID: mealUUID, bolusUUID: bolusUUID,
+                loggedAt: now, plannedAt: now, grams: 30, pizzaSettings: nil, mealKind: .normal))
+            uuids.append(mealUUID)
+        }
+        XCTAssertTrue(core.saveChangesSynchronously())
+        MealPlanReminderCoordinator.reconcile(coreDataManager: core, journal: journal,
+            store: store, now: now, onIssue: { XCTFail($0) })
+        for uuid in uuids { XCTAssertNil(try store.metadata(for: uuid)) }
+        XCTAssertEqual(TreatmentEntryAccessor(coreDataManager: core).getLatestTreatments(howOld: nil)
+            .filter { $0.treatmentType == .Insulin }.count, 6, "Reminder cleanup must never change insulin")
+    }
+}

@@ -1,3 +1,40 @@
+## Samlede databaseopslag til måltidspåmindelser — 18. oktober 2026
+
+Genåbning af Treatments afstemmer stadig påmindelser, også når selve listen
+kan genbruges. Afstemningen hentede tidligere hvert måltid og dets eventuelle
+bolus separat med en ny Core Data-kontekst og synkron ventetid på main.
+Den indledende gennemgang af 100 gemte måltidskoblinger kunne derfor kræve
+200 behandlingsforespørgsler. Nu samles de nødvendige, unikke UUID'er i én
+frisk databaseforespørgsel; værdikopierne genbruges kun under samme synkrone
+gennemgang. Journalens tilstand læses én gang i dette forløb.
+
+Den eksisterende refresh-logik genbruges. Friske opslag før/efter asynkron
+notifikationsplanlægning og ved åbning af påmindelser bevares. Læsefejl
+bevarer metadata/påmindelser, og en uafsluttet journal beskytter fortsat
+midlertidigt manglende behandlinger. Tvetydige UUID'er afstemmes ikke ved
+vilkårligt valg af en række; en entydigt slettet/manglende/annulleret måltidspost kan
+fortsat ryddes op, når journalen er klar, uanset bolussens identitet.
+
+Syv nye regressionstests kører produktionsafstemningen med en testdatabase
+og lokale metadatafiler: 0/1/100 måltider og delte bolus-ID'er, identiske
+resultater mod enkeltvis refresh inklusive påmindelsestider, ændringer og
+sletninger, fejl/manglende lager, uafsluttet journal og genstart, ugemte
+ændringer, friske efterfølgende læsninger og tvetydige identiteter. Den
+indledende suite med de første seks tests bestod (1726/1726, ingen fejl eller
+skipped; lokal kvittering `20261018T100523Z-17067`). En efterfølgende gennemgang
+fandt og rettede særtilfældet med slettet/annulleret måltid og dubleret bolus, dækket af
+den syvende test. Releaseproceduren gentester den endelige kode med Apples
+valgte nummer; faktisk test-/build- og Apple-status registreres i releaseafsnittet.
+Ingen eksisterende tests er fjernet eller svækket.
+
+Produktionsændringen er afgrænset til MealPlanReminders.swift. Der er ingen
+ændring af dosering, behandlingernes lagring, prognose/ML, alarmer, Sundhed
+eller Watch/Libre. En læsende iPhone-kontrol fejlede, fordi CoreDeviceService
+ikke kunne initialiseres. Ingen lokal installation, fysisk hastighedsmåling
+eller fysisk notifikationsprøve er udført; disse skal fortsat kontrolleres
+efter TestFlight-installation. Færre databaseforespørgsler er testet, men
+ændret åbningstid og batteriforbrug er ikke målt på brugerens telefon.
+
 <!-- testflight-7.1.1-4337:start -->
 ### TestFlight 7.1.1 (4337)
 
