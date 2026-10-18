@@ -1,3 +1,34 @@
+## Beregneren viser anvendt COB og kort kildeforklaring — 18. oktober 2026
+
+Beregnerens øverste COB-felt viser nu den mængde, der faktisk blev brugt i
+beregningen, fra samme uforanderlige input/resultat som dosisforslaget og ⓘ.
+Den korte kildeforklaring står samlet med BG/IOB/COB. CGM nævnes som anvendt
+estimat, når det sænker kurve-COB; ellers vises måltidskurven, også når et
+CGM-estimat er højere eller identisk. Den lange forklaring under insulinfeltet
+er fjernet. ⓘ bevarer kurve, CGM-estimat, anvendt COB og den konkrete årsag
+til fallback. Teksten om glukoseudsving forklarer nu, at der ikke kunne dannes
+et tydeligt optagelsesestimat. Home viser fortsat kurve-COB.
+
+Kun én produktionsfil er ændret. Dosisformel, sikkerhedsadvarsler, automatisk
+udfyldning, lagring, CGM-COB-algoritme, prognose/ML, Watch, Libre, HealthKit og
+alarmer er uændrede. Den eksisterende aktualitetskontrol styrer fortsat
+visningen; et manglende eller forældet beregningsresultat vises med en streg.
+
+Indledende fuld XCTest: **1766/1766 bestået, 0 fejl**, i
+`20261018T191746Z-26387`. To nye regressionstests og den eksisterende
+præsentationstest kontrollerer anvendt værdi/decimalpræcision, CGM-reduktion,
+kurvebegrænset estimat, fallback og ukendt kontra kendt nul. Kun den gamle
+præsentationstests forventninger om tekstplacering er ændret; de eksisterende
+beregnings-, autofill-, aktualitets-, lager- og sikkerhedstests er bevaret.
+Diffkontrol bestod. Releaseproceduren gentester det Apple-valgte buildnummer
+og registrerer det endelige checkpoint og Apples status i releaseafsnittet.
+
+Læsende enhedskontrol fandt iPhone med 7.1.1 (4342), Watch utilgængeligt.
+Der er ikke installeret lokalt eller ændret telefondata. Mac'en var låst
+under forsøg på visuel kontrol; ny skærm, større tekst og tastatur er derfor
+ikke visuelt eller fysisk verificeret. Layoutet genbruger eksisterende chips,
+ombrydning og informationsark. Ingen målt hastigheds- eller batterigevinst.
+
 <!-- testflight-7.1.1-4342:start -->
 ### TestFlight 7.1.1 (4342)
 

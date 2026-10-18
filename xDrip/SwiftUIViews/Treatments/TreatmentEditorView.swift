@@ -398,13 +398,17 @@ struct TreatmentEditorView: View {
 /// A pen-only calculator. Suggestions are copied explicitly; Log records the user's entry.
 /// Read-only wording for the calculation's COB evidence. Home keeps showing curve COB.
 enum PenDoseCOBPresentation {
-    static func proposalText(_ evidence: PenCOBEvidence) -> String {
-        let used = PenDoseDisplayFormatter.carbs(evidence.usedGrams)
-        if evidence.estimatedGrams != nil {
-            return "COB i regnestykket: \(used) g · højst kurve-COB efter CGM-estimat"
+    static func proposalText(_ evidence: PenCOBEvidence?) -> String {
+        let used = evidence.map { PenDoseDisplayFormatter.carbs($0.usedGrams) } ?? "—"
+        return "COB brugt \(used) g"
+    }
+
+    static func sourceText(_ evidence: PenCOBEvidence) -> String {
+        if evidence.fallbackReason == nil, evidence.estimatedGrams != nil,
+           evidence.usedGrams < evidence.curveGrams {
+            return "CGM-estimat bruges til COB."
         }
-        let reason = evidence.fallbackReason.map { " (\(fallbackText($0)))" } ?? ""
-        return "COB i regnestykket: \(used) g · kurve\(reason)"
+        return "Måltidskurven bruges til COB."
     }
 
     static func fallbackText(_ reason: PenCOBFallbackReason) -> String {
@@ -420,7 +424,7 @@ enum PenDoseCOBPresentation {
         case .sensorMismatch: return "sensor skiftet"
         case .historyGap: return "hul i glukosehistorikken"
         case .invalidHistory: return "ugyldig glukosehistorik"
-        case .oscillatingSignal: return "svingende signal uden sikker optagelse"
+        case .oscillatingSignal: return "udsvingene i glukosen gav ikke et tydeligt estimat af kulhydratoptagelsen"
         case .insufficientIntervals: return "for få sammenhængende målinger"
         }
     }
@@ -586,6 +590,12 @@ struct PenDoseCalculatorScreen: View {
                 HStack(spacing: 6) { metricChips }
                 VStack(alignment: .leading, spacing: 6) { metricChips }
             }
+            if viewModel.isReviewCurrent,
+               let evidence = viewModel.calculationDetails?.calculation.cobEvidence {
+                Text(PenDoseCOBPresentation.sourceText(evidence))
+                    .font(.footnote).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
 
             if viewModel.glucoseChoice == .manual {
                 input("Blodsukker", unit: viewModel.glucoseUnitIsMgdl ? "mg/dL" : "mmol/L",
@@ -746,12 +756,6 @@ struct PenDoseCalculatorScreen: View {
                     .accessibilityLabel("Insulin, enheder")
                 Text("E").font(.title3).foregroundStyle(.secondary)
             }
-            if viewModel.isReviewCurrent,
-               let evidence = viewModel.calculation?.cobEvidence {
-                Text(PenDoseCOBPresentation.proposalText(evidence))
-                    .font(.footnote).foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
             if viewModel.usesAutomaticMealDose {
                 Text("Forslaget udfyldes automatisk. Du kan rette mængden før Log.")
                     .font(.footnote).foregroundStyle(.secondary)
@@ -819,7 +823,8 @@ struct PenDoseCalculatorScreen: View {
         metricChip("\(value) \(trend) · \(age)")
             .accessibilityLabel("\(source), \(value), \(age), ændring \(trend)")
         metricChip("IOB \(details.map { PenDoseDisplayFormatter.insulin($0.iobUnits) } ?? "—") E")
-        metricChip("COB-kurve \(details.map { PenDoseDisplayFormatter.carbs($0.curveCOBGrams) } ?? "—") g")
+        metricChip(PenDoseCOBPresentation.proposalText(details?.calculation.cobEvidence))
+            .accessibilityHint("Aktive kulhydrater brugt i beregningen. Se kurve og CGM-estimat under beregningens grundlag.")
     }
 
     private func metricChip(_ text: String) -> some View {
@@ -1009,7 +1014,7 @@ private struct PenDoseInformationView: View {
                         Text("CGM-estimatet blev ikke brugt: \(PenDoseCOBPresentation.fallbackText(reason)). Kurve-COB blev brugt.")
                             .font(.footnote).foregroundStyle(.secondary)
                     }
-                    Text("Home viser fortsat COB fra behandlingskurven. CGM-estimatet er kun et usikkert alternativ i dette dosisforslag.")
+                    Text("Home viser COB fra måltidskurven. CGM-estimatet er beregnet ud fra glukosemålinger og kan kun sænke COB i denne beregner. Det er ikke en måling af optagelsen.")
                         .font(.footnote).foregroundStyle(.secondary)
                     detail("Nye kulhydrater i regnestykket", "\(PenDoseDisplayFormatter.carbs(snapshot.details.newCarbsGrams)) g")
                 }

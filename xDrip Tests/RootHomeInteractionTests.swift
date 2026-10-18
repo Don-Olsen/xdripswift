@@ -2071,20 +2071,44 @@ final class RootHomeInteractionTests: XCTestCase {
         XCTAssertTrue(coordinator.isShowingCurrentTimeRange)
     }
 
-    func testPenProposalLabelsCGMCOBAsEstimateAndFallbackAsCurve() {
-        let estimated = PenCOBEvidence(curveGrams: 12, estimatedGrams: 5,
-            usedGrams: 5, fallbackReason: nil)
-        let estimateText = PenDoseCOBPresentation.proposalText(estimated)
-        XCTAssertTrue(estimateText.contains("CGM-estimat"))
-        XCTAssertTrue(estimateText.contains("\(PenDoseDisplayFormatter.carbs(5)) g"))
-        XCTAssertFalse(estimateText.contains("\(PenDoseDisplayFormatter.carbs(12)) g"))
+    func testPenProposalShowsUsedCOBAndKeepsSourceSeparateFromDetails() {
+        let estimated = PenCOBEvidence(curveGrams: 12, estimatedGrams: 5.25,
+            usedGrams: 5.25, fallbackReason: nil)
+        XCTAssertEqual(PenDoseCOBPresentation.proposalText(estimated),
+            "COB brugt \(PenDoseDisplayFormatter.carbs(5.25)) g")
+        XCTAssertEqual(PenDoseCOBPresentation.sourceText(estimated), "CGM-estimat bruges til COB.")
 
         let fallback = PenCOBEvidence(curveGrams: 12, estimatedGrams: nil,
             usedGrams: 12, fallbackReason: .historyGap)
-        let fallbackText = PenDoseCOBPresentation.proposalText(fallback)
-        XCTAssertTrue(fallbackText.contains("kurve"))
-        XCTAssertTrue(fallbackText.contains("hul i glukosehistorikken"))
-        XCTAssertFalse(fallbackText.contains("CGM-estimeret"))
+        XCTAssertEqual(PenDoseCOBPresentation.proposalText(fallback),
+            "COB brugt \(PenDoseDisplayFormatter.carbs(12)) g")
+        XCTAssertEqual(PenDoseCOBPresentation.sourceText(fallback), "Måltidskurven bruges til COB.")
+        XCTAssertEqual(PenDoseCOBPresentation.fallbackText(.historyGap), "hul i glukosehistorikken",
+            "The detailed fallback reason remains available in the frozen information sheet")
+    }
+
+    func testPenCOBSourceFollowsUsedCurveWhenEstimateDoesNotReduceIt() {
+        for estimate in [12.0, 20.0] {
+            let evidence = PenCOBEvidence(curveGrams: 12, estimatedGrams: estimate,
+                usedGrams: 12, fallbackReason: nil)
+            XCTAssertEqual(PenDoseCOBPresentation.sourceText(evidence), "Måltidskurven bruges til COB.")
+            XCTAssertEqual(PenDoseCOBPresentation.proposalText(evidence),
+                "COB brugt \(PenDoseDisplayFormatter.carbs(12)) g")
+        }
+    }
+
+    func testPenCOBPresentationDistinguishesUnknownFromKnownZero() {
+        XCTAssertEqual(PenDoseCOBPresentation.proposalText(nil), "COB brugt — g")
+        let zero = PenCOBEvidence(curveGrams: 12, estimatedGrams: 0,
+            usedGrams: 0, fallbackReason: nil)
+        XCTAssertEqual(PenDoseCOBPresentation.proposalText(zero),
+            "COB brugt \(PenDoseDisplayFormatter.carbs(0)) g")
+        XCTAssertEqual(PenDoseCOBPresentation.sourceText(zero), "CGM-estimat bruges til COB.")
+        let oscillating = PenCOBEvidence(curveGrams: 12, estimatedGrams: nil,
+            usedGrams: 12, fallbackReason: .oscillatingSignal)
+        XCTAssertEqual(PenDoseCOBPresentation.sourceText(oscillating), "Måltidskurven bruges til COB.")
+        XCTAssertTrue(PenDoseCOBPresentation.fallbackText(.oscillatingSignal).contains("estimat"))
+        XCTAssertFalse(PenDoseCOBPresentation.proposalText(oscillating).contains("udsving"))
     }
 
     func testHomeCalculatorShortcutRequiresConsistentLocalOwnerAndLocalMetricSources() throws {

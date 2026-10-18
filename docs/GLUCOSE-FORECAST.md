@@ -481,6 +481,16 @@ changed snapshot leave curve COB in force with an explanation. This feature
 does not alter Home COB, the forecast engine, ML, alarms or stored treatments.
 It has not been verified as a clinically reliable measure of absorption.
 
+The calculator's top COB chip now shows the calculation's `usedGrams`, from
+the same frozen evidence as the dose and information sheet. A short line
+identifies the CGM estimate only when it actually lowers curve COB; otherwise
+it identifies the meal curve, including an estimate limited by that curve.
+The information sheet keeps curve COB, the estimate, used COB and the concrete
+fallback reason together. The oscillation explanation now describes why an
+absorption estimate was unavailable. A missing/currently invalidated calculation
+shows a dash, distinct from a known zero. This is presentation only: Home COB,
+CGM absorption, dose calculation, autofill and safety checks are unchanged.
+
 The combined local candidate passed 1,379/1,379 XCTest tests, all project
 Python controls, both simulator builds and an unsigned iPhoneOS/arm64 build.
 The exact Apple-numbered release checkpoint must be tested again. Synthetic
