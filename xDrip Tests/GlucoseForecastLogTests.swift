@@ -1,4 +1,5 @@
 import XCTest
+import CoreData
 import CryptoKit
 @testable import xdrip
 
@@ -639,6 +640,375 @@ final class GlucoseForecastLogTests: XCTestCase {
             try GlucoseForecastLogSnapshot.encoder().encode(confirmed))
         XCTAssertEqual(fixture.result.points, points)
         XCTAssertEqual(GlucoseForecastMLPresentation.points(in: fixture.result), displayed)
+    }
+
+    @MainActor
+    private func evaluationStack() throws -> CoreDataManager {
+        let directory = folder.appendingPathComponent("database-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let core = try CoreDataManager(testModelName: ConstantsCoreData.modelName,
+            persistentStoreURL: directory.appendingPathComponent("synthetic.sqlite"))
+        addTeardownBlock { try? core.disconnectPersistentStoresForTesting() }
+        return core
+    }
+
+    @MainActor @discardableResult
+    private func evaluationReading(_ id: String, at date: Date, value: Double,
+                                   sensor: Sensor?, context: NSManagedObjectContext,
+                                   suppressed: Bool = false) -> BgReading {
+        let row = BgReading(timeStamp: date, sensor: sensor, calibration: nil, rawData: 1,
+            deviceName: "Synthetic evaluation fixture", nsManagedObjectContext: context)
+        row.id = id
+        row.calculatedValue = value
+        row.isSuppressedByFiveMinuteCadence = suppressed
+        return row
+    }
+
+    private func evaluationSnapshot(sensorID: String, reference: Date? = nil,
+                                    horizon: Int = 120) throws -> GlucoseForecastLogSnapshot {
+        let base = input(at: reference, horizon: horizon)
+        let value = GlucoseForecastInput(glucose: base.glucose.map {
+            GlucoseForecastSample(date: $0.date, glucoseMgdl: $0.glucoseMgdl, sensorID: sensorID)
+        }, treatments: base.treatments, settings: base.settings,
+            sensitivityMgdlPerUnit: base.sensitivityMgdlPerUnit,
+            carbohydrateRatioGramsPerUnit: base.carbohydrateRatioGramsPerUnit,
+            horizonMinutes: horizon, now: base.now)
+        return try .make(input: value, result: GlucoseForecastEngine.predict(value),
+            context: .init(appVersion: "7.1.1", appBuild: "synthetic", sourceIdentity: "sensor:" + sensorID,
+                sensorIdentity: sensorID, knownReference: value.glucose.last,
+                computedAt: base.now, horizonMinutes: horizon, insulinModel: "Fiasp",
+                treatmentWindowStart: base.now.addingTimeInterval(-36000), treatmentWindowEnd: base.now))
+    }
+
+    private func evaluationCSV(_ bundle: ForecastEvaluationExport, actual: Bool) throws -> (URL, [[String]]) {
+        for url in bundle.urls where url.pathExtension == "csv" {
+            let rows = parseCSV(try String(contentsOf: url, encoding: .utf8))
+            if rows.first?.first == (actual ? "date_utc" : "schema_version") {
+                return (url, rows)
+            }
+        }
+        XCTFail("Combined export must contain both evaluator CSV files")
+        throw GlucoseForecastLogFailure.io
+    }
+
+    @MainActor
+    func testEvaluationExportUsesExactStoredFinalValuesUnitsDatesAndEscapedIdentity() throws {
+        let core = try evaluationStack()
+        let context = core.mainManagedObjectContext
+        let sensor = Sensor(startDate: now.addingTimeInterval(-3600), nsManagedObjectContext: context)
+        sensor.id = "sensor-A,\"quoted\"\nÆ"
+        let dates = (0..<4).map { now.addingTimeInterval(1800 + Double($0) * 60 + 0.25) }
+        evaluationReading("calculated", at: dates[0], value: 137.125, sensor: sensor, context: context)
+        let adjusted = evaluationReading("adjusted", at: dates[1], value: 90, sensor: sensor, context: context)
+        adjusted.adjustedValue = NSNumber(value: 142.625)
+        let smoothed = evaluationReading("smoothed", at: dates[2], value: 90, sensor: sensor, context: context)
+        smoothed.adjustedValue = NSNumber(value: 141)
+        smoothed.smoothedValue = NSNumber(value: 148.375)
+        let hidden = evaluationReading("display-suppressed-original", at: dates[3], value: 153.875,
+            sensor: sensor, context: context, suppressed: true)
+        hidden.rawData = 0
+        XCTAssertTrue(core.saveChangesSynchronously())
+        let logger = log(at: now.addingTimeInterval(10800))
+        logger.enqueue(try evaluationSnapshot(sensorID: sensor.id)); logger.waitUntilIdle()
+        let bundle = try logger.exportEvaluationForTesting(coreDataManager: core,
+            to: folder.appendingPathComponent("final-values"))
+        let rows = try evaluationCSV(bundle, actual: true).1
+        XCTAssertEqual(rows.first, ["date_utc", "glucose_mgdl", "source_identity", "sensor_identity"])
+        XCTAssertEqual(rows.count, 5)
+        for (index, row) in rows.dropFirst().enumerated() {
+            XCTAssertEqual(row, [GlucoseForecastLogSnapshot.isoDate(dates[index]),
+                String([137.125, 142.625, 148.375, 153.875][index]), "sensor:" + sensor.id, sensor.id])
+        }
+        XCTAssertEqual(rows[1][0], "2027-01-15T08:30:00.375Z")
+        XCTAssertTrue(bundle.coverageSummary.contains("Eksporterede glukoserækker: 4"))
+        XCTAssertFalse(context.hasChanges, "Export cannot alter or save clinical rows")
+    }
+
+    @MainActor
+    func testEvaluationExportPreservesSensorSwitchDuplicatesAndConflictsAndReportsExclusions() throws {
+        let core = try evaluationStack()
+        let context = core.mainManagedObjectContext
+        func sensor(_ id: String) -> Sensor {
+            let sensor = Sensor(startDate: now.addingTimeInterval(-3600), nsManagedObjectContext: context)
+            sensor.id = id
+            return sensor
+        }
+        let first = sensor("sensor-A"), second = sensor("sensor-B"), unrelated = sensor("sensor-C")
+        let empty = sensor("")
+        let target = now.addingTimeInterval(1800)
+        for (id, value) in [("same-id", 110.0), ("same-id", 110.0), ("conflicting", 125.0)] {
+            evaluationReading(id, at: target, value: value, sensor: first, context: context)
+        }
+        evaluationReading("sensor-switched", at: target, value: 135, sensor: second, context: context)
+        evaluationReading("unrelated", at: target, value: 145, sensor: unrelated, context: context)
+        evaluationReading("missing", at: target, value: 155, sensor: nil, context: context)
+        evaluationReading("empty", at: target, value: 156, sensor: empty, context: context)
+        evaluationReading("invalid-low", at: target, value: 0, sensor: first, context: context)
+        evaluationReading("invalid-high", at: target, value: 601, sensor: first, context: context)
+        evaluationReading("internal-error", at: target, value: 38, sensor: first, context: context)
+        let nativeLow = evaluationReading("native-low", at: target.addingTimeInterval(60), value: 38,
+            sensor: first, context: context)
+        nativeLow.rawData = 38
+        XCTAssertTrue(core.saveChangesSynchronously())
+        let logger = log(at: now.addingTimeInterval(10800))
+        logger.enqueue(try evaluationSnapshot(sensorID: first.id))
+        logger.enqueue(try evaluationSnapshot(sensorID: second.id)); logger.waitUntilIdle()
+        let bundle = try logger.exportEvaluationForTesting(coreDataManager: core,
+            to: folder.appendingPathComponent("identities"), pageSize: 2)
+        let rows = try evaluationCSV(bundle, actual: true).1.dropFirst()
+        XCTAssertEqual(rows.count, 5)
+        XCTAssertEqual(rows.filter { $0[3] == first.id }.map { $0[1] }.sorted(), ["110.0", "110.0", "125.0", "38.0"])
+        XCTAssertEqual(rows.filter { $0[3] == second.id }.map { $0[1] }, ["135.0"])
+        XCTAssertTrue(rows.allSatisfy { $0[2] == "sensor:" + $0[3] })
+        let reportURL = try XCTUnwrap(bundle.urls.first { $0.lastPathComponent == "coverage.txt" })
+        let report = try String(contentsOf: reportURL, encoding: .utf8)
+        XCTAssertTrue(report.contains("Udeladt: ugyldige glukoserækker: 3"))
+        XCTAssertTrue(report.contains("Udeladt: manglende sensor-ID: 2"))
+        XCTAssertTrue(report.contains("Udeladt: uden matchende prognoseidentitet/periode: 1"))
+    }
+
+    @MainActor
+    func testEvaluationExportIncludesToleranceEndpointsAndClipsAtExportTime() throws {
+        let core = try evaluationStack()
+        let context = core.mainManagedObjectContext
+        let sensor = Sensor(startDate: now.addingTimeInterval(-3600), nsManagedObjectContext: context)
+        sensor.id = "sensor-A"
+        let offsets: [Double] = [-150.001, -150, 1650, 1950, 3450, 3750, 7050, 7350, 7350.001]
+        for (index, offset) in offsets.enumerated() {
+            evaluationReading("boundary-\(index)", at: now.addingTimeInterval(offset), value: Double(100 + index),
+                sensor: sensor, context: context)
+        }
+        XCTAssertTrue(core.saveChangesSynchronously())
+        let logger = log(at: now.addingTimeInterval(10800))
+        logger.enqueue(try evaluationSnapshot(sensorID: sensor.id)); logger.waitUntilIdle()
+        let complete = try logger.exportEvaluationForTesting(coreDataManager: core,
+            to: folder.appendingPathComponent("boundaries"))
+        XCTAssertEqual(try evaluationCSV(complete, actual: true).1.dropFirst().map { $0[1] },
+            (101...107).map { String(Double($0)) })
+        let clipped = try log(at: now.addingTimeInterval(3750)).exportEvaluationForTesting(coreDataManager: core,
+            to: folder.appendingPathComponent("future-clipped"))
+        XCTAssertEqual(try evaluationCSV(clipped, actual: true).1.dropFirst().map { $0[1] },
+            (101...105).map { String(Double($0)) })
+    }
+
+    @MainActor
+    func testEvaluationExportReadsMoreThan500RowsWithoutDroppingRepeatedTimestamps() throws {
+        let core = try evaluationStack()
+        let context = core.mainManagedObjectContext
+        let sensor = Sensor(startDate: now.addingTimeInterval(-3600), nsManagedObjectContext: context)
+        sensor.id = "sensor-A"
+        // Tied timestamps and duplicate IDs cross page boundaries; export preserves every row.
+        for index in 0..<1103 {
+            evaluationReading("row-\(index % 7)", at: now.addingTimeInterval(1800),
+                value: Double(100 + index % 200), sensor: sensor, context: context,
+                suppressed: index % 2 == 0)
+        }
+        XCTAssertTrue(core.saveChangesSynchronously())
+        let logger = log(at: now.addingTimeInterval(10800))
+        logger.enqueue(try evaluationSnapshot(sensorID: sensor.id)); logger.waitUntilIdle()
+        var pages = [Int]()
+        let bundle = try logger.exportEvaluationForTesting(coreDataManager: core,
+            to: folder.appendingPathComponent("many-rows"), pageRead: { index, _ in pages.append(index) })
+        let rows = try evaluationCSV(bundle, actual: true).1.dropFirst()
+        XCTAssertEqual(rows.count, 1103)
+        XCTAssertGreaterThanOrEqual(pages.count, 3)
+        XCTAssertEqual(Array(pages.prefix(3)), [0, 1, 2])
+        for value in 100..<300 {
+            XCTAssertEqual(rows.filter { $0[1] == String(Double(value)) }.count, value < 203 ? 6 : 5)
+        }
+    }
+
+    @MainActor
+    func testEvaluationExportPinsOneSQLiteGenerationAcrossConcurrentPageChanges() throws {
+        let core = try evaluationStack()
+        let context = core.mainManagedObjectContext
+        let sensor = Sensor(startDate: now.addingTimeInterval(-3600), nsManagedObjectContext: context)
+        sensor.id = "sensor-A"
+        for index in 0..<8 {
+            evaluationReading("original-\(index)", at: now.addingTimeInterval(1800 + Double(index)),
+                value: Double(100 + index), sensor: sensor, context: context)
+        }
+        XCTAssertTrue(core.saveChangesSynchronously())
+        let logger = log(at: now.addingTimeInterval(10800))
+        logger.enqueue(try evaluationSnapshot(sensorID: sensor.id)); logger.waitUntilIdle()
+        var changed = false
+        let bundle = try logger.exportEvaluationForTesting(coreDataManager: core,
+            to: folder.appendingPathComponent("pinned"), pageSize: 3, pageRead: { page, reader in
+                XCTAssertNotNil(reader.queryGenerationToken)
+                guard page == 1 else { return }
+                let writer = NSManagedObjectContext(concurrencyType: .privateQueueConcurrencyType)
+                writer.persistentStoreCoordinator = reader.persistentStoreCoordinator
+                try writer.performAndWait {
+                    let request = BgReading.fetchRequest()
+                    request.predicate = NSPredicate(format: "id == %@", "original-6")
+                    let original = try XCTUnwrap(writer.fetch(request).first)
+                    original.calculatedValue = 206
+                    let deletedRequest = BgReading.fetchRequest()
+                    deletedRequest.predicate = NSPredicate(format: "id == %@", "original-4")
+                    writer.delete(try XCTUnwrap(writer.fetch(deletedRequest).first))
+                    let added = BgReading(timeStamp: self.now.addingTimeInterval(1806.5), sensor: original.sensor,
+                        calibration: nil, rawData: 1, deviceName: "Synthetic concurrent writer",
+                        nsManagedObjectContext: writer)
+                    added.calculatedValue = 250
+                    try writer.save()
+                }
+                changed = true
+            })
+        XCTAssertTrue(changed)
+        XCTAssertEqual(try evaluationCSV(bundle, actual: true).1.dropFirst().map { $0[1] },
+            (100...107).map { String(Double($0)) })
+        let fresh = try logger.exportEvaluationForTesting(coreDataManager: core,
+            to: folder.appendingPathComponent("fresh"), pageSize: 3)
+        XCTAssertEqual(try evaluationCSV(fresh, actual: true).1.dropFirst().map { $0[1] },
+            ["100.0", "101.0", "102.0", "103.0", "105.0", "206.0", "250.0", "107.0"])
+    }
+
+    @MainActor
+    func testEvaluationReadFailureRemovesPartialBundleAndDiffersFromNoRetainedActuals() throws {
+        let core = try evaluationStack()
+        let context = core.mainManagedObjectContext
+        let sensor = Sensor(startDate: now.addingTimeInterval(-3600), nsManagedObjectContext: context)
+        sensor.id = "sensor-A"
+        for index in 0..<4 {
+            evaluationReading("row-\(index)", at: now.addingTimeInterval(1800 + Double(index)),
+                value: 120, sensor: sensor, context: context)
+        }
+        XCTAssertTrue(core.saveChangesSynchronously())
+        let logger = log(at: now.addingTimeInterval(10800))
+        logger.enqueue(try evaluationSnapshot(sensorID: sensor.id)); logger.waitUntilIdle()
+        let failedDirectory = folder.appendingPathComponent("failed-bundle")
+        XCTAssertThrowsError(try logger.exportEvaluationForTesting(coreDataManager: core,
+            to: failedDirectory, pageSize: 2, pageRead: { page, _ in
+                if page == 1 { throw GlucoseForecastLogFailure.io }
+            }))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: failedDirectory.path),
+            "A failed read cannot leave apparently usable partial files")
+        let empty = try evaluationStack()
+        let successful = try logger.exportEvaluationForTesting(coreDataManager: empty,
+            to: folder.appendingPathComponent("no-retained-actuals"))
+        XCTAssertEqual(try evaluationCSV(successful, actual: true).1.count, 1)
+        XCTAssertTrue(successful.coverageSummary.contains("Eksporterede glukoserækker: 0"))
+    }
+
+    @MainActor
+    func testEvaluationExportPreservesLegacyCSVAndSourceLogAndDoesNotSavePendingChanges() throws {
+        let core = try evaluationStack()
+        let context = core.mainManagedObjectContext
+        let sensor = Sensor(startDate: now.addingTimeInterval(-3600), nsManagedObjectContext: context)
+        sensor.id = "sensor-A"
+        let original = evaluationReading("committed", at: now.addingTimeInterval(1800), value: 120,
+            sensor: sensor, context: context)
+        XCTAssertTrue(core.saveChangesSynchronously())
+        original.calculatedValue = 150
+        evaluationReading("pending", at: now.addingTimeInterval(3600), value: 160,
+            sensor: sensor, context: context)
+        let logger = log(at: now.addingTimeInterval(10800))
+        logger.enqueue(try snapshot())
+        let fixture = try presentationFixture(input(horizon: 120), modelID: "synthetic,\"model\"\nÆ")
+        logger.enqueue(try XCTUnwrap(fixture.snapshot.confirmingPresentation(of: fixture.result,
+            at: now.addingTimeInterval(1.250))))
+        logger.waitUntilIdle()
+        let sources = try dailyFiles().map { ($0, try Data(contentsOf: $0)) }
+        let legacy = folder.appendingPathComponent("legacy-compatible.csv")
+        try logger.exportCSVForTesting(to: legacy)
+        let bundle = try logger.exportEvaluationForTesting(coreDataManager: core,
+            to: folder.appendingPathComponent("read-only"))
+        XCTAssertEqual(try Data(contentsOf: evaluationCSV(bundle, actual: false).0), try Data(contentsOf: legacy))
+        for (url, bytes) in sources { XCTAssertEqual(try Data(contentsOf: url), bytes) }
+        XCTAssertEqual(try evaluationCSV(bundle, actual: true).1.dropFirst().map { $0[1] }, ["120.0"])
+        XCTAssertTrue(context.hasChanges)
+        XCTAssertEqual(original.calculatedValue, 150)
+    }
+
+    @MainActor
+    func testEmptyEvaluationExportCreatesHeaderOnlyFilesWithoutReadingGlucose() throws {
+        let core = try evaluationStack()
+        let logger = log()
+        var reads = 0
+        let bundle = try logger.exportEvaluationForTesting(coreDataManager: core,
+            to: folder.appendingPathComponent("empty"), pageRead: { _, _ in reads += 1 })
+        XCTAssertEqual(try evaluationCSV(bundle, actual: false).1.count, 1)
+        XCTAssertEqual(try evaluationCSV(bundle, actual: true).1.count, 1)
+        XCTAssertEqual(reads, 0)
+        XCTAssertTrue(try dailyFiles().isEmpty)
+        XCTAssertTrue(bundle.coverageSummary.contains("Eksporterede glukoserækker: 0"))
+    }
+
+    @MainActor
+    func testCombinedEvaluationExportProducesRealSwiftFilesForEvaluatorKnownAnswers() throws {
+        let core = try evaluationStack()
+        let context = core.mainManagedObjectContext
+        let sensor = Sensor(startDate: now.addingTimeInterval(-3600), nsManagedObjectContext: context)
+        sensor.id = "sensor-A"
+        for (minutes, glucose) in [(30, 125.0), (60, 130.0), (120, 140.0)] {
+            evaluationReading("actual-\(minutes)", at: now.addingTimeInterval(Double(minutes * 60)), value: glucose,
+                sensor: sensor, context: context, suppressed: minutes == 30)
+        }
+        XCTAssertTrue(core.saveChangesSynchronously())
+        let logger = log(at: now.addingTimeInterval(10800))
+        let model = "synthetic,\"model\"\nÆ"
+        for horizon in [60, 120] {
+            let fixture = try presentationFixture(input(horizon: horizon), modelID: model)
+            logger.enqueue(try XCTUnwrap(fixture.snapshot.confirmingPresentation(of: fixture.result,
+                at: now.addingTimeInterval(1.250))))
+        }
+        let fallback = try presentationFixture(modelID: nil)
+        logger.enqueue(try XCTUnwrap(fallback.snapshot.confirmingPresentation(of: fallback.result,
+            at: now.addingTimeInterval(2))))
+        logger.waitUntilIdle()
+        let bundle = try logger.exportEvaluationForTesting(coreDataManager: core,
+            to: folder.appendingPathComponent("integration"))
+        XCTAssertEqual(try evaluationCSV(bundle, actual: true).1.count, 4)
+        // Only synthetic fixtures leave this test's directory, for the actual Python CLI check.
+        for actual in [false, true] {
+            let source = try evaluationCSV(bundle, actual: actual).0
+            let name = actual ? "forecast-evaluation-actual-integration.csv" : "forecast-evaluation-forecast-integration.csv"
+            try Data(contentsOf: source).write(to: FileManager.default.temporaryDirectory.appendingPathComponent(name))
+        }
+    }
+
+    @MainActor
+    func testEvaluationExportReportsCorruptCompleteAndInterruptedRecordsWithoutChangingLog() throws {
+        let core = try evaluationStack()
+        let logger = log(at: now.addingTimeInterval(10800))
+        logger.enqueue(try snapshot()); logger.waitUntilIdle()
+        let source = try XCTUnwrap(dailyFiles().first)
+        let handle = try FileHandle(forWritingTo: source)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data("{\"broken\":true}\n{\"incomplete\":".utf8))
+        try handle.close()
+        let before = try Data(contentsOf: source)
+        let bundle = try logger.exportEvaluationForTesting(coreDataManager: core,
+            to: folder.appendingPathComponent("corrupt-records"))
+        XCTAssertEqual(try evaluationCSV(bundle, actual: false).1.count, 14)
+        XCTAssertEqual(try evaluationCSV(bundle, actual: true).1.count, 1)
+        XCTAssertTrue(bundle.coverageSummary.contains("Oversprungne ulæselige prognoseposter: 2"))
+        let reportURL = try XCTUnwrap(bundle.urls.first { $0.lastPathComponent == "coverage.txt" })
+        XCTAssertTrue(try String(contentsOf: reportURL, encoding: .utf8)
+            .contains("Oversprungne ulæselige prognoseposter: 2"))
+        XCTAssertEqual(try Data(contentsOf: source), before)
+    }
+
+    @MainActor
+    func testPublicEvaluationExportCompletesOnMainWithAllThreeFilesReady() async throws {
+        let core = try evaluationStack()
+        let logger = log(at: now.addingTimeInterval(10800))
+        logger.enqueue(try snapshot()); logger.waitUntilIdle()
+        let bundle: ForecastEvaluationExport = try await withCheckedThrowingContinuation { continuation in
+            logger.exportEvaluation(coreDataManager: core) { outcome in
+                XCTAssertTrue(Thread.isMainThread)
+                if case .success(let result) = outcome {
+                    XCTAssertEqual(Set(result.urls.map(\.lastPathComponent)),
+                        Set(["forecast.csv", "actual-glucose.csv", "coverage.txt"]))
+                    XCTAssertTrue(result.urls.allSatisfy { FileManager.default.fileExists(atPath: $0.path) })
+                }
+                continuation.resume(with: outcome)
+            }
+        }
+        let exportedDirectory = try XCTUnwrap(bundle.urls.first).deletingLastPathComponent()
+        addTeardownBlock { try? FileManager.default.removeItem(at: exportedDirectory) }
+        XCTAssertEqual(try evaluationCSV(bundle, actual: false).1.count, 14)
+        XCTAssertEqual(try evaluationCSV(bundle, actual: true).1.count, 1)
     }
 
     /// Independent RFC-4180 reader for checking the writer, including quoted newlines.

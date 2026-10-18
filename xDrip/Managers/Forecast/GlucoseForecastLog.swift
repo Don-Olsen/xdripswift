@@ -1,6 +1,7 @@
 // Local, prospective evidence only. Never feeds glucose storage, alarms or therapy.
 import Foundation
 import CryptoKit
+import CoreData
 import os
 
 struct GlucoseForecastLogContext: Sendable {
@@ -288,6 +289,123 @@ struct GlucoseForecastLogSnapshot: Codable, Sendable {
 
 enum GlucoseForecastLogFailure: String, Error { case invalidSnapshot, io, corruptRecord, oversizedRecord }
 
+/// An explicit local export. No destination is selected and nothing is transmitted here.
+struct ForecastEvaluationExport: Sendable {
+    let urls: [URL]
+    let coverageSummary: String
+}
+
+/// Keeps only one bounding interval per sensor, never the forecast or glucose history.
+private struct ForecastEvaluationCoverage {
+    struct Interval {
+        var start: Date
+        var end: Date
+        mutating func include(_ other: Self) {
+            start = min(start, other.start); end = max(end, other.end)
+        }
+    }
+    var intervals = [String: Interval]()
+    var forecastRecords = 0
+    var unavailableRecords = 0
+    var unidentifiedForecastRecords = 0
+    var corruptForecastRecords = 0
+    var exportedRows = 0
+    var invalidRows = 0
+    var unidentifiedRows = 0
+    var unrelatedRows = 0
+    var actualIntervals = [String: Interval]()
+    var actualCounts = [String: Int]()
+
+    var interval: Interval? {
+        intervals.values.reduce(nil as Interval?) { result, next in
+            guard var result else { return next }
+            result.include(next); return result
+        }
+    }
+
+    mutating func include(_ snapshot: GlucoseForecastLogSnapshot, through cutoff: Date) {
+        guard snapshot.recordType != .unavailable, snapshot.reason == nil,
+              let reference = snapshot.referenceDate,
+              reference.timeIntervalSince1970.isFinite else {
+            unavailableRecords += 1; return
+        }
+        let offsets = snapshot.points.filter {
+            $0.offsetMinutes >= 0 && $0.offsetMinutes <= snapshot.horizonMinutes &&
+                $0.glucoseMgdl.isFinite && (20...600).contains($0.glucoseMgdl)
+        }.map(\.offsetMinutes)
+        guard let first = offsets.min(), let last = offsets.max() else {
+            unavailableRecords += 1; return
+        }
+        forecastRecords += 1
+        guard let sensor = snapshot.sensorIdentity, !sensor.isEmpty,
+              snapshot.sourceIdentity == "sensor:" + sensor else {
+            unidentifiedForecastRecords += 1; return
+        }
+        // Include all exported point offsets (also zero), plus the evaluator's matching
+        // tolerance. Never manufacture follow-up beyond this export's fixed clock time.
+        let range = Interval(start: reference.addingTimeInterval(Double(first) * 60 - 150),
+            end: min(cutoff, reference.addingTimeInterval(Double(last) * 60 + 150)))
+        guard range.start <= range.end else { return }
+        if var previous = intervals[sensor] { previous.include(range); intervals[sensor] = previous }
+        else { intervals[sensor] = range }
+    }
+
+    mutating func recordActual(sensor: String, date: Date) {
+        exportedRows += 1; actualCounts[sensor, default: 0] += 1
+        let range = Interval(start: date, end: date)
+        if var previous = actualIntervals[sensor] { previous.include(range); actualIntervals[sensor] = previous }
+        else { actualIntervals[sensor] = range }
+    }
+
+    func summary() -> String {
+        "Eksporterede glukoserækker: \(exportedRows). " +
+        "Udeladt: ugyldige glukoserækker: \(invalidRows). " +
+        "Udeladt: manglende sensor-ID: \(unidentifiedRows). " +
+        "Udeladt: uden matchende prognoseidentitet/periode: \(unrelatedRows). " +
+        "Oversprungne ulæselige prognoseposter: \(corruptForecastRecords). " +
+        "Dækningen kan have huller; se coverage.txt. Der er ikke beregnet en præcisionsscore."
+    }
+
+    func report(exportedAt: Date, formatter: ISO8601DateFormatter) -> String {
+        func span(_ range: Interval?) -> String {
+            guard let range else { return "Ingen" }
+            return formatter.string(from: range.start) + " til " + formatter.string(from: range.end)
+        }
+        var lines = [
+            "Lokal prognose- og glukoseeksport",
+            "Eksporttid (UTC): \(formatter.string(from: exportedAt))",
+            "Prognosernes afledte måleperiode (UTC, inklusive ±150 sekunder, højst eksporttid): \(span(interval))",
+            "Gyldige prognose-/visningsposter: \(forecastRecords)",
+            "Utilgængelige prognoseposter uden måleperiode: \(unavailableRecords)",
+            "Prognoseposter uden matchende kilde-/sensoridentitet: \(unidentifiedForecastRecords)",
+            "Oversprungne ulæselige prognoseposter: \(corruptForecastRecords)",
+            "Eksporterede glukoserækker: \(exportedRows)",
+            "Udeladt: ugyldige glukoserækker: \(invalidRows)",
+            "Udeladt: manglende sensor-ID: \(unidentifiedRows)",
+            "Udeladt: uden matchende prognoseidentitet/periode: \(unrelatedRows)",
+            "",
+            "Dækning pr. sensor (antal rækker og første/sidste måling; ingen garanti for ubrudt dækning):"
+        ]
+        for sensor in intervals.keys.sorted() {
+            // Quote unusual sensor IDs consistently with their CSV representation.
+            lines.append("Sensor \(GlucoseForecastCSV.escape(sensor)): \(actualCounts[sensor, default: 0]) rækker; " +
+                "ønsket \(span(intervals[sensor])); målinger \(span(actualIntervals[sensor]))")
+        }
+        lines += ["", "Begrænsninger:",
+            "Kun allerede gemte glukosemålinger i et fast databasesnapshot er med. Ventende ugemte ændringer og senere målinger indgår ikke. Eksporten ændrer ikke databasen.",
+            "Glukose er den gemte finalValue i mg/dL: udglattet værdi, ellers justeret værdi, ellers beregnet værdi. Det er ikke en ny rå eller uafhængig reference-måling.",
+            "Kun downstream-gyldige, endelige værdier mellem 20 og 600 mg/dL med kendt sensor-ID eksporteres. Målinger skjult af visningens femminuttersregel kan være med. Udeladte rækker tælles i den samlede afledte måleperiode.",
+            "Sensor-ID kopieres fra hver måling. source_identity er sensor: efterfulgt af samme ID. Der tildeles aldrig en sensor til en måling uden identitet.",
+            "Dubletter og modstridende gyldige værdier bevares. Analyseværktøjet tæller dubletter og udelukker konflikter på samme kilde/sensor/tid; eksportens rækkeantal er derfor ikke antal analyserbare par.",
+            "Prognoseloggen opbevares i op til 400 UTC-dage. Glukosehistorikkens valgte opbevaring (7/30/90/180/365 dage), oprydning, gendannelse og manglende sensor-ID kan give kortere dækning. Manglende historik rekonstrueres ikke, og ingen opbevaringsindstilling ændres.",
+            "Første og sidste måling beviser ikke fuld dækning. Home-prognoser er ikke døgnkontinuerlige. Nyeste prognoser kan stadig mangle fremtidige målinger. Der udføres ingen interpolation eller sammenkobling på tværs af sensorer.",
+            "Filerne indeholder helbredsdata. De forbliver lokale, indtil du selv vælger en destination i delingsarket.",
+            "Lokal analyse: python3 -B scripts/evaluate-glucose-forecast.py --forecast-csv forecast.csv --glucose-csv actual-glucose.csv --output-json forecast-report.json"
+        ]
+        return lines.joined(separator: "\n") + "\n"
+    }
+}
+
 /// Serial, bounded-memory IO. One daily file is indexed lazily; at most two indexes
 /// are kept. A normal minute append never re-reads the previous 400 days.
 final class GlucoseForecastLog: @unchecked Sendable {
@@ -345,10 +463,159 @@ final class GlucoseForecastLog: @unchecked Sendable {
         }
     }
 
+    /// Writes all three files before returning any shareable URL. The log worker freezes
+    /// the forecast stream; a separate pinned Core Data context reads committed actuals.
+    func exportEvaluation(coreDataManager: CoreDataManager,
+                          completion: @escaping (Result<ForecastEvaluationExport, Error>) -> Void) {
+        let parent = coreDataManager.privateManagedObjectContext
+        worker.async { [self] in
+            let root = FileManager.default.temporaryDirectory
+                .appendingPathComponent("xdrip-forecast-evaluation-exports", isDirectory: true)
+            let outcome: Result<ForecastEvaluationExport, Error>
+            do {
+                try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+                try protect(root, backedUp: false)
+                try pruneEvaluationExports(in: root)
+                let destination = root.appendingPathComponent("evaluation-\(UUID().uuidString)", isDirectory: true)
+                outcome = .success(try exportEvaluation(parent: parent, to: destination, pageSize: 500))
+            } catch {
+                report(.io); outcome = .failure(GlucoseForecastLogFailure.io)
+            }
+            DispatchQueue.main.async { completion(outcome) }
+        }
+    }
+
+    private func pruneEvaluationExports(in root: URL) throws {
+        for file in try FileManager.default.contentsOfDirectory(at: root,
+            includingPropertiesForKeys: [.contentModificationDateKey, .isDirectoryKey, .isSymbolicLinkKey]) {
+            guard file.lastPathComponent.hasPrefix("evaluation-") ||
+                    file.lastPathComponent.hasPrefix(".pending-") else { continue }
+            let values = try file.resourceValues(forKeys: [.contentModificationDateKey, .isDirectoryKey, .isSymbolicLinkKey])
+            if values.isDirectory == true, values.isSymbolicLink != true,
+               let modified = values.contentModificationDate,
+               clock().timeIntervalSince(modified) > 24 * 60 * 60 {
+                try FileManager.default.removeItem(at: file)
+            }
+        }
+    }
+
+    private func exportEvaluation(parent: NSManagedObjectContext, to destination: URL,
+                                  pageSize: Int,
+                                  pageRead: ((Int, NSManagedObjectContext) throws -> Void)? = nil) throws -> ForecastEvaluationExport {
+        guard pageSize > 0, !FileManager.default.fileExists(atPath: destination.path) else {
+            throw GlucoseForecastLogFailure.io
+        }
+        let exportedAt = clock()
+        let staging = destination.deletingLastPathComponent()
+            .appendingPathComponent(".pending-\(UUID().uuidString)", isDirectory: true)
+        var completed = false
+        defer { if !completed { try? FileManager.default.removeItem(at: staging) } }
+        try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: false)
+        try protect(staging, backedUp: false)
+        var coverage = ForecastEvaluationCoverage()
+        try export(to: staging.appendingPathComponent("forecast.csv"),
+            snapshotExported: { coverage.include($0, through: exportedAt) },
+            corruptRecord: { coverage.corruptForecastRecords += 1 })
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        try exportActualGlucose(parent: parent, to: staging.appendingPathComponent("actual-glucose.csv"),
+            coverage: &coverage, formatter: formatter, pageSize: pageSize, pageRead: pageRead)
+        let report = staging.appendingPathComponent("coverage.txt")
+        try Data(coverage.report(exportedAt: exportedAt, formatter: formatter).utf8).write(to: report, options: .atomic)
+        try protect(report, backedUp: false)
+        try FileManager.default.moveItem(at: staging, to: destination)
+        completed = true
+        return ForecastEvaluationExport(urls: ["forecast.csv", "actual-glucose.csv", "coverage.txt"].map {
+            destination.appendingPathComponent($0)
+        }, coverageSummary: coverage.summary())
+    }
+
+    private func exportActualGlucose(parent: NSManagedObjectContext, to destination: URL,
+                                    coverage: inout ForecastEvaluationCoverage,
+                                    formatter: ISO8601DateFormatter, pageSize: Int,
+                                    pageRead: ((Int, NSManagedObjectContext) throws -> Void)?) throws {
+        guard FileManager.default.createFile(atPath: destination.path, contents: nil) else {
+            throw GlucoseForecastLogFailure.io
+        }
+        try protect(destination, backedUp: false)
+        let handle = try FileHandle(forWritingTo: destination)
+        defer { try? handle.close() }
+        try handle.write(contentsOf: Data("date_utc,glucose_mgdl,source_identity,sensor_identity\r\n".utf8))
+        if let interval = coverage.interval {
+            var coordinator: NSPersistentStoreCoordinator?
+            parent.performAndWait { coordinator = parent.persistentStoreCoordinator }
+            guard let coordinator, !coordinator.persistentStores.isEmpty,
+                  coordinator.persistentStores.allSatisfy({ $0.type == NSSQLiteStoreType }) else {
+                throw GlucoseForecastLogFailure.io
+            }
+            let context = NSManagedObjectContext(concurrencyType: .privateQueueConcurrencyType)
+            context.persistentStoreCoordinator = coordinator
+            context.undoManager = nil
+            try context.performAndWait {
+                defer { context.reset(); try? context.setQueryGenerationFrom(nil) }
+                try context.setQueryGenerationFrom(.current)
+                let request: NSFetchRequest<BgReading> = BgReading.fetchRequest()
+                request.predicate = NSPredicate(format: "timeStamp >= %@ AND timeStamp <= %@",
+                    interval.start as NSDate, interval.end as NSDate)
+                request.sortDescriptors = [NSSortDescriptor(key: #keyPath(BgReading.timeStamp), ascending: true),
+                    NSSortDescriptor(key: #keyPath(BgReading.id), ascending: true)]
+                request.includesPendingChanges = false
+                request.relationshipKeyPathsForPrefetching = ["sensor"]
+                request.fetchLimit = pageSize
+                // Resolve .current to an actual generation before any page hook or concurrent
+                // writer. reset() can advance a context, so reapply THIS token after each page.
+                let countRequest = BgReading.fetchRequest()
+                countRequest.predicate = request.predicate
+                countRequest.includesPendingChanges = false
+                let count = try context.count(for: countRequest)
+                guard let generation = context.queryGenerationToken else { throw GlucoseForecastLogFailure.io }
+                var offset = 0
+                while offset < count {
+                    try autoreleasepool {
+                        try context.setQueryGenerationFrom(generation)
+                        try pageRead?(offset / pageSize, context)
+                        request.fetchOffset = offset
+                        let readings = try context.fetch(request)
+                        guard !readings.isEmpty else { throw GlucoseForecastLogFailure.io }
+                        for reading in readings {
+                            let value = reading.finalValue
+                            guard reading.isValidForDownstream, value.isFinite, (20...600).contains(value) else {
+                                coverage.invalidRows += 1; continue
+                            }
+                            guard let sensor = reading.sensor?.id, !sensor.isEmpty else {
+                                coverage.unidentifiedRows += 1; continue
+                            }
+                            guard let range = coverage.intervals[sensor],
+                                  reading.timeStamp >= range.start, reading.timeStamp <= range.end else {
+                                coverage.unrelatedRows += 1; continue
+                            }
+                            let fields = [formatter.string(from: reading.timeStamp), String(value), "sensor:" + sensor, sensor]
+                            let row = fields.map(GlucoseForecastCSV.escape).joined(separator: ",") + "\r\n"
+                            try handle.write(contentsOf: Data(row.utf8))
+                            coverage.recordActual(sensor: sensor, date: reading.timeStamp)
+                        }
+                        offset += readings.count
+                        context.reset()
+                    }
+                }
+            }
+        }
+        try handle.synchronize()
+    }
+
     // Internal synchronization seams for deterministic unit tests only. Production
-    // forecast and UI paths exclusively use enqueue/exportCSV above.
+    // forecast and UI paths exclusively use the asynchronous APIs above.
     func waitUntilIdle() { worker.sync {} }
     func exportCSVForTesting(to url: URL) throws { try worker.sync { try export(to: url) } }
+    func exportEvaluationForTesting(coreDataManager: CoreDataManager, to destination: URL,
+                                    pageSize: Int = 500,
+                                    pageRead: ((Int, NSManagedObjectContext) throws -> Void)? = nil) throws -> ForecastEvaluationExport {
+        let parent = coreDataManager.privateManagedObjectContext
+        return try worker.sync {
+            try exportEvaluation(parent: parent, to: destination, pageSize: pageSize, pageRead: pageRead)
+        }
+    }
 
     private func report(_ failure: GlucoseForecastLogFailure) {
         if failure != lastDiagnostic { diagnostic(failure); lastDiagnostic = failure }
@@ -468,7 +735,7 @@ final class GlucoseForecastLog: @unchecked Sendable {
         } else { try handle.truncate(atOffset: 0); report(.corruptRecord) }
     }
 
-    private func readLines(_ url: URL, body: (Data) throws -> Void) throws {
+    private func readLines(_ url: URL, corruptRecord: (() -> Void)? = nil, body: (Data) throws -> Void) throws {
         let handle = try FileHandle(forReadingFrom: url); defer { try? handle.close() }
         var pending = Data()
         while let chunk = try handle.read(upToCount: 64 * 1024), !chunk.isEmpty {
@@ -484,11 +751,13 @@ final class GlucoseForecastLog: @unchecked Sendable {
             // written. Partial data is skipped diagnostically, never merged into prior data.
             if (try? JSONSerialization.jsonObject(with: pending)) != nil {
                 try body(pending)
-            } else { report(.corruptRecord) }
+            } else { report(.corruptRecord); corruptRecord?() }
         }
     }
 
-    private func export(to destination: URL) throws {
+    private func export(to destination: URL,
+                        snapshotExported: ((GlucoseForecastLogSnapshot) -> Void)? = nil,
+                        corruptRecord: (() -> Void)? = nil) throws {
         try prepare()
         guard FileManager.default.createFile(atPath: destination.path, contents: nil) else { throw GlucoseForecastLogFailure.io }
         try protect(destination, backedUp: false)
@@ -497,11 +766,12 @@ final class GlucoseForecastLog: @unchecked Sendable {
         try handle.write(contentsOf: Data((GlucoseForecastCSV.columns.joined(separator: ",") + "\r\n").utf8))
         do {
             for file in try dailyFiles() {
-                try readLines(file) { [self] line in
+                try readLines(file, corruptRecord: corruptRecord) { [self] line in
                     let snapshot: GlucoseForecastLogSnapshot
                     do { snapshot = try GlucoseForecastLogSnapshot.decoder().decode(GlucoseForecastLogSnapshot.self, from: line) }
-                    catch { report(.corruptRecord); return }
+                    catch { report(.corruptRecord); corruptRecord?(); return }
                     for row in try GlucoseForecastCSV.rows(snapshot) { try handle.write(contentsOf: Data(row.utf8)) }
+                    snapshotExported?(snapshot)
                 }
             }
             try handle.synchronize()

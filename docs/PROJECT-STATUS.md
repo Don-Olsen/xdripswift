@@ -10,6 +10,42 @@
 
 De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
 
+
+## Samlet prognose- og målingseksport — 18. oktober 2026
+
+4340 gemmer den viste ML-prognose, men eksporten leverede kun prognosefilen;
+analyseværktøjet krævede en separat glukosefil med nøjagtigt samme sensor- og
+kildeidentitet. Den eksisterende eksportindgang deler nu forecast.csv,
+actual-glucose.csv og en kort coverage.txt samlet. Målinger læses sidevis fra
+et fast databasesnapshot på en privat kø. Gyldige gemte finalValue-værdier,
+oprindelige tidspunkter og sensoridentitet bevares, også for målinger skjult
+af femminuttersvisningen. Manglende identitet eller ugyldige værdier optælles,
+og et læsesvigt er en eksportfejl, ikke et vellykket tomt resultat.
+
+Prognoseformat, motor, ML, dosis, alarmer, HealthKit, Watch og datalagringens
+opbevaringsregler er uændrede. Målinger, som allerede er slettet af almindelig
+oprydning, kan ikke genskabes. Dækningens tidsinterval beviser ikke, at alle
+prognoser kan matches; det afgør det eksisterende analyseværktøj.
+
+Indledende fuld XCTest: **1761/1761 bestået, ingen fejl**, heraf 11 nye tests,
+i `20261018T130408Z-73066`. De nye tests bruger virkelig SQLite-lagring og
+kontrollerer sensoridentitet, finalValue, visningsskjulte målinger, ugyldige og
+manglende værdier, dubletter, intervalgrænser, 1.103 rækker over flere sider,
+samtidig oprettelse/redigering/sletning, tomme data, læsefejl, ulæselige
+logposter, uændret ældre CSV og færdige filer før callback på main.
+192 Python-tests og 54 syntetiske Watch-kontroller bestod. Den rigtige
+Swift-eksports to CSV-filer blev kørt gennem analyseværktøjets CLI: fem
+ML-par og to motorreservepar gav de kendte MAE- og signed-bias-facit.
+Syntetiske integrationseksporter/rapport ligger kun i de lokale testartefakter.
+Ingen eksisterende test er fjernet eller svækket. Uafhængig kodegennemgang fandt
+ingen blokerende fejl. Releaseproceduren gentester det endelige checkpoint;
+resultater og faktisk Apple-status registreres i releaseafsnittet.
+
+Den læsende enhedskontrol viste iPhone og Watch som utilgængelige. Ingen lokal
+installation, fysisk deling, hastigheds-/batterimåling eller dokumenteret
+præcisionsforbedring er udført. Testene beviser eksport og sammenligning på
+syntetiske data, ikke komplet døgnlogning eller en bestemt fremtidig præcision.
+
 ## Fremadrettet måling af den viste ML-prognose — 18. oktober 2026
 
 Gennemgangen bekræftede, at den almindelige prognoselog kun gemte motoren

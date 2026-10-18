@@ -201,7 +201,7 @@ struct SettingsNavigationView: View {
                 .onlineHelp(.dataManagement)
 
         case .forecastLogExport:
-            GlucoseForecastLogExportView()
+            GlucoseForecastLogExportView(coreDataManager: coreDataManager)
 
         case .forecastMLTraining:
             GlucoseForecastMLSettingsView(coreDataManager: coreDataManager)

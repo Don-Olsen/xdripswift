@@ -732,7 +732,35 @@ Retention keeps at most **400 UTC calendar days** (today and the preceding 399 d
 
 Files use iOS `completeUntilFirstUserAuthentication` protection and are explicitly included in normal device backup, subject to the user's device backup settings. They are not added to xDrip's separate application-specific backup format. No automatic transmission to HealthKit, Nightscout, Watch, network or Git occurs. Restoring via normal device backup needs physical verification; unit tests cannot prove an actual iCloud/device restore.
 
-Use **Settings → Home Screen → Eksportér prognoselog / Export forecast log**. Export streams a separate UTF-8 CSV copy to the system share sheet. It does not rename JSONL. Source files stay local; a destination is selected by the user. Temporary CSV copies older than 24 hours are pruned on the next explicit export, not by a new timer.
+Use **Settings → Home Screen → Eksportér prognoselog / Export forecast log**.
+The same action prepares and shares `forecast.csv`, `actual-glucose.csv` and
+`coverage.txt` together. The forecast CSV retains its existing format. Actuals
+are a read-only export of retained, valid `finalValue` measurements with their
+original times and sensor identities, including measurements hidden only by the
+five-minute display cadence. Both CSVs use UTF-8, explicit UTC timestamps and
+mg/dL. Actual values reflect their stored finalValue at export, including any
+already persisted historical smoothing/calibration; they are not evidence of
+the first value originally displayed. No value is recalculated or written back.
+
+Export runs on the existing serial log worker. Actual measurements are fetched
+in bounded pages from a private Core Data context pinned to one persistent-store
+generation, so saves or cleanup during the read cannot shift page contents.
+The requested interval covers exported forecast points and the evaluator's
+±150-second matching tolerance, capped at export time. No future measurements
+are invented. The share sheet receives files only after the entire export has
+succeeded. A database read error fails the export instead of reporting zero
+measurements. Files stay local until the user selects a sharing destination.
+
+`coverage.txt` records the requested and retained time span, counts and missing
+or invalid identity/value exclusions. A time span is not evidence of continuous
+coverage: the evaluator still counts missing targets and rejects conflicting
+same-time readings. Valid duplicate/conflicting readings are preserved for that
+check. Sensorless rows cannot be reassigned to a known sensor. Current local
+retention may be shorter than the 400-day forecast log; deleted actuals cannot
+be recovered by this export. Export does not change retention settings or read
+HealthKit. Temporary completed exports older than 24 hours are pruned on a
+subsequent explicit export, without a new timer. The original engine-only CSV
+API remains compatible.
 
 ### Engine schemas 1/2 and presentation schema 3
 
@@ -805,10 +833,11 @@ Reports include comparable counts, MAE, signed bias (positive means overpredicti
 **Availability is limited to retained records:** first-valid deduplication and error throttling mean the CSV cannot count every Home calculation attempt. It reports valid versus unavailable retained records, not a percentage of all daily sensor minutes. Home-based logging does not establish continuous full-day coverage. It cannot identify later meals/insulin without separate event data, so prospective accuracy must be interpreted with that limitation.
 
 After roughly 14 usable days, export through the same Home Screen settings
-entry and retain an actual-glucose CSV for the same dates and sensor/source
-identities. Run the command above locally. Fourteen calendar days alone do not
-guarantee sufficient matched examples, particularly with little Home usage or
-model changes. The export does not itself fetch future glucose or upload data.
+entry and share all three files together. Use the two exported CSVs in the
+command above and read `coverage.txt` for data limitations. Fourteen calendar
+days alone do not guarantee sufficient matched examples, particularly with
+little Home usage, short measurement retention or model changes. Export does
+not upload data or alter the active model, training, forecasts or dosing.
 
 ## Evidence for this candidate
 
