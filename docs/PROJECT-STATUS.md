@@ -1,3 +1,15 @@
+<!-- testflight-7.1.1-4338:start -->
+### TestFlight 7.1.1 (4338)
+
+- Kildecommit og tag: `c155d17920223771cc2305ea16c69a919692ef98` / `testflight-7.1.1-4338`.
+- Tests: 1727/1727 bestået; 0 fejlet; 0 skipped. iPhone- og Watch-simulatorbuilds bestod.
+- Apple-status (2026-10-18T10:33:01.788128+00:00): [Internal / Testing](https://appstoreconnect.apple.com/apps/6795645396/testflight/ios/d7508cbe-baf7-4465-943e-0d1e2ce2b4e8).
+- Eksisterende intern gruppe: Ole Internal er bekræftet tilknyttet.
+- Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
+<!-- testflight-7.1.1-4338:end -->
+
+De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
+
 ## Samlede databaseopslag til måltidspåmindelser — 18. oktober 2026
 
 Genåbning af Treatments afstemmer stadig påmindelser, også når selve listen
