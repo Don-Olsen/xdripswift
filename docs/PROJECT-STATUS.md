@@ -1,3 +1,15 @@
+<!-- testflight-7.1.1-4337:start -->
+### TestFlight 7.1.1 (4337)
+
+- Kildecommit og tag: `bf8bcf17299627b6a8ac0a9555c79eb09b5ba68c` / `testflight-7.1.1-4337`.
+- Tests: 1720/1720 bestået; 0 fejlet; 0 skipped. iPhone- og Watch-simulatorbuilds bestod.
+- Apple-status (2026-10-18T07:50:23.121856+00:00): [Internal / Testing](https://appstoreconnect.apple.com/apps/6795645396/testflight/ios/f68724cf-6a40-4b7f-b2b6-96dc29b74fb4).
+- Eksisterende intern gruppe: Ole Internal er bekræftet tilknyttet.
+- Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
+<!-- testflight-7.1.1-4337:end -->
+
+De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
+
 ## Fire afgrænsede rettelser efter 4336 — 18. oktober 2026
 
 - iPhone-widgettens rigtige snapshots læser nu gemte data. Eksempeldata bruges
