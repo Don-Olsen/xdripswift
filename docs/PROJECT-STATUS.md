@@ -1,3 +1,15 @@
+<!-- testflight-7.1.1-4342:start -->
+### TestFlight 7.1.1 (4342)
+
+- Kildecommit og tag: `b603b849b8421703725598ee26045967b23ba914` / `testflight-7.1.1-4342`.
+- Tests: 1764/1764 bestået; 0 fejlet; 0 skipped. iPhone- og Watch-simulatorbuilds bestod.
+- Apple-status (2026-10-18T17:29:32.364921+00:00): [Internal / Testing](https://appstoreconnect.apple.com/apps/6795645396/testflight/ios/55f5f2c4-5863-4881-ba85-a6e485549249).
+- Eksisterende intern gruppe: Ole Internal er bekræftet tilknyttet.
+- Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
+<!-- testflight-7.1.1-4342:end -->
+
+De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
+
 ## Samlet adgang til penindstillinger og tydelig prognosesektion — 18. oktober 2026
 
 Indstillinger → Generelt → Behandling og pen samler nu adgangen til den
