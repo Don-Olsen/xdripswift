@@ -1307,48 +1307,57 @@ struct SettingsRowTextView: View {
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: .infinity, alignment: .center)
         } else {
-            HStack(alignment: .firstTextBaseline, spacing: 12) {
-                HStack(alignment: .center, spacing: 7) {
-                    if let icon {
-                        SettingsRowIconView(icon: icon, isEnabled: isEnabled)
+            // Measure full text widths before falling back to a wrapping layout.
+            ViewThatFits(in: .horizontal) {
+                HStack(alignment: .firstTextBaseline, spacing: 12) {
+                    titleContent.fixedSize(horizontal: true, vertical: true)
+                    Spacer(minLength: 8)
+                    if let detail {
+                        detailContent(detail, stacked: false)
+                            .fixedSize(horizontal: true, vertical: true)
                     }
-
-                    if let indicator {
-                        Image(systemName: indicator.symbolName)
-                            .font(.caption2)
-                            .foregroundStyle(isEnabled ? indicator.color : .gray)
-                            .accessibilityLabel(indicator.accessibilityLabel ?? "")
-                    }
-
-                    Text(title)
-                        .foregroundStyle(titleColor ?? (isEnabled ? ConstantsAppColors.rowTitleText : ConstantsAppColors.disabledText))
-                        .lineLimit(2)
-                        .minimumScaleFactor(0.75)
-                        .frame(alignment: .leading)
                 }
-                .layoutPriority(1)
 
-                Spacer(minLength: 8)
-
-                if let detail {
-                    HStack(spacing: 5) {
-                        if let detailIndicator {
-                            Image(systemName: detailIndicator.symbolName)
-                                .font(.caption2)
-                                .foregroundStyle(isEnabled ? detailIndicator.color : .gray)
-                                .accessibilityLabel(detailIndicator.accessibilityLabel ?? "")
-                        }
-
-                        Text(detail)
-                            .foregroundStyle(isEnabled ? (detailColor ?? ConstantsAppColors.rowDetailText) : ConstantsAppColors.disabledText)
-                            .lineLimit(1)
-                            .truncationMode(.tail)
-                            .multilineTextAlignment(.trailing)
-                            .frame(alignment: .trailing)
-                    }
+                VStack(alignment: .leading, spacing: 4) {
+                    titleContent
+                    if let detail { detailContent(detail, stacked: true) }
                 }
             }
+            .fixedSize(horizontal: false, vertical: true)
             .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private var titleContent: some View {
+        HStack(alignment: .center, spacing: 7) {
+            if let icon {
+                SettingsRowIconView(icon: icon, isEnabled: isEnabled)
+            }
+            if let indicator {
+                Image(systemName: indicator.symbolName)
+                    .font(.caption2)
+                    .foregroundStyle(isEnabled ? indicator.color : .gray)
+                    .accessibilityLabel(indicator.accessibilityLabel ?? "")
+            }
+            Text(title)
+                .foregroundStyle(titleColor ?? (isEnabled ? ConstantsAppColors.rowTitleText : ConstantsAppColors.disabledText))
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .layoutPriority(1)
+    }
+
+    private func detailContent(_ detail: String, stacked: Bool) -> some View {
+        HStack(spacing: 5) {
+            if let detailIndicator {
+                Image(systemName: detailIndicator.symbolName)
+                    .font(.caption2)
+                    .foregroundStyle(isEnabled ? detailIndicator.color : .gray)
+                    .accessibilityLabel(detailIndicator.accessibilityLabel ?? "")
+            }
+            Text(detail)
+                .foregroundStyle(isEnabled ? (detailColor ?? ConstantsAppColors.rowDetailText) : ConstantsAppColors.disabledText)
+                .multilineTextAlignment(stacked ? .leading : .trailing)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 }

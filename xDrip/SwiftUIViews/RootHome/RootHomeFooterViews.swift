@@ -222,84 +222,90 @@ struct RootHomeDataSourceView: View {
     let sensorState: RootHomeSensorState
     let sensorNoiseState: RootHomeSensorNoiseState
     let action: () -> Void
+    @ScaledMetric(relativeTo: .subheadline) private var textSize: CGFloat = 14
 
     private enum Layout {
         static let height: CGFloat = 30
     }
 
     var body: some View {
-        HStack(spacing: 5) {
-            HStack(spacing: 6) {
-                if sensorNoiseState.showsIndicator {
-                    Circle()
-                        .fill(sensorNoiseState.indicatorColor)
-                        .frame(width: 8, height: 8)
-                        .overlay {
-                            Circle()
-                                .stroke(sensorNoiseState.indicatorColor.opacity(0.35), lineWidth: 3)
-                        }
-                        .accessibilityLabel(sensorNoiseState.indicatorAccessibilityLabel)
-                }
-
-                if state.showsConnectionIcon {
-                    Circle()
-                        .fill(state.connectionColor)
-                        .frame(width: 8, height: 8)
-                }
-
-                if state.showsKeepAliveIcon {
-                    Image(systemName: state.keepAliveSystemImage)
-                        .font(.system(size: 15))
-                        .foregroundStyle(state.keepAliveColor)
-                }
-
-                if let mode = state.dexcomConnectionMode {
-                    Image(systemName: mode.systemImage)
-                        .foregroundStyle(mode.color)
-                        .font(.system(size: 14))
-                        .accessibilityLabel(dexcomModeAccessibilityLabel(mode))
-                }
-
-                Text(state.title)
-                    .font(.system(size: 14, weight: .bold))
-                    .foregroundStyle(ConstantsAppColors.dataSourceText)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.7)
+        // Measure full text widths before falling back to a wrapping layout.
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 5) {
+                sourceContent.fixedSize(horizontal: true, vertical: true)
+                Spacer(minLength: 8)
+                detailContent(stacked: false).fixedSize(horizontal: true, vertical: true)
             }
-            .layoutPriority(1)
-
-            Spacer(minLength: 8)
-
-            HStack(spacing: 4) {
-                Text(dataSourceDetailText)
-                    .font(.system(size: 14))
-                    .foregroundStyle(dataSourceDetailColor)
-                    .monospacedDigit()
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.7)
-
-                if let systemImage = state.detailSystemImage, sensorState.currentAge.isEmpty {
-                    Image(systemName: systemImage)
-                        .font(.system(size: 14))
-                        .foregroundStyle(state.detailSystemImageColor)
-                        .fixedSize()
-                        .accessibilityLabel(state.detailSystemImageAccessibilityLabel)
-                }
-
-                if let maxAgeText {
-                    Text(maxAgeText)
-                        .font(.system(size: 14))
-                        .foregroundStyle(ConstantsAppColors.dataSourceText)
-                        .monospacedDigit()
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.7)
-                }
+            VStack(alignment: .leading, spacing: 4) {
+                sourceContent
+                detailContent(stacked: true)
             }
         }
-        .frame(maxWidth: .infinity)
-        .frame(height: Layout.height)
+        .fixedSize(horizontal: false, vertical: true)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(minHeight: Layout.height)
         .contentShape(Rectangle())
         .onTapGesture(count: 2, perform: action)
+    }
+
+    private var sourceContent: some View {
+        HStack(spacing: 6) {
+            if sensorNoiseState.showsIndicator {
+                Circle()
+                    .fill(sensorNoiseState.indicatorColor)
+                    .frame(width: 8, height: 8)
+                    .overlay {
+                        Circle()
+                            .stroke(sensorNoiseState.indicatorColor.opacity(0.35), lineWidth: 3)
+                    }
+                    .accessibilityLabel(sensorNoiseState.indicatorAccessibilityLabel)
+            }
+            if state.showsConnectionIcon {
+                Circle().fill(state.connectionColor).frame(width: 8, height: 8)
+            }
+            if state.showsKeepAliveIcon {
+                Image(systemName: state.keepAliveSystemImage)
+                    .font(.system(size: textSize + 1))
+                    .foregroundStyle(state.keepAliveColor)
+            }
+            if let mode = state.dexcomConnectionMode {
+                Image(systemName: mode.systemImage)
+                    .foregroundStyle(mode.color)
+                    .font(.system(size: textSize))
+                    .accessibilityLabel(dexcomModeAccessibilityLabel(mode))
+            }
+            Text(state.title)
+                .font(.system(size: textSize, weight: .bold))
+                .foregroundStyle(ConstantsAppColors.dataSourceText)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .layoutPriority(1)
+    }
+
+    private func detailContent(stacked: Bool) -> some View {
+        HStack(spacing: 4) {
+            Text(dataSourceDetailText)
+                .font(.system(size: textSize))
+                .foregroundStyle(dataSourceDetailColor)
+                .monospacedDigit()
+                .multilineTextAlignment(stacked ? .leading : .trailing)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if let systemImage = state.detailSystemImage, sensorState.currentAge.isEmpty {
+                Image(systemName: systemImage)
+                    .font(.system(size: textSize))
+                    .foregroundStyle(state.detailSystemImageColor)
+                    .fixedSize()
+                    .accessibilityLabel(state.detailSystemImageAccessibilityLabel)
+            }
+            if let maxAgeText {
+                Text(maxAgeText)
+                    .font(.system(size: textSize))
+                    .foregroundStyle(ConstantsAppColors.dataSourceText)
+                    .monospacedDigit()
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
     }
 
     private var dataSourceDetailText: String {

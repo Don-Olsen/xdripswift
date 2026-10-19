@@ -3071,3 +3071,142 @@ extension RootHomeInteractionTests {
             at: date.addingTimeInterval(62)))
     }
 }
+
+
+extension RootHomeInteractionTests {
+    @MainActor
+    func testAdaptiveSettingsRowsKeepShortValuesCompactAndWrapLongValues() {
+        let short = adaptiveSize(SettingsRowTextView(title: "Insulin", detail: "0,5 E", isEnabled: true),
+            width: 320, textSize: .large)
+        let longRow = SettingsRowTextView(title: "Insulinfølsomhed (ISF)",
+            detail: "1,20 mmol/L pr. enhed insulin", isEnabled: true)
+        let narrow = adaptiveSize(longRow, width: 200, textSize: .large)
+        let wide = adaptiveSize(longRow, width: 768, textSize: .large)
+        XCTAssertLessThanOrEqual(short.height, 25)
+        XCTAssertEqual(wide.height, short.height, accuracy: 1)
+        XCTAssertGreaterThan(narrow.height, wide.height + 15,
+            "Long values need additional lines, rather than ellipsis or smaller text")
+        XCTAssertLessThanOrEqual(narrow.width, 200)
+    }
+
+    @MainActor
+    func testAdaptiveSettingsRowsSupportLargeTextAndMissingDetails() {
+        let row = SettingsRowTextView(title: "Historik fra Apple Sundhed", detail: nil,
+            isEnabled: false, icon: .init(symbolName: "heart.fill"), indicatorColor: .orange)
+        let normal = adaptiveSize(row, width: 265, textSize: .large)
+        let large = adaptiveSize(row, width: 265, textSize: .accessibility3)
+        XCTAssertGreaterThan(large.height, normal.height,
+            "A title without a detail must also wrap at accessible sizes")
+        XCTAssertLessThanOrEqual(large.width, 265)
+        let warning = SettingsRowTextView(title: "Sundhed", detail: "Afventer gyldige målinger",
+            isEnabled: true, detailColor: .orange,
+            detailIndicator: .init(color: .orange, accessibilityLabel: "Advarsel"))
+        let warningSize = adaptiveSize(warning, width: 265, textSize: .accessibility3)
+        XCTAssertGreaterThan(warningSize.height, normal.height)
+        XCTAssertLessThanOrEqual(warningSize.width, 265)
+    }
+
+    @MainActor
+    func testAdaptiveSourceRowsPreserveNormalHeightAndGrowWhenNeeded() {
+        var source = RootHomeDataSourceState()
+        source.title = "Libre 2 Plus EU"
+        source.showsConnectionIcon = true
+        var sensor = RootHomeSensorState()
+        sensor.currentAge = "1d 8h"
+        sensor.maxAge = "/ 15d 12h"
+        let view = RootHomeDataSourceView(state: source, sensorState: sensor,
+            sensorNoiseState: .init(), action: {})
+        for width in [320.0, 430.0, 768.0] {
+            XCTAssertEqual(adaptiveSize(view, width: width, textSize: .large).height,
+                30, accuracy: 0.5, "Ordinary sensor text must keep the existing chart space")
+        }
+        let accessible = adaptiveSize(view, width: 265, textSize: .accessibility3)
+        XCTAssertGreaterThan(accessible.height, 30)
+        XCTAssertLessThanOrEqual(accessible.width, 265)
+        source.title = "Følger · syntetisk-sensorforbindelse"
+        source.detail = "Afventer nye målinger fra telefonen"
+        source.detailColor = .orange
+        source.detailSystemImage = "exclamationmark.triangle.fill"
+        source.detailSystemImageAccessibilityLabel = "Forbindelsesadvarsel"
+        let follower = RootHomeDataSourceView(state: source, sensorState: .init(),
+            sensorNoiseState: .init(), action: {})
+        let narrow = adaptiveSize(follower, width: 200, textSize: .large)
+        XCTAssertGreaterThan(narrow.height, 30)
+        XCTAssertLessThanOrEqual(narrow.width, 200)
+    }
+
+    @MainActor
+    private func adaptiveSize<Content: View>(_ content: Content, width: CGFloat,
+                                            textSize: DynamicTypeSize) -> CGSize {
+        let host = UIHostingController(rootView: content.font(.body)
+            .environment(\.dynamicTypeSize, textSize))
+        return host.sizeThatFits(in: CGSize(width: width, height: 2000))
+    }
+
+    /// Render the production components with synthetic content; attachments stay outside Git.
+    @MainActor
+    func testRenderAdaptiveSettingsAndSourceRows() throws {
+        for width in [320.0, 430.0, 768.0] {
+            for textSize in [DynamicTypeSize.large, .accessibility3] {
+                let image = ImageRenderer(content: adaptiveRowsFixture(width: width, textSize: textSize))
+                image.scale = 2
+                let attachment = XCTAttachment(image: try XCTUnwrap(image.uiImage))
+                attachment.name = "Synthetic adaptive rows \(Int(width))pt \(textSize)"
+                attachment.lifetime = .keepAlways
+                add(attachment)
+            }
+        }
+    }
+
+    @MainActor
+    private func adaptiveRowsFixture(width: CGFloat, textSize: DynamicTypeSize) -> some View {
+        var source = RootHomeDataSourceState()
+        source.title = "Libre 2 Plus EU"
+        source.showsConnectionIcon = true
+        source.connectionColor = .green
+        var sensor = RootHomeSensorState()
+        sensor.currentAge = "1d 8h"
+        sensor.maxAge = "/ 15d 12h"
+        var noise = RootHomeSensorNoiseState()
+        noise.showsIndicator = true
+        noise.indicatorColor = .yellow
+        noise.indicatorAccessibilityLabel = "Syntetisk støjstatus"
+        var follower = RootHomeDataSourceState()
+        follower.title = "Følger · syntetisk-sensorforbindelse"
+        follower.detail = "Afventer nye målinger fra telefonen"
+        follower.detailColor = .orange
+        follower.showsConnectionIcon = true
+        follower.showsKeepAliveIcon = true
+        follower.detailSystemImage = "exclamationmark.triangle.fill"
+        follower.detailSystemImageAccessibilityLabel = "Syntetisk forbindelsesadvarsel"
+        return VStack(alignment: .leading, spacing: 16) {
+            Text("Syntetiske visningsdata · \(Int(width)) pt · \(String(describing: textSize))")
+                .font(.caption).foregroundStyle(.secondary)
+            SettingsStaticRowView(title: "Blodsukkerprognose", detail: "60 minutter", isEnabled: true,
+                showsDisclosure: true, action: {})
+            Divider()
+            SettingsStaticRowView(title: "Insulinfølsomhed (ISF)",
+                detail: "1,20 mmol/L pr. enhed insulin", isEnabled: true,
+                showsDisclosure: true, icon: .init(symbolName: "drop.fill"), action: {})
+            Divider()
+            SettingsStaticRowView(title: "Historik fra Apple Sundhed",
+                detail: "Ingen læsbar historik fra den valgte Sundhed-kilde", isEnabled: true,
+                showsDisclosure: true, detailColor: .orange,
+                detailIndicator: .init(color: .orange, accessibilityLabel: "Syntetisk advarsel"), action: {})
+            Divider()
+            SettingsStaticRowView(title: "Ikke tilgængelig indstilling", detail: "Afventer gyldige data",
+                isEnabled: false, showsDisclosure: false, indicatorColor: .red, action: {})
+            Divider()
+            RootHomeDataSourceView(state: source, sensorState: sensor, sensorNoiseState: noise, action: {})
+            Divider()
+            RootHomeDataSourceView(state: follower, sensorState: .init(), sensorNoiseState: .init(), action: {})
+        }
+        .padding(16)
+        .frame(width: width)
+        .background(ConstantsAppColors.background)
+        .font(.body)
+        .environment(\.locale, Locale(identifier: "da_DK"))
+        .environment(\.colorScheme, .dark)
+        .environment(\.dynamicTypeSize, textSize)
+    }
+}

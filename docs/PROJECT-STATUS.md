@@ -1,3 +1,39 @@
+## Adaptive indstillingsrækker og sensorlinje — 19. oktober 2026
+
+De almindelige indstillingsrækker viser titel og værdi ved siden af hinanden,
+når hele teksten kan være der, og ellers over hinanden med ombrydning.
+Farver, statusmarkører, tilgængelighedstekster, handlinger og centrerede rækker
+er bevaret. Home bruger samme enkle tilpasning i kilde-/sensorlinjen; kort
+sensor- og alderstekst beholder højden på 30 point. Ved lange tekster og større
+systemtekst må linjen vokse, så forbindelsesoplysninger kan læses. Glukoseværdi,
+graf, øvrige Home-elementer, beregning, navigation og dataflow er uændrede.
+Der er kun ændringer i to produktionsfiler og eksisterende visningstests.
+Særskilte picker-/menurækker uden den fælles tekstkomponent er ikke ombygget.
+
+Indledende fuld XCTest: **1770/1770 bestået, 0 fejl**, i
+`20261019T044224Z-58255`. Fire nye tests dækker kompakte rækker, lange danske
+tekster, manglende detalje, statusmarkører, store tekststørrelser og Home-linjens
+normale højde. Produktionskomponenterne er renderet før/efter med identiske,
+tydeligt syntetiske data ved 320, 430 og 768 points bredde, med normal tekst og
+stor tilgængelighedstekst. Der blev observeret fulde værdier og advarselstekster
+i stedet for afkortning. På den faktiske iPhone-simulator blev Home-indstillingen
+med ombrudt kulhydratfaktor åbnet i sin eksisterende editor og forladt uden
+lagring. Normal systemtekst er gendannet. Breddetests omfatter iPad-bredde;
+der er ikke udført separat manuel navigation på iPad.
+
+Før/efter-billeder, xcresult, log og faktisk simulatorbillede er kun lokale i
+`build/visual-checks/adaptive-rows-20261019/` (Git-ignoreret). Diffkontrol bestod;
+releaseproceduren gentester det endelige Apple-valgte buildnummer og registrerer
+releasekvittering og Apple-status særskilt. Der er ikke målt hastighed eller
+batteriforbrug.
+
+Den læsende enhedsliste fandt en parret iPhone, men forespørgslen efter den
+installerede app fejlede med CoreDevice 4000 / forbindelsen nulstillet. Uret var
+utilgængeligt. Den fysiske iPhone-/Watch-version og den nye visning er derfor
+ikke verificeret ved denne kontrol. Ingen lokal installation eller ændring af
+telefondata er udført. Prognose/ML, dosisregler, behandlinger, HealthKit,
+Libre/Watch og alarmer er ikke ændret.
+
 <!-- testflight-7.1.1-4343:start -->
 ### TestFlight 7.1.1 (4343)
 
