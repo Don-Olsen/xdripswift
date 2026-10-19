@@ -41,6 +41,36 @@ under forsøg på visuel kontrol; ny skærm, større tekst og tastatur er derfor
 ikke visuelt eller fysisk verificeret. Layoutet genbruger eksisterende chips,
 ombrydning og informationsark. Ingen målt hastigheds- eller batterigevinst.
 
+## Opfølgende visuel kontrol af 4343 — 19. oktober 2026
+
+Skærmstyringen virker igen efter opdateringen af chatens arbejdsmapper.
+I den installerede Xcode 27.1 ligger den grafiske simulator i **Device Hub**
+(`Xcode.app/Contents/Applications/DeviceHub.app`); manglende
+`Developer/Applications/Simulator.app` var derfor ikke bevis for en defekt
+Xcode-installation. Den eksisterende iPhone 18 Pro-simulator blev valgt,
+og simulatorens aktuelle xDrip-build blev kontrolleret som 7.1.1 (4343).
+
+Den faktiske `PenDoseCalculatorScreen` er nu kontrolleret med rent syntetiske
+målinger og måltid i en hukommelsesdatabase samt en syntetisk profil i midlertidige
+testindstillinger. En midlertidig hosted XCTest anvendte de eksisterende
+produktionsafhængigheder; ingen produktionskode
+blev ændret. Den indledende kontrol bekræftede et gyldigt CGM-estimat, der
+sænkede kurve-COB. Skærmen viste det anvendte COB og den korrekte korte kilde;
+ⓘ viste samme anvendte værdi sammen med kurve og estimat. Eksplicit manuel
+glukose gav kurve-COB og den tilsvarende forklaring i ⓘ. Ombrydning med stor
+tilgængelighedstekst og synlig Log-knap med softwaretastaturet åbent blev
+observeret. Beregneren blev lukket uden Log.
+
+Den ekstra visningstest bestod: **1/1, 0 fejl**. Den er et supplement til den
+oprindelige releasekvittering på 1766 tests. Testtilføjelsen blev efterfølgende
+fjernet, og den oprindelige testfil blev verificeret byte for byte. Skærmbilleder,
+midlertidig testkilde, log og xcresult er bevaret lokalt under den Git-ignorerede
+`build/testflight-7.1.1-4343/visual-check-20261019/`.
+
+Der er ingen ny upload eller lokal installation på iPhone/Watch. Den fysiske
+visning, notifikationslevering og klinisk effekt er fortsat ikke verificeret
+ved denne kontrol. Der er ikke målt hastighed eller batteriforbrug.
+
 <!-- testflight-7.1.1-4342:start -->
 ### TestFlight 7.1.1 (4342)
 

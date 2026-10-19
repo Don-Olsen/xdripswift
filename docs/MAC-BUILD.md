@@ -46,6 +46,16 @@ GO UPLOAD gælder den konkrete udgivelse. Vedligeholdelse og oprydning starter
 ingen release, ændrer intet versionsnummer og uploader ikke. Marketingversionen
 er fortsat 7.1.1 på alle fem bundles. Fallback 4231 må ikke uploades.
 
+## Grafisk simulator i Xcode 27.1
+
+På denne installation åbnes simulatorens brugerflade gennem
+`/Applications/Xcode.app/Contents/Applications/DeviceHub.app` (**Device Hub**).
+Vælg enheden mærket **Simulator** i sidepanelet. Den separate gamle sti
+`Contents/Developer/Applications/Simulator.app` findes ikke på denne
+installation; det kræver ikke i sig selv geninstallation af Xcode.
+Dette forløb blev verificeret med iPhone 18 Pro-simulatoren den 19. oktober 2026.
+`xcrun simctl` bruges fortsat af de eksisterende automatiske tests og builds.
+
 ## Permanent automatisk TestFlight-proces
 
 Læs [AGENTS.md](../AGENTS.md) og [PROJECT-STATUS.md](PROJECT-STATUS.md).
