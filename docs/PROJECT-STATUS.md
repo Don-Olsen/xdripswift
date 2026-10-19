@@ -1,3 +1,15 @@
+<!-- testflight-7.1.1-4344:start -->
+### TestFlight 7.1.1 (4344)
+
+- Kildecommit og tag: `4ae03a50a1ce4d4b08cc2790ef980d4706c628d5` / `testflight-7.1.1-4344`.
+- Tests: 1770/1770 bestået; 0 fejlet; 0 skipped. iPhone- og Watch-simulatorbuilds bestod.
+- Apple-status (2026-10-19T05:10:52.374825+00:00): [Internal / Testing](https://appstoreconnect.apple.com/apps/6795645396/testflight/ios/bd12c8f2-f8f4-4f24-88b2-915a18a0af1c).
+- Eksisterende intern gruppe: Ole Internal er bekræftet tilknyttet.
+- Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
+<!-- testflight-7.1.1-4344:end -->
+
+De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
+
 ## Adaptive indstillingsrækker og sensorlinje — 19. oktober 2026
 
 De almindelige indstillingsrækker viser titel og værdi ved siden af hinanden,
