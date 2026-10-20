@@ -1,3 +1,15 @@
+<!-- testflight-7.1.1-4346:start -->
+### TestFlight 7.1.1 (4346)
+
+- Kildecommit og tag: `a8a65294872e1d1b224bc24ebd032ab407348298` / `testflight-7.1.1-4346`.
+- Tests: 1817/1817 bestået; 0 fejlet; 0 skipped. iPhone- og Watch-simulatorbuilds bestod.
+- Apple-status (2026-10-20T16:07:09.690176+00:00): [Internal / Testing](https://appstoreconnect.apple.com/apps/6795645396/testflight/ios/d75b710d-1459-407e-ab49-bb7a62a03ecf).
+- Eksisterende intern gruppe: Ole Internal er bekræftet tilknyttet.
+- Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
+<!-- testflight-7.1.1-4346:end -->
+
+De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
+
 ## Automatisk måltidsro — lokal kandidat 20. oktober 2026
 
 Funktionen er fra som standard. Under alarmindstillinger vælges en varighed
