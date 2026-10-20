@@ -99,6 +99,8 @@ struct AlertEntryEditRequest {
 struct AlertsSettingsView: View {
     @ObservedObject var viewModel: AlertsSettingsViewModel
     @AppStorage(HighSoonAdvisoryPolicy.enabledKey) private var highSoonAdvisoryEnabled = true
+    @ObservedObject private var mealQuiet = MealQuietManager.shared
+    @State private var mealQuietDurationSelection: SettingsSelectionListContent?
 
     let openAlertEntry: (AlertEntryEditRequest) -> Void
 
@@ -118,6 +120,26 @@ struct AlertsSettingsView: View {
                 }
             }
             Section {
+                Toggle("Automatisk måltidsro", isOn: Binding(
+                    get: { mealQuiet.isEnabled },
+                    set: { mealQuiet.setEnabled($0) }
+                ))
+                if mealQuiet.isEnabled {
+                    SettingsStaticRowView(title: "Varighed",
+                        detail: mealQuiet.durationMinutes.map { "\($0) minutter" } ?? "Vælg varighed",
+                        isEnabled: true, showsDisclosure: true,
+                        action: presentMealQuietDurationSelection)
+                    if mealQuiet.durationMinutes == nil {
+                        Text("Vælg en varighed, før Måltidsro kan starte.")
+                            .foregroundStyle(.orange)
+                    }
+                }
+            } header: {
+                Text("Måltidsro")
+            } footer: {
+                Text("Starter automatisk efter en gemt registrering med både kulhydrat og bolus, når sikkerhedskontrollerne er opfyldt. Dæmper Høj og Højt om lidt samt Hurtig stigning under højgrænsen. Akut høj og alle lave alarmer fortsætter. En registrering fra et offline Watch starter ikke Måltidsro.")
+            }
+            Section {
                 Toggle("Højt om lidt", isOn: $highSoonAdvisoryEnabled)
             } footer: {
                 Text("Bruger grænsen og tidsplanen for Høj. Varsler ved en stigende prognose over grænsen inden for 30 minutter, når en bekræftet doseringsprofil giver et positivt, kontrolleret forslag i beregneren. Tryk åbner en ny beregning; beskeden indeholder ingen dosis.")
@@ -127,7 +149,21 @@ struct AlertsSettingsView: View {
             AlertManager.highSoonSettingDidChange(isEnabled: isEnabled)
         }
         .id(viewModel.reloadToken)
+        .settingsPushPresentation(selectionList: $mealQuietDurationSelection)
         .settingsListStyle(title: Texts_Alerts.alertsScreenTitle, titleDisplayMode: .inline)
+    }
+
+    private func presentMealQuietDurationSelection() {
+        let choices = MealQuietManager.validDurationMinutes
+        mealQuietDurationSelection = SettingsSelectionListContent(
+            title: "Måltidsro · varighed",
+            data: ["Vælg varighed"] + choices.map { "\($0) minutter" },
+            selectedRow: mealQuiet.durationMinutes.flatMap { choices.firstIndex(of: $0) }.map { $0 + 1 } ?? 0,
+            actionTitle: Texts_Common.Ok, cancelTitle: Texts_Common.Cancel,
+            action: { index in
+                guard index > 0, choices.indices.contains(index - 1) else { return }
+                mealQuiet.setDurationMinutes(choices[index - 1])
+            }, cancel: nil, didSelectRow: nil)
     }
 }
 

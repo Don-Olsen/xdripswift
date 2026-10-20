@@ -74,6 +74,94 @@ final class HighSoonNotificationTests: XCTestCase {
         XCTAssertEqual(harness.requests.count, 2, "A successful request keeps the persisted repeat limit")
     }
 
+    func testMealQuietBeforeSchedulingLeavesExistingReservationAndSnoozeUntouched() throws {
+        let harness = Harness()
+        defer { harness.finish() }
+        let previous = now.addingTimeInterval(-3600)
+        harness.defaults.set(previous, forKey: HighSoonAdvisoryPolicy.lastScheduledKey)
+        let high = harness.manager.getSnoozeParameters(alertKind: .high)
+        let snoozeStamp = high.snoozeTimeStamp
+        let snoozeMinutes = high.snoozePeriodInMinutes
+        harness.mealQuietState = (true, 1)
+        harness.evaluate(try outcome(at: now), at: now)
+        XCTAssertTrue(harness.requests.isEmpty)
+        XCTAssertEqual(harness.defaults.object(forKey: HighSoonAdvisoryPolicy.lastScheduledKey) as? Date, previous)
+        XCTAssertEqual(high.snoozeTimeStamp, snoozeStamp)
+        XCTAssertEqual(high.snoozePeriodInMinutes, snoozeMinutes)
+    }
+
+    func testMealQuietDuringPendingReplyRestoresOnlyItsPriorReservation() async throws {
+        let previousReservations: [Date?] = [nil, now.addingTimeInterval(-3600)]
+        for previous in previousReservations {
+            let harness = Harness()
+            defer { harness.finish() }
+            if let previous { harness.defaults.set(previous, forKey: HighSoonAdvisoryPolicy.lastScheduledKey) }
+            harness.evaluate(try outcome(at: now), at: now)
+            harness.mealQuietState = (true, 1)
+            harness.completions[0](nil)
+            await drainCallbacks()
+            XCTAssertEqual(harness.clearCount, 1)
+            XCTAssertEqual(harness.defaults.object(forKey: HighSoonAdvisoryPolicy.lastScheduledKey) as? Date, previous)
+            XCTAssertFalse(harness.manager.getSnoozeParameters(alertKind: .high).getSnoozeValue().isSnoozed)
+
+            // The canceled request no longer owns the reservation or notification identifier.
+            harness.completions[0](nil)
+            await drainCallbacks()
+            XCTAssertEqual(harness.clearCount, 1)
+            harness.mealQuietState = (false, 1)
+            harness.evaluate(try outcome(at: now), at: now)
+            XCTAssertEqual(harness.requests.count, 2, "A suppressed request must not count as sent")
+        }
+    }
+
+    func testMealQuietEndingBeforeSystemReplyCannotReviveOldAdvisory() async throws {
+        let harness = Harness()
+        defer { harness.finish() }
+        harness.evaluate(try outcome(at: now), at: now)
+        // The current flag is false again, but an intervening quiet activation advanced its epoch.
+        harness.mealQuietState = (false, 1)
+        harness.completions[0](nil)
+        await drainCallbacks()
+        XCTAssertEqual(harness.clearCount, 1)
+        XCTAssertNil(harness.defaults.object(forKey: HighSoonAdvisoryPolicy.lastScheduledKey))
+    }
+
+    func testOldQuietReplyCannotClearNewerAttemptOrRestoreItsReservation() async throws {
+        let harness = Harness()
+        defer { harness.finish() }
+        harness.evaluate(try outcome(at: now), at: now)
+        let later = now.addingTimeInterval(HighSoonAdvisoryPolicy.minimumInterval)
+        harness.evaluate(try outcome(at: later), at: later)
+        harness.mealQuietState = (true, 1)
+        harness.completions[0](nil)
+        await drainCallbacks()
+        XCTAssertEqual(harness.clearCount, 0, "The older callback no longer owns the shared notification ID")
+        XCTAssertEqual(harness.defaults.object(forKey: HighSoonAdvisoryPolicy.lastScheduledKey) as? Date, later)
+        harness.completions[1](nil)
+        await drainCallbacks()
+        XCTAssertEqual(harness.clearCount, 1)
+        XCTAssertEqual(harness.defaults.object(forKey: HighSoonAdvisoryPolicy.lastScheduledKey) as? Date, now)
+    }
+
+    func testSameTimestampReplacementStillRejectsOlderCallbackOwnership() async throws {
+        let harness = Harness()
+        defer { harness.finish() }
+        harness.evaluate(try outcome(at: now), at: now)
+        // Force a second request with the same timestamp to prove ownership is more than Date equality.
+        harness.defaults.removeObject(forKey: HighSoonAdvisoryPolicy.lastScheduledKey)
+        harness.evaluate(try outcome(at: now), at: now)
+        XCTAssertEqual(harness.requests.count, 2)
+        harness.mealQuietState = (false, 1)
+        harness.completions[0](nil)
+        await drainCallbacks()
+        XCTAssertEqual(harness.clearCount, 0)
+        XCTAssertEqual(harness.defaults.object(forKey: HighSoonAdvisoryPolicy.lastScheduledKey) as? Date, now)
+        harness.completions[1](nil)
+        await drainCallbacks()
+        XCTAssertEqual(harness.clearCount, 1)
+        XCTAssertNil(harness.defaults.object(forKey: HighSoonAdvisoryPolicy.lastScheduledKey))
+    }
+
     func testOldFailedRequestCannotEraseANewerReservation() async throws {
         let harness = Harness()
         defer { harness.finish() }
@@ -255,6 +343,7 @@ final class HighSoonNotificationTests: XCTestCase {
         var requests: [UNNotificationRequest] = []
         var completions: [(Error?) -> Void] = []
         var clearCount = 0
+        var mealQuietState = (suppressed: false, revision: 0)
 
         init() {
             defaults = UserDefaults(suiteName: suiteName)!
@@ -274,7 +363,8 @@ final class HighSoonNotificationTests: XCTestCase {
                 defaults: defaults, schedule: { [unowned self] request, completion in
                     requests.append(request)
                     completions.append(completion)
-                }, clearNotifications: { [weak self] in self?.clearCount += 1 })
+                }, clearNotifications: { [weak self] in self?.clearCount += 1 },
+                mealQuietState: { [unowned self] in mealQuietState })
         }
 
         func finish() {

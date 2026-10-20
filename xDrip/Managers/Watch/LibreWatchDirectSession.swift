@@ -89,8 +89,25 @@ struct WatchBolusOperation: Codable, Equatable, Identifiable {
     let penStepUnits: Double?
     let maximumUnits: Double?
     let profileSignature: String?
+    /// Frozen at confirmation. Legacy and offline-origin logs never start meal quiet.
+    var allowsMealQuietStart: Bool? = nil
+    /// The same freshness anchor used by Watch calculation requests, frozen before queueing.
+    var latestWatchReadingAt: Date? = nil
 
     var id: UUID { operationID }
+
+    func mayStartMealQuiet(at now: Date, latestPhoneReadingAt: Date? = nil,
+                           phoneOwnsSensor: Bool = false) -> Bool {
+        guard allowsMealQuietStart == true, (0...30).contains(now.timeIntervalSince(recordedAt)) else { return false }
+        guard let latestWatchReadingAt else { return phoneOwnsSensor }
+        guard latestWatchReadingAt.timeIntervalSince1970.isFinite,
+              latestWatchReadingAt <= now.addingTimeInterval(20),
+              now.timeIntervalSince(latestWatchReadingAt) <= 180,
+              let latestPhoneReadingAt, latestPhoneReadingAt.timeIntervalSince1970.isFinite,
+              (0...330).contains(now.timeIntervalSince(latestPhoneReadingAt)) else { return false }
+        // Match the existing phone calculation's one-second timestamp tolerance.
+        return latestPhoneReadingAt.addingTimeInterval(1) >= latestWatchReadingAt
+    }
 
     func isValid(at now: Date = Date()) -> Bool {
         let timestamp = recordedAt.timeIntervalSince1970

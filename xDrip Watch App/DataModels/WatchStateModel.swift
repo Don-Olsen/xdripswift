@@ -181,6 +181,8 @@ final class WatchStateModel: NSObject, ObservableObject {
     @Published private(set) var localAlarmReadinessWarning: String?
     @Published private(set) var canRequestLocalAlarmPermission = false
     private let localAlarms = LibreWatchAlarmController()
+    @Published private(set) var mealQuietPeriod: MealQuietPeriod?
+    private var lastMealQuietEndAttemptAt: Date?
 
     // Manual treatments are independent of Libre ownership and its six-hour sensor outbox.
     // They remain on disk until the iPhone confirms a durable Core Data save.
@@ -307,8 +309,14 @@ final class WatchStateModel: NSObject, ObservableObject {
         localAlarms.onReadinessWarningChange = { [weak self] warning in self?.localAlarmReadinessWarning = warning }
         localAlarms.onReadinessChange = { [weak self] in self?.synchronizeLocalAlarmState() }
         localAlarms.onSnooze = { [weak self] in self?.synchronizeLocalAlarmState() }
+        localAlarms.onMealQuietChange = { [weak self] in
+            guard let self else { return }
+            self.mealQuietPeriod = self.localAlarms.mealQuietPeriod
+            self.synchronizeMealQuietEnds()
+        }
         localAlarms.validate(session: libreWatchDirectSession)
         localAlarms.ownershipDidChange(libreWatchOwnership)
+        refreshDirectLibreReadingFreshness()
         localAlarms.refreshPermission()
 
         session.delegate = self
@@ -1050,6 +1058,8 @@ final class WatchStateModel: NSObject, ObservableObject {
     }
 
     func refreshDirectLibreReadingFreshness(at date: Date = Date()) {
+        localAlarms.updateMealQuietReading(glucose: isShowingDirectLibreReading ? bgValueInMgDl() : nil,
+            measuredAt: isShowingDirectLibreReading ? bgReadingDate() : nil, at: date)
         guard isShowingDirectLibreReading else {
             directLibreReadingIsStale = false
             return
@@ -1379,6 +1389,7 @@ final class WatchStateModel: NSObject, ObservableObject {
         if ownership == .watch {
             if directReadingHistory.isEmpty {
                 restorePersistedLibreWatchReadingIfPossible()
+                refreshDirectLibreReadingFreshness()
             } else {
                 refreshDirectLibreReadingFreshness()
             }
@@ -1389,6 +1400,7 @@ final class WatchStateModel: NSObject, ObservableObject {
 
     @discardableResult
     private func processLibreWatchPayload(_ incomingPayload: [String: Any]) -> Bool {
+        processMealQuietPayload(incomingPayload)
         var payload = incomingPayload
         var handoffRevision: UInt64?
         var applyingSnapshot: LibreWatchHandoffSnapshot?
@@ -1837,7 +1849,12 @@ final class WatchStateModel: NSObject, ObservableObject {
             pizzaReminderRequested: phoneIsReachable && carbohydrateGrams > 0 && mealKindRaw == "slow",
             manualWithoutCurrentSuggestion: manualWithoutCurrentSuggestion,
             penStepUnits: frozenProfile?.penStepUnits, maximumUnits: frozenProfile?.maximumUnits,
-            profileSignature: frozenProfile?.profileSignature)
+            profileSignature: frozenProfile?.profileSignature,
+            allowsMealQuietStart: phoneIsReachable && pendingBolusOperations.isEmpty &&
+                pendingManualTreatments.isEmpty && !connectivityOutbox.items.contains(where: { $0.reading != nil }) &&
+                (libreWatchOwnership == .iphone || (libreWatchOwnership == .watch &&
+                    isShowingDirectLibreReading && bgReadingDate() != nil)),
+            latestWatchReadingAt: isShowingDirectLibreReading ? bgReadingDate() : nil)
         guard operation.isValid(at: recordedAt) else {
             bolusStorageIssue = "Indtast kulhydrater eller insulin med gyldige mængder."
             return false
@@ -2001,6 +2018,10 @@ final class WatchStateModel: NSObject, ObservableObject {
     /// Called by the collector's existing health/activation opportunity, even after return.
     /// A final transient failure must not need another sensor frame to become eligible.
     func retryPendingLibreDeliveries(at date: Date, executionIsAvailable: Bool) {
+        if executionIsAvailable {
+            refreshDirectLibreReadingFreshness(at: date)
+            synchronizeMealQuietEnds(at: date)
+        }
         if executionIsAvailable { retryPendingPhoneReturn(at: date) }
         if executionIsAvailable, session.activationState == .activated, outboxSendGate.isIdle,
            date.timeIntervalSince(lastDiagnosticReplayAt ?? .distantPast) >= LibreWatchConnectivityOutbox.retryInterval {
@@ -2348,7 +2369,48 @@ final class WatchStateModel: NSObject, ObservableObject {
 
     func requestLocalAlarmPermission() { localAlarms.requestPermission() }
 
-    func refreshLocalAlarmPermission() { localAlarms.refreshPermission() }
+    func refreshLocalAlarmPermission() {
+        refreshDirectLibreReadingFreshness()
+        localAlarms.refreshPermission()
+    }
+
+    func endMealQuiet() { localAlarms.endMealQuiet() }
+
+    private func processMealQuietPayload(_ payload: [String: Any]) {
+        let candidates = [payload["mealQuietState"], (payload["status"] as? [String: Any])?["mealQuietState"]]
+        let states = candidates.compactMap { value -> MealQuietSyncState? in
+            let data: Data?
+            if let encoded = value as? Data { data = encoded }
+            else if let dictionary = value as? [String: Any] { data = try? JSONSerialization.data(withJSONObject: dictionary) }
+            else { data = nil }
+            return data.flatMap { try? JSONDecoder().decode(MealQuietSyncState.self, from: $0) }
+        }
+        // Application-context merging can retain an older standalone state next
+        // to a newer status stream. Both use their own durable revision ordering.
+        for state in states.sorted(by: { $0.revision < $1.revision }) {
+            localAlarms.apply(mealQuiet: state)
+        }
+        mealQuietPeriod = localAlarms.mealQuietPeriod
+    }
+
+    private func synchronizeMealQuietEnds(at date: Date = Date()) {
+        guard !localAlarms.pendingMealQuietEndIDs.isEmpty, session.activationState == .activated,
+              date.timeIntervalSince(lastMealQuietEndAttemptAt ?? .distantPast) >= 60 else { return }
+        lastMealQuietEndAttemptAt = date
+        for id in localAlarms.pendingMealQuietEndIDs.sorted() {
+            let payload: [String: Any] = ["mealQuietEndID": id]
+            // The persisted local tombstone survives transport failure. Reuse the
+            // existing activation/health opportunities and WC's durable delivery queue.
+            if !session.outstandingUserInfoTransfers.contains(where: { $0.userInfo["mealQuietEndID"] as? String == id }) {
+                session.transferUserInfo(payload)
+            }
+            if phoneIsReachable {
+                session.sendMessage(payload, replyHandler: { [weak self] response in
+                    DispatchQueue.main.async { self?.processMealQuietPayload(response) }
+                }, errorHandler: nil)
+            }
+        }
+    }
 
     private func synchronizeLocalAlarmState() {
         guard let sessionID = libreWatchDirectSession?.id else { return }
@@ -2484,6 +2546,7 @@ final class WatchStateModel: NSObject, ObservableObject {
     }
 
     private func processStatusFromDictionary(dictionary: [String: Any], restoring: Bool = false) -> Bool {
+        processMealQuietPayload(dictionary)
         // transferUserInfo queues every payload while the Watch app is inactive. Ignore old status
         // updates so reopening the app does not replay days of state changes one by one.
         guard WatchPhoneSnapshotStore.isValid(dictionary, stream: .status, sessionID: libreWatchDirectSession?.id,
@@ -2667,6 +2730,7 @@ extension WatchStateModel: WCSessionDelegate {
             self.phoneRefresh.reachabilityDidChange()
             self.retryPendingPhoneReturn()
             self.synchronizeLocalAlarmState()
+            self.synchronizeMealQuietEnds()
             self.flushWatchConnectivityOutbox()
             self.flushManualTreatmentQueue()
             self.flushBolusOperationQueue()
@@ -2677,6 +2741,7 @@ extension WatchStateModel: WCSessionDelegate {
         DispatchQueue.main.async {
             self.retryPendingPhoneReturn()
             self.synchronizeLocalAlarmState()
+            self.synchronizeMealQuietEnds()
             self.phoneRefresh.reachabilityDidChange()
             self.flushWatchConnectivityOutbox()
             self.flushManualTreatmentQueue()

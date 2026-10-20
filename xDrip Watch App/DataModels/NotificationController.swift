@@ -107,6 +107,16 @@ final class LibreWatchAlarmController: NSObject, UNUserNotificationCenterDelegat
     private var permissionEvidence = "authorization=unknown:alert=unknown:sound=unknown"
     private var previousReadinessEvidence: [String: String] = [:]
     private var pendingGlucoseAlarm = false
+    private var mealQuiet = WatchMealQuietStore.load()
+    private var mealQuietStorageIsHealthy = WatchMealQuietStore.storageIsHealthy()
+    private var mealQuietSuppressionGeneration: UInt64 = 0
+    private var mealQuietGlucose: Double?
+    private var mealQuietMeasuredAt: Date?
+    var onMealQuietChange: (() -> Void)?
+    var mealQuietPeriod: MealQuietPeriod? {
+        mealQuietStorageIsHealthy ? mealQuiet.activePeriod(at: Date()) : nil
+    }
+    var pendingMealQuietEndIDs: Set<String> { mealQuiet.pendingEndIDs }
     var onStatusChange: ((String) -> Void)?
     var onReadinessWarningChange: ((String?) -> Void)?
     var onReadinessChange: (() -> Void)?
@@ -137,14 +147,91 @@ final class LibreWatchAlarmController: NSObject, UNUserNotificationCenterDelegat
         refreshPermission()
     }
 
+    func apply(mealQuiet candidate: MealQuietSyncState, at date: Date = Date()) {
+        let previous = mealQuietPeriod
+        var updated = mealQuiet
+        updated.apply(candidate, at: date)
+        if !mealQuietStorageIsHealthy { updated.stop(at: date) }
+        reconcileMealQuiet(&updated, at: date)
+        persistMealQuiet(updated)
+        if let current = mealQuietPeriod {
+            if previous != current { mealQuietSuppressionGeneration &+= 1 }
+            // Only an ordinary high belongs to this pause. An already played sound
+            // cannot be recalled; pending and delivered presentation is best effort.
+            let highID = identifier(for: .high)
+            center.removePendingNotificationRequests(withIdentifiers: [highID])
+            center.removeDeliveredNotifications(withIdentifiers: [highID])
+        }
+    }
+
+    func endMealQuiet(at date: Date = Date()) {
+        var updated = mealQuiet
+        updated.stop(at: date)
+        persistMealQuiet(updated)
+    }
+
+    func updateMealQuietReading(glucose: Double?, measuredAt: Date?, at date: Date = Date()) {
+        if watchOwnsSensor {
+            var updated = mealQuiet
+            // Background delivery of a missed-reading notification need not execute
+            // willPresent. A later fresh sample cannot erase the intervening gap.
+            updated.observeReadingGap(previouslyMeasuredAt: mealQuietMeasuredAt ?? state.lastReadingAt, at: date)
+            persistMealQuiet(updated)
+        }
+        mealQuietGlucose = glucose
+        mealQuietMeasuredAt = measuredAt
+        refreshMealQuiet(at: date)
+    }
+
+    func refreshMealQuiet(at date: Date = Date()) {
+        var updated = mealQuiet
+        reconcileMealQuiet(&updated, at: date)
+        persistMealQuiet(updated)
+        // Expiry changes presentation even when no persisted field changes.
+        onMealQuietChange?()
+    }
+
+    private func reconcileMealQuiet(_ value: inout WatchMealQuietState, at date: Date) {
+        value.prune(at: date)
+        if watchOwnsSensor {
+            value.refreshLocalBasis(glucose: mealQuietGlucose,
+                measuredAt: mealQuietMeasuredAt, settings: settings, at: date)
+        }
+    }
+
+    private func persistMealQuiet(_ value: WatchMealQuietState) {
+        guard value != mealQuiet else { return }
+        mealQuiet = value
+        do {
+            try WatchMealQuietStore.save(value)
+            mealQuietStorageIsHealthy = true
+        } catch {
+            mealQuietStorageIsHealthy = false
+            // The store's persistent fault marker also disables restoration. Retain
+            // the meal identity so a later successful sync cannot revive this meal.
+            mealQuiet.stop(at: Date())
+        }
+        onMealQuietChange?()
+    }
+
+    private func mealQuietSuppresses(_ kind: LibreWatchAlarmKind, at date: Date = Date()) -> Bool {
+        refreshMealQuiet(at: date)
+        return mealQuietStorageIsHealthy && mealQuiet.suppresses(kind, at: date)
+    }
+
     func apply(settings candidate: LibreWatchAlarmSettings, session: LibreWatchDirectSession) {
         let previousRevision = readinessRevision
         guard configuration.propose(candidate, session: session), let committed = configuration.settings else { return }
-        if state.sessionID != committed.sessionID { cancelScheduledAlarms() }
+        if state.sessionID != committed.sessionID {
+            cancelScheduledAlarms()
+            mealQuietGlucose = nil
+            mealQuietMeasuredAt = nil
+        }
         state.use(committed)
         state.acknowledgePhoneSnoozes(committed)
         LibreWatchAlarmStore.save(configuration)
         LibreWatchAlarmStore.save(state)
+        refreshMealQuiet()
         // Unconfirmed revisions do not delete the previous missed-reading deadline.
         // Only a confirmed change (or an explicit later snooze) changes its identity.
         scheduleMissedIfNeeded()
@@ -158,6 +245,9 @@ final class LibreWatchAlarmController: NSObject, UNUserNotificationCenterDelegat
             configuration = LibreWatchAlarmConfiguration()
             state = LibreWatchAlarmState()
             LibreWatchAlarmStore.clearSession()
+            mealQuietGlucose = nil
+            mealQuietMeasuredAt = nil
+            if watchOwnsSensor { endMealQuiet() }
             publishStatus()
             return
         }
@@ -246,21 +336,26 @@ final class LibreWatchAlarmController: NSObject, UNUserNotificationCenterDelegat
     }
 
     func acceptedDirectReading(_ reading: LibreWatchDirectReadingPayload, glucose: Double, at now: Date = Date()) {
+        updateMealQuietReading(glucose: glucose, measuredAt: reading.receivedAt, at: now)
         guard let settings, readinessRevision != nil else { return }
         let rule = state.accept(id: reading.id, measuredAt: reading.receivedAt, glucose: glucose,
             settings: settings, delegation: delegation, watchOwnsSensor: watchOwnsSensor, now: now)
         LibreWatchAlarmStore.save(state)
         scheduleMissedIfNeeded(at: now)
-        guard let rule, !pendingGlucoseAlarm else { return }
+        guard let rule, !pendingGlucoseAlarm, !mealQuietSuppresses(rule.kind, at: now) else { return }
         pendingGlucoseAlarm = true
+        let quietGeneration = mealQuietSuppressionGeneration
         let content = content(for: rule)
+        if rule.kind == .high { content.userInfo["mealQuietGeneration"] = String(quietGeneration) }
         content.body = "\(glucose.mgDlToMmolAndToString(mgDl: settings.isMgDl)) \(settings.isMgDl ? "mg/dL" : "mmol/L") · Direkte fra Libre · \(reading.receivedAt.formatted(date: .omitted, time: .shortened))"
         let request = UNNotificationRequest(identifier: identifier(for: rule.kind), content: content, trigger: nil)
         center.add(request) { [weak self] error in
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.pendingGlucoseAlarm = false
-                guard self.state.glucoseNotificationIsCurrent(
+                guard (rule.kind != .high || quietGeneration == self.mealQuietSuppressionGeneration),
+                      !self.mealQuietSuppresses(rule.kind),
+                      self.state.glucoseNotificationIsCurrent(
                     readingID: reading.id, rule: rule, submittedSettings: settings,
                     currentSettings: self.settings, delegation: self.delegation,
                     watchOwnsSensor: self.watchOwnsSensor,
@@ -495,6 +590,8 @@ final class LibreWatchAlarmController: NSObject, UNUserNotificationCenterDelegat
             guard let self,
                   let rawKind = info["libreWatchAlarmKind"] as? Int,
                   let kind = LibreWatchAlarmKind(rawValue: rawKind),
+                  (kind != .high || (info["mealQuietGeneration"] as? String ?? "0") == String(self.mealQuietSuppressionGeneration)),
+                  !self.mealQuietSuppresses(kind),
                   self.state.notificationMayBePresented(kind: kind, notificationSessionID: notificationSessionID,
                     notificationReadingID: (info["libreWatchAlarmReading"] as? String).flatMap(UUID.init(uuidString:)),
                     settings: self.settings, delegation: self.delegation,
@@ -502,6 +599,7 @@ final class LibreWatchAlarmController: NSObject, UNUserNotificationCenterDelegat
                     at: Date(), notificationMissedBaseline: (info["libreWatchAlarmBaseline"] as? Double)
                         .map { Date(timeIntervalSince1970: $0) })
             else { completionHandler([]); return }
+            if kind == .missed { self.endMealQuiet() }
             completionHandler([.banner, .sound])
         }
     }

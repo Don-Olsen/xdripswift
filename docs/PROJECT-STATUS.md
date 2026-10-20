@@ -1,3 +1,91 @@
+## Automatisk måltidsro — lokal kandidat 20. oktober 2026
+
+Funktionen er fra som standard. Under alarmindstillinger vælges en varighed
+på 15, 30, 45 eller 60 minutter; ingen varighed vælges automatisk. Der er ingen
+20 g-grænse. En ny, verificeret fælles registrering med positiv kulhydratmængde
+og eksplicit tilknyttet positiv bolus kan starte én periode. Kulhydrater alene,
+hurtigknappen, import, almindelig redigering og genlevering starter ikke ro.
+Planlagt mad vurderes først ved den eksisterende bekræftelse af faktisk spisetid.
+Madtypen alene bruges ikke som bevis for hypobehandling.
+
+Start kræver frisk, gyldig CGM under den gældende Høj-regel, over den gældende
+Lav-regel og ikke under den eksisterende 3,9-grænse samt en gyldig, aktiv Akut
+høj-regel over Høj. En ny motorprognose efter den verificerede gemning skal kunne
+udelukke den eksisterende Snart lavt-betingelse for hele de kommende 30 minutter.
+Dette sker uafhængigt af, om Snart lavt-alarmen er slået til eller snoozet.
+Manglende eller ændrede input giver ingen start; beslutningen gemmes pr. måltid.
+
+Kun Høj og Højt om lidt dæmpes; Hurtig stigning dæmpes kun under den aktuelle
+Høj-grænse. Lav, Snart lavt, hurtigt fald, Akut høj, manglende målinger og tekniske
+alarmer ændres ikke. En stadig frisk og oprindeligt valideret motorprognose kan
+bruges mellem nye målinger, mens den eksisterende sikkerhedsberegning arbejder.
+Den beholder sin oprindelige reference, højst den eksisterende 330-sekunders
+friskhed og et komplet vindue frem til nu +30 minutter. Nyeste målte lav/akut
+høj kontrolleres straks. Sensor-, behandlings- eller kildeændringer kan ikke
+låne dette tidligere grundlag. En usikker behandlingstransaktion afslutter
+perioden konservativt; en senere fuldførelse genstarter ikke samme måltid.
+
+Sluttiden er fast: faktisk spisetid plus valgt varighed. Ekstra mad kan ikke
+forlænge perioden eller sætte en ny i kø. Stop, udløb, lavrisiko, Akut høj,
+ugyldige regler, slettet/ændret grundlag og lagringsfejl genaktiverer ikke samme
+måltid. Beregnerens registrering står ved magt ved fejl i måltidsro. Tilstanden
+lagres atomisk med filbeskyttelse og en separat afbrydelsesmarkør; usikker
+lagring giver almindelige alarmer. Status/“Afslut” findes i den eksisterende
+snoozevisning og urets eksisterende alarmvisning.
+
+iPhone godkender nye perioder. Kun en oprindeligt forbundet og aktuel samlet
+Watch-registrering uden uafstemte ældre behandlinger/CGM kan vurderes til start.
+En tom Watch-sendekø er ikke alene en kvittering: den fastlåste seneste
+Watch-måletid sammenholdes også med telefonens faktisk validerede måling.
+Offline registreringer gemmes som før, men starter ikke ro ved senere levering.
+Et godkendt interval kan udløbe lokalt på Watch uden telefonkontakt; lokale
+lav/akut-høj/manglende data stopper det. Watch får ingen prognosemotor. Stop-ID,
+revision og fast udløb hindrer genaktivering ved gamle beskeder. Dæmpningen bruger
+ikke den eksisterende fælles højsnooze, der også omfatter Akut høj på Watch.
+
+Dæmpede forsøg opdaterer ikke alarmfrister. Igangværende notifikationssvar og
+vedhæftningsgenforsøg kontrolleres igen og må ikke genoplive et gammelt varsel.
+Allerede afspillet lyd eller vibration kan ikke tilbagekaldes. Den nye funktion
+ændrer ikke dosisformel, prognosematematik/ML, behandlingers betydning,
+HealthKit/Nightscout, Libre-forbindelse eller sensorejerskab.
+
+Den afsluttende lokale `local-build.sh release-test` i
+`20261020T153105Z-89518` bestod: **1.817/1.817 XCTest, 0 fejl**, alle
+Python-kontroller og syntetiske Watch-kontroller samt iPhone- og
+Watch-simulatorbuilds. De 45 nye tests dækker den reelle asynkrone manager,
+logger/editorens gemmehændelser, Watch-tilstand og højvarslers callback-ejerskab.
+Ingen eksisterende sikkerhedstest er fjernet eller lempet. En ny testforventning
+blev korrigeret til den eksisterende alarmhelpers afrunding af lagrede mg/dL;
+selve alarmberegningen blev ikke ændret.
+Den efterfølgende usignerede Release-build til iPhoneOS med Apples valgte
+buildnummer **4346** bestod også efter den sidste rettelse; den faktiske appbinær
+er `arm64`. Loggen er bevaret som `logs/iphoneos-unsigned.log` i samme lokale kørsel.
+
+Den faktiske iPhone-simulators indstillingsside er gennemgået: fra som standard,
+krav om varighed, valg og gemning af 30 minutter, og fra igen. Billedet ligger
+uden for Git i `/tmp/xdrip-meal-quiet-settings-simulator.png` og viser kun en
+testinstallation uden tilsluttet sensor. Aktiv status og afslutning er testet
+som tilstandsovergange; Watch-UI og faktisk alarmlevering er ikke fysisk afprøvet.
+
+Den sidste gennemgang fandt desuden, at et ekstra måltids commit kunne afslutte
+den aktive periode og derefter starte en erstatningsperiode. Afslutningstidspunktet
+gemmes nu, begrænset af det oprindelige udløb. En registrering, der blev startet
+før afslutningen, afvises varigt som ny roperiode, også når en gemmeobserver eller
+genstart ligger imellem. En ny hændelse efter udløb/Stop kan stadig vurderes.
+Watch bruger den fastlåste registreringstid til denne vurdering; telefonens
+modtagelsestid bevares separat som behandlingsproveniens. Regressionerne dækker
+begge rækkefølger, genstart og den reelle logger→manager-sti. Den første release-
+kørsel blev standset før commit/upload; tidligere testkvitteringer genbruges ikke.
+
+Den første kørsel afslørede en trådlåsning i den nye gemmeobserver: en privat
+Core Data-kø ventede på hovedkøen, mens hovedkøen ventede på gemning. Observeren
+modtager nu på afsenderkøen og sender kun en asynkron værdifri opdatering til
+MainActor. Den afbrudte testkørsel tæller ikke som bestået.
+En læsende enhedskontrol fandt parret iPhone; Watch var utilgængeligt. Der er
+ikke installeret på eller leveret testalarmer til fysiske enheder. Varighederne
+er en afgrænset brugerindstilling, ikke klinisk validerede personlige intervaller.
+Fysisk levering, offlineforløb og brugeroplevelse kræver opfølgning via TestFlight.
+
 <!-- testflight-7.1.1-4345:start -->
 ### TestFlight 7.1.1 (4345)
 

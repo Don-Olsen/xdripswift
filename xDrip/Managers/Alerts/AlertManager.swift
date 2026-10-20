@@ -142,6 +142,10 @@ public class AlertManager: NSObject {
     /// constant for key in ApplicationManager.shared.addClosureToRunWhenAppWillEnterForeground - for closure that will stop playing sound
     private let applicationManagerKeyStopPlayingSound = "AlertManager-stopplayingsound"
     private var watchAlarmDelegationObserver: NSObjectProtocol?
+    private var mealQuietObserver: NSObjectProtocol?
+    private var mealQuietGenerations: [AlertKind: Int] = [:]
+    private var mealQuietRequestIDs: [AlertKind: UUID] = [:]
+    private static let highSoonPendingRequestKey = "highSoonPendingRequestID"
     
     // MARK: - initializer
     
@@ -188,6 +192,19 @@ public class AlertManager: NSObject {
             self.uNUserNotificationCenter.removePendingNotificationRequests(withIdentifiers: identifiers)
             self.uNUserNotificationCenter.removeDeliveredNotifications(withIdentifiers: identifiers)
         }
+        mealQuietObserver = NotificationCenter.default.addObserver(
+            forName: Notification.Name("xdrip.mealQuiet.changed"), object: nil, queue: .main
+        ) { [weak self] _ in
+            // The manager posts on main. Record activation synchronously so a quiet
+            // period ending before iOS replies cannot revive its older request.
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                for kind in [AlertKind.high, .fastrise] where self.mealQuietSuppresses(kind) {
+                    self.mealQuietGenerations[kind, default: 0] &+= 1
+                    _ = self.clearMealQuietNotificationIfSuppressed(kind)
+                }
+            }
+        }
     }
     
     // MARK: - public functions
@@ -197,7 +214,10 @@ public class AlertManager: NSObject {
     ///     - maxAgeOfLastBgReadingInSeconds : for master mode max 1 minute should be ok, but for follower mode it could be interesting to take a higher value
     /// - returns:
     ///     - if true then an immediate notification is created (immediate being not a future planned, like missed reading), which contains the bg reading in the text - so there's no need to create an additional notificationwith the text in it
+    @MainActor
     public func checkAlerts(maxAgeOfLastBgReadingInSeconds: Double) -> Bool {
+        // Recheck current glucose/rules before any alert group can short-circuit the pass.
+        MealQuietManager.shared.refreshMeasuredBasis()
         // Clear only glucose alert requests. Other features (for example a planned meal
         // reminder) own their notifications and must survive a new sensor reading.
         uNUserNotificationCenter.removeDeliveredNotifications(withIdentifiers: alertNotificationIdentifers)
@@ -389,8 +409,15 @@ public class AlertManager: NSObject {
                        at now: Date = .now,
                        defaults: UserDefaults = .standard,
                        schedule: ((UNNotificationRequest, @escaping @Sendable (Error?) -> Void) -> Void)? = nil,
-                       clearNotifications: (@MainActor () -> Void)? = nil) {
-        guard HighSoonAdvisoryPolicy.isEnabled(defaults: defaults) else { return }
+                       clearNotifications: (@MainActor () -> Void)? = nil,
+                       mealQuietState: (@MainActor () -> (suppressed: Bool, revision: Int))? = nil) {
+        let quietState: @MainActor () -> (suppressed: Bool, revision: Int) = mealQuietState ?? { [self] in
+            let suppressed = MealQuietManager.shared.shouldSuppressHighSoon()
+            return (suppressed, mealQuietGenerations[.high, default: 0])
+        }
+        let quietAtScheduling = quietState()
+        guard !quietAtScheduling.suppressed,
+              HighSoonAdvisoryPolicy.isEnabled(defaults: defaults) else { return }
         let (entry, _) = alertEntriesAccessor.getCurrentAndNextAlertEntry(
             forAlertKind: .high, forWhen: now, alertTypesAccessor: alertTypesAccessor)
         guard !entry.isDisabled, entry.alertType.enabled,
@@ -403,9 +430,8 @@ public class AlertManager: NSObject {
             expectedReferenceDate: expectedReferenceDate, expectedSensorID: expectedSensorID,
             expectedGlucoseMgdl: expectedGlucoseMgdl, highLimitMgdl: Double(entry.value), at: now)
         else { return }
-        guard HighSoonAdvisoryPolicy.maySchedule(
-            lastScheduled: defaults.object(forKey: HighSoonAdvisoryPolicy.lastScheduledKey) as? Date,
-            at: now) else { return }
+        let previousReservation = defaults.object(forKey: HighSoonAdvisoryPolicy.lastScheduledKey) as? Date
+        guard HighSoonAdvisoryPolicy.maySchedule(lastScheduled: previousReservation, at: now) else { return }
 
         let content = UNMutableNotificationContent()
         content.title = "Højt om lidt"
@@ -419,10 +445,28 @@ public class AlertManager: NSObject {
             uNUserNotificationCenter.add(request, withCompletionHandler: completion)
         }
         let clear: @MainActor () -> Void = clearNotifications ?? { Self.clearHighSoonNotifications() }
-        // Reserve before calling iOS, including when two reading callbacks arrive before its reply.
+        // The UUID distinguishes overlapping replies, including two attempts using the same
+        // timestamp or different AlertManager instances. Only its owner may undo a reservation.
+        let requestID = UUID().uuidString
+        defaults.set(requestID, forKey: Self.highSoonPendingRequestKey)
         defaults.set(now, forKey: HighSoonAdvisoryPolicy.lastScheduledKey)
         add(request) { [weak self] error in
             DispatchQueue.main.async { [weak self] in
+                guard defaults.string(forKey: Self.highSoonPendingRequestKey) == requestID,
+                      (defaults.object(forKey: HighSoonAdvisoryPolicy.lastScheduledKey) as? Date) == now
+                else { return }
+                let currentQuiet = quietState()
+                if currentQuiet.suppressed || currentQuiet.revision != quietAtScheduling.revision {
+                    if let previousReservation {
+                        defaults.set(previousReservation, forKey: HighSoonAdvisoryPolicy.lastScheduledKey)
+                    } else {
+                        defaults.removeObject(forKey: HighSoonAdvisoryPolicy.lastScheduledKey)
+                    }
+                    defaults.removeObject(forKey: Self.highSoonPendingRequestKey)
+                    clear()
+                    return
+                }
+                defaults.removeObject(forKey: Self.highSoonPendingRequestKey)
                 if let error {
                     if (defaults.object(forKey: HighSoonAdvisoryPolicy.lastScheduledKey) as? Date) == now {
                         defaults.removeObject(forKey: HighSoonAdvisoryPolicy.lastScheduledKey)
@@ -735,13 +779,19 @@ public class AlertManager: NSObject {
     /// this function looks very similar to the UNUserNotificationCenterDelegate function, difference is that it returns an optional instance of PickerViewData. This will have the snooze data, ie title, actionHandler, cancelHandler, list of values, etc.  Goal is not to have UI related stuff in AlertManager class. it's the caller that needs to decide how to present the data
     /// - returns:
     ///     - PickerViewData : contains data that user needs to pick from, nil means nothing to pick from
+    @MainActor
     public func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification, withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) -> PickerViewData? {
+        MealQuietManager.shared.refreshMeasuredBasis()
         // declare returnValue
         var returnValue: PickerViewData?
         
         /// check if it's for one of the alert notification
         loop: for alertKind in AlertKind.allCases {
             if alertKind.notificationIdentifier() == notification.request.identifier {
+                if clearMealQuietNotificationIfSuppressed(alertKind) {
+                    completionHandler([])
+                    return nil
+                }
                 // it is possible to play the sound, show the content and/or set the badge counter as explained here https://developer.apple.com/documentation/usernotifications/unnotificationpresentationoptions
                 // none of them seems useful here
                 completionHandler([])
@@ -1047,6 +1097,15 @@ public class AlertManager: NSObject {
         // check if alert is required
         let (alertNeeded, alertBody, alertTitle, delayInSeconds) = alertKind.alertNeeded(currentAlertEntry: currentAlertEntry, nextAlertEntry: nextAlertEntry, lastBgReading: lastBgReading, lastButOneBgReading, lastCalibration: lastCalibration, transmitterBatteryInfo: transmitterBatteryInfo, deviceStatus: deviceStatus)
 
+        // Suppression is separate from user snooze state and happens before sound,
+        // notification scheduling, automatic repeat suppression or vibration.
+        if alertNeeded, mealQuietSuppresses(alertKind) {
+            trace("alert '%{public}@' suppressed during a verified meal quiet period",
+                  log: log, category: ConstantsLog.categoryAlertManager, type: .info,
+                  alertKind.descriptionForLogging())
+            return false
+        }
+
         // A low initial Voltage B is not trustworthy during the configured initial period of Dexcom
         // hardware life. G5/G6/ONE use the transmitter start date. G7/ONE+/Stelo use the sensor
         // start date. This gate affects only notification firing. The raw response remains available
@@ -1308,23 +1367,28 @@ public class AlertManager: NSObject {
             // create the notificationrequest
             let notificationRequest = UNNotificationRequest(identifier: alertKind.notificationIdentifier(), content: content, trigger: trigger)
             
-            // Add Request to User Notification Center
+            // Capture only quietable requests; unrelated alarm replies remain unchanged.
+            let quietRequest = mealQuietRequestContext(for: alertKind)
             uNUserNotificationCenter.add(notificationRequest) { error in
-                if let error = error {
-                    trace("Unable to Add Notification Request %{public}@", log: self.log, category: ConstantsLog.categoryAlertManager, type: .error, error.localizedDescription)
-                    if !content.attachments.isEmpty {
-                        content.attachments = []
-                        let fallbackNotificationRequest = UNNotificationRequest(identifier: alertKind.notificationIdentifier(), content: content, trigger: trigger)
-                        self.uNUserNotificationCenter.add(fallbackNotificationRequest) { fallbackError in
-                            if let fallbackError = fallbackError {
-                                trace("Unable to Add Notification Request without attachment %{public}@", log: self.log, category: ConstantsLog.categoryAlertManager, type: .error, fallbackError.localizedDescription)
-                            } else {
-                                trace("in checkAlert, added notification request without attachment for alert '%{public}@'", log: self.log, category: ConstantsLog.categoryAlertManager, type: .info, alertKind.descriptionForLogging())
+                self.handleNotificationReply(for: alertKind, context: quietRequest) {
+                    if let error = error {
+                        trace("Unable to Add Notification Request %{public}@", log: self.log, category: ConstantsLog.categoryAlertManager, type: .error, error.localizedDescription)
+                        if !content.attachments.isEmpty {
+                            content.attachments = []
+                            let fallbackNotificationRequest = UNNotificationRequest(identifier: alertKind.notificationIdentifier(), content: content, trigger: trigger)
+                            self.uNUserNotificationCenter.add(fallbackNotificationRequest) { fallbackError in
+                                self.handleNotificationReply(for: alertKind, context: quietRequest) {
+                                    if let fallbackError = fallbackError {
+                                        trace("Unable to Add Notification Request without attachment %{public}@", log: self.log, category: ConstantsLog.categoryAlertManager, type: .error, fallbackError.localizedDescription)
+                                    } else {
+                                        trace("in checkAlert, added notification request without attachment for alert '%{public}@'", log: self.log, category: ConstantsLog.categoryAlertManager, type: .info, alertKind.descriptionForLogging())
+                                    }
+                                }
                             }
                         }
+                    } else {
+                        trace("in checkAlert, added notification request for alert '%{public}@'", log: self.log, category: ConstantsLog.categoryAlertManager, type: .info, alertKind.descriptionForLogging())
                     }
-                } else {
-                    trace("in checkAlert, added notification request for alert '%{public}@'", log: self.log, category: ConstantsLog.categoryAlertManager, type: .info, alertKind.descriptionForLogging())
                 }
             }
             
@@ -1424,6 +1488,48 @@ public class AlertManager: NSObject {
         UserDefaults.standard.addObserver(self, forKeyPath: UserDefaults.Key.nightscoutFollowType.rawValue, options: .new, context: nil)
     }
 
+    /// Measured high/rise evaluation enters through main-actor checkAlerts. Legacy
+    /// missed-reading callers remain nonisolated and must never acquire quiet suppression.
+    private func mealQuietSuppresses(_ kind: AlertKind) -> Bool {
+        guard kind == .high || kind == .fastrise, Thread.isMainThread else { return false }
+        return MainActor.assumeIsolated { MealQuietManager.shared.shouldSuppress(kind) }
+    }
+
+    private func mealQuietRequestContext(for kind: AlertKind) -> (id: UUID, generation: Int)? {
+        guard kind == .high || kind == .fastrise, Thread.isMainThread else { return nil }
+        let id = UUID()
+        mealQuietRequestIDs[kind] = id
+        return (id, mealQuietGenerations[kind, default: 0])
+    }
+
+    /// Only quietable notifications need a main-actor recheck before an attachment retry.
+    /// An activation also cancels an old reply after quiet has ended; request identity prevents
+    /// that old callback from removing a newer notification with the same alarm identifier.
+    private func handleNotificationReply(for kind: AlertKind, context: (id: UUID, generation: Int)?,
+                                         action: @escaping () -> Void) {
+        guard let context else { action(); return }
+        DispatchQueue.main.async {
+            guard self.mealQuietRequestIDs[kind] == context.id else { return }
+            if self.mealQuietSuppresses(kind) || self.mealQuietGenerations[kind, default: 0] != context.generation {
+                let identifiers = [kind.notificationIdentifier()]
+                self.uNUserNotificationCenter.removePendingNotificationRequests(withIdentifiers: identifiers)
+                self.uNUserNotificationCenter.removeDeliveredNotifications(withIdentifiers: identifiers)
+                return
+            }
+            action()
+        }
+    }
+
+    @MainActor
+    @discardableResult
+    private func clearMealQuietNotificationIfSuppressed(_ kind: AlertKind) -> Bool {
+        guard mealQuietSuppresses(kind) else { return false }
+        let identifiers = [kind.notificationIdentifier()]
+        uNUserNotificationCenter.removePendingNotificationRequests(withIdentifiers: identifiers)
+        uNUserNotificationCenter.removeDeliveredNotifications(withIdentifiers: identifiers)
+        return true
+    }
+
     private func clearNotLoopingNotifications() {
         uNUserNotificationCenter.removeDeliveredNotifications(withIdentifiers: [AlertKind.notlooping.notificationIdentifier()])
         uNUserNotificationCenter.removePendingNotificationRequests(withIdentifiers: [AlertKind.notlooping.notificationIdentifier()])
@@ -1441,6 +1547,7 @@ public class AlertManager: NSObject {
 
     deinit {
         if let watchAlarmDelegationObserver { NotificationCenter.default.removeObserver(watchAlarmDelegationObserver) }
+        if let mealQuietObserver { NotificationCenter.default.removeObserver(mealQuietObserver) }
         UserDefaults.standard.removeObserver(self, forKeyPath: UserDefaults.Key.missedReadingAlertChanged.rawValue)
         UserDefaults.standard.removeObserver(self, forKeyPath: UserDefaults.Key.notLoopingAlertChanged.rawValue)
         UserDefaults.standard.removeObserver(self, forKeyPath: UserDefaults.Key.nightscoutEnabled.rawValue)

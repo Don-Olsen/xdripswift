@@ -15,6 +15,7 @@ import UIKit
 /// dismissal of the picker used by configurable snooze periods.
 struct SnoozeView: View {
     @StateObject private var viewModel: SnoozeViewModel
+    @ObservedObject private var mealQuiet = MealQuietManager.shared
     @Environment(\.presentationMode) private var presentationMode: Binding<PresentationMode>
     
     init(viewModel: SnoozeViewModel) {
@@ -25,7 +26,9 @@ struct SnoozeView: View {
         NavigationView {
             ZStack {
                 // Keep the all-snoozed illustration out of the List
-                contentList()
+                TimelineView(.periodic(from: .now, by: 60)) { context in
+                    contentList(at: context.date)
+                }
                 
                 if viewModel.showAllSnoozedImage {
                     allSnoozedPlaceholderView()
@@ -68,7 +71,7 @@ struct SnoozeView: View {
         }
     }
     
-    @ViewBuilder private func contentList() -> some View {
+    @ViewBuilder private func contentList(at now: Date) -> some View {
         List {
             Section {
                 // This replaces snoozeAllUISwitchAction(_:) from SnoozeViewController.
@@ -85,6 +88,20 @@ struct SnoozeView: View {
                     .listRowBackground(snoozeAllStatusBackgroundColor())
             }
             
+            if let period = mealQuiet.activePeriod(at: now) {
+                Section {
+                    HStack {
+                        Text("Måltidsro til \(period.until.formatted(date: .omitted, time: .shortened))")
+                            .foregroundStyle(Color(.colorPrimary))
+                        Spacer()
+                        Button("Afslut") { mealQuiet.end(reason: "Afsluttet af brugeren", at: Date()) }
+                            .buttonStyle(.borderless)
+                    }
+                } footer: {
+                    Text("Høj og Højt om lidt er dæmpet, samt Hurtig stigning under højgrænsen. Akut høj og alle lave alarmer fortsætter.")
+                }
+            }
+
             if !viewModel.showAllSnoozedImage {
                 ForEach(viewModel.rows) { row in
                     Section(header: alarmSectionHeader(title: row.sectionTitle)) {

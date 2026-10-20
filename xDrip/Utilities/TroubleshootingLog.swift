@@ -742,6 +742,7 @@ enum TroubleshootingAlertActivity: Codable, Equatable {
     case disabled
     case notificationsDenied
     case suppressedBySnooze
+    case mealQuiet(reason: String)
 }
 
 /// A closed list of optional destinations whose sharing result can be exposed safely.
@@ -1722,6 +1723,9 @@ final class TroubleshootingLogStore {
                     if case .disabled? = lastAlertActivity[kindRawValue] { continue }
                     result.append(entry)
                     lastAlertActivity[kindRawValue] = activity
+                case .mealQuiet:
+                    result.append(entry)
+                    lastAlertActivity[kindRawValue] = activity
                 case .suppressedBySnooze:
                     // The same condition can be evaluated on every reading during a snooze. One row
                     // explains the suppression until this alert reaches a different state.
@@ -2414,6 +2418,7 @@ struct TroubleshootingLogReportBuilder {
             case .disabled: return "\(alertName) alert condition was met, but the alert is disabled."
             case .notificationsDenied: return "Notifications are not allowed, so an alert may not appear."
             case .suppressedBySnooze: return "\(alertName) alert condition was met, but the alert was pre-snoozed."
+            case let .mealQuiet(reason): return "Måltidsro: \(reason)."
             }
 
         case let .integration(name, activity):

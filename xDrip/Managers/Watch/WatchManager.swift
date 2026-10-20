@@ -385,7 +385,8 @@ enum WatchManualTreatmentStore {
                 manualWithoutCurrentSuggestion: operation.manualWithoutCurrentSuggestion,
                 pizzaSettings: storedPizza,
                 metadataStore: metadataStore,
-                onReminderIssue: MealReminderIssueCenter.report)
+                onReminderIssue: MealReminderIssueCenter.report,
+                allowsMealQuietStart: mealQuietStartIsAllowed(operation, coreDataManager: coreDataManager, at: now))
             switch result {
             case .success:
                 guard case .exact = persistedMatch(operation, coreDataManager: coreDataManager) else {
@@ -396,6 +397,22 @@ enum WatchManualTreatmentStore {
             case .failure(.storageFailed), .failure(.metadataFailed): return .persistenceFailed
             }
         }
+    }
+
+    private static func mealQuietStartIsAllowed(_ operation: WatchBolusOperation,
+                                                coreDataManager: CoreDataManager, at now: Date) -> Bool {
+        // An empty Watch outbox also follows permanent rejection. Read actual phone
+        // glucose instead of treating queue removal as a successful CGM receipt.
+        var latestPhoneReadingAt: Date?
+        if operation.allowsMealQuietStart == true, operation.latestWatchReadingAt != nil,
+           let latest = BgReadingsAccessor(coreDataManager: coreDataManager)
+            .getLatestBgReadingSnapshots(limit: 1, fromDate: nil, forSensor: nil,
+                ignoreRawData: true, ignoreCalculatedValue: true).first,
+           latest.isValidForDownstream {
+            latestPhoneReadingAt = latest.timeStamp
+        }
+        return operation.mayStartMealQuiet(at: now, latestPhoneReadingAt: latestPhoneReadingAt,
+            phoneOwnsSensor: LibreWatchSessionStore.loadOwnership() == .iphone)
     }
 
     private static func persistedMatch(_ operation: WatchBolusOperation,
@@ -506,6 +523,7 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
     private var libreWatchDiagnosticReceipts = LibreWatchSessionStore.loadDiagnosticReceipts()
     private var libreWatchObservers: [NSObjectProtocol] = []
     private var lastPenConfigurationSignature = ""
+    private var mealQuietState: MealQuietSyncState?
 
     /// Statistics manager used to build compact AGP backgrounds for the Watch chart
     private var statisticsManager: StatisticsManager
@@ -695,6 +713,12 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
             self?.processWatchUpdate(updateTypes: [.status], forceComplicationUpdate: false)
         })
 
+        libreWatchObservers.append(NotificationCenter.default.addObserver(
+            forName: Notification.Name("xdrip.mealQuiet.changed"), object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.publishMealQuietState() }
+        })
+        Task { @MainActor [weak self] in self?.publishMealQuietState() }
+
         if let transmitter = bluetoothPeripheralManager.getCGMTransmitter() as? CGMLibre2Transmitter {
             if startupDecision.phoneConnectionIsBlocked, let libreWatchDirectSession {
                 transmitter.restoreWatchOwnership(libreWatchDirectSession)
@@ -852,6 +876,7 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
 
     private func currentStatus(therapyMetrics: TherapyMetricsSnapshot? = nil) -> WatchStatus {
         var status = WatchStatus()
+        status.mealQuietState = mealQuietState
 
         if let session = libreWatchDirectSession {
             status.libreAlarmSettings = AlertManager.makeLibreWatchAlarmSettings(session: session, coreDataManager: coreDataManager)
@@ -1831,6 +1856,38 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
         return true
     }
 
+    @MainActor
+    private func publishMealQuietState() {
+        let latest = MealQuietManager.shared.watchState
+        let transported = (session.applicationContext["mealQuietState"] as? Data)
+            .flatMap { try? JSONDecoder().decode(MealQuietSyncState.self, from: $0) }
+        guard mealQuietState != latest || transported != latest else { return }
+        mealQuietState = latest
+        processWatchUpdate(updateTypes: [.status], forceComplicationUpdate: false)
+        guard session.activationState == .activated,
+              let data = try? JSONEncoder().encode(latest) else { return }
+        let payload: [String: Any] = ["mealQuietState": data]
+        try? session.updateApplicationContext(WatchPhoneRefreshService.merging(payload, into: session.applicationContext))
+        if session.isReachable { session.sendMessage(payload, replyHandler: nil, errorHandler: nil) }
+    }
+
+    @discardableResult
+    private func handleMealQuietEnd(_ message: [String: Any], reply: (([String: Any]) -> Void)?) -> Bool {
+        guard let mealID = message["mealQuietEndID"] as? String, !mealID.isEmpty else { return false }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            // A delayed stop for an earlier meal must never stop a newer period.
+            if MealQuietManager.shared.watchState.period?.mealID == mealID {
+                MealQuietManager.shared.end(mealID: mealID, reason: "Afsluttet på uret")
+            }
+            self.publishMealQuietState()
+            if let data = try? JSONEncoder().encode(MealQuietManager.shared.watchState) {
+                reply?(["mealQuietState": data])
+            } else { reply?([:]) }
+        }
+        return true
+    }
+
     @discardableResult
     private func handleWatchPenLog(_ message: [String: Any],
                                    reply: (([String: Any]) -> Void)?) -> Bool {
@@ -1951,11 +2008,13 @@ extension WatchManager: WCSessionDelegate {
         DispatchQueue.main.async { [weak self] in
             self?.processWatchUpdate(updateTypes: [.status, .bgReadings], forceComplicationUpdate: false)
             self?.sendLibreWatchSession()
+            Task { @MainActor [weak self] in self?.publishMealQuietState() }
         }
     }
 
     // process any received messages from the watch app
     func session(_ session: WCSession, didReceiveMessage message: [String: Any]) {
+        if handleMealQuietEnd(message, reply: nil) { return }
         if handleWatchPenLog(message, reply: nil) { return }
         if handleWatchPenCalculation(message, reply: nil) { return }
         if handleManualWatchTreatment(message, reply: nil) { return }
@@ -1977,6 +2036,7 @@ extension WatchManager: WCSessionDelegate {
         didReceiveMessage message: [String: Any],
         replyHandler: @escaping ([String: Any]) -> Void
     ) {
+        if handleMealQuietEnd(message, reply: replyHandler) { return }
         if handleWatchPenLog(message, reply: replyHandler) { return }
         if handleWatchPenCalculation(message, reply: replyHandler) { return }
         if handleManualWatchTreatment(message, reply: replyHandler) { return }
@@ -1993,6 +2053,7 @@ extension WatchManager: WCSessionDelegate {
     }
 
     func session(_: WCSession, didReceiveUserInfo userInfo: [String: Any] = [:]) {
+        if handleMealQuietEnd(userInfo, reply: nil) { return }
         if handleWatchPenLog(userInfo, reply: nil) { return }
         if handleManualWatchTreatment(userInfo, reply: nil) { return }
         _ = handleLibreWatchMessage(userInfo, transport: .queuedUserInfo, reply: nil)
@@ -2005,6 +2066,7 @@ extension WatchManager: WCSessionDelegate {
             DispatchQueue.main.async {
                 self.phoneRefresh.reachable()
                 self.sendLibreWatchSession()
+                Task { @MainActor [weak self] in self?.publishMealQuietState() }
             }
         }
     }

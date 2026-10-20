@@ -101,6 +101,15 @@ struct LibreDirectView: View {
                     .font(.caption2)
                     .multilineTextAlignment(.center)
                     .foregroundStyle(.secondary)
+                if let period = watchState.mealQuietPeriod, period.isActive(at: now) {
+                    VStack(spacing: 2) {
+                        Text("Måltidsro til \(period.until.formatted(date: .omitted, time: .shortened))")
+                            .font(.caption2)
+                        Button("Afslut") { watchState.endMealQuiet() }
+                            .font(.caption2)
+                    }
+                    .accessibilityElement(children: .contain)
+                }
                 if watchState.canRequestLocalAlarmPermission {
                     Button("Tillad Watch-notifikationer") {
                         watchState.requestLocalAlarmPermission()
@@ -123,7 +132,10 @@ struct LibreDirectView: View {
             .padding(.horizontal, 5)
         }
         .navigationTitle("Libre")
-        .onAppear { displayDate = Date() }
+        .onAppear {
+            displayDate = Date()
+            watchState.refreshDirectLibreReadingFreshness(at: displayDate)
+        }
         .onChange(of: scenePhase) { phase in
             if phase == .active { displayDate = Date() }
         }

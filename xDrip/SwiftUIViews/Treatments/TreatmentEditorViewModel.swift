@@ -50,6 +50,7 @@ import UserNotifications
     private let localSaveOperation = PenDoseLogOperation()
     private let localSaveStartedAt = Date()
     private let localSaveOverride: (() -> Bool)?
+    private let considerMealQuiet: ((String, String, Date, Date, Bool) -> Void)?
     private var requestedExistingMealState: TreatmentMealState?
     private let log = OSLog(subsystem: ConstantsLog.subSystem, category: ConstantsLog.categoryApplicationDataTreatments)
 
@@ -59,7 +60,8 @@ import UserNotifications
          quickCarbohydrateGrams: Double? = nil, localSaveJournal: PenDoseLogJournal? = nil,
          localSaveOverride: (() -> Bool)? = nil, mealMetadataStore: MealPlanMetadataStore? = nil,
          carbohydrateAdviceEvidence: CarbohydrateAdviceEvidence? = nil,
-         carbohydrateAdviceJournal: CarbohydrateAdviceJournal = .shared) {
+         carbohydrateAdviceJournal: CarbohydrateAdviceJournal = .shared,
+         considerMealQuiet: ((String, String, Date, Date, Bool) -> Void)? = nil) {
         self.carbohydrateAdviceEvidence = carbohydrateAdviceEvidence
         self.carbohydrateAdviceJournal = carbohydrateAdviceJournal
         let localSaveJournal = localSaveJournal ?? .shared
@@ -70,6 +72,7 @@ import UserNotifications
         self.localSaveJournal = localSaveJournal
         self.mealMetadataStore = mealMetadataStore ?? .shared
         self.localSaveOverride = localSaveOverride
+        self.considerMealQuiet = considerMealQuiet
         self.localSaveGateState = coreDataManager.map { localSaveJournal.recoveryState(coreDataManager: $0) } ?? .ready
         self.originalTreatment = treatmentToEdit
         self.initialTreatmentState = treatmentToEdit.map {
@@ -267,6 +270,10 @@ import UserNotifications
         }
 
         let treatmentToEdit = treatmentToEdit(in: coreDataManager)
+        // Capture the explicit state transition before mutating the existing row.
+        // Ordinary edits and merely reaching a planned time are not eating confirmations.
+        let confirmsPlannedMeal = requestedExistingMealState == .confirmed &&
+            treatmentToEdit?.isPlannedMeal == true && selectedType == .Carbs
         // An edit whose target was deleted or detached must never fall through to insertion.
         guard isAddMode || treatmentToEdit != nil else { return false }
         let changesBasal = selectedType == .BasalInjection ||
@@ -493,6 +500,24 @@ import UserNotifications
             BasalReminderScheduler.shared.refreshAfterTreatmentChange(
                 coreDataManager: coreDataManager,
                 savedBasalAt: selectedType == .BasalInjection ? selectedDate : nil)
+        }
+        if confirmsPlannedMeal, let meal = savedTreatment, meal.isConfirmedMeal,
+           meal.value.isFinite, meal.value > 0, let mealID = meal.localTreatmentUUID,
+           let metadata = try? mealMetadataStore.metadata(for: mealID),
+           let bolusID = metadata.bolusUUID,
+           let rows = try? MealPlanReminderCoordinator.storedTreatments(
+            coreDataManager: coreDataManager, uuids: [mealID, bolusID]),
+           rows.count == 2,
+           rows.filter({ $0.uuid == mealID && $0.isConfirmedMeal &&
+               $0.value == meal.value && $0.date == meal.date }).count == 1,
+           rows.filter({ $0.uuid == bolusID && $0.type == .Insulin &&
+               !$0.deleted && $0.value.isFinite && $0.value > 0 }).count == 1 {
+            if let considerMealQuiet {
+                considerMealQuiet(mealID, bolusID, meal.date, now, true)
+            } else {
+                MealQuietManager.shared.considerCommittedMeal(coreDataManager: coreDataManager,
+                    mealID: mealID, bolusID: bolusID, eatingAt: meal.date, eventAt: now)
+            }
         }
         requestedExistingMealState = nil
 
@@ -1982,7 +2007,9 @@ struct PenDoseLogIntent: Codable, Equatable {
                     pizzaSettings: PizzaSplitSettings = .load(),
                     metadataStore: MealPlanMetadataStore? = nil,
                     onReminderIssue: ((String) -> Void)? = nil,
-                    saveOverride: (() -> Bool)? = nil)
+                    saveOverride: (() -> Bool)? = nil,
+                    allowsMealQuietStart: Bool = true,
+                    considerMealQuiet: ((String, String, Date, Date, Bool) -> Void)? = nil)
         -> Result<PenDoseLogReceipt, PenDoseLogError> {
         let journal = journal ?? .shared
         let metadataStore = metadataStore ?? .shared
@@ -2086,6 +2113,21 @@ struct PenDoseLogIntent: Codable, Equatable {
               journal.completeVerified(coreDataManager: coreDataManager, operation: operation,
                 insulinUnits: insulinUnits, carbohydrateGrams: carbohydrateGrams) else {
             return .failure(.storageFailed)
+        }
+        // Only the first verified paired registration is a new meal event. A retry
+        // may acknowledge existing rows, but must never start or extend quiet time.
+        // Quiet eligibility uses the immutable event date, including delayed Watch delivery;
+        // knownAt remains the separate phone-availability provenance saved above.
+        if plannedDate == nil, insulinUnits > 0, carbohydrateGrams > 0,
+           priorBolus == nil, priorMeal == nil {
+            if let considerMealQuiet {
+                considerMealQuiet(operation.mealUUID, operation.bolusUUID, now, now,
+                    allowsMealQuietStart)
+            } else {
+                MealQuietManager.shared.considerCommittedMeal(coreDataManager: coreDataManager,
+                    mealID: operation.mealUUID, bolusID: operation.bolusUUID,
+                    eatingAt: now, eventAt: now, allowsStart: allowsMealQuietStart)
+            }
         }
         let reminderWarning = carbohydrateGrams > 0 ? MealPlanReminderCoordinator.refresh(
             coreDataManager: coreDataManager, mealUUID: operation.mealUUID,

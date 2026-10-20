@@ -627,6 +627,177 @@ final class BasalInjectionTests: XCTestCase {
 
 /// The local meal flow shares the established editor with insulin and basal entries.
 final class LocalTreatmentPlanningTests: XCTestCase {
+    @MainActor func testMealQuietReceivesOnlyNewVerifiedPairWithOriginalTimeForEveryMealKind() throws {
+        for kind in [TreatmentMealKind.fast, .normal, .slow] {
+            let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let journal = PenDoseLogJournal(directory: directory)
+            let metadata = MealPlanMetadataStore(directory: directory)
+            let operation = PenDoseLogOperation()
+            let eatingAt = Date().addingTimeInterval(-120)
+            let receivedAt = eatingAt.addingTimeInterval(90)
+            var events = 0
+            let consider: (String, String, Date, Date, Bool) -> Void = { meal, bolus, eaten, known, allowed in
+                events += 1
+                XCTAssertEqual(meal, operation.mealUUID)
+                XCTAssertEqual(bolus, operation.bolusUUID)
+                XCTAssertEqual(eaten, eatingAt)
+                XCTAssertEqual(known, eatingAt)
+                XCTAssertTrue(allowed)
+                XCTAssertEqual(journal.recoveryState(coreDataManager: core), .ready)
+                let rows = try? MealPlanReminderCoordinator.storedTreatments(
+                    coreDataManager: core, uuids: [meal, bolus])
+                XCTAssertEqual(rows?.count, 2, "Both rows must already exist in the permanent store")
+                XCTAssertEqual(rows?.first(where: { $0.uuid == meal })?.value, 1)
+                XCTAssertEqual(rows?.first(where: { $0.uuid == bolus })?.value, 0.5)
+            }
+            for _ in 0..<2 {
+                let result = PenDoseTreatmentLogger.log(coreDataManager: core, insulinUnits: 0.5,
+                    carbohydrateGrams: 1, mealKind: kind, plannedDate: nil, operation: operation,
+                    now: eatingAt, knownAt: receivedAt, journal: journal,
+                    penSettings: PenDoseProfile.prefilledUnconfirmed.settings,
+                    pizzaSettings: PizzaSplitSettings(isEnabled: false, percentageNow: 70, reminderMinutes: 90),
+                    metadataStore: metadata, considerMealQuiet: consider)
+                guard case .success = result else { return XCTFail("The paired treatment should save") }
+                XCTAssertEqual(events, 1, "Acknowledging the same operation must not repeat the meal event")
+            }
+            XCTAssertEqual(try metadata.metadata(for: operation.mealUUID)?.bolusUUID, operation.bolusUUID)
+        }
+    }
+
+    @MainActor func testMealQuietRejectsUnpairedPlannedAndUncertainRegistrations() throws {
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let journal = PenDoseLogJournal(directory: directory)
+        let metadata = MealPlanMetadataStore(directory: directory)
+        let now = Date()
+        var events = 0
+        let consider: (String, String, Date, Date, Bool) -> Void = { _, _, _, _, _ in events += 1 }
+        for (insulin, carbs, planned) in [(0.0, 12.0, false), (1.0, 0.0, false), (1.0, 12.0, true)] {
+            let result = PenDoseTreatmentLogger.log(coreDataManager: core, insulinUnits: insulin,
+                carbohydrateGrams: carbs, mealKind: .fast,
+                plannedDate: planned ? now.addingTimeInterval(15 * 60) : nil,
+                now: now, journal: journal, penSettings: PenDoseProfile.prefilledUnconfirmed.settings,
+                metadataStore: metadata, considerMealQuiet: consider)
+            guard case .success = result else { return XCTFail("Valid treatment should still save") }
+        }
+        XCTAssertEqual(events, 0, "Separate entries at the same time must never be paired")
+
+        let uncertain = PenDoseLogOperation()
+        let failed = PenDoseTreatmentLogger.log(coreDataManager: core, insulinUnits: 1,
+            carbohydrateGrams: 12, mealKind: .normal, plannedDate: nil, operation: uncertain,
+            now: now, journal: journal, penSettings: PenDoseProfile.prefilledUnconfirmed.settings,
+            metadataStore: metadata, saveOverride: { false }, considerMealQuiet: consider)
+        guard case .failure(.storageFailed) = failed else { return XCTFail("Save must be unverified") }
+        XCTAssertEqual(events, 0)
+        let retry = PenDoseTreatmentLogger.log(coreDataManager: core, insulinUnits: 1,
+            carbohydrateGrams: 12, mealKind: .normal, plannedDate: nil, operation: uncertain,
+            now: now, journal: journal, penSettings: PenDoseProfile.prefilledUnconfirmed.settings,
+            metadataStore: metadata, considerMealQuiet: consider)
+        guard case .success = retry else { return XCTFail("The existing retry contract must remain intact") }
+        XCTAssertEqual(events, 0, "Resolving an uncertain attempt is not a fresh meal event")
+    }
+
+    @MainActor func testMealQuietKeepsOfflineOriginIneligibleAfterVerifiedPhoneStorage() throws {
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let eatingAt = Date().addingTimeInterval(-120)
+        let receivedAt = Date()
+        var permissions: [Bool] = []
+        let result = PenDoseTreatmentLogger.log(coreDataManager: core, insulinUnits: 1,
+            carbohydrateGrams: 12, mealKind: .normal, plannedDate: nil,
+            now: eatingAt, knownAt: receivedAt, journal: PenDoseLogJournal(directory: directory),
+            penSettings: PenDoseProfile.prefilledUnconfirmed.settings,
+            metadataStore: MealPlanMetadataStore(directory: directory), allowsMealQuietStart: false,
+            considerMealQuiet: { _, _, eaten, received, allowed in
+                XCTAssertEqual(eaten, eatingAt)
+                XCTAssertEqual(received, eatingAt)
+                permissions.append(allowed)
+            })
+        guard case .success = result else { return XCTFail("Offline treatment must still be stored") }
+        XCTAssertEqual(permissions, [false])
+    }
+
+    @MainActor func testMealQuietPlannedMealRequiresExplicitVerifiedConfirmationAndExistingBolus() throws {
+        for hasBolus in [false, true] {
+            let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let journal = PenDoseLogJournal(directory: directory)
+            let metadata = MealPlanMetadataStore(directory: directory)
+            let operation = PenDoseLogOperation()
+            let now = Date()
+            var events = 0
+            let consider: (String, String, Date, Date, Bool) -> Void = { meal, bolus, eaten, known, allowed in
+                events += 1
+                XCTAssertEqual(meal, operation.mealUUID)
+                XCTAssertEqual(bolus, operation.bolusUUID)
+                XCTAssertLessThanOrEqual(eaten, known)
+                XCTAssertTrue(allowed)
+                XCTAssertEqual(journal.recoveryState(coreDataManager: core), .ready)
+                let rows = try? MealPlanReminderCoordinator.storedTreatments(
+                    coreDataManager: core, uuids: [meal, bolus])
+                XCTAssertTrue(rows?.first(where: { $0.uuid == meal })?.isConfirmedMeal == true)
+                XCTAssertEqual(rows?.first(where: { $0.uuid == meal })?.date, eaten)
+            }
+            let result = PenDoseTreatmentLogger.log(coreDataManager: core, insulinUnits: hasBolus ? 1 : 0,
+                carbohydrateGrams: 12, mealKind: .normal, plannedDate: now.addingTimeInterval(15 * 60),
+                operation: operation, now: now, journal: journal,
+                penSettings: PenDoseProfile.prefilledUnconfirmed.settings,
+                metadataStore: metadata, considerMealQuiet: consider)
+            guard case .success = result else { return XCTFail("Plan should save") }
+            let meal = try XCTUnwrap(TreatmentEntryAccessor(coreDataManager: core)
+                .getLatestTreatments(howOld: nil).first { $0.localTreatmentUUID == operation.mealUUID })
+            let edit = TreatmentEditorViewModel(coreDataManager: core, treatmentToEdit: meal,
+                localSaveJournal: journal, mealMetadataStore: metadata, considerMealQuiet: consider)
+            edit.enteredValue = "14"
+            XCTAssertTrue(edit.saveTreatment())
+            XCTAssertEqual(events, 0, "A plan edit is not evidence of eating")
+            let confirmation = TreatmentEditorViewModel(coreDataManager: core, treatmentToEdit: meal,
+                localSaveJournal: journal, mealMetadataStore: metadata, considerMealQuiet: consider)
+            confirmation.selectedDate = now.addingTimeInterval(-30)
+            XCTAssertTrue(confirmation.confirmPlannedMeal())
+            XCTAssertEqual(events, hasBolus ? 1 : 0)
+            let ordinaryEdit = TreatmentEditorViewModel(coreDataManager: core, treatmentToEdit: meal,
+                localSaveJournal: journal, mealMetadataStore: metadata, considerMealQuiet: consider)
+            ordinaryEdit.enteredValue = "16"
+            XCTAssertTrue(ordinaryEdit.saveTreatment())
+            XCTAssertEqual(events, hasBolus ? 1 : 0, "An eaten-meal edit must never start another period")
+        }
+    }
+
+    @MainActor func testMealQuietDoesNotStartOnFailedPlannedConfirmationOrQuickCarbs() throws {
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let journal = PenDoseLogJournal(directory: directory)
+        let metadata = MealPlanMetadataStore(directory: directory)
+        var events = 0
+        let consider: (String, String, Date, Date, Bool) -> Void = { _, _, _, _, _ in events += 1 }
+        let quickCarbs = TreatmentEditorViewModel(coreDataManager: core, treatmentToEdit: nil,
+            quickCarbohydrateGrams: 12, localSaveJournal: journal,
+            mealMetadataStore: metadata, considerMealQuiet: consider)
+        XCTAssertTrue(quickCarbs.saveTreatment())
+        XCTAssertEqual(events, 0)
+        let operation = PenDoseLogOperation()
+        let result = PenDoseTreatmentLogger.log(coreDataManager: core, insulinUnits: 1,
+            carbohydrateGrams: 12, mealKind: .normal,
+            plannedDate: Date().addingTimeInterval(15 * 60), operation: operation,
+            journal: journal, penSettings: PenDoseProfile.prefilledUnconfirmed.settings,
+            metadataStore: metadata, considerMealQuiet: consider)
+        guard case .success = result else { return XCTFail("Plan should save") }
+        let meal = try XCTUnwrap(TreatmentEntryAccessor(coreDataManager: core)
+            .getLatestTreatments(howOld: nil).first { $0.localTreatmentUUID == operation.mealUUID })
+        let confirmation = TreatmentEditorViewModel(coreDataManager: core, treatmentToEdit: meal,
+            localSaveJournal: journal, localSaveOverride: { false }, mealMetadataStore: metadata,
+            considerMealQuiet: consider)
+        XCTAssertFalse(confirmation.confirmPlannedMealNow())
+        XCTAssertEqual(events, 0)
+    }
+
     @MainActor func testPlannedMealStaysUnconfirmedUntilExplicitAction() throws {
         let manager = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
         let draft = TreatmentEditorViewModel(coreDataManager: manager, treatmentToEdit: nil, initialType: .Carbs)

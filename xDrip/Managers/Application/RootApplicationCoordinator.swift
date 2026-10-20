@@ -1058,6 +1058,7 @@ struct InitialCalibrationRequestGate {
         if let alertManager {
             sensorHealthIssueManager.configure(oneOffAlarmRaiser: alertManager)
         }
+        MealQuietManager.shared.configure(coreDataManager: coreDataManager)
         
         // setup calendarManager
         calendarManager = CalendarManager(coreDataManager: coreDataManager)
@@ -2493,6 +2494,7 @@ struct InitialCalibrationRequestGate {
             }
             Task { @MainActor [weak self] in
                 let includeHigh = HighSoonAdvisoryPolicy.isEnabled()
+                let mealQuietToken = MealQuietManager.shared.inputRevisionToken()
                 let outcome = await adapter.engineOnlyForecast(horizonMinutes: 60, at: .now,
                     includeHighAdvisory: includeHigh)
                 guard let self else { return }
@@ -2510,6 +2512,7 @@ struct InitialCalibrationRequestGate {
                     }
                     return
                 }
+                MealQuietManager.shared.acceptSafetyOutcome(outcome, token: mealQuietToken, at: .now)
                 self.alertManager?.checkLowSoon(outcome,
                     expectedReferenceDate: pending.measuredAt, expectedSensorID: pending.sensorID,
                     expectedGlucoseMgdl: pending.finalValueMgdl)
@@ -3551,6 +3554,13 @@ extension RootApplicationCoordinator: @preconcurrency UNUserNotificationCenterDe
     // called when notification created while app is in foreground
     func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification, withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
         if notification.request.identifier == HighSoonAdvisoryPolicy.notificationIdentifier {
+            MealQuietManager.shared.refreshMeasuredBasis()
+            if MealQuietManager.shared.shouldSuppressHighSoon() {
+                center.removePendingNotificationRequests(withIdentifiers: [HighSoonAdvisoryPolicy.notificationIdentifier])
+                center.removeDeliveredNotifications(withIdentifiers: [HighSoonAdvisoryPolicy.notificationIdentifier])
+                completionHandler([])
+                return
+            }
             completionHandler([.banner, .list, .sound])
             return
         }

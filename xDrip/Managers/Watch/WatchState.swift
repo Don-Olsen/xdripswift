@@ -19,6 +19,155 @@ extension WatchPayload {
     }
 }
 
+/// A phone-authorized interval. Dates never move when it is transported or restored.
+struct MealQuietPeriod: Codable, Equatable, Sendable {
+    let mealID: String
+    let startedAt: Date
+    let until: Date
+    static let maximumDuration: TimeInterval = 60 * 60
+
+    func isActive(at date: Date) -> Bool {
+        !mealID.isEmpty && startedAt.timeIntervalSince1970.isFinite &&
+            until.timeIntervalSince1970.isFinite && date.timeIntervalSince1970.isFinite &&
+            until > startedAt && until.timeIntervalSince(startedAt) <= Self.maximumDuration &&
+            startedAt <= date && date < until
+    }
+}
+
+struct MealQuietSyncState: Codable, Equatable, Sendable {
+    let revision: Int
+    let period: MealQuietPeriod?
+}
+
+/// Independent of alarm ownership and snooze groups; an ended meal cannot restart
+/// when an older phone message arrives after a local stop or an app restart.
+struct WatchMealQuietState: Codable, Equatable {
+    private(set) var received: MealQuietSyncState?
+    private(set) var stoppedUntil: [String: Date] = [:]
+    private(set) var pendingEndIDs: Set<String> = []
+
+    func activePeriod(at date: Date) -> MealQuietPeriod? {
+        guard let period = received?.period, period.isActive(at: date),
+              stoppedUntil[period.mealID] == nil else { return nil }
+        return period
+    }
+
+    mutating func apply(_ candidate: MealQuietSyncState, at date: Date) {
+        prune(at: date)
+        guard candidate.revision >= 0, candidate.revision > (received?.revision ?? -1) else { return }
+        if let prior = received?.period, prior != candidate.period {
+            // A period's dates are immutable, even if a later packet claims otherwise.
+            if let changed = candidate.period, changed.mealID == prior.mealID {
+                stoppedUntil[prior.mealID] = max(prior.until, changed.until)
+                pendingEndIDs.insert(prior.mealID)
+            } else if prior.until > date {
+                stoppedUntil[prior.mealID] = prior.until
+            }
+        }
+        received = candidate
+        pendingEndIDs = pendingEndIDs.filter { $0 == candidate.period?.mealID }
+        if let period = candidate.period, !period.isActive(at: date) { stop(at: date) }
+    }
+
+    mutating func stop(at date: Date) {
+        prune(at: date)
+        guard let period = received?.period, period.until.timeIntervalSince1970.isFinite,
+              period.until > date else { return }
+        stoppedUntil[period.mealID] = max(stoppedUntil[period.mealID] ?? period.until, period.until)
+        pendingEndIDs.insert(period.mealID)
+    }
+
+    mutating func prune(at date: Date) {
+        stoppedUntil = stoppedUntil.filter { $0.value > date }
+        pendingEndIDs = pendingEndIDs.filter { stoppedUntil[$0] != nil }
+    }
+
+    mutating func observeReadingGap(previouslyMeasuredAt: Date?, at date: Date) {
+        guard activePeriod(at: date) != nil, let previouslyMeasuredAt,
+              !previouslyMeasuredAt.timeIntervalSince1970.isFinite ||
+                date.timeIntervalSince(previouslyMeasuredAt) > 180 else { return }
+        stop(at: date)
+    }
+
+    mutating func refreshLocalBasis(glucose: Double?, measuredAt: Date?,
+        settings: LibreWatchAlarmSettings?, at date: Date) {
+        prune(at: date)
+        if activePeriod(at: date) != nil,
+           !Self.localBasisIsSafe(glucose: glucose, measuredAt: measuredAt, settings: settings, at: date) {
+            stop(at: date)
+        }
+    }
+
+    /// Watch has no phone forecast engine. Its own existing measured-low, urgent-high,
+    /// rule and direct-reading freshness checks can only stop an authorized period.
+    static func localBasisIsSafe(glucose: Double?, measuredAt: Date?,
+        settings: LibreWatchAlarmSettings?, at date: Date, calendar: Calendar = .current) -> Bool {
+        guard date.timeIntervalSince1970.isFinite,
+              let settings, let glucose, glucose.isFinite, glucose > 0,
+              let measuredAt, measuredAt.timeIntervalSince1970.isFinite,
+              measuredAt <= date.addingTimeInterval(20), date.timeIntervalSince(measuredAt) <= 180,
+              let low = settings.rule(for: .low, at: date, calendar: calendar), low.enabled,
+              let high = settings.rule(for: .high, at: date, calendar: calendar), high.enabled,
+              let urgent = settings.rule(for: .veryHigh, at: date, calendar: calendar), urgent.enabled,
+              [low.value, high.value, urgent.value].allSatisfy({ $0.isFinite && (20...600).contains($0) }),
+              low.value < high.value, urgent.value > high.value,
+              glucose >= 3.9 / ConstantsBloodGlucose.mgDlToMmoll else { return false }
+        let value = glucose.bgValueRounded(mgDl: settings.isMgDl)
+        return value > low.value.bgValueRounded(mgDl: settings.isMgDl) &&
+            value < urgent.value.bgValueRounded(mgDl: settings.isMgDl)
+    }
+
+    func suppresses(_ kind: LibreWatchAlarmKind, at date: Date) -> Bool {
+        kind == .high && activePeriod(at: date) != nil
+    }
+}
+
+/// Atomic storage and readback precede enabling suppression. A missing/corrupt file
+/// restores no quiet interval; existing alarm and treatment stores remain separate.
+enum WatchMealQuietStore {
+    private static let storageFaultKey = "watchMealQuietStorageFailed.v1"
+    static var fileURL: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("watch-meal-quiet-v1.json")
+    }
+    static func storageIsHealthy(defaults: UserDefaults = .standard) -> Bool {
+        !defaults.bool(forKey: storageFaultKey)
+    }
+    static func load(from url: URL = fileURL, defaults: UserDefaults = .standard) -> WatchMealQuietState {
+        guard FileManager.default.fileExists(atPath: url.path) else { return WatchMealQuietState() }
+        guard let data = try? Data(contentsOf: url),
+              var value = try? JSONDecoder().decode(WatchMealQuietState.self, from: data) else {
+            defaults.set(true, forKey: storageFaultKey)
+            return WatchMealQuietState()
+        }
+        if !storageIsHealthy(defaults: defaults) { value.stop(at: Date()) }
+        return value
+    }
+    static func save(_ state: WatchMealQuietState, to url: URL = fileURL,
+                     defaults: UserDefaults = .standard) throws {
+        do {
+            // Fence before the write so process termination during a Stop cannot
+            // restore the previous active document as suppression permission.
+            defaults.set(true, forKey: storageFaultKey)
+            guard defaults.synchronize() else { throw CocoaError(.fileWriteUnknown) }
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            let data = try JSONEncoder().encode(state)
+            try data.write(to: url, options: .atomic)
+            let handle = try FileHandle(forWritingTo: url)
+            try handle.synchronize()
+            try handle.close()
+            guard try Data(contentsOf: url) == data else { throw CocoaError(.fileWriteUnknown) }
+            defaults.set(false, forKey: storageFaultKey)
+            _ = defaults.synchronize()
+        } catch {
+            // Keep the prior revision on disk, but never restore its permission to
+            // suppress after an unsuccessful local stop or other state update.
+            defaults.set(true, forKey: storageFaultKey)
+            throw error
+        }
+    }
+}
+
 /// current status data used to manage watch views
 struct WatchStatus: WatchPayload {
     var generatedAt: Double = Date().timeIntervalSince1970
@@ -46,6 +195,7 @@ struct WatchStatus: WatchPayload {
 
     var aidStatus: AIDStatus?
     var libreAlarmSettings: LibreWatchAlarmSettings?
+    var mealQuietState: MealQuietSyncState?
     var therapyMetrics: TherapyMetricsSnapshot? = nil
 }
 

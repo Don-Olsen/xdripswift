@@ -1,3 +1,20 @@
+## Måltidsro og sikkerhedsprognose — 20. oktober 2026
+
+Den valgfrie måltidsro ændrer ikke motorens punkter eller ML. Efter en ny,
+verificeret sammenkoblet mad-/bolusregistrering bruger den den eksisterende
+motorbaserede sikkerhedslæsning fra de gemte behandlinger. Perioden kan kun
+starte ved gyldigt grundlag uden den eksisterende risiko for Snart lavt.
+Senere beregninger genbruges fra den eksisterende gemte-CGM-alarmkæde; der
+indføres ingen ny polling, Watch-prognose eller doseringsberegning.
+
+Et tidligere valideret resultat må alene bygge bro til næste beregning med
+uændret behandlings-/kilderevision, samme sensor, oprindelig gyldig reference
+og den eksisterende 330-sekunders friskhed. Hele vinduet nu til nu+30 skal
+stadig være dækket. Den nyeste målte glukose vurderes separat og kan straks
+ophæve roen. Et gammelt asynkront resultat må ikke starte/stoppe en nyere
+måltidsperiode. Manglende eller ændret grundlag giver almindelig alarmadfærd.
+Se PROJECT-STATUS.md for funktionsafgrænsning, tests og fysisk testbehov.
+
 # Local glucose forecast
 
 The iPhone Home chart can show a separate, dotted estimate for the next 60 minutes, or 120 minutes when selected. Set **Settings → Home Screen → Glucose forecast** to Off to hide it. The values at +30 and +60 minutes (+120 when selected) are estimates, never sensor readings. The 120-minute horizon is more uncertain. The calculation assumes no new, unrecorded food or insulin after its starting reading. The chart itself does not calculate a dose; the separate, confirmation-gated pen calculator described below does.
