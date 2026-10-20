@@ -15,6 +15,19 @@ ophæve roen. Et gammelt asynkront resultat må ikke starte/stoppe en nyere
 måltidsperiode. Manglende eller ændret grundlag giver almindelig alarmadfærd.
 Se PROJECT-STATUS.md for funktionsafgrænsning, tests og fysisk testbehov.
 
+Varighed kan vælges som 15, 30, 45, 60 eller 90 minutter. Telefon og Watch
+validerer samme maksimum på 90 minutter; den oprindelige absolutte sluttid
+bevares ved genstart, genlevering og ændret indstilling. Det er brugerens
+valg, ikke en klinisk valideret personlig varighed. Et ældre Watch fra 4346
+kan ikke bruge 90-minuttersperioder og falder tilbage til almindelige alarmer;
+opdatér begge apps før afprøvning af den nye varighed.
+
+Alarmindstillingerne viser den seneste gemte årsag, når en periode afvises
+eller afsluttes. Visningen genberegner intet og ændrer ingen snoozes. En lille,
+valgfri beslutningstid sikrer korrekt rækkefølge, også ved tilbagedateret mad;
+ældre poster kan stadig læses. En aktiv eller igangværende vurdering skjuler
+den gamle forklaring. Læse-/skrivefejl vises særskilt. Ingen ny notifikation.
+
 # Local glucose forecast
 
 The iPhone Home chart can show a separate, dotted estimate for the next 60 minutes, or 120 minutes when selected. Set **Settings → Home Screen → Glucose forecast** to Off to hide it. The values at +30 and +60 minutes (+120 when selected) are estimates, never sensor readings. The 120-minute horizon is more uncertain. The calculation assumes no new, unrecorded food or insulin after its starting reading. The chart itself does not calculate a dose; the separate, confirmation-gated pen calculator described below does.

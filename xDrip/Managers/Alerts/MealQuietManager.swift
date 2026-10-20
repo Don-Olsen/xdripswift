@@ -16,6 +16,8 @@ struct MealQuietRecord: Codable, Equatable {
     var sourceSignature: String? = nil
     var sensorID: String? = nil
     var endedAt: Date? = nil
+    // Optional for records written before the settings explanation was added.
+    var decisionAt: Date? = nil
 
     var period: MealQuietPeriod { .init(mealID: mealID, startedAt: eatingAt, until: until) }
 }
@@ -59,7 +61,7 @@ struct MealQuietRules: Equatable {
 @MainActor final class MealQuietManager: ObservableObject {
     static let shared = MealQuietManager()
     static let changed = Notification.Name("xdrip.mealQuiet.changed")
-    static let validDurationMinutes = [15, 30, 45, 60]
+    static let validDurationMinutes = [15, 30, 45, 60, 90]
 
     /// Narrow dependencies for exercising the production asynchronous lifecycle without
     /// changing global therapy settings or delivering real notifications in tests.
@@ -138,7 +140,8 @@ struct MealQuietRules: Equatable {
                           record.eatingAt.timeIntervalSince1970.isFinite &&
                           record.until.timeIntervalSince1970.isFinite &&
                           (record.endedAt.map { $0.timeIntervalSince1970.isFinite && $0 <= record.until } ?? true) &&
-                          (0...3600).contains(record.until.timeIntervalSince(record.eatingAt)) &&
+                          (record.decisionAt.map { $0.timeIntervalSince1970.isFinite } ?? true) &&
+                          (0...MealQuietPeriod.maximumDuration).contains(record.until.timeIntervalSince(record.eatingAt)) &&
                           ((record.decision != .active && record.decision != .pending) ||
                            Self.validDurationMinutes.contains(where: {
                                abs(record.until.timeIntervalSince(record.eatingAt) - Double($0 * 60)) < 0.001
@@ -169,6 +172,7 @@ struct MealQuietRules: Equatable {
                 next.records[id]?.decision = .rejected
                 next.records[id]?.reason = "Afbrudt startvurdering"
                 next.records[id]?.endedAt = min(clock(), record.until)
+                next.records[id]?.decisionAt = clock()
             }
             _ = persist(next)
         }
@@ -215,6 +219,24 @@ struct MealQuietRules: Equatable {
         _ = persist(next) // The active record's absolute expiry is deliberately untouched.
     }
 
+    /// Presentation only: reuse the recorded decision; never reassess a meal from a view.
+    var latestExplanation: String? {
+        guard storageAvailable else {
+            return "Måltidsro er ikke aktiv: Tilstanden kunne ikke læses eller gemmes."
+        }
+        guard isEnabled, document.active == nil, !document.hasPending,
+              let record = document.records.values.max(by: {
+                  let left = $0.decisionAt ?? $0.endedAt ?? $0.eatingAt
+                  let right = $1.decisionAt ?? $1.endedAt ?? $1.eatingAt
+                  return left == right ? $0.mealID < $1.mealID : left < right
+              }) else { return nil }
+        switch record.decision {
+        case .rejected: return "Måltidsro startede ikke: \(record.reason)."
+        case .ended: return "Måltidsro afsluttet: \(record.reason)."
+        case .active, .pending: return nil
+        }
+    }
+
     func activePeriod(at now: Date = .now) -> MealQuietPeriod? {
         guard storageAvailable, isEnabled, let active = document.active,
               active.period.isActive(at: now) else { return nil }
@@ -239,7 +261,9 @@ struct MealQuietRules: Equatable {
             guard let record = state.records[id], record.decision == .active || record.decision == .pending else { continue }
             state.records[id]?.decision = record.decision == .pending ? .rejected : .ended
             state.records[id]?.reason = reason
-            state.records[id]?.endedAt = min(now ?? clock(), record.until)
+            let decidedAt = now ?? clock()
+            state.records[id]?.endedAt = min(decidedAt, record.until)
+            state.records[id]?.decisionAt = decidedAt
         }
     }
 
@@ -290,7 +314,7 @@ struct MealQuietRules: Equatable {
         refreshMeasuredBasis(at: now)
         let until = eatingAt.addingTimeInterval(Double(durationMinutes ?? 0) * 60)
         var record = MealQuietRecord(mealID: mealID, bolusID: bolusID, eatingAt: eatingAt,
-                                    until: until, decision: .pending, reason: "Vurderer registreret måltid")
+                                    until: until, decision: .pending, reason: "Vurderer registreret måltid", decisionAt: now)
         let rejection: String?
         if !allowsStart { rejection = "Registreringen havde ikke et aktuelt startgrundlag" }
         else if !storageAvailable { rejection = "Måltidsroens lagring er utilgængelig" }
@@ -336,6 +360,7 @@ struct MealQuietRules: Equatable {
             var approved = document
             approved.records[mealID]?.decision = .active
             approved.records[mealID]?.reason = "Startet efter gemt mad og insulin"
+            approved.records[mealID]?.decisionAt = finishedAt
             approved.records[mealID]?.sourceSignature = contextSignature()
             approved.records[mealID]?.sensorID = measured.sensorID
             safety = (outcome, token)

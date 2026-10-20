@@ -510,6 +510,127 @@ final class MealQuietTests: XCTestCase {
         XCTAssertTrue(decimalMode.permitsCurrent(249.94, starting: false))
     }
 
+    @MainActor func testNinetyMinuteSelectionRestoresAndKeepsOriginalExpiry() async throws {
+        let inputs = MealQuietInputs()
+        let manager = inputs.manager()
+        manager.setDurationMinutes(90)
+        await activate(manager, inputs: inputs)
+        let period = try XCTUnwrap(manager.activePeriod(at: inputs.now))
+        XCTAssertEqual(period.until.timeIntervalSince(period.startedAt), 5400)
+        manager.setDurationMinutes(15)
+        XCTAssertEqual(manager.activePeriod(at: inputs.now), period)
+        XCTAssertEqual(manager.watchState.period, period)
+
+        inputs.now = period.startedAt.addingTimeInterval(61 * 60)
+        inputs.sample = .init(date: inputs.now, glucoseMgdl: 120, sensorID: "sensor-A")
+        let restored = inputs.manager(configured: false)
+        XCTAssertEqual(restored.durationMinutes, 15, "Changed duration applies only to a future meal")
+        XCTAssertEqual(restored.activePeriod(at: inputs.now), period)
+        XCTAssertFalse(restored.shouldSuppress(.high, at: inputs.now), "Fresh safety must still be revalidated")
+        restored.configure(coreDataManager: inputs.core)
+        await waitUntil { inputs.requests == 2 }
+        inputs.complete()
+        await waitUntil { inputs.returned == 2 }
+        XCTAssertTrue(restored.shouldSuppress(.high, at: inputs.now))
+        XCTAssertFalse(restored.shouldSuppress(.veryhigh, at: inputs.now))
+        XCTAssertEqual(restored.watchState.period, period)
+        XCTAssertNotNil(restored.activePeriod(at: period.until.addingTimeInterval(-0.001)))
+        inputs.now = period.until
+        restored.refreshMeasuredBasis(at: inputs.now)
+        XCTAssertNil(restored.activePeriod(at: inputs.now))
+        XCTAssertNil(restored.watchState.period)
+        XCTAssertEqual(restored.document.records["meal"]?.decision, .ended)
+    }
+
+    @MainActor func testDurationBeyondNinetyMinutesRemainsInvalid() throws {
+        let inputs = MealQuietInputs()
+        let manager = inputs.manager()
+        manager.setDurationMinutes(90)
+        for invalid in [0, 75, 91, 120] { manager.setDurationMinutes(invalid) }
+        XCTAssertEqual(manager.durationMinutes, 90)
+        var saved = manager.document
+        saved.records["meal"] = .init(mealID: "meal", bolusID: "bolus", eatingAt: inputs.now,
+            until: inputs.now.addingTimeInterval(5401), decision: .active, reason: "Invalid test interval")
+        inputs.data = try JSONEncoder().encode(saved)
+        let restored = inputs.manager(configured: false)
+        XCTAssertFalse(restored.isEnabled)
+        XCTAssertNil(restored.watchState.period)
+        XCTAssertEqual(restored.latestExplanation,
+            "Måltidsro er ikke aktiv: Tilstanden kunne ikke læses eller gemmes.")
+    }
+
+    @MainActor func testExplanationUsesActualDecisionAndReadingItHasNoSideEffects() {
+        let inputs = MealQuietInputs()
+        let manager = inputs.manager()
+        XCTAssertNil(manager.latestExplanation)
+        inputs.consider(manager, allowsStart: false)
+        XCTAssertEqual(manager.latestExplanation,
+            "Måltidsro startede ikke: Registreringen havde ikke et aktuelt startgrundlag.")
+        let document = manager.document
+        let saved = inputs.data
+        _ = manager.latestExplanation
+        XCTAssertEqual(manager.document, document)
+        XCTAssertEqual(inputs.data, saved)
+        XCTAssertEqual(inputs.requests, 0)
+        let restored = inputs.manager(configured: false)
+        XCTAssertEqual(restored.latestExplanation, manager.latestExplanation)
+        manager.setEnabled(false)
+        XCTAssertNil(manager.latestExplanation)
+    }
+
+    @MainActor func testPendingAndActiveMealHideOlderExplanationAndLowRiskShowsEndReason() async {
+        let inputs = MealQuietInputs()
+        let manager = inputs.manager()
+        inputs.consider(manager, mealID: "rejected", allowsStart: false)
+        XCTAssertNotNil(manager.latestExplanation)
+        inputs.now = inputs.now.addingTimeInterval(1)
+        inputs.consider(manager)
+        XCTAssertNil(manager.latestExplanation)
+        await waitUntil { inputs.requests == 1 }
+        inputs.complete()
+        await waitUntil { inputs.returned == 1 }
+        XCTAssertNil(manager.latestExplanation)
+        manager.acceptSafetyOutcome(inputs.outcome(risk: true), token: inputs.token, at: inputs.now)
+        XCTAssertEqual(manager.latestExplanation,
+            "Måltidsro afsluttet: Risiko for lavt blodsukker.")
+        XCTAssertFalse(manager.shouldSuppress(.high, at: inputs.now))
+        let restored = inputs.manager(configured: false)
+        XCTAssertEqual(restored.latestExplanation, manager.latestExplanation)
+    }
+
+    @MainActor func testExplanationOrdersByDecisionTimeNotBackdatedEatingTime() {
+        let inputs = MealQuietInputs()
+        let manager = inputs.manager()
+        inputs.consider(manager, mealID: "earlier", allowsStart: false)
+        inputs.now = inputs.now.addingTimeInterval(10)
+        inputs.pairValid = false
+        inputs.consider(manager, mealID: "later", eatingAt: inputs.now.addingTimeInterval(-300))
+        XCTAssertEqual(manager.latestExplanation,
+            "Måltidsro startede ikke: Gemte mad- og insulinregistreringer kunne ikke bekræftes.")
+        XCTAssertEqual(inputs.manager(configured: false).latestExplanation, manager.latestExplanation)
+    }
+
+    @MainActor func testLegacyExplanationWithoutDecisionTimeAndStorageFailure() async throws {
+        let inputs = MealQuietInputs()
+        var saved = MealQuietDocument()
+        saved.enabled = true
+        saved.durationMinutes = 60
+        saved.records["legacy"] = .init(mealID: "legacy", bolusID: "bolus", eatingAt: inputs.now,
+            until: inputs.now.addingTimeInterval(3600), decision: .rejected, reason: "Varighed er ikke valgt")
+        let data = try JSONEncoder().encode(saved)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let records = try XCTUnwrap(object["records"] as? [String: [String: Any]])
+        XCTAssertNil(records["legacy"]?["decisionAt"])
+        inputs.data = data
+        let manager = inputs.manager(configured: false)
+        XCTAssertEqual(manager.latestExplanation, "Måltidsro startede ikke: Varighed er ikke valgt.")
+        inputs.failWrites = true
+        manager.setDurationMinutes(90)
+        XCTAssertEqual(manager.latestExplanation,
+            "Måltidsro er ikke aktiv: Tilstanden kunne ikke læses eller gemmes.")
+        XCTAssertNil(manager.watchState.period)
+    }
+
     @MainActor private func activate(_ manager: MealQuietManager, inputs: MealQuietInputs,
                                     mealID: String = "meal") async {
         let next = inputs.requests + 1

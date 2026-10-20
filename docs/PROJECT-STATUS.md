@@ -1,3 +1,46 @@
+## Måltidsro: 90 minutter og forklaring — 20. oktober 2026
+
+Den eksisterende varighedsvælger har nu også 90 minutter. Ingen varighed vælges
+automatisk, og allerede aktive perioder beholder deres oprindelige sluttid.
+Den fælles periodevalidering på iPhone/Watch og telefonens genindlæsning bruger
+samme 90-minutters maksimum. Et ældre Watch fra 4346 afviser denne længere
+periode og bruger almindelig alarmadfærd; begge apps skal opdateres.
+
+Alarmindstillingerne viser den seneste gemte afvisnings-/afslutningsårsag,
+når måltidsro ikke er aktiv eller under vurdering. Forklaringen læser kun den
+eksisterende tilstand. En valgfri beslutningstid bevarer den faktiske rækkefølge
+ved tilbagedateret spisetid; gamle poster kan fortsat læses. Lagringsfejl vises
+særskilt. Der er ingen ny notifikation eller ny start-/alarmvurdering fra UI.
+De øvrige startbetingelser, faste udløb, stopregler, akut høj/lavvarsler,
+snoozes, behandlinger, beregner, prognose/ML og sensorforbindelser er uændrede.
+
+Den indledende `local-build.sh release-test` i `20261020T163121Z-7697` bestod:
+**1.827/1.827 XCTest, 0 fejl, 0 skipped**, Python-kontroller, syntetiske
+Watch-kontroller samt iPhone- og Watch-simulatorbuilds. Ti nye tests dækker
+90-minutters genstart/udløb/synkronisering/Stop, uændrede kritiske alarmregler
+efter første time, forklaringer, gammel lagring og visning uden sideeffekter.
+Kun den tidligere forventning om afvisning over 60 minutter er bevidst ændret
+til afvisning over 90; de eksisterende sikkerhedstests er bevaret.
+Apples `prepare` valgte build **4347**. Den efterfølgende usignerede Release-build
+til iPhoneOS bestod med faktisk `arm64`-binær og CFBundleVersion 4347; loggen
+ligger i samme kørsels `logs/iphoneos-unsigned.log`.
+
+På den faktiske iPhone 18 Pro-simulator er 90 minutter valgt og gemt gennem
+indstillingssiden. En tydeligt syntetisk afvisning er indlæst i det eksisterende
+lokale måltidsrolager og kontrolleret som fuldt ombrudt tekst på skærmen;
+ingen behandlinger eller målinger er oprettet. Testlager og tidligere
+indstillinger (fra/30 minutter) er gendannet. Billeder ligger kun uden for Git
+i kørselsmappens `results/meal-quiet-ui/`. Den manuelle kontrol blev først
+blokeret af låst Mac, men kunne derefter gennemføres.
+
+En læsende kontrol fandt parret fysisk iPhone; Watch var utilgængeligt. Der er
+ikke installeret på fysiske enheder, og faktisk alarmlevering eller en hel
+90-minutters periode på telefon/ur er ikke fysisk verificeret. UI-kontrollen
+gælder simulator med normal tekststørrelse. Varigheden er et valgfrit interval,
+ikke dokumentation for klinisk bedre eller sikrere personlige alarmindstillinger.
+Releaseproceduren gentester det præcise staged checkpoint før commit/upload;
+Apple-status registreres separat efter udgivelsen.
+
 <!-- testflight-7.1.1-4346:start -->
 ### TestFlight 7.1.1 (4346)
 

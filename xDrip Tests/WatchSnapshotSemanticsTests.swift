@@ -460,11 +460,105 @@ final class WatchMealQuietTests: XCTestCase {
         XCTAssertFalse(period().isActive(at: when.addingTimeInterval(-1)))
         XCTAssertFalse(period().isActive(at: when.addingTimeInterval(1800)))
         XCTAssertFalse(period(duration: 0).isActive(at: when))
-        XCTAssertFalse(period(duration: 3601).isActive(at: when))
+        XCTAssertFalse(period(duration: 5401).isActive(at: when))
         XCTAssertTrue(period(duration: 3600).isActive(at: when))
+        XCTAssertTrue(period(duration: 3601).isActive(at: when))
+        XCTAssertTrue(period(duration: 5400).isActive(at: when))
         XCTAssertFalse(period("").isActive(at: when))
         XCTAssertFalse(MealQuietPeriod(mealID: "bad", startedAt: when,
             until: Date(timeIntervalSince1970: .infinity)).isActive(at: when))
+    }
+
+    func testNinetyMinutePeriodSurvivesSyncAndRestartWithExactOriginalExpiry() throws {
+        let original = period(duration: 90 * 60)
+        let payload = MealQuietSyncState(revision: 1, period: original)
+        let received = try JSONDecoder().decode(MealQuietSyncState.self, from: JSONEncoder().encode(payload))
+        var value = WatchMealQuietState()
+        value.apply(received, at: when.addingTimeInterval(30))
+        value = try JSONDecoder().decode(WatchMealQuietState.self, from: JSONEncoder().encode(value))
+        let settings = settings()
+        for seconds in [3600.0, 4200, 5399] {
+            let now = when.addingTimeInterval(seconds)
+            value.refreshLocalBasis(glucose: 200, measuredAt: now, settings: settings, at: now)
+            XCTAssertEqual(value.activePeriod(at: now), original)
+            XCTAssertTrue(value.suppresses(.high, at: now))
+            for kind: LibreWatchAlarmKind in [.veryHigh, .veryLow, .low, .missed] {
+                XCTAssertFalse(value.suppresses(kind, at: now))
+            }
+        }
+        value.apply(.init(revision: 2, period: original), at: original.until.addingTimeInterval(-1))
+        XCTAssertEqual(value.activePeriod(at: original.until.addingTimeInterval(-1)), original)
+        value.apply(.init(revision: 3, period: original), at: original.until)
+        XCTAssertNil(value.activePeriod(at: original.until))
+        XCTAssertFalse(value.suppresses(.high, at: original.until))
+        value = try JSONDecoder().decode(WatchMealQuietState.self, from: JSONEncoder().encode(value))
+        XCTAssertNil(value.activePeriod(at: original.until.addingTimeInterval(1)))
+        XCTAssertTrue(settings.snoozes.isEmpty)
+    }
+
+    func testNinetyMinuteLocalStopSurvivesRestartAndNewerPhoneReplay() throws {
+        let original = period(duration: 90 * 60)
+        let stoppedAt = when.addingTimeInterval(70 * 60)
+        var value = WatchMealQuietState()
+        value.apply(.init(revision: 1, period: original), at: when)
+        XCTAssertEqual(value.activePeriod(at: stoppedAt), original)
+        value.stop(at: stoppedAt)
+        value = try JSONDecoder().decode(WatchMealQuietState.self, from: JSONEncoder().encode(value))
+        let later = stoppedAt.addingTimeInterval(60)
+        value.apply(.init(revision: 2, period: original), at: later)
+        value.refreshLocalBasis(glucose: 200, measuredAt: later, settings: settings(), at: later)
+        XCTAssertNil(value.activePeriod(at: later))
+        XCTAssertFalse(value.suppresses(.high, at: later))
+        XCTAssertEqual(value.stoppedUntil[original.mealID], original.until)
+        XCTAssertEqual(value.pendingEndIDs, [original.mealID])
+        value.apply(.init(revision: 3, period: nil), at: later)
+        XCTAssertTrue(value.pendingEndIDs.isEmpty)
+        value.apply(.init(revision: 2, period: original), at: later.addingTimeInterval(1))
+        XCTAssertNil(value.activePeriod(at: later.addingTimeInterval(1)))
+    }
+
+    func testNinetyMinuteHighSuppressionPreservesUrgentHighAndLowDelivery() throws {
+        let settings = settings()
+        let now = when.addingTimeInterval(70 * 60)
+        let unsafeReadings: [(Double, LibreWatchAlarmKind)] = [(50, .veryLow), (60, .low), (260, .veryHigh)]
+        for (glucose, expected) in unsafeReadings {
+            var alarms = LibreWatchAlarmState()
+            alarms.use(settings)
+            alarms.beginWatchOwnership(at: when)
+            var quiet = WatchMealQuietState()
+            quiet.apply(.init(revision: 1, period: period(duration: 90 * 60)), at: when)
+            quiet.refreshLocalBasis(glucose: 200, measuredAt: now, settings: settings, at: now)
+            let high = try XCTUnwrap(alarms.accept(id: UUID(), measuredAt: now, glucose: 200,
+                settings: settings, delegation: .confirmed(for: settings), watchOwnsSensor: true, now: now))
+            XCTAssertEqual(high.kind, .high)
+            XCTAssertTrue(quiet.suppresses(high.kind, at: now))
+            XCTAssertEqual(alarms.snoozedUntil(.high, settings: settings), .distantPast)
+            XCTAssertNotNil(alarms.nextMissedAlarm(settings: settings, delegation: .confirmed(for: settings),
+                watchOwnsSensor: true, now: now))
+            let later = now.addingTimeInterval(60)
+            quiet.refreshLocalBasis(glucose: glucose, measuredAt: later, settings: settings, at: later)
+            let alarm = try XCTUnwrap(alarms.accept(id: UUID(), measuredAt: later, glucose: glucose,
+                settings: settings, delegation: .confirmed(for: settings), watchOwnsSensor: true, now: later))
+            XCTAssertEqual(alarm.kind, expected)
+            XCTAssertFalse(quiet.suppresses(alarm.kind, at: later))
+            XCTAssertNil(quiet.activePeriod(at: later))
+            quiet.refreshLocalBasis(glucose: 200, measuredAt: later, settings: settings, at: later)
+            XCTAssertNil(quiet.activePeriod(at: later), "A later safe reading cannot restart the stopped meal")
+            XCTAssertEqual(quiet.pendingEndIDs, ["meal-a"])
+        }
+    }
+
+    func testNinetyMinuteReadingGapStillEndsQuietAfterFirstHour() throws {
+        let now = when.addingTimeInterval(70 * 60)
+        var value = WatchMealQuietState()
+        value.apply(.init(revision: 1, period: period(duration: 90 * 60)), at: when)
+        value.observeReadingGap(previouslyMeasuredAt: now.addingTimeInterval(-180), at: now)
+        XCTAssertNotNil(value.activePeriod(at: now))
+        value.observeReadingGap(previouslyMeasuredAt: now.addingTimeInterval(-181), at: now)
+        value = try JSONDecoder().decode(WatchMealQuietState.self, from: JSONEncoder().encode(value))
+        value.refreshLocalBasis(glucose: 200, measuredAt: now, settings: settings(), at: now)
+        XCTAssertNil(value.activePeriod(at: now))
+        XCTAssertEqual(value.pendingEndIDs, ["meal-a"])
     }
 
     func testPhoneStopRejectsReorderedStartsAndSameRevisionConflicts() throws {

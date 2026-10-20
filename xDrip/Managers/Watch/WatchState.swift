@@ -24,7 +24,7 @@ struct MealQuietPeriod: Codable, Equatable, Sendable {
     let mealID: String
     let startedAt: Date
     let until: Date
-    static let maximumDuration: TimeInterval = 60 * 60
+    static let maximumDuration: TimeInterval = 90 * 60
 
     func isActive(at date: Date) -> Bool {
         !mealID.isEmpty && startedAt.timeIntervalSince1970.isFinite &&

@@ -134,6 +134,13 @@ struct AlertsSettingsView: View {
                             .foregroundStyle(.orange)
                     }
                 }
+                if let explanation = mealQuiet.latestExplanation {
+                    Text(explanation)
+                        .font(.footnote)
+                        .foregroundStyle(Color(.colorSecondary))
+                        .fixedSize(horizontal: false, vertical: true)
+                        .accessibilityIdentifier("mealQuiet.latestExplanation")
+                }
             } header: {
                 Text("Måltidsro")
             } footer: {
