@@ -1,3 +1,15 @@
+<!-- testflight-7.1.1-4347:start -->
+### TestFlight 7.1.1 (4347)
+
+- Kildecommit og tag: `61cf5705a0405b2e4c530debc411cdbf3b487d4a` / `testflight-7.1.1-4347`.
+- Tests: 1827/1827 bestået; 0 fejlet; 0 skipped. iPhone- og Watch-simulatorbuilds bestod.
+- Apple-status (2026-10-20T17:19:28.814706+00:00): [Internal / Testing](https://appstoreconnect.apple.com/apps/6795645396/testflight/ios/b434161b-7e92-4e7a-9f42-eb230b2fdfa6).
+- Eksisterende intern gruppe: Ole Internal er bekræftet tilknyttet.
+- Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
+<!-- testflight-7.1.1-4347:end -->
+
+De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
+
 ## Måltidsro: 90 minutter og forklaring — 20. oktober 2026
 
 Den eksisterende varighedsvælger har nu også 90 minutter. Ingen varighed vælges
