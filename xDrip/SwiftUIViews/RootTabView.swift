@@ -527,14 +527,8 @@ struct RootTabView: View {
                 Text(message)
             }
         }
-        .overlay {
-            // Alert-driven snooze sheets should remain visually distinct from the current screen.
-            if stateModel.pickerData != nil {
-                Color.black.opacity(0.65)
-                    .ignoresSafeArea()
-                    .allowsHitTesting(false)
-            }
-        }
+        // The sheet owns its backdrop. A pending request must not dim Home
+        // when another presentation prevents the snooze sheet from appearing.
         .sheet(item: $stateModel.pickerData, onDismiss: MealPlanReminderCoordinator.presentationFinished) { pickerData in
             // Root-level requests are alerts. The preference changes their scale, not their actions.
             if UserDefaults.standard.preferLargeSnoozeScreen {

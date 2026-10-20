@@ -2113,6 +2113,156 @@ final class MealReminderNavigationTests: XCTestCase {
 /// Real root/tab/sheet regression: only the scene phase and synthetic database are injected.
 /// No manual Treatments tap or artificial dismissal notification may rescue the route.
 final class ReminderRootPresentationTests: XCTestCase {
+    @MainActor func testPendingSnoozePickerDoesNotDimHomeBehindAnotherPresentation() async throws {
+        let h = try ReminderRootHarness()
+        defer { h.finish() }
+        h.configure()
+        await h.mount(in: self)
+        let host = try XCTUnwrap(h.host)
+        let blocker = UIViewController()
+        blocker.modalPresentationStyle = .overFullScreen
+        blocker.view.backgroundColor = .clear
+        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+            host.present(blocker, animated: false) { c.resume() }
+        }
+        await h.render()
+        let before = try rootBrightness(host.view, attachmentName: "Synthetic Home before pending snooze")
+        var confirmed: [Int] = []
+        var cancelled = 0
+        var selected: [Int] = []
+        h.root.presentPicker(PickerViewData(withMainTitle: "Synthetic alert",
+            withSubTitle: "Select snooze period", withData: ["5 minutes", "15 minutes"],
+            selectedRow: 1, withPriority: .normal, actionButtonText: "Snooze",
+            cancelButtonText: "Cancel", onActionClick: { confirmed.append($0) },
+            onCancelClick: { cancelled += 1 }, didSelectRowHandler: { selected.append($0) }))
+        let requestedID = try XCTUnwrap(h.root.pickerData?.id)
+        await h.render()
+
+        XCTAssertTrue(host.presentedViewController === blocker)
+        XCTAssertNil(blocker.presentedViewController, "The picker is pending, not visibly presented")
+        XCTAssertEqual(h.root.pickerData?.id, requestedID)
+        XCTAssertEqual(h.selectedTab, 0)
+        let pending = try rootBrightness(host.view, attachmentName: "Synthetic Home with pending snooze")
+        for (name, baseline, actual) in [
+            ("Home and tabs", before.whole, pending.whole),
+            ("Lower Home and tab bar", before.bottom, pending.bottom)
+        ] {
+            XCTAssertGreaterThan(baseline, 0.001, "\(name) must contain visible content")
+            XCTAssertEqual(actual, baseline, accuracy: max(0.002, baseline * 0.05),
+                "\(name) must not darken merely because a picker request is pending")
+        }
+        XCTAssertTrue(confirmed.isEmpty)
+        XCTAssertEqual(cancelled, 0)
+        XCTAssertTrue(selected.isEmpty)
+        h.root.pickerData = nil
+        await h.render()
+    }
+
+    @MainActor func testRootSnoozeSheetsRetainWheelSelectionAndDismissalCallbacks() async throws {
+        let defaults = UserDefaults.standard
+        let keys = [UserDefaults.Key.preferLargeSnoozeScreen.rawValue,
+                    UserDefaults.Key.updateSnoozeStatus.rawValue]
+        let saved = keys.map { ($0, defaults.object(forKey: $0)) }
+        defer {
+            for (key, value) in saved {
+                if let value { defaults.set(value, forKey: key) }
+                else { defaults.removeObject(forKey: key) }
+            }
+        }
+        for large in [false, true] {
+            defaults.preferLargeSnoozeScreen = large
+            let h = try ReminderRootHarness()
+            defer { h.finish() }
+            h.configure()
+            await h.mount(in: self)
+            var confirmed: [Int] = []
+            var cancelled = 0
+            var selected: [Int] = []
+            h.root.presentPicker(PickerViewData(withMainTitle: "Synthetic alert",
+                withSubTitle: "Select snooze period", withData: ["5 minutes", "15 minutes"],
+                selectedRow: 1, withPriority: .normal, actionButtonText: "Snooze",
+                cancelButtonText: "Cancel", onActionClick: { confirmed.append($0) },
+                onCancelClick: { cancelled += 1 }, didSelectRowHandler: { selected.append($0) }))
+            await wait { h.host?.presentedViewController != nil }
+            let sheet = try XCTUnwrap(h.host?.presentedViewController)
+            await h.render()
+            let wheel = try XCTUnwrap(ReminderRootHarness.descendants(sheet.view)
+                .compactMap { $0 as? UIPickerView }.first)
+            sheet.view.layoutIfNeeded()
+            let image = UIGraphicsImageRenderer(bounds: sheet.view.bounds).image { _ in
+                XCTAssertTrue(sheet.view.drawHierarchy(in: sheet.view.bounds, afterScreenUpdates: true))
+            }
+            let attachment = XCTAttachment(image: image)
+            attachment.name = large ? "Synthetic large snooze sheet" : "Synthetic standard snooze sheet"
+            attachment.lifetime = .keepAlways
+            add(attachment)
+            XCTAssertEqual(wheel.numberOfRows(inComponent: 0), 2)
+            XCTAssertEqual(wheel.selectedRow(inComponent: 0), 1)
+            wheel.selectRow(0, inComponent: 0, animated: false)
+            wheel.delegate?.pickerView?(wheel, didSelectRow: 0, inComponent: 0)
+            await h.render()
+            XCTAssertEqual(selected, [0])
+            XCTAssertTrue(confirmed.isEmpty, "Changing the wheel must not snooze the alert")
+            XCTAssertEqual(cancelled, 0)
+
+            if large {
+                // Large alerts prohibit interactive dismissal; ending their presentation
+                // programmatically must not manufacture a Cancel or Snooze action.
+                h.root.pickerData = nil
+            } else {
+                sheet.dismiss(animated: false)
+            }
+            await wait { h.host?.presentedViewController == nil }
+            await h.render()
+            XCTAssertNil(h.root.pickerData)
+            XCTAssertEqual(cancelled, large ? 0 : 1)
+            XCTAssertTrue(confirmed.isEmpty)
+            XCTAssertEqual(h.treatmentCount, 0)
+        }
+    }
+
+    /// Snapshot the mounted production root, excluding the transparent blocking controller.
+    /// Mean luminance catches a full-screen tint without depending on text rasterization.
+    @MainActor private func rootBrightness(_ view: UIView, attachmentName: String) throws -> (whole: Double, bottom: Double) {
+        view.layoutIfNeeded()
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        let image = UIGraphicsImageRenderer(bounds: view.bounds, format: format).image { _ in
+            XCTAssertTrue(view.drawHierarchy(in: view.bounds, afterScreenUpdates: true))
+        }
+        let attachment = XCTAttachment(image: image)
+        attachment.name = attachmentName
+        attachment.lifetime = .keepAlways
+        add(attachment)
+        let cgImage = try XCTUnwrap(image.cgImage)
+        let width = cgImage.width
+        let height = cgImage.height
+        var pixels = [UInt8](repeating: 0, count: width * height * 4)
+        let rendered = pixels.withUnsafeMutableBytes { bytes -> Bool in
+            guard let context = CGContext(data: bytes.baseAddress, width: width, height: height,
+                bitsPerComponent: 8, bytesPerRow: width * 4,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue |
+                    CGBitmapInfo.byteOrder32Big.rawValue) else { return false }
+            context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+            return true
+        }
+        XCTAssertTrue(rendered)
+        var whole = 0.0
+        var bottom = 0.0
+        let bottomStart = height * 3 / 4
+        for y in 0..<height {
+            for x in 0..<width {
+                let offset = (y * width + x) * 4
+                let luminance = (0.2126 * Double(pixels[offset]) +
+                    0.7152 * Double(pixels[offset + 1]) + 0.0722 * Double(pixels[offset + 2])) / 255
+                whole += luminance
+                if y >= bottomStart { bottom += luminance }
+            }
+        }
+        return (whole / Double(width * height), bottom / Double(width * (height - bottomStart)))
+    }
+
     @MainActor func testPlannedTapBeforeActivationOpensFromHomeWithoutAnotherEvent() async throws {
         let h = try ReminderRootHarness(phase: .inactive)
         defer { h.finish() }

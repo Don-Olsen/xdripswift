@@ -1,3 +1,35 @@
+## Lokal rettelse: Home dæmpes af en ventende snoozevælger — 20. oktober 2026
+
+En renderet regression af den faktiske `RootTabView` genskaber, at Home og
+fanebjælken bliver mørke, når en snoozevælger er bestilt, men en anden modal
+hindrer præsentationen. Det separate sorte overlay fulgte `pickerData != nil`
+og dæmpede med 65 %, også uden en synlig vælger. I før-testen faldt den målte
+billedlyshed til cirka 35 %; begge lyshedsassertioner fejlede som forventet.
+Det dokumenterer kodefejlen, men ikke den præcise udløsende hændelse på brugerens
+fysiske telefon. Overlayet fandtes allerede før den visuelle ændring i 4344.
+
+Kun det ekstra overlay er fjernet fra produktionskoden. Den eksisterende
+`.sheet` sørger for sin egen baggrund, når den faktisk vises. Ventende
+anmodning, binding, almindelig/stor snoozevælger, handlinger, alarmregler og
+skærmlås/nattilstand er uændrede; der tilføjes ingen timer eller navigation.
+Ingen ændring af glukosedata, beregner, prognose/ML, HealthKit eller Watch/Libre.
+
+To nye regressionstests består efter rettelsen: uændret lyshed ved blokeret
+præsentation samt begge faktiske snoozevælgeres hjulvalg og dismiss-callbacks.
+Ingen snooze eller behandlingsregistrering udløses af den ventende anmodning.
+Før/efter-billeder med syntetisk, tom database og begge snoozevisninger er
+inspiceret og ligger kun i Git-ignoreret
+`build/visual-checks/snooze-dimming-20261020/`. Testene aktiverer ikke fysisk
+notifikationslevering og trykker ikke på Snooze-/Cancel-knapperne.
+
+`local-build.sh release-test` i `20261020T030419Z-22096` bestod: **1772/1772
+XCTest, 0 fejl**, alle Python-kontroller, syntetiske Watch-kontroller samt
+både iPhone- og Watch-simulatorbuild. Log, XCResult og lokal kvittering ligger
+under `~/DeveloperBuildData/xDrip/local-runs/xdripswift/`.
+En læsende enhedsliste fandt parret iPhone og Watch; rettelsen er ikke installeret
+eller afprøvet på dem. Den indledende lokale kontrol ændrede ikke versionen
+og udførte ingen push eller TestFlight-upload; efterfølgende release dokumenteres særskilt.
+
 <!-- testflight-7.1.1-4344:start -->
 ### TestFlight 7.1.1 (4344)
 
