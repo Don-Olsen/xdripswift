@@ -32,8 +32,17 @@ tomme felter, lukket tastatur ved åbning og ombrydning ved stor systemtekst.
 Kontrollen bruger simulatorens tomme data, ikke brugerens glukose/behandlinger.
 Skærmbilleder bevares i samme kørselsmappe. Ingen behandling er registreret.
 Fysisk iPhone/Watch er ikke installeret eller funktionstestet i denne opgave.
-Der påstås ingen målt hastigheds- eller batteriforbedring. Den fulde release-
-validering og faktisk Apple-status registreres særskilt for det valgte nummer.
+Der påstås ingen målt hastigheds- eller batteriforbedring. Samme build blev
+også visuelt kontrolleret på den mindre iPhone 17e-simulator; skærmbillederne
+ligger i den nævnte kørselsmappe. Simulatorens normale tekststørrelse er gendannet.
+
+Apple valgte build **4348**. På det præcise release-checkpoint bestod
+**1.827/1.827 XCTest, 0 fejl, 0 skipped**, Python-kontroller, de krævede
+syntetiske/automatiske Watch-kontroller og begge simulatorbuilds. En særskilt
+usigneret Release-build bestod med faktisk `arm64` og CFBundleVersion 4348;
+kvittering og log ligger i `build/testflight-7.1.1-4348/test/` uden for Git.
+Arkiv og den faktisk eksporterede IPA er verificeret fra det uændrede release-tag.
+Apple-status og Ole Internal-tilknytning er registreret ovenfor.
 
 <!-- testflight-7.1.1-4347:start -->
 ### TestFlight 7.1.1 (4347)
