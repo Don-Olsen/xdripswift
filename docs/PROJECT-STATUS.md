@@ -1,3 +1,15 @@
+<!-- testflight-7.1.1-4350:start -->
+### TestFlight 7.1.1 (4350)
+
+- Kildecommit og tag: `1e95539fa8e8728eda5dc16e552ed56a70d1db5c` / `testflight-7.1.1-4350`.
+- Tests: 1848/1848 bestået; 0 fejlet; 0 skipped. iPhone- og Watch-simulatorbuilds bestod.
+- Apple-status (2026-10-21T15:46:17.145321+00:00): [Internal / Testing](https://appstoreconnect.apple.com/apps/6795645396/testflight/ios/7021a257-e912-4dc1-a112-33dffb61b6c8).
+- Eksisterende intern gruppe: Ole Internal er bekræftet tilknyttet.
+- Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
+<!-- testflight-7.1.1-4350:end -->
+
+De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
+
 ## Afgrænset ID-opslag ved Log — 21. oktober 2026
 
 `PenDoseTreatmentLogger` henter nu kun poster med registreringens bolus- og
