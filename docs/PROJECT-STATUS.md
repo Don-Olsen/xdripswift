@@ -41,8 +41,21 @@ Testlog, xcresult og benchmarkbilag ligger uden for Git:
 Læsende `devicectl`-kontrol fandt den parrede iPhone 17 Pro Max og Apple Watch
 Ultra tilgængelige. Ingen lokal installation eller behandling er foretaget
 på enhederne. Fysisk Log-svartid og batteriforbrug er ikke målt.
-Den fulde releasevalidering og Apples faktisk bekræftede status registreres
-ved den efterfølgende udgivelse; de tidligere kvitteringer genbruges ikke.
+Endelig validering af Apple-valgt build **4350**, kildecheckpoint
+`1e95539fa8e8728eda5dc16e552ed56a70d1db5c`: **1.848/1.848 XCTest**, ingen
+fejl eller skipped, alle Python-kontroller, de otte krævede Watch-/Libre-suiter,
+begge simulatorbuilds og unsigned Release iPhoneOS/**arm64** bestod.
+Kvitteringerne ligger i `build/testflight-7.1.1-4350/test/` uden for Git;
+`results/iphoneos-unsigned.json` kontrollerer også det faktiske buildnummer.
+Det signerede arkiv og den faktisk eksporterede IPA blev verificeret mod
+release-tag, kildecommit og alle fem bundles. Apple har bekræftet `VALID`,
+`INTERNAL_ONLY`, `IN_BETA_TESTING` og tilknytning til den eksisterende
+**Ole Internal**-gruppe. Tagget er uændret; denne afsluttende dokumentation
+committes separat. Ingen eksisterende test er fjernet eller lempet.
+
+GitHub afviste første tag-push. Et læsende fjernopslag bekræftede, at tagget
+ikke fandtes; samme uændrede tag blev derefter pushed og verificeret. Dette
+skete før upload, og der blev kun foretaget ét uploadforsøg til Apple.
 
 <!-- testflight-7.1.1-4349:start -->
 ### TestFlight 7.1.1 (4349)
