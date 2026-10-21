@@ -47,7 +47,23 @@ et fortsat gyldigt, tidligere måltid skal stadig vises, når det nærmeste slet
 Forventningen er rettet; ingen eksisterende test er fjernet eller lempet.
 Log og xcresult ligger uden for Git under
 `~/DeveloperBuildData/xDrip/local-runs/xdripswift/20261021T134032Z-two-shortcuts-rerun/`.
-Den fulde releasekontrol køres på det præcise Apple-valgte buildnummer.
+Endelig validering af release-checkpointet `521c8fa3e78a00480a51aba3a80127ed4542826f`
+med Apple-valgt build 4349: alle Python-kontroller, 1.842/1.842 XCTest-tests
+(0 fejl, 0 skipped), iPhone- og Watch-simulatorbuilds samt unsigned
+Release iPhoneOS/arm64-build bestod. De otte krævede regressionssuiter er
+kontrolleret af releaseværktøjet. Det unsigned build er kontrolleret for arm64
+og det korrekte CFBundleVersion; kvitteringen ligger i
+`build/testflight-7.1.1-4349/test/results/iphoneos-unsigned.json`.
+
+På det færdigtestede build i iPhone 18 Pro-simulatoren er Lyd-rækken og den
+danske lydvælger kontrolleret visuelt; “Short High 1” blev valgt, gemt og
+bekræftet ved genåbning, hvorefter simulatorens Standardlyd blev gendannet.
+Simulatorbilleder ligger uden for Git i den ovennævnte lokale run-mappe
+(`high-soon-sound-settings-4349.png` og `high-soon-sound-picker-4349.png`).
+Gårsdagens måltidsvalg/kopiering er dækket gennem den rigtige viewmodel,
+Core Data og kilderegler med syntetiske tests. Den nye måltidsknap er ikke
+manuelt visuelt afprøvet med en gårsdagsfixture. Ingen fysisk installation
+eller faktisk notifikationslevering på iPhone/Watch er udført.
 
 <!-- testflight-7.1.1-4348:start -->
 ### TestFlight 7.1.1 (4348)
