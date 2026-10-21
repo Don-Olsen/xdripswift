@@ -1,3 +1,15 @@
+<!-- testflight-7.1.1-4349:start -->
+### TestFlight 7.1.1 (4349)
+
+- Kildecommit og tag: `521c8fa3e78a00480a51aba3a80127ed4542826f` / `testflight-7.1.1-4349`.
+- Tests: 1842/1842 bestået; 0 fejlet; 0 skipped. iPhone- og Watch-simulatorbuilds bestod.
+- Apple-status (2026-10-21T14:22:38.705839+00:00): [Internal / Testing](https://appstoreconnect.apple.com/apps/6795645396/testflight/ios/376c5f69-677c-418d-b7f3-0425e28293ea).
+- Eksisterende intern gruppe: Ole Internal er bekræftet tilknyttet.
+- Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
+<!-- testflight-7.1.1-4349:end -->
+
+De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
+
 ## Gårsdagens måltid og lyd til Højt om lidt — 21. oktober 2026
 
 Beregnerens eksisterende kulhydratoverskrift kan nu vise en lille “I går”-knap
