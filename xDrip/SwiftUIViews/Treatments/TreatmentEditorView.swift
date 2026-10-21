@@ -466,9 +466,7 @@ struct PenDoseCalculatorScreen: View {
                     storageStatus
                     glucoseCard
                     carbohydrateAdviceCard
-                    if viewModel.reminderMealUUID == nil {
-                        mealCard
-                    } else {
+                    if viewModel.reminderMealUUID != nil {
                         card {
                             Label("Ny beregning efter måltidet", systemImage: "arrow.clockwise")
                                 .font(.headline)
@@ -477,6 +475,9 @@ struct PenDoseCalculatorScreen: View {
                         }
                     }
                     insulinCard
+                    if viewModel.reminderMealUUID == nil {
+                        mealCard
+                    }
                     calculationStatus
                 }
                 .padding()
@@ -535,10 +536,12 @@ struct PenDoseCalculatorScreen: View {
                 viewModel.scheduleCalculation(debounce: false)
             }
             .task {
-                guard !didSetInitialFocus else { return }
+                // Ordinary opening leaves both fields unfocused so a correction cannot
+                // accidentally start in carbohydrates. Keep explicit meal-reassessment focus.
+                guard viewModel.reminderMealUUID != nil, !didSetInitialFocus else { return }
                 didSetInitialFocus = true
                 await Task.yield()
-                focusedField = viewModel.reminderMealUUID == nil ? .carbohydrates : .insulin
+                focusedField = .insulin
             }
             .onReceive(NotificationCenter.default.publisher(for: TherapyMetricsManager.changed)) { _ in
                 viewModel.scheduleCalculation()
@@ -677,7 +680,8 @@ struct PenDoseCalculatorScreen: View {
 
     private var mealCard: some View {
         card {
-            input("Kulhydrater", unit: "g", text: $viewModel.carbohydratesText, field: .carbohydrates)
+            input("Kulhydrater · gram (g)", unit: "g", text: $viewModel.carbohydratesText,
+                  field: .carbohydrates, accessibilityTitle: "Kulhydrater")
             LazyVGrid(columns: [GridItem(.adaptive(minimum: dynamicTypeSize.isAccessibilitySize ? 150 : 95))],
                       spacing: 8) {
                 chip("🍭 Hurtig", selected: viewModel.mealKind == .fast) { viewModel.mealKind = .fast }
@@ -740,12 +744,12 @@ struct PenDoseCalculatorScreen: View {
         card {
             ViewThatFits(in: .horizontal) {
                 HStack(alignment: .firstTextBaseline) {
-                    Text("Insulin").font(.headline)
+                    Text("Insulin · enheder (E)").font(.headline)
                     Spacer()
                     recommendation
                 }
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("Insulin").font(.headline)
+                    Text("Insulin · enheder (E)").font(.headline)
                     recommendation
                 }
             }
@@ -940,7 +944,8 @@ struct PenDoseCalculatorScreen: View {
         }
     }
 
-    private func input(_ title: String, unit: String, text: Binding<String>, field: InputField) -> some View {
+    private func input(_ title: String, unit: String, text: Binding<String>, field: InputField,
+                       accessibilityTitle: String? = nil) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(title).font(.headline)
             HStack(alignment: .firstTextBaseline, spacing: 10) {
@@ -949,7 +954,7 @@ struct PenDoseCalculatorScreen: View {
                     .font(.largeTitle.weight(.semibold))
                     .monospacedDigit()
                     .focused($focusedField, equals: field)
-                    .accessibilityLabel("\(title), \(unit)")
+                    .accessibilityLabel("\(accessibilityTitle ?? title), \(unit)")
                 Text(unit).font(.title3).foregroundStyle(.secondary)
             }
         }

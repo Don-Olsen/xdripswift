@@ -976,6 +976,10 @@ final class RootHomeInteractionTests: XCTestCase {
         let fields = calculatorTextFields(in: sheet.view)
         let carbohydrates = try XCTUnwrap(fields.first { $0.placeholder == "0" })
         let insulin = try XCTUnwrap(fields.first { $0.placeholder == "0,0" })
+        XCTAssertFalse(fields.contains(where: \.isFirstResponder),
+            "Opening for a correction must not automatically focus carbohydrates")
+        XCTAssertLessThan(insulin.convert(insulin.bounds, to: sheet.view).minY,
+                          carbohydrates.convert(carbohydrates.bounds, to: sheet.view).minY)
         carbohydrates.text = "19,5"
         carbohydrates.sendActions(for: .editingChanged)
         insulin.text = "1,75"
@@ -1120,7 +1124,15 @@ final class RootHomeInteractionTests: XCTestCase {
 
         await harness.mount(in: self)
         await fulfillment(of: [appeared], timeout: 2)
-        XCTAssertNotNil(harness.host?.presentedViewController)
+        let sheet = try XCTUnwrap(harness.host?.presentedViewController)
+        await harness.renderPendingChanges()
+        sheet.view.layoutIfNeeded()
+        let fields = calculatorTextFields(in: sheet.view)
+        let carbohydrates = try XCTUnwrap(fields.first { $0.placeholder == "0" })
+        let insulin = try XCTUnwrap(fields.first { $0.placeholder == "0,0" })
+        XCTAssertFalse(fields.contains(where: \.isFirstResponder))
+        XCTAssertLessThan(insulin.convert(insulin.bounds, to: sheet.view).minY,
+                          carbohydrates.convert(carbohydrates.bounds, to: sheet.view).minY)
         XCTAssertEqual(harness.consumedRequests, [request])
         XCTAssertNil(harness.root.penCalculatorQuickActionRequest)
     }
@@ -1156,6 +1168,12 @@ final class RootHomeInteractionTests: XCTestCase {
         await fulfillment(of: [reopened], timeout: 2)
         XCTAssertNotNil(harness.host?.presentedViewController)
         XCTAssertFalse(harness.host?.presentedViewController === sheet)
+        await harness.renderPendingChanges()
+        let reopenedSheet = try XCTUnwrap(harness.host?.presentedViewController)
+        let reopenedFields = calculatorTextFields(in: reopenedSheet.view)
+        XCTAssertFalse(reopenedFields.isEmpty)
+        XCTAssertFalse(reopenedFields.contains(where: \.isFirstResponder),
+            "Reopening must also leave the keyboard closed")
         XCTAssertEqual(harness.consumedRequests, [request, nextRequest])
         XCTAssertNil(harness.root.penCalculatorQuickActionRequest)
         XCTAssertTrue(try harness.core.mainManagedObjectContext.fetch(TreatmentEntry.fetchRequest()).isEmpty)

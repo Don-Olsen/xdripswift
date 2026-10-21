@@ -723,6 +723,15 @@ CGM-COB, rounding, safety checks and journal/storage are unchanged. Physical iPh
 interaction has not yet been verified for this change. Software validation and the
 authorised release outcome are recorded separately in PROJECT-STATUS.md.
 
+### iPhone calculator presentation — 21 October 2026
+
+The existing insulin card precedes carbohydrates, with explicit E/g headings.
+Ordinary opening and reopening leave both fields unfocused; explicit focus actions
+and pizza reassessment's insulin focus remain unchanged. This is presentation only:
+meal-dose autofill, drafts, validation, calculations and treatment logging retain
+their existing behavior. Hosted-screen checks and rendered simulator observations
+are recorded in PROJECT-STATUS.md; no physical-device behavior is claimed.
+
 ### Watch registration completion and meal reminder opening after 4330
 
 After a confirmed Watch registration has been durably queued, the calculator

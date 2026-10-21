@@ -1,3 +1,28 @@
+## Beregner: insulin først og rolig åbning — 21. oktober 2026
+
+Den eksisterende iPhone-beregner viser nu insulinkortet før kulhydraterne,
+med overskrifterne “Insulin · enheder (E)” og “Kulhydrater · gram (g)”.
+Ved almindelig åbning/genåbning fokuseres intet felt automatisk. Det mindsker
+risikoen for at begynde en korrektion i kulhydratfeltet. Begge felter er fortsat
+på samme skærm. Eksplicitte fokusvalg og 🍕-revurderingens insulinfokus bevares.
+Dosisformel, automatisk måltidsforslag, kladder, validering, Log, behandlinger,
+alarmregler, prognose/ML, Sundhed og Watch er uændrede.
+
+Tre eksisterende hosted-skærmtests er udvidet og bestået (3/3, 0 fejl):
+notifikationsåbning med bevarede indtastninger, tidlig appikon-genvej samt
+lukning/genåbning uden registrering. Testene kontrollerer de faktiske felters
+rækkefølge og manglende automatisk tastaturfokus. Der er ikke fjernet eller
+svækket eksisterende tests. Testlog og xcresult ligger uden for Git under
+`~/DeveloperBuildData/xDrip/local-runs/xdripswift/20261021T110623Z-calculator-ui/`.
+
+Manuel kontrol af den byggede iPhone 18 Pro-simulator viser insulin først,
+tomme felter, lukket tastatur ved åbning og ombrydning ved stor systemtekst.
+Kontrollen bruger simulatorens tomme data, ikke brugerens glukose/behandlinger.
+Skærmbilleder bevares i samme kørselsmappe. Ingen behandling er registreret.
+Fysisk iPhone/Watch er ikke installeret eller funktionstestet i denne opgave.
+Der påstås ingen målt hastigheds- eller batteriforbedring. Den fulde release-
+validering og faktisk Apple-status registreres særskilt for det valgte nummer.
+
 <!-- testflight-7.1.1-4347:start -->
 ### TestFlight 7.1.1 (4347)
 
