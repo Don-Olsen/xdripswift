@@ -3650,3 +3650,290 @@ final class TreatmentListRefreshTests: XCTestCase {
             PenDoseCalculatorViewModel.unavailableText(.missingGlucose))
     }
 }
+
+
+/// Production calculator/accessor integration with synthetic local meals only.
+@MainActor final class YesterdayMealShortcutTests: XCTestCase {
+    @MainActor private final class Fixture {
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let manager = TherapyMetricsManager()
+        let suite = "YesterdayMealShortcutTests." + UUID().uuidString
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let defaults: UserDefaults
+        var calendar: Calendar
+        let now: Date
+
+        init(now: String = "2026-10-21T12:00:00+02:00", zone: String = "Europe/Copenhagen") throws {
+            defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+            calendar = Calendar(identifier: .gregorian)
+            calendar.timeZone = try XCTUnwrap(TimeZone(identifier: zone))
+            self.now = try XCTUnwrap(ISO8601DateFormatter().date(from: now))
+            defaults.therapyDataSourceType = .none
+            defaults.nightscoutEnabled = false
+            XCTAssertTrue(TreatmentSourceCutover.persist(.init(cutoff: self.now.addingTimeInterval(-7 * 86400),
+                insulinSourceBundleID: "synthetic.insulin", carbohydrateSourceBundleID: "synthetic.carbs"),
+                defaults: defaults))
+            manager.configure(coreDataManager: core, externalStatus: { nil })
+        }
+
+        func cleanup() {
+            defaults.removePersistentDomain(forName: suite)
+            try? FileManager.default.removeItem(at: directory)
+        }
+
+        func date(_ text: String) -> Date { ISO8601DateFormatter().date(from: text)! }
+
+        @discardableResult func meal(_ grams: Double, at date: Date? = nil,
+                                     kind: TreatmentMealKind = .normal) -> TreatmentEntry {
+            let row = TreatmentEntry(date: date ?? calendar.date(byAdding: .day, value: -1, to: now)!,
+                value: grams, treatmentType: .Carbs, nightscoutEventType: nil, enteredBy: "Synthetic test",
+                nsManagedObjectContext: core.mainManagedObjectContext)
+            row.localTreatmentUUID = UUID().uuidString
+            row.mealKindRaw = kind.rawValue
+            row.carbohydrateDurationMinutes = NSNumber(value: kind.durationMinutes)
+            row.plannedMealStateRaw = TreatmentMealState.confirmed.rawValue
+            return row
+        }
+
+        func save() { XCTAssertTrue(core.saveChangesSynchronously()) }
+
+        func calculator(reminder: String? = nil) -> PenDoseCalculatorViewModel {
+            var profile = PenDoseProfile.prefilledUnconfirmed
+            XCTAssertTrue(profile.confirm())
+            let confirmed = profile
+            return PenDoseCalculatorViewModel(coreDataManager: core, reminderMealUUID: reminder,
+                logJournal: PenDoseLogJournal(directory: directory), profileProvider: { confirmed },
+                sourceReadyOverride: { true }, snapshotProvider: { now, _ in
+                    let samples = stride(from: -30, through: 0, by: 5).map {
+                        GlucoseForecastSample(date: now.addingTimeInterval(Double($0) * 60),
+                            glucoseMgdl: 140, sensorID: "synthetic-sensor")
+                    }
+                    return PenDoseInputSnapshot.make(capturedAt: now, glucose: samples, treatments: [],
+                        therapySettings: TherapyModelSettings(), treatmentRevision: 1,
+                        sourceSignature: "synthetic-local-source")
+                }, automaticallyFillMealDose: true, mealShortcutDefaults: defaults,
+                mealShortcutTherapyManager: manager, mealShortcutCalendar: { self.calendar })
+        }
+
+        var count: Int { TreatmentEntryAccessor(coreDataManager: core).getLatestTreatments(howOld: nil).count }
+    }
+
+    func testNearestYesterdayMealUsesEarlierTieAndLeavesOpeningFieldsEmpty() throws {
+        let f = try Fixture(); defer { f.cleanup() }
+        let earlier = f.meal(45, at: f.date("2026-10-20T11:45:00+02:00"))
+        f.meal(60, at: f.date("2026-10-20T12:15:00+02:00"), kind: .slow)
+        f.meal(20, at: f.date("2026-10-20T13:01:00+02:00"))
+        f.meal(30, at: f.now)
+        f.save()
+        let vm = f.calculator(); defer { vm.stop() }
+        vm.start(now: f.now)
+        XCTAssertEqual(vm.yesterdayMeal?.objectID, earlier.objectID)
+        XCTAssertEqual(vm.yesterdayMeal?.title, "I går: 🌮 45 g")
+        XCTAssertEqual(vm.carbohydratesText, "")
+        XCTAssertEqual(vm.insulinToLogText, "")
+        XCTAssertNil(vm.confirmationDraft)
+        XCTAssertEqual(f.count, 4)
+    }
+
+    func testNoMatchPlannedDeletedInvalidAndUncommittedMealsProduceNoShortcut() throws {
+        let f = try Fixture(); defer { f.cleanup() }
+        f.meal(10).plannedMealStateRaw = TreatmentMealState.planned.rawValue
+        f.meal(11).plannedMealStateRaw = TreatmentMealState.cancelled.rawValue
+        f.meal(12).treatmentdeleted = true
+        f.meal(13).mealKindRaw = "invalid"
+        f.meal(14).carbohydrateDurationMinutes = NSNumber(value: 0)
+        f.meal(0); f.meal(-1); f.meal(501)
+        f.meal(18, at: f.date("2026-10-20T13:00:01+02:00"))
+        f.meal(19, at: f.date("2026-10-19T12:00:00+02:00"))
+        for type: TreatmentType in [.Insulin, .BasalInjection, .Basal] {
+            let row = TreatmentEntry(date: f.date("2026-10-20T12:00:00+02:00"), value: 2,
+                treatmentType: type, nightscoutEventType: nil, enteredBy: "Synthetic test",
+                nsManagedObjectContext: f.core.mainManagedObjectContext)
+            row.localTreatmentUUID = UUID().uuidString
+        }
+        f.save()
+        let vm = f.calculator()
+        vm.refreshYesterdayMeal(now: f.now)
+        XCTAssertNil(vm.yesterdayMeal)
+        f.meal(45) // A not-yet-saved row cannot become a reusable historical meal.
+        vm.refreshYesterdayMeal(now: f.now, force: true)
+        XCTAssertNil(vm.yesterdayMeal)
+        XCTAssertFalse(vm.useYesterdayMeal(now: f.now))
+        XCTAssertEqual(vm.carbohydratesText, "")
+    }
+
+    func testSourceCutoverAndSourceChangesUseExistingEligibility() throws {
+        let f = try Fixture(); defer { f.cleanup() }
+        f.defaults.removeObject(forKey: TreatmentSourceCutover.defaultsKey)
+        XCTAssertTrue(TreatmentSourceCutover.persist(.init(cutoff: f.date("2026-10-20T12:30:00+02:00"),
+            insulinSourceBundleID: "synthetic.insulin", carbohydrateSourceBundleID: "synthetic.carbs"),
+            defaults: f.defaults))
+        let imported = f.meal(45)
+        imported.localTreatmentUUID = nil
+        imported.healthKitSampleUUID = UUID().uuidString
+        imported.healthKitSourceBundleIdentifier = "synthetic.carbs"
+        let wrongImport = f.meal(80)
+        wrongImport.healthKitSampleUUID = UUID().uuidString
+        wrongImport.healthKitSourceBundleIdentifier = "wrong.source"
+        f.meal(90) // Local meal from before the local-source cutover is ineligible.
+        let remote = f.meal(100)
+        remote.localTreatmentUUID = nil
+        remote.id = "synthetic-remote"
+        remote.nightscoutEventType = "Carb Correction"
+        f.save()
+        let vm = f.calculator()
+        vm.refreshYesterdayMeal(now: f.now)
+        XCTAssertEqual(vm.yesterdayMeal?.objectID, imported.objectID,
+            "The frozen pre-cutover Health source remains eligible after import has stopped")
+        f.defaults.set(Data("invalid".utf8), forKey: TreatmentSourceCutover.defaultsKey)
+        vm.refreshYesterdayMeal(now: f.now)
+        XCTAssertNil(vm.yesterdayMeal, "An invalid source boundary is not an empty/default source")
+        XCTAssertEqual(f.count, 4)
+    }
+
+    func testTapRecalculatesCurrentInsulinCopiesOnlyFoodAndNeverLogsTreatment() async throws {
+        let f = try Fixture(); defer { f.cleanup() }
+        let meal = f.meal(45.25, kind: .slow)
+        meal.carbohydrateDurationMinutes = NSNumber(value: 360)
+        _ = TreatmentEntry(date: meal.date, value: 19, treatmentType: .Insulin,
+            nightscoutEventType: nil, enteredBy: "Synthetic test",
+            nsManagedObjectContext: f.core.mainManagedObjectContext)
+        f.save()
+        let vm = f.calculator(); defer { vm.stop() }
+        vm.start(now: f.now)
+        let planned = vm.plannedDate
+        XCTAssertTrue(vm.useYesterdayMeal(now: f.now))
+        XCTAssertEqual(vm.carbohydratesText, "45,25")
+        XCTAssertEqual(vm.mealKind, .slow)
+        XCTAssertEqual(vm.mealKind.durationMinutes, 300,
+            "The current kind selects duration; the custom historical 360 minutes is not copied")
+        XCTAssertEqual(vm.plannedDate, planned)
+        XCTAssertFalse(vm.isPlannedMeal)
+        XCTAssertEqual(vm.insulinToLogText, "", "An old recorded dose is never inserted")
+        await vm.calculate()
+        let suggestion = try XCTUnwrap(vm.suggestedUnits)
+        XCTAssertEqual(vm.insulinToLogText, PenDoseDisplayFormatter.insulinInput(suggestion))
+        XCTAssertNotEqual(suggestion, 19)
+        XCTAssertEqual(vm.calculationDetails?.newCarbsGrams, 45.25)
+        XCTAssertNil(vm.confirmationDraft)
+        XCTAssertEqual(f.count, 2)
+    }
+
+    func testTapPreservesManualInsulinIncludingZeroOrClearingAndCurrentPlannedTime() async throws {
+        let f = try Fixture(); defer { f.cleanup() }
+        f.meal(45, kind: .fast); f.save()
+        for manual in ["2,5", "0", ""] {
+            let vm = f.calculator(); defer { vm.stop() }
+            vm.start(now: f.now)
+            vm.insulinToLogText = manual
+            vm.carbohydratesText = "22"
+            vm.isPlannedMeal = true
+            let planned = Date().addingTimeInterval(20 * 60)
+            vm.plannedDate = planned
+            XCTAssertTrue(vm.useYesterdayMeal(now: f.now))
+            await vm.calculate()
+            XCTAssertEqual(vm.insulinToLogText, manual)
+            XCTAssertFalse(vm.usesAutomaticMealDose)
+            XCTAssertEqual(vm.carbohydratesText, "45")
+            XCTAssertEqual(vm.mealKind, .fast)
+            XCTAssertEqual(vm.plannedDate, planned)
+            XCTAssertTrue(vm.isPlannedMeal)
+            XCTAssertNil(vm.confirmationDraft)
+            XCTAssertEqual(f.count, 1)
+        }
+    }
+
+    func testTapRechecksEditedDeletedAndNewNearestCandidatesWithoutSubstituting() throws {
+        let f = try Fixture(); defer { f.cleanup() }
+        let row = f.meal(45); f.save()
+        let vm = f.calculator()
+        vm.refreshYesterdayMeal(now: f.now)
+        row.value = 50; f.save()
+        XCTAssertFalse(vm.useYesterdayMeal(now: f.now))
+        XCTAssertEqual(vm.yesterdayMeal?.grams, 50)
+        XCTAssertEqual(vm.carbohydratesText, "")
+        row.treatmentdeleted = true; f.save()
+        XCTAssertFalse(vm.useYesterdayMeal(now: f.now))
+        XCTAssertNil(vm.yesterdayMeal)
+        XCTAssertEqual(vm.carbohydratesText, "")
+        let old = f.meal(60, at: f.date("2026-10-20T11:30:00+02:00")); f.save()
+        vm.refreshYesterdayMeal(now: f.now)
+        XCTAssertEqual(vm.yesterdayMeal?.objectID, old.objectID)
+        let closer = f.meal(30); f.save()
+        XCTAssertFalse(vm.useYesterdayMeal(now: f.now))
+        XCTAssertEqual(vm.yesterdayMeal?.objectID, closer.objectID)
+        XCTAssertEqual(vm.carbohydratesText, "")
+    }
+
+    func testClockAndReopeningRefreshCandidateWhileUnchangedRefreshDoesNotPublish() throws {
+        let f = try Fixture(); defer { f.cleanup() }
+        let old = f.meal(45, at: f.date("2026-10-20T11:00:00+02:00")); f.save()
+        let vm = f.calculator(); defer { vm.stop() }
+        vm.start(now: f.now)
+        XCTAssertEqual(vm.yesterdayMeal?.objectID, old.objectID)
+        var publications = 0
+        let observation = vm.$yesterdayMeal.dropFirst().sink { _ in publications += 1 }
+        defer { observation.cancel() }
+        vm.refreshYesterdayMeal(now: f.now.addingTimeInterval(15))
+        vm.refreshYesterdayMeal(now: f.now.addingTimeInterval(30))
+        XCTAssertEqual(publications, 0, "CGM/15-second ticks reuse the minute's bounded read")
+        vm.refreshClock(now: f.now.addingTimeInterval(60))
+        XCTAssertNil(vm.yesterdayMeal)
+        let recent = f.meal(30); f.save()
+        vm.refreshYesterdayMeal(now: f.now)
+        XCTAssertEqual(vm.yesterdayMeal?.objectID, recent.objectID)
+        vm.stop()
+        recent.treatmentdeleted = true; f.save()
+        vm.start(now: f.now)
+        XCTAssertEqual(vm.yesterdayMeal?.objectID, old.objectID,
+            "Reopening drops the deleted meal and selects the remaining eligible earlier meal")
+    }
+
+    func testYesterdayBoundsDoNotWrapIntoTodayOrPreviousEvening() throws {
+        let f = try Fixture(now: "2026-10-21T00:20:00+02:00"); defer { f.cleanup() }
+        f.meal(10, at: f.date("2026-10-19T23:50:00+02:00"))
+        f.meal(20, at: f.date("2026-10-21T00:20:00+02:00"))
+        let match = f.meal(30, at: f.date("2026-10-20T00:50:00+02:00"))
+        f.save()
+        let vm = f.calculator()
+        vm.refreshYesterdayMeal(now: f.now)
+        XCTAssertEqual(vm.yesterdayMeal?.objectID, match.objectID)
+        XCTAssertEqual(YesterdayMealShortcut.window(at: f.now, calendar: f.calendar)?.start,
+            f.date("2026-10-20T00:00:00+02:00"))
+    }
+
+    func testCalendarDSTUsesWallClockDistanceAndEarlierRepeatedHour() throws {
+        let spring = try Fixture(now: "2026-03-30T02:30:00+02:00"); defer { spring.cleanup() }
+        let beforeGap = spring.meal(30, at: spring.date("2026-03-29T01:45:00+01:00"))
+        let afterGap = spring.meal(45, at: spring.date("2026-03-29T03:00:00+02:00"))
+        spring.save()
+        let springVM = spring.calculator()
+        springVM.refreshYesterdayMeal(now: spring.now)
+        XCTAssertEqual(springVM.yesterdayMeal?.objectID, afterGap.objectID,
+            "03:00 is 30 clock-minutes away; 01:45 is 45, despite the missing hour")
+        XCTAssertNotEqual(springVM.yesterdayMeal?.objectID, beforeGap.objectID)
+        let autumn = try Fixture(now: "2026-10-26T02:30:00+01:00"); defer { autumn.cleanup() }
+        let first = autumn.meal(40, at: autumn.date("2026-10-25T02:30:00+02:00"))
+        autumn.meal(50, at: autumn.date("2026-10-25T02:30:00+01:00"))
+        autumn.save()
+        let autumnVM = autumn.calculator()
+        autumnVM.refreshYesterdayMeal(now: autumn.now)
+        XCTAssertEqual(autumnVM.yesterdayMeal?.objectID, first.objectID)
+        first.treatmentdeleted = true; autumn.save()
+        autumnVM.refreshYesterdayMeal(now: autumn.now)
+        XCTAssertEqual(autumnVM.yesterdayMeal?.grams, 50,
+            "The second occurrence of the same local hour must also be inside the fetch window")
+    }
+
+    func testPizzaReassessmentNeverOffersOrAppliesYesterdayMeal() throws {
+        let f = try Fixture(); defer { f.cleanup() }
+        f.meal(45); f.save()
+        let vm = f.calculator(reminder: "synthetic-pizza")
+        vm.refreshYesterdayMeal(now: f.now)
+        XCTAssertNil(vm.yesterdayMeal)
+        XCTAssertFalse(vm.useYesterdayMeal(now: f.now))
+        XCTAssertEqual(vm.carbohydratesText, "")
+        XCTAssertEqual(vm.insulinToLogText, "")
+        XCTAssertEqual(f.count, 1)
+    }
+}

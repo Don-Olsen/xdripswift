@@ -1,3 +1,4 @@
+import AVFoundation
 import CoreData
 import UserNotifications
 import XCTest
@@ -55,6 +56,117 @@ final class HighSoonNotificationTests: XCTestCase {
         XCTAssertTrue(AlertManager.ownedPendingNotificationIdentifiers.contains(AlertKind.high.notificationIdentifier()))
         XCTAssertFalse(harness.manager.getSnoozeParameters(alertKind: .high).getSnoozeValue().isSnoozed)
         XCTAssertTrue(try harness.core.mainManagedObjectContext.fetch(TreatmentEntry.fetchRequest()).isEmpty)
+    }
+
+    func testRealNotificationUsesIndependentSoundPreferenceWithSafeDefaultFallback() throws {
+        let cases: [(String?, UNNotificationSound?)] = [
+            (nil, .default),
+            ("", nil),
+            (ConstantsSounds.shorthigh1.rawValue,
+             UNNotificationSound(named: UNNotificationSoundName("shorthigh1.caf"))),
+            ("unknown-sound.caf", .default),
+            (ConstantsSounds.Early_Sunrise.rawValue, .default)
+        ]
+        for (stored, expectedSound) in cases {
+            let harness = Harness()
+            defer { harness.finish() }
+            if let stored { harness.defaults.set(stored, forKey: HighSoonAdvisorySound.defaultsKey) }
+            harness.evaluate(try outcome(at: now), at: now)
+            let request = try XCTUnwrap(harness.requests.first)
+            XCTAssertEqual(request.content.sound, expectedSound)
+            XCTAssertEqual(request.content.interruptionLevel, .active)
+            XCTAssertEqual(request.content.categoryIdentifier, HighSoonAdvisoryPolicy.categoryIdentifier)
+            XCTAssertNil(request.trigger)
+            XCTAssertEqual(harness.type.soundname, "", "The measured-high alarm stays independently silent")
+            XCTAssertTrue(harness.type.overridemute, "No measured-high alert settings are rewritten")
+            XCTAssertFalse(harness.manager.getSnoozeParameters(alertKind: .high).getSnoozeValue().isSnoozed)
+            harness.evaluate(try outcome(at: now), at: now)
+            XCTAssertEqual(harness.requests.count, 1, "Changing sound does not remove the repeat limit")
+        }
+    }
+
+    func testSoundPickerPreviewsAndCancellationStopsWithoutSaving() throws {
+        let harness = Harness()
+        defer { harness.finish() }
+        let player = PreviewSoundPlayer()
+        let model = AlertsSettingsViewModel(coreDataManager: harness.core,
+            defaults: harness.defaults, soundPlayer: player)
+        let picker = model.highSoonSoundSelection()
+        let namedIndex = try XCTUnwrap(HighSoonAdvisorySound.choices.firstIndex(of: .named(.shorthigh1)))
+        let silentIndex = try XCTUnwrap(HighSoonAdvisorySound.choices.firstIndex(of: .silent))
+        XCTAssertEqual(picker.selectedRow, HighSoonAdvisorySound.choices.firstIndex(of: .systemDefault))
+        XCTAssertEqual(model.highSoonSoundTitle, "Standardlyd")
+        picker.didSelectRow?(namedIndex)
+        XCTAssertEqual(player.played, ["shorthigh1.caf"])
+        XCTAssertTrue(player.isPlaying())
+        XCTAssertNil(harness.defaults.object(forKey: HighSoonAdvisorySound.defaultsKey))
+        picker.didSelectRow?(silentIndex)
+        XCTAssertFalse(player.isPlaying(), "Selecting silence stops the previous preview")
+        picker.didSelectRow?(namedIndex)
+        picker.cancel?()
+        XCTAssertFalse(player.isPlaying())
+        XCTAssertEqual(player.stopCount, 4)
+        XCTAssertEqual(model.highSoonSound, .systemDefault)
+        XCTAssertNil(harness.defaults.object(forKey: HighSoonAdvisorySound.defaultsKey))
+    }
+
+    func testSoundPickerConfirmationPersistsNamedSilentAndDefaultAcrossReopening() throws {
+        let harness = Harness()
+        defer { harness.finish() }
+        let player = PreviewSoundPlayer()
+        let model = AlertsSettingsViewModel(coreDataManager: harness.core,
+            defaults: harness.defaults, soundPlayer: player)
+        let choices: [HighSoonAdvisorySound] = [.named(.shorthigh1), .silent, .systemDefault]
+        let titles = ["Short High 1", "Ingen lyd",
+                      "Standardlyd"]
+        for (choice, title) in zip(choices, titles) {
+            let picker = model.highSoonSoundSelection()
+            let index = try XCTUnwrap(HighSoonAdvisorySound.choices.firstIndex(of: choice))
+            picker.didSelectRow?(index)
+            picker.action(index)
+            XCTAssertFalse(player.isPlaying(), "Confirming stops the preview")
+            XCTAssertEqual(model.highSoonSound, choice)
+            XCTAssertEqual(model.highSoonSoundTitle, title)
+            let reopenedDefaults = try XCTUnwrap(UserDefaults(suiteName: harness.suiteName))
+            let reopened = AlertsSettingsViewModel(coreDataManager: harness.core,
+                defaults: reopenedDefaults, soundPlayer: player)
+            XCTAssertEqual(reopened.highSoonSound, choice)
+            XCTAssertEqual(reopened.highSoonSoundSelection().selectedRow, index)
+            XCTAssertEqual(reopened.highSoonSoundTitle, title)
+        }
+        XCTAssertNil(harness.defaults.object(forKey: HighSoonAdvisorySound.defaultsKey),
+            "Restoring the default preserves the original unset preference")
+        XCTAssertEqual(harness.type.soundname, "")
+    }
+
+    func testUnknownOrTooLongStoredSoundShowsDefaultAndCanBeReplaced() throws {
+        for stored in ["removed-sound", ConstantsSounds.Nightguard.rawValue] {
+            let harness = Harness()
+            defer { harness.finish() }
+            harness.defaults.set(stored, forKey: HighSoonAdvisorySound.defaultsKey)
+            let model = AlertsSettingsViewModel(coreDataManager: harness.core,
+                defaults: harness.defaults, soundPlayer: PreviewSoundPlayer())
+            XCTAssertEqual(model.highSoonSound, .systemDefault)
+            XCTAssertEqual(model.highSoonSoundTitle, "Standardlyd")
+            let picker = model.highSoonSoundSelection()
+            XCTAssertEqual(picker.selectedRow, HighSoonAdvisorySound.choices.firstIndex(of: .systemDefault))
+            let index = try XCTUnwrap(HighSoonAdvisorySound.choices.firstIndex(of: .named(.shorthigh2)))
+            picker.action(index)
+            XCTAssertEqual(HighSoonAdvisorySound.load(defaults: harness.defaults), .named(.shorthigh2))
+        }
+    }
+
+    func testEverySelectableNamedSoundExistsInAppBundleAndIsShorterThanThirtySeconds() throws {
+        XCTAssertFalse(HighSoonAdvisorySound.availableSounds.isEmpty)
+        for sound in HighSoonAdvisorySound.availableSounds {
+            let filename = ConstantsSounds.getSoundFile(forSound: sound)
+            let url = try XCTUnwrap(Bundle.main.url(forResource: filename, withExtension: ""), filename)
+            let file = try AVAudioFile(forReading: url)
+            XCTAssertGreaterThan(file.processingFormat.sampleRate, 0, filename)
+            let duration = Double(file.length) / file.processingFormat.sampleRate
+            XCTAssertGreaterThan(duration, 0, filename)
+            XCTAssertLessThan(duration, 30, "\(filename) cannot be used as a custom notification sound")
+        }
     }
 
     func testFailedSchedulingReleasesOnlyItsReservationAndAllowsRetry() async throws {
@@ -330,6 +442,24 @@ final class HighSoonNotificationTests: XCTestCase {
     private func drainCallbacks() async {
         await withCheckedContinuation { continuation in
             DispatchQueue.main.async { continuation.resume() }
+        }
+    }
+
+    private final class PreviewSoundPlayer: SoundPlayer {
+        var played: [String] = []
+        var stopCount = 0
+        private var playing = false
+
+        override func playSound(soundFileName: String) {
+            played.append(soundFileName)
+            playing = true
+        }
+
+        override func isPlaying() -> Bool { playing }
+
+        override func stopPlaying() {
+            stopCount += 1
+            playing = false
         }
     }
 

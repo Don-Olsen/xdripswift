@@ -544,13 +544,24 @@ struct PenDoseCalculatorScreen: View {
                 focusedField = .insulin
             }
             .onReceive(NotificationCenter.default.publisher(for: TherapyMetricsManager.changed)) { _ in
+                viewModel.refreshYesterdayMeal()
                 viewModel.scheduleCalculation()
             }
             .onReceive(NotificationCenter.default.publisher(for: .penDoseSettingsChanged)) { _ in
                 viewModel.scheduleCalculation()
             }
             .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
+                viewModel.refreshYesterdayMeal(force: true)
                 viewModel.scheduleCalculation()
+            }
+            .onReceive(NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification).receive(on: RunLoop.main)) { _ in
+                viewModel.refreshYesterdayMeal()
+            }
+            .onReceive(NotificationCenter.default.publisher(for: UIApplication.significantTimeChangeNotification).receive(on: RunLoop.main)) { _ in
+                viewModel.refreshYesterdayMeal(force: true)
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .NSSystemTimeZoneDidChange).receive(on: RunLoop.main)) { _ in
+                viewModel.refreshYesterdayMeal(force: true)
             }
             .onReceive(NotificationCenter.default.publisher(for: Notification.Name(
                 ConstantsNotifications.NotificationIdentifierForBgPostProcessing.bgPostProcessingDidUpdate))) { _ in
@@ -947,7 +958,21 @@ struct PenDoseCalculatorScreen: View {
     private func input(_ title: String, unit: String, text: Binding<String>, field: InputField,
                        accessibilityTitle: String? = nil) -> some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text(title).font(.headline)
+            if field == .carbohydrates, let meal = viewModel.yesterdayMeal {
+                ViewThatFits(in: .horizontal) {
+                    HStack(alignment: .firstTextBaseline) {
+                        Text(title).font(.headline)
+                        Spacer(minLength: 8)
+                        yesterdayMealButton(meal)
+                    }
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(title).font(.headline)
+                        yesterdayMealButton(meal)
+                    }
+                }
+            } else {
+                Text(title).font(.headline)
+            }
             HStack(alignment: .firstTextBaseline, spacing: 10) {
                 TextField("0", text: text)
                     .keyboardType(.decimalPad)
@@ -958,6 +983,15 @@ struct PenDoseCalculatorScreen: View {
                 Text(unit).font(.title3).foregroundStyle(.secondary)
             }
         }
+    }
+
+    private func yesterdayMealButton(_ meal: YesterdayMealShortcut) -> some View {
+        Button { viewModel.useYesterdayMeal() } label: {
+            Text(meal.title).font(.subheadline).frame(minHeight: 44)
+        }
+            .buttonStyle(.borderless)
+            .accessibilityIdentifier("calculator.yesterdayMeal")
+            .accessibilityHint("Indsætter kun kulhydrater og madtype fra i går. Insulin beregnes på ny, medmindre du selv har indtastet den. Registrerer ikke et måltid.")
     }
 
     private func chip(_ title: String, selected: Bool, action: @escaping () -> Void) -> some View {

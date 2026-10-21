@@ -23,13 +23,20 @@ struct AlertsSettingsSection: Identifiable {
 @MainActor
 final class AlertsSettingsViewModel: ObservableObject {
     @Published var reloadToken = UUID()
+    @Published private(set) var highSoonSound: HighSoonAdvisorySound
 
+    private let defaults: UserDefaults
+    private let highSoonSoundPlayer: SoundPlayer
     private let coreDataManager: CoreDataManager
     private let alertEntriesAccessor: AlertEntriesAccessor
     private let alertTypesAccessor: AlertTypesAccessor
 
     /// Keeps the Core Data accessors inside the list model so it can rebuild alarm groups.
-    init(coreDataManager: CoreDataManager) {
+    init(coreDataManager: CoreDataManager, defaults: UserDefaults = .standard,
+         soundPlayer: SoundPlayer = SoundPlayer()) {
+        self.defaults = defaults
+        self.highSoonSoundPlayer = soundPlayer
+        self.highSoonSound = HighSoonAdvisorySound.load(defaults: defaults)
         self.coreDataManager = coreDataManager
         self.alertEntriesAccessor = AlertEntriesAccessor(coreDataManager: coreDataManager)
         self.alertTypesAccessor = AlertTypesAccessor(coreDataManager: coreDataManager)
@@ -51,6 +58,42 @@ final class AlertsSettingsViewModel: ObservableObject {
     /// The rows are read again from Core Data through AlertEntriesAccessor.
     func reload() {
         reloadToken = UUID()
+    }
+
+    var highSoonSoundTitle: String { title(for: highSoonSound) }
+
+    /// Reuses the normal alert sound catalogue and pushed picker, with its own preview player.
+    /// Selecting a row only previews; confirming persists the independent notification preference.
+    func highSoonSoundSelection() -> SettingsSelectionListContent {
+        let choices = HighSoonAdvisorySound.choices
+        return SettingsSelectionListContent(
+            title: "Højt om lidt · lyd",
+            data: choices.map { title(for: $0) },
+            selectedRow: choices.firstIndex(of: highSoonSound),
+            actionTitle: Texts_Common.Ok, cancelTitle: Texts_Common.Cancel,
+            action: { [weak self] index in
+                guard let self else { return }
+                self.highSoonSoundPlayer.stopPlaying()
+                guard choices.indices.contains(index) else { return }
+                let choice = choices[index]
+                choice.store(defaults: self.defaults)
+                self.highSoonSound = choice
+            },
+            cancel: { [weak self] in self?.highSoonSoundPlayer.stopPlaying() },
+            didSelectRow: { [weak self] index in
+                guard let self else { return }
+                self.highSoonSoundPlayer.stopPlaying()
+                guard choices.indices.contains(index), case .named(let sound) = choices[index] else { return }
+                self.highSoonSoundPlayer.playSound(soundFileName: ConstantsSounds.getSoundFile(forSound: sound))
+            })
+    }
+
+    private func title(for sound: HighSoonAdvisorySound) -> String {
+        switch sound {
+        case .systemDefault: return "Standardlyd"
+        case .silent: return "Ingen lyd"
+        case .named(let sound): return ConstantsSounds.getSoundName(forSound: sound)
+        }
     }
 
     /// Returns the visible alarm rows for a section.
@@ -100,7 +143,7 @@ struct AlertsSettingsView: View {
     @ObservedObject var viewModel: AlertsSettingsViewModel
     @AppStorage(HighSoonAdvisoryPolicy.enabledKey) private var highSoonAdvisoryEnabled = true
     @ObservedObject private var mealQuiet = MealQuietManager.shared
-    @State private var mealQuietDurationSelection: SettingsSelectionListContent?
+    @State private var settingsSelection: SettingsSelectionListContent?
 
     let openAlertEntry: (AlertEntryEditRequest) -> Void
 
@@ -148,6 +191,12 @@ struct AlertsSettingsView: View {
             }
             Section {
                 Toggle("Højt om lidt", isOn: $highSoonAdvisoryEnabled)
+                if highSoonAdvisoryEnabled {
+                    SettingsStaticRowView(title: "Lyd",
+                        detail: viewModel.highSoonSoundTitle, isEnabled: true, showsDisclosure: true,
+                        action: { settingsSelection = viewModel.highSoonSoundSelection() })
+                        .accessibilityIdentifier("highSoon.sound")
+                }
             } footer: {
                 Text("Bruger grænsen og tidsplanen for Høj. Varsler ved en stigende prognose over grænsen inden for 30 minutter, når en bekræftet doseringsprofil giver et positivt, kontrolleret forslag i beregneren. Tryk åbner en ny beregning; beskeden indeholder ingen dosis.")
             }
@@ -156,13 +205,13 @@ struct AlertsSettingsView: View {
             AlertManager.highSoonSettingDidChange(isEnabled: isEnabled)
         }
         .id(viewModel.reloadToken)
-        .settingsPushPresentation(selectionList: $mealQuietDurationSelection)
+        .settingsPushPresentation(selectionList: $settingsSelection)
         .settingsListStyle(title: Texts_Alerts.alertsScreenTitle, titleDisplayMode: .inline)
     }
 
     private func presentMealQuietDurationSelection() {
         let choices = MealQuietManager.validDurationMinutes
-        mealQuietDurationSelection = SettingsSelectionListContent(
+        settingsSelection = SettingsSelectionListContent(
             title: "Måltidsro · varighed",
             data: ["Vælg varighed"] + choices.map { "\($0) minutter" },
             selectedRow: mealQuiet.durationMinutes.flatMap { choices.firstIndex(of: $0) }.map { $0 + 1 } ?? 0,

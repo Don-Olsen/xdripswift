@@ -1,4 +1,5 @@
 import Foundation
+import UserNotifications
 
 /// Immutable provenance for the existing pen calculator, run with no NEW carbohydrates.
 /// The advisory carries no dose to the UI: opening always requests a fresh calculation.
@@ -82,5 +83,51 @@ enum HighSoonAdvisoryPolicy {
         guard now.timeIntervalSinceReferenceDate.isFinite else { return false }
         guard let lastScheduled else { return true }
         return now.timeIntervalSince(lastScheduled) >= minimumInterval
+    }
+}
+
+/// A separate notification sound preference; it never changes the measured-high Alert Type.
+enum HighSoonAdvisorySound: Equatable {
+    case systemDefault
+    case silent
+    case named(ConstantsSounds)
+
+    static let defaultsKey = "highSoonAdvisorySound"
+    // UNNotificationSound requires files shorter than 30 seconds. These existing alarm
+    // sounds are 30 seconds or longer; the ordinary alarm catalogue remains unchanged.
+    static var availableSounds: [ConstantsSounds] {
+        ConstantsSounds.allCases.filter {
+            switch $0 {
+            case .batterwakeup, .bruteforce, .modernalarm2, .modernalarm, .spaceship,
+                 .Early_Sunrise, .Nightguard: return false
+            default: return true
+            }
+        }
+    }
+    static var choices: [Self] { [.silent, .systemDefault] + availableSounds.map { .named($0) } }
+
+    static func load(defaults: UserDefaults = .standard) -> Self {
+        guard let stored = defaults.string(forKey: defaultsKey) else { return .systemDefault }
+        if stored.isEmpty { return .silent }
+        guard let sound = ConstantsSounds(rawValue: stored), availableSounds.contains(sound)
+        else { return .systemDefault }
+        return .named(sound)
+    }
+
+    func store(defaults: UserDefaults = .standard) {
+        switch self {
+        case .systemDefault: defaults.removeObject(forKey: Self.defaultsKey)
+        case .silent: defaults.set("", forKey: Self.defaultsKey)
+        case .named(let sound): defaults.set(sound.rawValue, forKey: Self.defaultsKey)
+        }
+    }
+
+    var notificationSound: UNNotificationSound? {
+        switch self {
+        case .systemDefault: return .default
+        case .silent: return nil
+        case .named(let sound):
+            return UNNotificationSound(named: UNNotificationSoundName(ConstantsSounds.getSoundFile(forSound: sound)))
+        }
     }
 }

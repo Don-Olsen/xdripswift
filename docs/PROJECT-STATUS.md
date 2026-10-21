@@ -1,3 +1,42 @@
+## Gårsdagens måltid og lyd til Højt om lidt — 21. oktober 2026
+
+Beregnerens eksisterende kulhydratoverskrift kan nu vise en lille “I går”-knap
+med madtype og gram. Den vælger det nærmeste bekræftede, gyldige måltid fra
+foregående lokale kalenderdag inden for ±1 klokketidstime; ved lige afstand
+vælges det tidligere måltid. Ingen egnet post giver ingen knap. Eksisterende
+kilde-/skifteregler og dubletprioritet genbruges. Planlagte, slettede, ugyldige
+og endnu ikke gemte poster kan ikke vælges. Et afgrænset opslag genbruges inden
+for samme minut og behandlings-/kildetilstand; ved tryk genkontrolleres den viste
+post. Redigering/sletning må ikke lydløst erstatte den med et andet måltid.
+
+Et eksplicit tryk kopierer kun gram og madtype til kladden. Ingen behandling
+registreres, og historisk insulin eller spisetid kopieres aldrig. Den eksisterende
+beregning bruger aktuelle data; brugerens manuelt indtastede insulin bevares.
+Madtypens aktuelle varighed bruges, ikke en særskilt historisk specialvarighed.
+Genvejen vises ikke ved 🍕-revurdering. Felterne er fortsat tomme ved almindelig
+åbning, og insulin står fortsat øverst uden automatisk tastaturfokus.
+
+Under alarmindstillinger → Højt om lidt findes nu Lyd med standardlyd, ingen
+lyd eller en af 114 eksisterende korte lyde. Den eksisterende listevælger og
+forhåndsafspilning genbruges. Valget gemmes særskilt og ændrer kun notifikationens
+lyd; standarden er uændret, indtil brugeren vælger. Syv eksisterende lydfiler
+på mindst 30 sekunder udelades kun her, fordi iOS kræver kortere brugerdefinerede
+notifikationslyde. Den almindelige alarmlydliste er uændret. Alarmbetingelser,
+Måltidsro, snoozes, gentagelsesfrister, prioritet og åbning af beregner bevares.
+
+Der er tilføjet 15 målrettede tests af de reelle beregner-/database- og
+notifikationsforløb. Koden og testene ændrer ingen dosisformel, behandlinger,
+prognose/ML, Sundhed, Nightscout, Watch eller Libre-forbindelse. Den fysiske
+iPhone er fundet ved en læsende enhedskontrol; der er ikke installeret eller
+afspillet nye alarmer på den. Levering af den valgte lyd på fysisk iPhone og
+Watch er derfor ikke verificeret. De målrettede simulator-tests bestod 35/35, inklusive tre eksisterende hosted-
+åbnings-/genvejstests. Første kørsel fandt én forkert forventning i en ny test:
+et fortsat gyldigt, tidligere måltid skal stadig vises, når det nærmeste slettes.
+Forventningen er rettet; ingen eksisterende test er fjernet eller lempet.
+Log og xcresult ligger uden for Git under
+`~/DeveloperBuildData/xDrip/local-runs/xdripswift/20261021T134032Z-two-shortcuts-rerun/`.
+Den fulde releasekontrol køres på det præcise Apple-valgte buildnummer.
+
 <!-- testflight-7.1.1-4348:start -->
 ### TestFlight 7.1.1 (4348)
 

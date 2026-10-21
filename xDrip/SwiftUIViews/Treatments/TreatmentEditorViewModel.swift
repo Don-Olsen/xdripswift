@@ -906,6 +906,53 @@ struct PenDoseCalculationDetails {
     let suggestedNowUnits: Double?
 }
 
+/// A value-only shortcut. Historical insulin, identifiers for logging and eating time are
+/// deliberately absent. The calculator uses the selected kind's current absorption duration;
+/// an imported/custom historical duration is never installed as a new calculator setting.
+struct YesterdayMealShortcut: Equatable {
+    let objectID: NSManagedObjectID
+    let date: Date
+    let grams: Double
+    let kind: TreatmentMealKind
+    let originalDurationMinutes: Double
+
+    var title: String {
+        let symbol: String
+        switch kind {
+        case .fast: symbol = "🍭"
+        case .normal: symbol = "🌮"
+        case .slow: symbol = "🍕"
+        }
+        return "I går: \(symbol) \(PenDoseDisplayFormatter.carbs(grams)) g"
+    }
+
+    /// Compare wall-clock time on the previous calendar day, not a fixed 24-hour offset.
+    /// Both occurrences of a repeated autumn hour are eligible; a missing spring hour
+    /// has no rows. The SQL window covers only the matching hours, clipped to yesterday.
+    static func window(at now: Date, calendar: Calendar) -> DateInterval? {
+        guard now.timeIntervalSinceReferenceDate.isFinite,
+              let yesterday = calendar.date(byAdding: .day, value: -1, to: now),
+              let day = calendar.dateInterval(of: .day, for: yesterday) else { return nil }
+        let target = clockSeconds(now, calendar: calendar)
+        func boundary(_ seconds: Int, repeated: Calendar.RepeatedTimePolicy) -> Date? {
+            if seconds <= 0 { return day.start }
+            if seconds >= 86400 { return day.end }
+            return calendar.nextDate(after: day.start.addingTimeInterval(-1),
+                matching: DateComponents(hour: seconds / 3600, minute: (seconds % 3600) / 60,
+                                         second: seconds % 60),
+                matchingPolicy: .nextTime, repeatedTimePolicy: repeated, direction: .forward)
+        }
+        guard let start = boundary(target - 3600, repeated: .first),
+              let end = boundary(target + 3600, repeated: .last), start <= end else { return nil }
+        return DateInterval(start: max(day.start, start), end: min(day.end, end))
+    }
+
+    static func clockSeconds(_ date: Date, calendar: Calendar) -> Int {
+        let parts = calendar.dateComponents([.hour, .minute, .second], from: date)
+        return (parts.hour ?? 0) * 3600 + (parts.minute ?? 0) * 60 + (parts.second ?? 0)
+    }
+}
+
 /// UI state for a read-only pen suggestion and an independent local treatment log.
 @MainActor final class PenDoseCalculatorViewModel: ObservableObject {
     @Published var carbohydratesText = "" { didSet { scheduleCalculation() } }
@@ -920,6 +967,7 @@ struct PenDoseCalculationDetails {
             if !isUpdatingAutomaticInsulin { hasManualInsulinEntry = true }
         }
     }
+    @Published private(set) var yesterdayMeal: YesterdayMealShortcut?
     @Published private(set) var calculation: PenDoseCalculation?
     @Published private(set) var carbohydrateAdvice: CarbohydrateAdviceResult?
     private var carbohydrateAdviceContext: CarbohydrateAdviceContext?
@@ -960,6 +1008,24 @@ struct PenDoseCalculationDetails {
     private let forecastDefaults: UserDefaults
     private var hasManualInsulinEntry = false
     private var isUpdatingAutomaticInsulin = false
+    private let mealShortcutDefaults: UserDefaults
+    private let mealShortcutTherapyManager: TherapyMetricsManager
+    private let mealShortcutCalendar: () -> Calendar
+    private var mealShortcutRefreshKey: MealShortcutRefreshKey?
+
+    private struct MealShortcutRefreshKey: Equatable {
+        let minute: Int
+        let calendar: Calendar
+        let revision: Int
+        let pending: Bool
+        let source: Int
+        let importsNightscout: Bool
+        let importsCareLink: Bool
+        let carbsSource: String?
+        let importsCarbs: Bool
+        let cutover: TreatmentSourceCutover?
+        let sourceIsConsistent: Bool
+    }
 
     init(coreDataManager: CoreDataManager, reminderMealUUID: String? = nil,
          glucoseStore: ManualDoseGlucoseStore = .shared,
@@ -971,7 +1037,10 @@ struct PenDoseCalculationDetails {
          automaticallyFillMealDose: Bool = false,
          enablesCarbohydrateAdvice: Bool = false,
          carbohydrateAdviceJournal: CarbohydrateAdviceJournal = .shared,
-         forecastDefaults: UserDefaults = .standard) {
+         forecastDefaults: UserDefaults = .standard,
+         mealShortcutDefaults: UserDefaults = .standard,
+         mealShortcutTherapyManager: TherapyMetricsManager = .shared,
+         mealShortcutCalendar: @escaping () -> Calendar = { .current }) {
         let logJournal = logJournal ?? .shared
         self.coreDataManager = coreDataManager
         self.reminderMealUUID = reminderMealUUID
@@ -985,6 +1054,9 @@ struct PenDoseCalculationDetails {
         self.enablesCarbohydrateAdvice = enablesCarbohydrateAdvice
         self.carbohydrateAdviceJournal = carbohydrateAdviceJournal
         self.forecastDefaults = forecastDefaults
+        self.mealShortcutDefaults = mealShortcutDefaults
+        self.mealShortcutTherapyManager = mealShortcutTherapyManager
+        self.mealShortcutCalendar = mealShortcutCalendar
         self.storageGateState = logJournal.recoveryState(coreDataManager: coreDataManager)
         if storageGateState != .ready { statusMessage = storageGateState.message }
     }
@@ -1096,9 +1168,77 @@ struct PenDoseCalculationDetails {
         logValidationMessage == nil
     }
 
-    func start() {
+    func start(now: Date = .now) {
         isOpen = true
+        refreshYesterdayMeal(now: now, force: true)
         scheduleCalculation(debounce: false)
+    }
+
+    /// A small bounded read on opening, minute/calendar changes, committed treatment changes
+    /// or source changes. Ordinary CGM refreshes and the 15-second clock reuse the snapshot.
+    func refreshYesterdayMeal(now: Date = .now, force: Bool = false) {
+        guard reminderMealUUID == nil, now.timeIntervalSince1970.isFinite else {
+            yesterdayMeal = nil
+            return
+        }
+        let calendar = mealShortcutCalendar()
+        let defaults = mealShortcutDefaults
+        let policy = defaults.dataFlowPolicy
+        let importer = HealthKitTherapyImportManager.shared
+        let cutover = TreatmentSourceCutover.current(defaults: defaults)
+        let manager = mealShortcutTherapyManager
+        let key = MealShortcutRefreshKey(minute: Int(now.timeIntervalSince1970 / 60),
+            calendar: calendar, revision: manager.treatmentChangeRevision,
+            pending: manager.hasUncommittedTreatmentChanges,
+            source: Int(policy.therapyDataSource.rawValue),
+            importsNightscout: policy.importsTreatmentsFromNightscout,
+            importsCareLink: policy.importsTherapyFromCareLink,
+            carbsSource: importer.selectedSource(.carbohydrates)?.bundleIdentifier,
+            importsCarbs: importer.isEnabled(.carbohydrates), cutover: cutover,
+            sourceIsConsistent: TherapyMetricsManager.cutoverPolicyIsConsistent(policy,
+                cutover: cutover, defaults: defaults))
+        guard force || key != mealShortcutRefreshKey else { return }
+        mealShortcutRefreshKey = key
+        guard !key.pending, key.sourceIsConsistent,
+              let window = YesterdayMealShortcut.window(at: now, calendar: calendar),
+              let yesterday = calendar.date(byAdding: .day, value: -1, to: now) else {
+            yesterdayMeal = nil
+            return
+        }
+        let rows = TreatmentEntryAccessor(coreDataManager: coreDataManager).getTreatments(
+            fromDate: window.start, toDate: window.end, on: coreDataManager.mainManagedObjectContext)
+        let target = YesterdayMealShortcut.clockSeconds(now, calendar: calendar)
+        let eligible = TherapyMetricsManager.eligibleTreatments(rows,
+            policy: policy, insulinSource: nil, carbsSource: key.carbsSource,
+            insulinEnabled: false, carbsEnabled: key.importsCarbs, cutover: cutover)
+        let candidates = eligible.filter {
+            $0.treatmentType == .Carbs && !$0.isDeleted && !$0.hasChanges && $0.isConfirmedMeal &&
+                $0.value.isFinite && $0.value > 0 && $0.value <= 500 &&
+                calendar.isDate($0.date, inSameDayAs: yesterday) &&
+                abs(YesterdayMealShortcut.clockSeconds($0.date, calendar: calendar) - target) <= 3600
+        }.map {
+            YesterdayMealShortcut(objectID: $0.objectID, date: $0.date, grams: $0.value,
+                kind: $0.mealKind, originalDurationMinutes: $0.effectiveCarbohydrateDurationMinutes)
+        }
+        yesterdayMeal = candidates.min { lhs, rhs in
+            let left = abs(YesterdayMealShortcut.clockSeconds(lhs.date, calendar: calendar) - target)
+            let right = abs(YesterdayMealShortcut.clockSeconds(rhs.date, calendar: calendar) - target)
+            if left != right { return left < right }
+            if lhs.date != rhs.date { return lhs.date < rhs.date }
+            return lhs.objectID.uriRepresentation().absoluteString < rhs.objectID.uriRepresentation().absoluteString
+        }
+    }
+
+    /// Re-read before applying exactly what the user saw. A changed/deleted candidate updates
+    /// the button but never substitutes a different meal during that same tap.
+    @discardableResult func useYesterdayMeal(now: Date = .now) -> Bool {
+        guard reminderMealUUID == nil, !isSaving, confirmationDraft == nil,
+              let displayed = yesterdayMeal else { return false }
+        refreshYesterdayMeal(now: now, force: true)
+        guard yesterdayMeal == displayed else { return false }
+        carbohydratesText = PenDoseDisplayFormatter.profileInput(displayed.grams)
+        mealKind = displayed.kind
+        return true
     }
 
     func stop() {
@@ -1122,6 +1262,7 @@ struct PenDoseCalculationDetails {
             currentTime.timeIntervalSince($0) <= PenBolusCalculator.freshCGMSeconds
         } ?? false
         currentTime = now
+        refreshYesterdayMeal(now: now)
         if isPlannedMeal && plannedDate <= now { expiredPlan = true }
         let isFresh = latestGlucoseDate.map {
             now.timeIntervalSince($0) <= PenBolusCalculator.freshCGMSeconds

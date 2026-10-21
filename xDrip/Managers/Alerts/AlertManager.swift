@@ -437,7 +437,7 @@ public class AlertManager: NSObject {
         content.title = "Højt om lidt"
         content.body = Self.highSoonNotificationBody(prediction, usesMgDl: defaults.bloodGlucoseUnitIsMgDl)
         content.categoryIdentifier = HighSoonAdvisoryPolicy.categoryIdentifier
-        content.sound = .default
+        content.sound = HighSoonAdvisorySound.load(defaults: defaults).notificationSound
         content.interruptionLevel = .active
         let request = UNNotificationRequest(identifier: HighSoonAdvisoryPolicy.notificationIdentifier,
                                             content: content, trigger: nil)
