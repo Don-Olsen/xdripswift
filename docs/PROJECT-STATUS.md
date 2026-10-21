@@ -1,3 +1,37 @@
+## Afgrænset ID-opslag ved Log — 21. oktober 2026
+
+`PenDoseTreatmentLogger` henter nu kun poster med registreringens bolus- og
+måltids-UUID i stedet for at hente og sortere hele behandlingshistorikken.
+Opslaget bruger fortsat den levende hovedkontekst, inklusive ugemte poster,
+ændringer og slettemarkerede behandlinger. Det har ingen aldersgrænse eller
+fetch-limit, der kan skjule dubletter. Læsefejl returnerer lagerfejl før
+indsættelse/gemning; de bliver ikke behandlet som et vellykket tomt resultat.
+Journal, verificering af varig lagring, ID'er, genforsøg, eksport og påmindelser
+bevares. Ingen dosis-, alarm-, prognose-, ML-, kilde- eller modelændring.
+Produktionsændringen er begrænset til accessor og eksisterende logger.
+
+Seks nye tests bruger en isoleret SQLite-database og det rigtige Log-forløb:
+afgrænsning mod gammel hentning, ugemte indsættelser/ændringer og soft-delete,
+genforsøg efter fejl før/efter child-context-save, genåbning af SQLite for
+insulin/kulhydrat/begge, afvisning af retry efter redigering/sletning samt
+injiceret forespørgselsfejl uden indsættelse eller gemning. Eksisterende tests
+er bevaret. Den målrettede kørsel bestod **53/53**, inklusive
+`LocalTreatmentPlanningTests` og `WatchPenPhoneServiceTests`.
+
+Syntetisk måling i iPhone 18 Pro-simulator med 5.003 SQLite-poster, seks opslag
+pr. metode og skiftende rækkefølge: median **9,80 ms** for det tidligere
+fulde opslag og **0,55 ms** for det afgrænsede. Antal materialiserede poster
+faldt fra **5.003 til 2**, med samme valgte identiteter og rækkefølge.
+Målingen omfatter kun opslaget, ikke samlet Log-svartid eller fysisk iPhone.
+Testlog, xcresult og benchmarkbilag ligger uden for Git:
+`/Users/donolsen/DeveloperBuildData/xDrip/local-runs/xdripswift/20261021T151350Z-log-lookup/`.
+
+Læsende `devicectl`-kontrol fandt den parrede iPhone 17 Pro Max og Apple Watch
+Ultra tilgængelige. Ingen lokal installation eller behandling er foretaget
+på enhederne. Fysisk Log-svartid og batteriforbrug er ikke målt.
+Den fulde releasevalidering og Apples faktisk bekræftede status registreres
+ved den efterfølgende udgivelse; de tidligere kvitteringer genbruges ikke.
+
 <!-- testflight-7.1.1-4349:start -->
 ### TestFlight 7.1.1 (4349)
 

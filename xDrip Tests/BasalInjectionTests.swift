@@ -7,6 +7,7 @@
 //
 
 import XCTest
+import CoreData
 import UIKit
 import SwiftUI
 import UserNotifications
@@ -3012,5 +3013,214 @@ extension BasalInjectionTests {
         for uuid in uuids { XCTAssertNil(try store.metadata(for: uuid)) }
         XCTAssertEqual(TreatmentEntryAccessor(coreDataManager: core).getLatestTreatments(howOld: nil)
             .filter { $0.treatmentType == .Insulin }.count, 6, "Reminder cleanup must never change insulin")
+    }
+}
+
+/// The production logger must find only its operation's identities, including
+/// unsaved retry rows. These fixtures use a private SQLite store, never app data.
+@MainActor final class PenDoseIdentityLookupTests: XCTestCase {
+    private let now = Date(timeIntervalSince1970: 1_800_000_000)
+
+    private func fixture() throws -> (CoreDataManager, URL) {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let core = try CoreDataManager(testModelName: ConstantsCoreData.modelName,
+            persistentStoreURL: directory.appendingPathComponent("identity.sqlite"))
+        addTeardownBlock {
+            try core.disconnectPersistentStoresForTesting()
+            try FileManager.default.removeItem(at: directory)
+        }
+        return (core, directory)
+    }
+
+    @discardableResult private func row(_ uuid: String?, type: TreatmentType = .Insulin,
+                                       at date: Date, core: CoreDataManager) -> TreatmentEntry {
+        let entry = TreatmentEntry(date: date, value: type == .Carbs ? 24 : 2,
+            treatmentType: type, nightscoutEventType: nil, enteredBy: "Synthetic lookup test",
+            nsManagedObjectContext: core.mainManagedObjectContext)
+        entry.localTreatmentUUID = uuid
+        entry.mealKindRaw = TreatmentMealKind.normal.rawValue
+        return entry
+    }
+
+    private func log(_ core: CoreDataManager, directory: URL, operation: PenDoseLogOperation,
+                     insulin: Double = 2, carbs: Double = 24,
+                     save: (() -> Bool)? = nil,
+                     fetch: TreatmentEntryAccessor.LocalIdentityFetch? = nil)
+        -> Result<PenDoseLogReceipt, PenDoseLogError> {
+        PenDoseTreatmentLogger.log(coreDataManager: core, insulinUnits: insulin,
+            carbohydrateGrams: carbs, mealKind: .normal, plannedDate: nil,
+            operation: operation, now: now,
+            journal: PenDoseLogJournal(directory: directory, processToken: "identity-test"),
+            penSettings: PenDoseProfile.prefilledUnconfirmed.settings,
+            pizzaSettings: PizzaSplitSettings(isEnabled: false, percentageNow: 70, reminderMinutes: 90),
+            metadataStore: MealPlanMetadataStore(directory: directory),
+            saveOverride: save, existingTreatmentFetch: fetch,
+            allowsMealQuietStart: false, considerMealQuiet: { _, _, _, _, _ in })
+    }
+
+    func testSQLiteLookupMatchesLegacySelectionWithoutMaterializingUnrelatedHistory() throws {
+        let (core, _) = try fixture()
+        let ids = ["synthetic-bolus", "synthetic-meal"]
+        for index in 0..<5_000 {
+            row("history-\(index)", at: now.addingTimeInterval(Double(-index * 60)), core: core)
+        }
+        row(nil, at: now, core: core)
+        row(ids[0], at: now.addingTimeInterval(-500_000), core: core)
+        row(ids[1], type: .Carbs, at: now, core: core)
+        XCTAssertTrue(core.saveChangesSynchronously())
+        let context = core.mainManagedObjectContext
+        let accessor = TreatmentEntryAccessor(coreDataManager: core)
+        context.retainsRegisteredObjects = true
+        func reset() {
+            context.reset()
+            core.privateManagedObjectContext.performAndWait { core.privateManagedObjectContext.reset() }
+        }
+        var targetedTimes: [Double] = []
+        var legacyTimes: [Double] = []
+        // Alternate order to avoid giving only the new path a warm SQLite cache.
+        for iteration in 0..<6 {
+            for targeted in iteration.isMultiple(of: 2) ? [true, false] : [false, true] {
+                reset()
+                let start = ProcessInfo.processInfo.systemUptime
+                let rows = targeted ? try accessor.getTreatments(localUUIDs: ids)
+                    : accessor.getLatestTreatments(howOld: nil)
+                let selected = rows.filter { ids.contains($0.localTreatmentUUID ?? "") }
+                let milliseconds = (ProcessInfo.processInfo.systemUptime - start) * 1_000
+                XCTAssertEqual(selected.compactMap(\.localTreatmentUUID), [ids[1], ids[0]])
+                XCTAssertEqual(rows.count, targeted ? 2 : 5_003)
+                XCTAssertEqual(context.registeredObjects.filter { $0 is TreatmentEntry }.count,
+                               targeted ? 2 : 5_003)
+                if targeted { targetedTimes.append(milliseconds) }
+                else { legacyTimes.append(milliseconds) }
+            }
+        }
+        func median(_ values: [Double]) -> Double {
+            let sorted = values.sorted()
+            return (sorted[2] + sorted[3]) / 2
+        }
+        let report = "Synthetic SQLite, 5003 rows; median of 6 reads: legacy=\(median(legacyTimes)) ms, targeted=\(median(targetedTimes)) ms. Lookup only, not end-to-end Log or physical iPhone latency."
+        print(report)
+        let attachment = XCTAttachment(string: report)
+        attachment.name = "Synthetic identity lookup benchmark"
+        attachment.lifetime = .keepAlways
+        add(attachment)
+    }
+
+    func testLookupIncludesPendingInsertsEditsSoftDeletesAndEveryMatchingIdentity() throws {
+        let (core, _) = try fixture()
+        let accessor = TreatmentEntryAccessor(coreDataManager: core)
+        let edited = row("before-edit", at: now, core: core)
+        let removed = row("target", at: now.addingTimeInterval(-1), core: core)
+        row("target-suffix", at: now, core: core)
+        XCTAssertTrue(core.saveChangesSynchronously())
+        edited.localTreatmentUUID = "target"
+        removed.treatmentdeleted = true
+        let pending = row("target", type: .Carbs, at: now.addingTimeInterval(1), core: core)
+        let rows = try accessor.getTreatments(localUUIDs: ["target", "missing"])
+        XCTAssertEqual(rows.map(\.objectID), [pending, edited, removed].map(\.objectID))
+        XCTAssertTrue(rows.last?.treatmentdeleted == true)
+        XCTAssertTrue(try accessor.getTreatments(localUUIDs: ["before-edit"]).isEmpty)
+        XCTAssertTrue(try accessor.getTreatments(localUUIDs: []).isEmpty)
+        XCTAssertTrue(try accessor.getTreatments(localUUIDs: ["absent"]).isEmpty)
+    }
+
+    func testLoggerRetryUsesUnsavedAndParentPendingRowsWithoutDuplicatingEitherTreatment() throws {
+        for parentPending in [false, true] {
+            let (core, directory) = try fixture()
+            let operation = PenDoseLogOperation()
+            let first = log(core, directory: directory, operation: operation, save: {
+                if parentPending { try? core.mainManagedObjectContext.save() }
+                return false
+            })
+            guard case .failure(.storageFailed) = first else { return XCTFail("Unverified save must fail") }
+            let before = try TreatmentEntryAccessor(coreDataManager: core)
+                .getTreatments(localUUIDs: [operation.bolusUUID, operation.mealUUID])
+            XCTAssertEqual(before.count, 2)
+            guard case .success = log(core, directory: directory, operation: operation) else {
+                return XCTFail("Retry must reuse the pending rows and commit them")
+            }
+            let after = TreatmentEntryAccessor(coreDataManager: core).getLatestTreatments(howOld: nil)
+            XCTAssertEqual(after.count, 2)
+            XCTAssertEqual(Set(after.compactMap(\.localTreatmentUUID)),
+                           Set([operation.bolusUUID, operation.mealUUID]))
+            XCTAssertEqual(PenDoseLogJournal(directory: directory, processToken: "identity-test")
+                .recoveryState(coreDataManager: core), .ready)
+        }
+    }
+
+    func testLoggerRetryAfterSQLiteReopenPreservesSingleAndPairedOperations() throws {
+        for (insulin, carbs) in [(2.0, 0.0), (0.0, 24.0), (2.0, 24.0)] {
+            let (core, directory) = try fixture()
+            let operation = PenDoseLogOperation()
+            guard case .success = log(core, directory: directory, operation: operation,
+                                      insulin: insulin, carbs: carbs) else { return XCTFail("First log") }
+            try core.disconnectPersistentStoresForTesting()
+            let restarted = try CoreDataManager(testModelName: ConstantsCoreData.modelName,
+                persistentStoreURL: directory.appendingPathComponent("identity.sqlite"))
+            defer { try? restarted.disconnectPersistentStoresForTesting() }
+            guard case .success = log(restarted, directory: directory, operation: operation,
+                                      insulin: insulin, carbs: carbs) else { return XCTFail("Retry after restart") }
+            let entries = TreatmentEntryAccessor(coreDataManager: restarted).getLatestTreatments(howOld: nil)
+            XCTAssertEqual(entries.count, (insulin > 0 ? 1 : 0) + (carbs > 0 ? 1 : 0))
+            XCTAssertEqual(entries.first(where: { $0.localTreatmentUUID == operation.bolusUUID })?.value,
+                           insulin > 0 ? insulin : nil)
+            XCTAssertEqual(entries.first(where: { $0.localTreatmentUUID == operation.mealUUID })?.value,
+                           carbs > 0 ? carbs : nil)
+        }
+    }
+
+    func testLoggerDoesNotOverwriteEditedOrRecreateSoftDeletedTreatmentOnRetry() throws {
+        for editMeal in [false, true] {
+            for delete in [false, true] {
+                let (core, directory) = try fixture()
+                let operation = PenDoseLogOperation()
+                guard case .success = log(core, directory: directory, operation: operation) else {
+                    return XCTFail("First log")
+                }
+                let uuid = editMeal ? operation.mealUUID : operation.bolusUUID
+                let changed = try XCTUnwrap(TreatmentEntryAccessor(coreDataManager: core)
+                    .getTreatments(localUUIDs: [uuid]).first)
+                if delete { changed.treatmentdeleted = true } else { changed.value += 1 }
+                XCTAssertTrue(core.saveChangesSynchronously())
+                guard case .failure(.invalidInput) = log(core, directory: directory, operation: operation) else {
+                    return XCTFail("Retry cannot undo a later edit or deletion")
+                }
+                XCTAssertEqual(TreatmentEntryAccessor(coreDataManager: core).getLatestTreatments(howOld: nil).count, 2)
+                XCTAssertEqual(changed.treatmentdeleted, delete)
+                XCTAssertEqual(changed.value, (editMeal ? 24 : 2) + (delete ? 0 : 1))
+            }
+        }
+    }
+
+    func testReadFailurePreservesJournalAndNeverInsertsOrSavesBeforeSuccessfulRetry() throws {
+        let (core, directory) = try fixture()
+        let operation = PenDoseLogOperation()
+        var reads = 0
+        var saves = 0
+        let failed = log(core, directory: directory, operation: operation, save: {
+            saves += 1
+            return false
+        }, fetch: { context, request in
+            reads += 1
+            XCTAssertTrue(Thread.isMainThread)
+            XCTAssertTrue(context === core.mainManagedObjectContext)
+            XCTAssertTrue(request.includesPendingChanges)
+            XCTAssertEqual(request.fetchLimit, 0, "Do not hide multiple rows with the same identity")
+            XCTAssertTrue(request.predicate?.evaluate(with: ["localTreatmentUUID": operation.bolusUUID]) == true)
+            XCTAssertTrue(request.predicate?.evaluate(with: ["localTreatmentUUID": operation.mealUUID]) == true)
+            XCTAssertFalse(request.predicate?.evaluate(with: ["localTreatmentUUID": "unrelated"]) == true)
+            throw NSError(domain: "SyntheticTreatmentRead", code: 1)
+        })
+        guard case .failure(.storageFailed) = failed else { return XCTFail("Read error is not empty history") }
+        XCTAssertEqual(reads, 1)
+        XCTAssertEqual(saves, 0)
+        XCTAssertTrue(core.mainManagedObjectContext.insertedObjects.isEmpty)
+        XCTAssertEqual(PenDoseLogJournal(directory: directory, processToken: "identity-test")
+            .recoveryState(coreDataManager: core), .awaitingRestart)
+        guard case .success = log(core, directory: directory, operation: operation) else {
+            return XCTFail("The same operation can retry once the read succeeds")
+        }
+        XCTAssertEqual(TreatmentEntryAccessor(coreDataManager: core).getLatestTreatments(howOld: nil).count, 2)
     }
 }

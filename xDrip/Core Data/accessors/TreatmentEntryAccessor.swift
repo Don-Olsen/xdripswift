@@ -44,6 +44,24 @@ class TreatmentEntryAccessor {
         fetchTreatmentsIfAvailable(limit: nil, fromDate: nil)
     }
 
+    typealias LocalIdentityFetch = (NSManagedObjectContext, NSFetchRequest<TreatmentEntry>) throws -> [TreatmentEntry]
+
+    /// Identity checks must include pending edits/inserts and soft-deleted rows in
+    /// the live context. A failed read must not be mistaken for an unused identity.
+    func getTreatments(localUUIDs: [String], fetch: LocalIdentityFetch? = nil) throws -> [TreatmentEntry] {
+        guard !localUUIDs.isEmpty else { return [] }
+        let request: NSFetchRequest<TreatmentEntry> = TreatmentEntry.fetchRequest()
+        request.predicate = NSPredicate(format: "localTreatmentUUID IN %@", localUUIDs)
+        request.sortDescriptors = [NSSortDescriptor(key: #keyPath(TreatmentEntry.date), ascending: false)]
+        request.includesPendingChanges = true
+        request.returnsObjectsAsFaults = false
+        let context = coreDataManager.mainManagedObjectContext
+        return try context.performAndWait {
+            if let fetch { return try fetch(context, request) }
+            return try context.fetch(request)
+        }
+    }
+
     /// Gives latest treatments
     ///
     /// - parameters:

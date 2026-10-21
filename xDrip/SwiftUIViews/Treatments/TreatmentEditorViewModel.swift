@@ -2149,6 +2149,7 @@ struct PenDoseLogIntent: Codable, Equatable {
                     metadataStore: MealPlanMetadataStore? = nil,
                     onReminderIssue: ((String) -> Void)? = nil,
                     saveOverride: (() -> Bool)? = nil,
+                    existingTreatmentFetch: TreatmentEntryAccessor.LocalIdentityFetch? = nil,
                     allowsMealQuietStart: Bool = true,
                     considerMealQuiet: ((String, String, Date, Date, Bool) -> Void)? = nil)
         -> Result<PenDoseLogReceipt, PenDoseLogError> {
@@ -2207,8 +2208,11 @@ struct PenDoseLogIntent: Codable, Equatable {
             return .failure(.storageFailed)
         }
         let context = coreDataManager.mainManagedObjectContext
-        let existing = TreatmentEntryAccessor(coreDataManager: coreDataManager)
-            .getLatestTreatments(howOld: nil)
+        guard let existing = try? TreatmentEntryAccessor(coreDataManager: coreDataManager)
+            .getTreatments(localUUIDs: [operation.bolusUUID, operation.mealUUID],
+                           fetch: existingTreatmentFetch) else {
+            return .failure(.storageFailed)
+        }
         let priorBolus = existing.first { $0.localTreatmentUUID == operation.bolusUUID }
         let priorMeal = existing.first { $0.localTreatmentUUID == operation.mealUUID }
         guard priorBolus == nil || (insulinUnits > 0 && priorBolus?.treatmentType == .Insulin &&
