@@ -1,3 +1,15 @@
+<!-- testflight-7.1.1-4348:start -->
+### TestFlight 7.1.1 (4348)
+
+- Kildecommit og tag: `a44d882eca399fa86b67b44b408f81b3f4161045` / `testflight-7.1.1-4348`.
+- Tests: 1827/1827 bestået; 0 fejlet; 0 skipped. iPhone- og Watch-simulatorbuilds bestod.
+- Apple-status (2026-10-21T11:39:55.363581+00:00): [Internal / Testing](https://appstoreconnect.apple.com/apps/6795645396/testflight/ios/9b6e47a7-068e-4c08-a1ab-2c0071ae1a81).
+- Eksisterende intern gruppe: Ole Internal er bekræftet tilknyttet.
+- Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
+<!-- testflight-7.1.1-4348:end -->
+
+De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
+
 ## Beregner: insulin først og rolig åbning — 21. oktober 2026
 
 Den eksisterende iPhone-beregner viser nu insulinkortet før kulhydraterne,
