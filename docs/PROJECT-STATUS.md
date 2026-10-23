@@ -1,3 +1,15 @@
+<!-- testflight-7.1.1-4351:start -->
+### TestFlight 7.1.1 (4351)
+
+- Kildecommit og tag: `5ac8471f79d93045ccc34c4a6d598327aeb8ec01` / `testflight-7.1.1-4351`.
+- Tests: 1850/1850 bestået; 0 fejlet; 0 skipped. iPhone- og Watch-simulatorbuilds bestod.
+- Apple-status (2026-10-23T06:14:35.991674+00:00): [Internal / Testing](https://appstoreconnect.apple.com/apps/6795645396/testflight/ios/9494502c-a2b3-48c5-add4-f1734f8ef824).
+- Eksisterende intern gruppe: Ole Internal er bekræftet tilknyttet.
+- Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
+<!-- testflight-7.1.1-4351:end -->
+
+De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
+
 ## Måltidsro direkte på iPhone Home — 23. oktober 2026
 
 Den almindelige iPhone-forside viser nu en diskret “Måltidsro til [tid]”,
