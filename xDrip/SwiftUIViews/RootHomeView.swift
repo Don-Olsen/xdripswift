@@ -808,7 +808,12 @@ struct RootHomeView: View {
         // Resolve once so an asynchronous cache completion cannot disagree with row contents.
         let loop = loopDisplayState
         return VStack(spacing: Layout.sectionSpacing) {
-            homeHeader
+            VStack(spacing: 0) {
+                VStack(spacing: Layout.sectionSpacing) { homeHeader }
+                if UIDevice.current.userInterfaceIdiom == .phone {
+                    RootHomeMealQuietStatusView(openSnooze: actions.showSnooze)
+                }
+            }
 
             VStack(spacing: Layout.rowSpacing) {
                 glucoseStatusRow

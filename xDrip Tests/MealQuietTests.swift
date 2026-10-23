@@ -1,5 +1,6 @@
 import XCTest
 import CoreData
+import SwiftUI
 @testable import xdrip
 
 /// These tests drive the real durable manager and its suspended forecast task. Only external
@@ -631,6 +632,83 @@ final class MealQuietTests: XCTestCase {
         XCTAssertNil(manager.watchState.period)
     }
 
+    @MainActor func testHostedHomeStatusTracksCommittedPeriodWithoutChangingTreatments() async throws {
+        let inputs = MealQuietInputs()
+        inputs.now = Date()
+        inputs.sample = .init(date: inputs.now, glucoseMgdl: 120, sensorID: "sensor-A")
+        let manager = inputs.manager(configured: false)
+        let host = try HostedMealQuietStatus(manager: manager)
+        defer { host.finish() }
+        await waitUntil { host.height >= 0 }
+        XCTAssertLessThan(host.height, 1, "Disabled status must not reserve a Home row")
+
+        manager.setDurationMinutes(30)
+        manager.setEnabled(true)
+        inputs.consider(manager)
+        await waitUntil { inputs.requests == 1 }
+        await host.render()
+        XCTAssertEqual(manager.document.records["meal"]?.decision, .pending)
+        XCTAssertLessThan(host.height, 1, "Pending is not an active quiet period")
+        inputs.complete()
+        await waitUntil { host.height >= 44 }
+        XCTAssertNotNil(manager.activePeriod())
+        for category in [ContentSizeCategory.large, .accessibilityExtraExtraExtraLarge] {
+            host.setTextSize(category)
+            await host.render()
+            let attachment = XCTAttachment(image: host.image())
+            attachment.name = "Synthetic Home meal quiet \(category)"
+            attachment.lifetime = .keepAlways
+            add(attachment)
+        }
+
+        let document = manager.document
+        let saved = inputs.data
+        await host.render()
+        XCTAssertGreaterThanOrEqual(host.height, 44)
+        XCTAssertEqual(manager.document, document, "Presentation must not reassess or extend a period")
+        XCTAssertEqual(inputs.data, saved)
+        XCTAssertEqual(inputs.requests, 1)
+        XCTAssertEqual(inputs.clearCalls, 1)
+        XCTAssertEqual(host.snoozeRequests, 0)
+        XCTAssertTrue(try inputs.core.mainManagedObjectContext.fetch(TreatmentEntry.fetchRequest()).isEmpty)
+        XCTAssertFalse(inputs.core.mainManagedObjectContext.hasChanges)
+
+        manager.end(reason: "Hosted test stopped period")
+        await waitUntil { host.height < 1 }
+        XCTAssertEqual(manager.document.records["meal"]?.decision, .ended)
+        XCTAssertNil(manager.activePeriod())
+        XCTAssertFalse(inputs.core.mainManagedObjectContext.hasChanges)
+    }
+
+    @MainActor func testHostedHomeStatusExpiresWithoutManagerPublicationOrPersistence() async throws {
+        let inputs = MealQuietInputs()
+        let until = Date().addingTimeInterval(2)
+        var document = MealQuietDocument()
+        document.enabled = true
+        document.durationMinutes = 15
+        document.records["meal"] = .init(mealID: "meal", bolusID: "bolus",
+            eatingAt: until.addingTimeInterval(-15 * 60), until: until,
+            decision: .active, reason: "Synthetic restored period")
+        inputs.data = try JSONEncoder().encode(document)
+        let manager = inputs.manager(configured: false)
+        let saved = inputs.data
+        let revision = manager.revision
+        let host = try HostedMealQuietStatus(manager: manager)
+        defer { host.finish() }
+        await waitUntil { host.height >= 44 }
+        await waitUntil { host.height >= 0 && host.height < 1 }
+
+        XCTAssertGreaterThanOrEqual(Date(), until)
+        XCTAssertNil(manager.activePeriod())
+        XCTAssertEqual(manager.document, document, "The view must only hide the expired record")
+        XCTAssertEqual(manager.revision, revision, "No manager publication may be needed for expiry")
+        XCTAssertEqual(inputs.data, saved)
+        XCTAssertEqual(inputs.requests, 0)
+        XCTAssertEqual(inputs.clearCalls, 0)
+        XCTAssertEqual(host.snoozeRequests, 0)
+        XCTAssertFalse(inputs.core.mainManagedObjectContext.hasChanges)
+    }
+
     @MainActor private func activate(_ manager: MealQuietManager, inputs: MealQuietInputs,
                                     mealID: String = "meal") async {
         let next = inputs.requests + 1
@@ -646,6 +724,69 @@ final class MealQuietTests: XCTestCase {
         let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in condition() }, object: nil)
         await fulfillment(of: [ready], timeout: 3)
         XCTAssertTrue(condition(), file: file, line: line)
+    }
+}
+
+@MainActor private final class HostedMealQuietStatus {
+    private let controller: UIHostingController<AnyView>
+    private let content: AnyView
+    private let window: UIWindow
+    private weak var previousKeyWindow: UIWindow?
+    private let observed: Observations
+    private final class Observations {
+        var height: CGFloat = -1
+        var snoozeRequests = 0
+    }
+
+    init(manager: MealQuietManager) throws {
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .first { $0.activationState == .foregroundActive })
+        let observed = Observations()
+        self.observed = observed
+        let content = VStack(spacing: 0) {
+            RootHomeMealQuietStatusView(mealQuiet: manager,
+                openSnooze: { observed.snoozeRequests += 1 })
+        }
+        .background(GeometryReader { geometry in
+            Color.clear
+                .onAppear { observed.height = geometry.size.height }
+                .onChange(of: geometry.size.height) { observed.height = $0 }
+        })
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .background(Color.black)
+        .environment(\.colorScheme, .dark)
+        self.content = AnyView(content)
+        controller = UIHostingController(rootView: self.content)
+        previousKeyWindow = scene.windows.first { $0.isKeyWindow }
+        window = UIWindow(windowScene: scene)
+        window.frame = CGRect(x: 0, y: 0, width: 320, height: 300)
+        window.rootViewController = controller
+        window.makeKeyAndVisible()
+    }
+
+    var height: CGFloat { observed.height }
+    var snoozeRequests: Int { observed.snoozeRequests }
+
+    func setTextSize(_ size: ContentSizeCategory) {
+        controller.rootView = AnyView(content.environment(\.sizeCategory, size))
+    }
+
+    func render() async {
+        try? await Task.sleep(nanoseconds: 150_000_000)
+        controller.view.layoutIfNeeded()
+    }
+
+    func image() -> UIImage {
+        UIGraphicsImageRenderer(bounds: controller.view.bounds).image { _ in
+            XCTAssertTrue(controller.view.drawHierarchy(in: controller.view.bounds, afterScreenUpdates: true))
+        }
+    }
+
+    func finish() {
+        window.isHidden = true
+        window.rootViewController = nil
+        previousKeyWindow?.makeKey()
     }
 }
 

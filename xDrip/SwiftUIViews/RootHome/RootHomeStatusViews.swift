@@ -18,6 +18,51 @@ private extension Bool {
     }
 }
 
+/// Observe only the existing quiet state, without refreshing Home's graphs or clinical data.
+/// One cancellable expiry task removes the row even without a new glucose reading.
+struct RootHomeMealQuietStatusView: View {
+    @ObservedObject var mealQuiet: MealQuietManager
+    @State private var observedExpiry = Date.distantPast
+    let openSnooze: () -> Void
+
+    init(mealQuiet: MealQuietManager = .shared, openSnooze: @escaping () -> Void) {
+        self.mealQuiet = mealQuiet
+        self.openSnooze = openSnooze
+    }
+
+    var body: some View {
+        let period = mealQuiet.activePeriod()
+        Group {
+            if let period, period.isActive(at: max(observedExpiry, Date())) {
+                Button(action: openSnooze) {
+                    HStack(spacing: 6) {
+                        Text("Måltidsro til \(period.until.formatted(date: .omitted, time: .shortened))")
+                            .fixedSize(horizontal: false, vertical: true)
+                        Image(systemName: "chevron.right")
+                            .accessibilityHidden(true)
+                        Spacer(minLength: 0)
+                    }
+                    .font(.caption)
+                    .foregroundStyle(ConstantsAppColors.accent)
+                    .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("home.mealQuiet")
+                .accessibilityHint("Åbner alarmvisningen, hvor du kan afslutte Måltidsro.")
+            }
+        }
+        .task(id: period?.until) {
+            guard let until = period?.until else { return }
+            let delay = max(0, until.timeIntervalSinceNow)
+            do { try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) }
+            catch { return }
+            guard !Task.isCancelled else { return }
+            observedExpiry = until
+        }
+    }
+}
+
 /// Compact pump status displayed beside the current glucose reading.
 struct RootHomePumpView: View {
     let state: RootHomePumpState

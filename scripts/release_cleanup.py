@@ -138,7 +138,13 @@ def disposable(relative):
         return False
     if parts[0] in CACHE_DIRS:
         return True
-    return parts[:2] == ("Build", "Intermediates.noindex") and relative.suffix in OBJECT_SUFFIXES
+    if parts[:2] != ("Build", "Intermediates.noindex"):
+        return False
+    # Xcode also leaves generated debug libraries beside intermediate objects.
+    # Keep other dylibs and all protected bundles/evidence under the rules above.
+    debug_library = (len(parts) >= 7 and parts[-4] == "Objects-normal"
+                     and parts[-2] == "Binary" and relative.name.endswith(".debug.dylib"))
+    return relative.suffix in OBJECT_SUFFIXES or debug_library
 
 def scan_derived(dd):
     require(dd.is_dir() and not dd.is_symlink(), "Unknown DerivedData root")

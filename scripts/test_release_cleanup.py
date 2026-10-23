@@ -110,6 +110,106 @@ class CleanupTests(unittest.TestCase):
         self.assertEqual(result["gitBefore"],result["gitAfter"])
         self.assertEqual(self.git("rev-parse","HEAD").strip(),self.head)
 
+    def debug_library(self, release=None, instance="test/DerivedData/all-tests"):
+        path = (release or self.old) / instance / (
+            "Build/Intermediates.noindex/xdrip.build/Debug-iphonesimulator/"
+            "xdrip.build/Objects-normal/arm64/Binary/xdrip.debug.dylib")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"generated debug library")
+        return path
+
+    def test_debug_library_cleanup_preserves_evidence_and_protected_releases(self):
+        library = self.debug_library()
+        self.debug_library(self.previous)
+        self.debug_library(self.current)
+        newer = self.make_release("102")
+        self.debug_library(newer)
+        protected = {r: self.manifest(r) for r in (self.previous, self.current, newer)}
+        before = self.manifest(self.old)
+        dry = c.cleanup(self.root, self.client)
+        planned = {f["path"] for row in dry["candidates"] for f in row["files"]}
+        self.assertIn(str(library), planned)
+        self.assertEqual(self.manifest(self.old), before)
+        result = c.cleanup(self.root, self.client, True)
+        self.assertEqual(result["deletedFiles"], 5)
+        self.assertFalse(library.exists())
+        for release, manifest in protected.items():
+            self.assertEqual(self.manifest(release), manifest)
+        self.assertEqual(result["retainedBefore"], result["retainedAfter"])
+        self.assertEqual(result["gitBefore"], result["gitAfter"])
+        self.assertEqual(c.cleanup(self.root, self.client, True)["deletedFiles"], 0)
+
+    def test_debug_library_rule_is_limited_to_generated_intermediate_binary(self):
+        prefix = "Build/Intermediates.noindex/xdrip.build/Debug/xdrip.build/"
+        for arch in ("arm64", "x86_64", "arm64_32"):
+            with self.subTest(arch=arch):
+                self.assertTrue(c.disposable(Path(
+                    prefix + "Objects-normal/" + arch + "/Binary/xdrip.debug.dylib")))
+        for relative in (
+            prefix + "Objects-normal/arm64/Binary/vendor.dylib",
+            prefix + "Objects-normal/arm64/Binary/xdrip.debug.dylib.backup",
+            prefix + "Objects-normal/arm64/xdrip.debug.dylib",
+            prefix + "Other/arm64/Binary/xdrip.debug.dylib",
+            "Objects-normal/arm64/Binary/xdrip.debug.dylib",
+            "Build/Intermediates.noindex/xdrip.debug.dylib",
+            prefix + "app.dSYM/Objects-normal/arm64/Binary/xdrip.debug.dylib",
+            prefix + "app.app/Objects-normal/arm64/Binary/xdrip.debug.dylib",
+            prefix + "vendor.framework/Objects-normal/arm64/Binary/xdrip.debug.dylib",
+            prefix + "SourcePackages/Objects-normal/arm64/Binary/xdrip.debug.dylib",
+            prefix + "Logs/Objects-normal/arm64/Binary/xdrip.debug.dylib",
+            prefix + "BuildProductsPath/Objects-normal/arm64/Binary/xdrip.debug.dylib",
+        ):
+            with self.subTest(path=relative):
+                self.assertFalse(c.disposable(Path(relative)))
+
+    def test_debug_library_incomplete_and_unregistered_releases_are_preserved(self):
+        library = self.debug_library()
+        unknown = self.debug_library(self.root / "build/unregistered")
+        path = self.old / "release-state.json"
+        state = json.loads(path.read_text())
+        self.write(path, dict(state, step="tagged"))
+        self.assertEqual(c.cleanup(self.root, self.client, True)["deletedFiles"], 0)
+        self.assertTrue(library.exists())
+        self.assertTrue(unknown.exists())
+        self.write(path, state)
+        (self.old / "build/export/xdrip.ipa").write_bytes(b"changed IPA")
+        self.assertEqual(c.cleanup(self.root, self.client, True)["deletedFiles"], 0)
+        self.assertTrue(library.exists())
+
+    def test_debug_library_links_are_rejected(self):
+        library = self.debug_library()
+        source = self.root / "source.swift"
+        library.unlink()
+        library.symlink_to(source)
+        self.assertEqual(c.cleanup(self.root, self.client, True)["deletedFiles"], 0)
+        library.unlink()
+        os.link(source, library)
+        self.assertEqual(c.cleanup(self.root, self.client, True)["deletedFiles"], 0)
+        self.assertEqual(source.read_text(), "source")
+
+    def test_debug_library_obeys_open_file_and_changed_file_guards(self):
+        library = self.debug_library()
+        with mock.patch.object(c, "ensure_unopened", side_effect=c.CleanupBlocked("open")):
+            with self.assertRaises(c.CleanupBlocked):
+                c.cleanup(self.root, self.client, True)
+        self.assertTrue(library.exists())
+        item = {"path": str(library), "fingerprint": c.fingerprint(library)}
+        library.write_bytes(b"recompiled debug library")
+        with self.assertRaises(c.CleanupBlocked):
+            c.safe_unlink(item)
+        self.assertTrue(library.exists())
+
+    def test_debug_library_in_approved_external_signing_output_is_reclaimed(self):
+        library = self.debug_library(instance="build/DerivedData/archive")
+        relative = library.relative_to(self.old / "build")
+        external = self.external_signing()
+        result = c.cleanup(self.root, self.client, True)
+        self.assertEqual(result["deletedFiles"], 5)
+        self.assertFalse((external / relative).exists())
+        self.assertTrue((external / "archive/xdrip.xcarchive/dSYMs").is_dir())
+        self.assertTrue((external / "export/xdrip.ipa").is_file())
+        self.assertEqual(result["retainedBefore"], result["retainedAfter"])
+
     def test_latest_previous_verified_build_is_complete_and_untouched(self):
         before = self.manifest(self.previous)
         result = c.cleanup(self.root, self.client, True)

@@ -204,6 +204,10 @@ ikke kravene til IPA, arkiv, testresultater eller verificeret release-status.
 Der slettes kun navngivne, gendannelige filer fra **ældre afsluttede** builds,
 aldrig hele DerivedData: compiler-/SDK-moduler, indeks- og compilercache samt
 objekt-, dependency- og Swift-modulfiler under `Build/Intermediates.noindex`.
+Det omfatter også genererede `*.debug.dylib` præcis under
+`Objects-normal/<arkitektur>/Binary/` i dette mellemproduktområde. Andre
+biblioteker og beskyttede bundles/artefakter omfattes ikke af denne udvidelse.
+Den aktuelle og den seneste tidligere verificerede release bevares i fuld form.
 Desuden må genererede filer under `Build/Products` ryddes, mens kilde-, log-,
 JSON-, plist-, database- og releaseartefakter bevares. Udvidede kopier af en IPA
 under `build/export-verification` eller `verify/ipa-*` må kun ryddes, hvis hver

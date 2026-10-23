@@ -1,3 +1,30 @@
+## Måltidsro direkte på iPhone Home — 23. oktober 2026
+
+Den almindelige iPhone-forside viser nu en diskret “Måltidsro til [tid]”,
+kun mens den eksisterende gemte periode er aktiv. Tryk åbner den samme
+alarm-/snoozevisning som den eksisterende alarmknap, inklusive “Afslut”.
+Der er ingen ny start-/stopregel, alarmdæmpning, dosisberegning eller behandling.
+En planlagt eller afvist periode vises ikke som aktiv.
+
+Den lille visning observerer selv den eksisterende manager. Et enkelt
+annullerbart venteforløb til det faste udløb skjuler status uden at vente på
+nye målinger; der tilføjes ingen periodisk timer eller graf-/databaseopslag.
+Status har mindst 44 points trykhøjde og tekst, der kan ombrydes. Den er
+begrænset til almindelig iPhone Home; Clock Mode, iPad og Watch bevares.
+Sensorens eksisterende advarselsbanner beholder sin plads og handling.
+
+De tidligere gennemgåede lokale oprydningsændringer fra 22. oktober bevares
+og indgår i samme release-checkpoint. De to nye monterede SwiftUI-tests bestod:
+aktiv/deaktiveret/afventende/afsluttet status, mindst 44 points trykhøjde og
+udløb uden ny manager-publicering, persistence eller behandlingsændringer.
+Statuskomponenten er kontrolleret på faktiske simulatorrenderinger med
+syntetiske data, 320 points bredde samt normal og største systemtekst.
+Dette er en komponentkontrol, ikke en fysisk ende-til-ende-test af Home.
+Testresultater og billeder: `~/DeveloperBuildData/xDrip/local-runs/xdripswift/20261023-mealquiet-home-deadline/`.
+De fulde release-resultater tilføjes efter faktisk validering.
+Den læsende enhedskontrol fandt fysisk iPhone og Watch utilgængelige;
+der er ikke installeret eller ændret noget på dem.
+
 <!-- testflight-7.1.1-4350:start -->
 ### TestFlight 7.1.1 (4350)
 
@@ -7,6 +34,39 @@
 - Eksisterende intern gruppe: Ole Internal er bekræftet tilknyttet.
 - Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
 <!-- testflight-7.1.1-4350:end -->
+
+## Selektiv oprydning af gamle debug-biblioteker — 22. oktober 2026
+
+Den automatiske release-oprydning omfatter nu også Xcodes genererede
+`*.debug.dylib` under `Build/Intermediates.noindex/.../Objects-normal/<arkitektur>/Binary/`.
+Disse filer lå tidligere uden for den tilladte liste og ophobede sig efter
+færdige releases. Andre biblioteker, beskyttede bundles, kildekode, logs og
+release-/testartefakter er fortsat udeladt. Ingen ændring af appkode,
+buildnummer eller TestFlight-version; den aktuelle udgivelse er stadig 4350.
+
+Seks nye syntetiske regressionstests genskabte den manglende oprydning før
+rettelsen og kontrollerer afgrænsning, dry-run, sletning, gentagelse, bevaring
+af nuværende/foregående/nyere builds, uafsluttede og uregistrerede mapper,
+ændret IPA, links, åbne/ændrede filer og godkendt eksternt signeringsoutput.
+`scripts/local-build.sh python` bestod alle kontroller: **198 Python-tests**,
+heraf **54 oprydningstests**, samt Watch-verifikationsværktøjernes selvkontroller.
+Logs: `~/DeveloperBuildData/xDrip/local-runs/xdripswift/20261022T045755Z-44292/`.
+Der er ikke kørt nye XCTest- eller appbuilds for denne rene oprydningsændring.
+
+Den faktiske `cleanup --apply` gennemførte alle eksisterende Apple-, låse-,
+proces-, åben-fil-, tag- og arkivkontroller og slettede **1.062 filer** med
+**14.968.188.928 allokerede bytes**. Ledig diskplads steg under kørslen med
+**14.962.180.096 bytes** (cirka 15 GB). Sletningsjournalen indeholder kun de
+nye, afgrænsede debug-biblioteker. Alle slettede stier er efterkontrolleret
+som fraværende. Før/efter-kontrollen bekræfter uændret Git/HEAD/index/refs
+og uændret metadatafingerprint for alle bevarede releasefiler, inklusive hele
+build 4349 og 4350. Ingen historiske checkouts, signeringsnøgler, helbredsdata,
+IPA, XCArchive/dSYM eller XCResult er slettet.
+Rapport og journal ligger uden for Git:
+`build/release-automation/cleanup/20261022T050237.829635Z/`.
+De opmålte buildområder faldt fra 93,81 til 78,85 GB. Resterende beskyttede
+arkiver, testmateriale, delte caches og uklassificerede filer er bevaret;
+15-GiB-målet er derfor fortsat ikke nået. Ingen upload er foretaget.
 
 De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
 
