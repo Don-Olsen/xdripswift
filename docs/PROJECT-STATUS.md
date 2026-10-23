@@ -33,7 +33,21 @@ Statuskomponenten er kontrolleret på faktiske simulatorrenderinger med
 syntetiske data, 320 points bredde samt normal og største systemtekst.
 Dette er en komponentkontrol, ikke en fysisk ende-til-ende-test af Home.
 Testresultater og billeder: `~/DeveloperBuildData/xDrip/local-runs/xdripswift/20261023-mealquiet-home-deadline/`.
-De fulde release-resultater tilføjes efter faktisk validering.
+Det præcise 4351-checkpoint bestod **1.850/1.850 XCTest** (ingen fejl eller
+skipped), **198 Python-tests**, Watch-værktøjernes syntetiske selvkontroller
+og alle otte krævede Watch/Libre-regressionssuiter. Begge simulatorbuilds og
+unsigned Release iPhoneOS/**arm64** bestod; det faktiske CFBundleVersion er
+4351. Kvitteringer og logs findes i `build/testflight-7.1.1-4351/test/`, inklusive
+`results/iphoneos-unsigned.json`. Det tagbyggede arkiv og den faktiske IPA
+bestod kontrol af source-stempel, alle fem bundles, signaturer, profiler,
+entitlements og Watch-indlejring. Apple bekræftede `VALID`, `INTERNAL_ONLY`,
+`IN_BETA_TESTING` samt den eksisterende **Ole Internal**-relation.
+
+Den automatiske oprydning efter udgivelsen gennemførte alle beskyttelsestjek
+og fjernede 31.081 gendannelige filer fra ældre builds, i alt
+4.952.027.136 allokerede bytes (cirka 5 GB). Den aktuelle release og de
+beskyttede kilde-, release- og testartefakter blev bevaret. Rapport:
+`build/release-automation/cleanup/20261023T061818.045085Z/report.json`.
 Den læsende enhedskontrol fandt fysisk iPhone og Watch utilgængelige;
 der er ikke installeret eller ændret noget på dem.
 
