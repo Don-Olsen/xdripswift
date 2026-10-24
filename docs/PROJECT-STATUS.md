@@ -44,8 +44,38 @@ kilder verificeret med SHA-256 før release. Billeder/manifest findes uden for
 Git i `~/DeveloperBuildData/xDrip/diagnostics/watch-calculator-20261024/`.
 Indledende XCTest-artefakter findes i
 `~/DeveloperBuildData/xDrip/local-runs/xdripswift/20261024T125621Z-80346/`.
-Det endelige release-checkpoint skal bestå hele den normale validering;
-resultater og Apple-status registreres særskilt i releasejournalen.
+Det præcise 4352-checkpoint (`72c30604`) bestod **1.854/1.854 XCTest**
+(ingen fejl eller skipped), **198 Python-tests**, alle otte krævede
+Watch/Libre-suiter og Watch-værktøjernes 30 + 24 syntetiske selvkontroller.
+Begge simulatorbuilds og unsigned Release iPhoneOS/**arm64** bestod.
+Den faktiske versionsfil og unsigned app er verificeret som 7.1.1 (4352).
+Testkvitteringer findes i `build/testflight-7.1.1-4352/test/`, herunder
+`results/iphoneos-unsigned.json`. Første release-testforsøg fandt en manglende
+`self` i den nye billedtests rekursive hjælpefunktion; dette blev rettet,
+og hele release-kontrollen blev gentaget. Den fejlede kørsel er bevaret i
+`test/failed-attempts/20261024-first-compile/`. Første unsigned-kommando
+påtvang utilsigtet Watch-targetet iOS SDK; kommandoen blev rettet til det
+samme destinationsvalg som den tidligere release. Ingen produktionskode
+blev ændret på grund af denne kommandofejl; første log er bevaret.
+
+De endelige renderinger er kontrolleret efter den adaptive ændring af
+beregnerens bundområde. Ved stor tekst kan status og Log rulles frem samlet;
+ved normal tekst ligger de fast nederst. 14 syntetiske iPhone-/Settings-/Home-
+billeder og manifest er bevaret uden for Git i
+`~/DeveloperBuildData/xDrip/diagnostics/visual-4352-20261024/`.
+Watch-fixturen blev efter kontrol fjernet, og begge delte simulatorprodukter
+blev genbygget fra produktionskoden uden fixture-symboler før release.
+Ingen skærmbilleder, helbredsdata eller buildprodukter er tilføjet Git.
+Fysisk betjening, softwaretastatur/VoiceOver og ændringer på brugerens Watch
+står fortsat som ikke verificeret. Ingen hastigheds- eller batterigevinst er målt.
+
+Det tagbyggede arkiv og den faktiske IPA bestod kilde-, versions-, signatur-,
+profil-, entitlement- og Watch-kontrol for alle fem bundles. Apple bekræftede
+`VALID`, `INTERNAL_ONLY`, `IN_BETA_TESTING` og den eksisterende **Ole Internal**-
+relation. Den automatiske oprydning afsluttede med 31.074 gamle cachefiler
+(4.944.605.184 allokerede bytes, ca. 4,60 GiB) fjernet. Aktuelt build 4352,
+release-/testbeviser og Git-tilstand blev bevaret; rapporten ligger i
+`build/release-automation/cleanup/20261024T134603.192188Z/`.
 
 Den læsende fysiske kontrol fandt en tilgængelig iPhone med 7.1.1 (4351),
 bundle `com.GFZ896KN66.xdripswift`; det fysiske Watch var utilgængeligt.
