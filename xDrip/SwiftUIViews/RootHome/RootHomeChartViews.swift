@@ -35,6 +35,7 @@ struct RootHomeForecastInformation: Identifiable {
 
 /// Only this compact control intercepts taps; the surrounding chart keeps its pan gesture.
 struct RootHomeForecastBadge: View {
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     let information: RootHomeForecastInformation
     let showInformation: () -> Void
 
@@ -46,7 +47,9 @@ struct RootHomeForecastBadge: View {
                         .fontWeight(.semibold)
                     if let status = information.status {
                         Text(status).foregroundStyle(ConstantsAppColors.secondaryText)
-                    } else {
+                    } else if !dynamicTypeSize.isAccessibilitySize {
+                        // Large accessibility text keeps this entry compact over the plot.
+                        // The same button opens every horizon value in the existing detail sheet.
                         ViewThatFits(in: .horizontal) {
                             HStack(spacing: 8) { forecastValues }
                             VStack(alignment: .leading, spacing: 2) { forecastValues }

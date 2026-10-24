@@ -359,10 +359,18 @@ private struct WatchManualTreatmentsView: View {
     }
 
     private func mealButton(_ icon: String, kind: String) -> some View {
-        Button(icon) { mealKindRaw = kind }
+        let isSelected = mealKindRaw == kind
+        return Button(icon) { mealKindRaw = kind }
             .buttonStyle(.bordered)
-            .tint(mealKindRaw == kind ? .orange : .gray)
+            .tint(isSelected ? .orange : .gray)
+            .overlay {
+                Capsule()
+                    .strokeBorder(isSelected ? Color.primary : .clear, lineWidth: 2)
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
+            }
             .accessibilityLabel(kind == "fast" ? "Hurtig mad" : kind == "slow" ? "Langsom mad" : "Normal mad")
+            .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
 
     private var calculationResult: some View {
@@ -392,8 +400,8 @@ private struct WatchManualTreatmentsView: View {
                 if result.unavailableReason == nil ||
                     (result.safetyRaw != nil && result.glucoseMeasuredAt != nil) {
                     if let glucose = result.glucoseMgdl, let measuredAt = result.glucoseMeasuredAt {
-                        let shown = watchState.isMgDl ? glucose : glucose / 18.01559
-                        Text("BG \(shown.formatted())\(trendArrow(result.glucoseTrendMgdl)) · \(max(0, Int(visibleNow.timeIntervalSince(measuredAt) / 60))) min")
+                        let shown = glucose.mgDlToMmolAndToString(mgDl: watchState.isMgDl)
+                        Text("BG \(shown) \(watchState.bgUnitString())\(trendArrow(result.glucoseTrendMgdl)) · \(max(0, Int(visibleNow.timeIntervalSince(measuredAt) / 60))) min")
                     }
                     Text("IOB \(result.iobUnits.formatted()) E · COB \(result.cobGrams.formatted()) g")
                 }

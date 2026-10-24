@@ -1,3 +1,47 @@
+## Afgrænset visuel finpudsning — 24. oktober 2026
+
+Fire eksisterende visninger er justeret uden ændringer i dosisberegning,
+lagring, alarmer, prognoser, modeldata eller Watch-kommunikation:
+
+- Beregnerens eksisterende beregningsstatus vises samlet med Log. Ved normal
+  tekst ligger de i bundområdet; ved store tilgængelighedsstørrelser ruller
+  de samlet med indholdet, så et fast område ikke dækker indtastningsfelterne.
+  Profil-/genforsøgshandlinger, advarsler og spærring under gemning bevares.
+- Begge almindelige Settings-menuvarianter ombryder lange valgte værdier
+  under titlen, når de ikke kan være på én linje. Symboler, farver, valg,
+  deaktivering og menuhandlinger bevares.
+- Home-prognosens overlay viser ved tilgængelighedsstørrelser en kompakt
+  indgang. Alle horisontværdier findes fortsat i det eksisterende informationsark;
+  prognosetype, enhed, status og betingelsen for planlagt mad bevares på grafen.
+- Watch-beregneren bruger den eksisterende glukoseformatter på resultatets
+  snapshot og viser enheden. Valgt madtype har en ramme samt VoiceOver-markering.
+
+Den indledende regressionskørsel bestod 712 tests. En ny test, der forsøgte at
+læse SwiftUI-status via in-process accessibility, blev erstattet med kontrol
+på de faktiske renderinger; ingen eksisterende sikkerhedstest er fjernet.
+De nye layoutkontroller omfatter smalle/brede indstillingsrækker og stor tekst.
+Der er faktiske syntetiske simulatorrenderinger af Settings ved 320/430/768 pt,
+Home-prognosen ved normal og stor tekst samt beregneren med ukendte data.
+Fokus i et felt er ikke alene bevis for synligt softwaretastatur, og de billeder
+skal ikke fremstilles som en fuld fysisk tastatur-/VoiceOver-test.
+
+Seks nye Watch-renderinger ved 40/49 mm viser valgt madtype og resultatets
+mg/dL/mmol/L. De brugte en midlertidig simulatorfixture uden sensor-, kø- eller
+registreringshandlinger; fixturekoden er fjernet og de oprindelige redigerede
+kilder verificeret med SHA-256 før release. Billeder/manifest findes uden for
+Git i `~/DeveloperBuildData/xDrip/diagnostics/watch-calculator-20261024/`.
+Indledende XCTest-artefakter findes i
+`~/DeveloperBuildData/xDrip/local-runs/xdripswift/20261024T125621Z-80346/`.
+Det endelige release-checkpoint skal bestå hele den normale validering;
+resultater og Apple-status registreres særskilt i releasejournalen.
+
+Den læsende fysiske kontrol fandt en tilgængelig iPhone med 7.1.1 (4351),
+bundle `com.GFZ896KN66.xdripswift`; det fysiske Watch var utilgængeligt.
+Ingen lokal installation eller ændring af enhederne er foretaget.
+Mac'en var låst under den indledende kontrol, så manuel simulatorbetjening
+kunne ikke gennemføres. Visningsændringerne er ikke fysisk verificeret, og
+hastigheds-/batterigevinst er ikke målt.
+
 <!-- testflight-7.1.1-4351:start -->
 ### TestFlight 7.1.1 (4351)
 

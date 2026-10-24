@@ -478,14 +478,18 @@ struct PenDoseCalculatorScreen: View {
                     if viewModel.reminderMealUUID == nil {
                         mealCard
                     }
-                    calculationStatus
+                    if dynamicTypeSize.isAccessibilitySize { logBar }
                 }
                 .padding()
                 .disabled(viewModel.isSaving)
             }
             .background(Color(.systemGroupedBackground))
             .scrollDismissesKeyboard(.interactively)
-            .safeAreaInset(edge: .bottom, spacing: 0) { logBar }
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                // At accessibility sizes the status and action scroll together, leaving
+                // room for the inputs instead of covering the screen with a fixed footer.
+                if !dynamicTypeSize.isAccessibilitySize { logBar }
+            }
             .navigationTitle("Bolusberegner")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -851,14 +855,14 @@ struct PenDoseCalculatorScreen: View {
 
     @ViewBuilder private var calculationStatus: some View {
         if !viewModel.profile.isConfirmed {
-            card {
+            VStack(alignment: .leading, spacing: 6) {
                 Label("Bekræft din doseringsprofil", systemImage: "exclamationmark.triangle.fill")
-                    .font(.headline).foregroundStyle(.orange)
+                    .foregroundStyle(.orange)
                 NavigationLink("Kontrollér profil") { PenDoseSettingsView() }
                     .buttonStyle(.bordered)
             }
         } else if let message = viewModel.statusMessage {
-            card {
+            VStack(alignment: .leading, spacing: 6) {
                 Label(message, systemImage: statusIcon)
                     .foregroundStyle(statusColor)
                 retryButton
@@ -868,7 +872,7 @@ struct PenDoseCalculatorScreen: View {
             if case .checked = safety {
                 EmptyView()
             } else {
-                card {
+                VStack(alignment: .leading, spacing: 6) {
                     Label(safetyMessage(safety), systemImage: statusIcon)
                         .foregroundStyle(statusColor)
                     if case .forecastUnchecked = safety { retryButton }
@@ -913,6 +917,11 @@ struct PenDoseCalculatorScreen: View {
 
     private var logBar: some View {
         VStack(spacing: 8) {
+            calculationStatus
+                .disabled(viewModel.isSaving)
+                .font(.footnote)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
             if let message = viewModel.logValidationMessage {
                 Text(message).font(.footnote).foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)

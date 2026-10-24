@@ -496,7 +496,7 @@ final class RootHomeInteractionTests: XCTestCase {
     }
 
     @MainActor
-    func testForecastBadgeWrapsValuesAndRetainsTouchHeightAtLargeText() {
+    func testForecastBadgeKeepsAccessibleEntryCompactAndRetainsTouchHeight() {
         let info = forecastVisualInformation()
         let regular = UIHostingController(rootView: RootHomeForecastBadge(
             information: info, showInformation: {}).frame(maxWidth: 265)
@@ -510,7 +510,9 @@ final class RootHomeInteractionTests: XCTestCase {
         XCTAssertLessThanOrEqual(regularSize.width, 265)
         XCTAssertLessThanOrEqual(accessibleSize.width, 265)
         XCTAssertGreaterThan(accessibleSize.height, regularSize.height,
-            "Large text must wrap rather than shrink or cut off the forecast values")
+            "The accessible heading must remain readable without shrinking")
+        XCTAssertLessThanOrEqual(accessibleSize.height, 120,
+            "The accessible entry must leave the graph visible; values remain in its detail sheet")
     }
 
     /// Synthetic presentation fixtures only; no user measurements or model are loaded.
@@ -520,6 +522,7 @@ final class RootHomeInteractionTests: XCTestCase {
         let start = now.addingTimeInterval(-3 * 3600)
         for (width, textSize, isMgDl) in [(320.0, DynamicTypeSize.large, false),
                                         (320.0, .accessibility3, false),
+                                        (320.0, .accessibility5, false),
                                         (430.0, .large, true)] {
             var state = GlucoseChartState.empty(startDate: start, endDate: now)
             state.bgReadingDates = (0...180).map { start.addingTimeInterval(Double($0) * 60) }
@@ -3226,5 +3229,183 @@ extension RootHomeInteractionTests {
         .environment(\.locale, Locale(identifier: "da_DK"))
         .environment(\.colorScheme, .dark)
         .environment(\.dynamicTypeSize, textSize)
+    }
+}
+
+
+extension RootHomeInteractionTests {
+    /// Mount the real screen: no treatment or dose is created by this presentation check.
+    @MainActor
+    func testRenderCalculatorStatusAtSmallWidthAndWithFocusedInput() async throws {
+        let sourceHarness = try HostedHomeCalculatorHarness()
+        defer { sourceHarness.finish() }
+        let defaults = UserDefaults.standard
+        let profileData = defaults.object(forKey: PenDoseProfile.storageKey)
+        defaults.removeObject(forKey: PenDoseProfile.storageKey)
+        defer { defaults.set(profileData, forKey: PenDoseProfile.storageKey) }
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }.first { $0.activationState == .foregroundActive })
+        let previous = scene.windows.first { $0.isKeyWindow }
+        let window = UIWindow(windowScene: scene)
+        window.frame = CGRect(x: 0, y: 0, width: 320, height: 680)
+        defer {
+            window.endEditing(true)
+            window.isHidden = true
+            window.rootViewController = nil
+            previous?.makeKey()
+        }
+        for size in [DynamicTypeSize.large, .accessibility3] {
+            let appeared = expectation(description: "Synthetic calculator appears at \(size)")
+            let screen = PenDoseCalculatorScreen(coreDataManager: sourceHarness.core,
+                onSave: { XCTFail("Visual check must not save") }, onCancel: {})
+                .environment(\.dynamicTypeSize, size)
+                .environment(\.colorScheme, .dark)
+                .onAppear { appeared.fulfill() }
+            let host = UIHostingController(rootView: screen)
+            window.rootViewController = host
+            window.makeKeyAndVisible()
+            await fulfillment(of: [appeared], timeout: 2)
+            try await Task.sleep(nanoseconds: 200_000_000)
+            host.view.layoutIfNeeded()
+            if size.isAccessibilitySize,
+               let scroll = calculatorScrollView(in: host.view) {
+                scroll.setContentOffset(CGPoint(x: 0,
+                    y: max(0, scroll.contentSize.height - scroll.bounds.height + scroll.adjustedContentInset.bottom)),
+                    animated: false)
+                try await Task.sleep(nanoseconds: 150_000_000)
+                host.view.layoutIfNeeded()
+            }
+            addCalculatorLayoutAttachment(host.view, name: "Synthetic calculator status \(size)")
+            if size == .large {
+                let insulin = try XCTUnwrap(calculatorTextFields(in: host.view)
+                    .first { $0.placeholder == "0,0" })
+                XCTAssertTrue(insulin.becomeFirstResponder())
+                try await Task.sleep(nanoseconds: 500_000_000)
+                host.view.layoutIfNeeded()
+                XCTAssertTrue(insulin.isFirstResponder)
+                addCalculatorLayoutAttachment(host.view, name: "Synthetic calculator status with focused insulin")
+                window.endEditing(true)
+            }
+            window.rootViewController = nil
+            await Task.yield()
+        }
+        XCTAssertTrue(try sourceHarness.core.mainManagedObjectContext.fetch(TreatmentEntry.fetchRequest()).isEmpty)
+        XCTAssertFalse(sourceHarness.core.mainManagedObjectContext.hasChanges)
+    }
+
+    @MainActor
+    private func calculatorScrollView(in view: UIView) -> UIScrollView? {
+        if let scroll = view as? UIScrollView { return scroll }
+        return view.subviews.lazy.compactMap { self.calculatorScrollView(in: $0) }.first
+    }
+
+    @MainActor
+    private func addCalculatorLayoutAttachment(_ view: UIView, name: String) {
+        let image = UIGraphicsImageRenderer(bounds: view.bounds).image { _ in
+            view.drawHierarchy(in: view.bounds, afterScreenUpdates: true)
+        }
+        let attachment = XCTAttachment(image: image)
+        attachment.name = name
+        attachment.lifetime = .keepAlways
+        add(attachment)
+    }
+}
+
+extension RootHomeInteractionTests {
+    @MainActor
+    func testAdaptiveMenuLabelsKeepShortValuesCompactAndWrapLongSelections() {
+        let short = SettingsMenuRowLabel(title: "Prognose", selectionTitle: "60 minutter")
+        let long = SettingsMenuRowLabel(title: "Blodsukkerprognose",
+            selectionTitle: "120 minutter (mere usikker)")
+        let compact = menuLabelSize(short, width: 320, textSize: .large)
+        let wide = menuLabelSize(long, width: 768, textSize: .large)
+        let narrow = menuLabelSize(long, width: 265, textSize: .large)
+        XCTAssertLessThanOrEqual(compact.height, 25)
+        XCTAssertEqual(wide.height, compact.height, accuracy: 1)
+        XCTAssertGreaterThan(narrow.height, wide.height + 15,
+            "The uncertainty qualifier needs another line instead of truncation or smaller type")
+        XCTAssertLessThanOrEqual(narrow.width, 265)
+    }
+
+    @MainActor
+    func testAdaptiveMenuLabelsSupportLargestTextSymbolsAndDisabledValues() {
+        for isEnabled in [true, false] {
+            let row = SettingsMenuRowLabel(title: "Baggrundsforbindelse",
+                selectionTitle: "Bluetooth fra en hjerteslagsenhed",
+                selectionSymbolName: "antenna.radiowaves.left.and.right", isEnabled: isEnabled)
+            let normal = menuLabelSize(row, width: 265, textSize: .large)
+            let accessible = menuLabelSize(row, width: 265, textSize: .accessibility5)
+            XCTAssertGreaterThan(accessible.height, normal.height + 20)
+            XCTAssertLessThanOrEqual(accessible.width, 265)
+            XCTAssertTrue(accessible.height.isFinite)
+        }
+    }
+
+    @MainActor
+    private func menuLabelSize<Content: View>(_ content: Content, width: CGFloat,
+                                              textSize: DynamicTypeSize) -> CGSize {
+        let host = UIHostingController(rootView: content.font(.body)
+            .environment(\.dynamicTypeSize, textSize))
+        return host.sizeThatFits(in: CGSize(width: width, height: 4000))
+    }
+
+    /// Exercise both real Menu branches in the Settings List, including disabled and symbol rows.
+    @MainActor
+    func testRenderAdaptiveNativeSettingsMenusWithoutSelectingValues() async throws {
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .first { $0.activationState == .foregroundActive })
+        let previousWindow = scene.windows.first { $0.isKeyWindow }
+        defer { previousWindow?.makeKey() }
+        var selectedIndexes: [Int] = []
+        let options = [SettingsMenuOption(title: "60 minutter", isSelected: false),
+            SettingsMenuOption(title: "120 minutter (mere usikker)", isSelected: true)]
+        let rows = [
+            SettingsRow(id: "synthetic.forecast", title: "Blodsukkerprognose",
+                control: .menu(options: { options }, selectOption: { selectedIndexes.append($0) })),
+            SettingsRow(id: "synthetic.selectionTitle", title: "Automatisk basal",
+                control: .menuWithSelectionTitle(options: { options },
+                    selectionTitle: { "Syntetisk lang valgt visning af automatisk basal" },
+                    selectOption: { selectedIndexes.append($0) }), keepsControlLabelOnSingleLine: true),
+            SettingsRow(id: "synthetic.symbol", title: "Baggrundsforbindelse", control: .menu(options: {
+                [SettingsMenuOption(title: "Bluetooth fra en hjerteslagsenhed",
+                    symbolName: "antenna.radiowaves.left.and.right", isSelected: true)]
+            }, selectOption: { selectedIndexes.append($0) }), isEnabled: false)
+        ]
+        for width in [320.0, 430.0, 768.0] {
+            for textSize in [DynamicTypeSize.large, .accessibility3] {
+                let model = SettingsListModel(sections: [SettingsSectionModel(id: 0) {
+                    SettingsSection(title: "Syntetiske visningsdata", rows: rows)
+                }])
+                let appeared = expectation(description: "Native Settings menus appear")
+                let content = NavigationStack {
+                    SettingsListView(listModel: model,
+                        presenter: SettingsActionPresenter(router: SettingsRouter()), title: "Syntetisk test")
+                }
+                .environment(\.dynamicTypeSize, textSize)
+                .environment(\.colorScheme, .dark)
+                .onAppear { appeared.fulfill() }
+                let host = UIHostingController(rootView: content)
+                let window = UIWindow(windowScene: scene)
+                window.frame = CGRect(x: 0, y: 0, width: width, height: 1200)
+                window.rootViewController = host
+                window.makeKeyAndVisible()
+                defer {
+                    window.isHidden = true
+                    window.rootViewController = nil
+                }
+                await fulfillment(of: [appeared], timeout: 2)
+                try await Task.sleep(nanoseconds: 150_000_000)
+                host.view.layoutIfNeeded()
+                let image = UIGraphicsImageRenderer(bounds: host.view.bounds).image { _ in
+                    XCTAssertTrue(host.view.drawHierarchy(in: host.view.bounds, afterScreenUpdates: true))
+                }
+                let attachment = XCTAttachment(image: image)
+                attachment.name = "Synthetic Settings menus \(Int(width))pt \(textSize)"
+                attachment.lifetime = .keepAlways
+                add(attachment)
+                XCTAssertTrue(selectedIndexes.isEmpty, "Presenting or resizing menus must not choose a value")
+            }
+        }
     }
 }

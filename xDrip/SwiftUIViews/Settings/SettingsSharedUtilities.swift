@@ -958,31 +958,14 @@ private struct SettingsNativeRowView: View {
                     }
                 }
             } label: {
-                HStack(spacing: 8) {
-                    Text(row.title)
-                        .foregroundStyle(row.titleColor ?? (row.isEnabled ? ConstantsAppColors.rowTitleText : ConstantsAppColors.disabledText))
-                        .lineLimit(2)
-                        .minimumScaleFactor(0.75)
-                    Spacer(minLength: 8)
-                    if let selectedOption = selectedMenuOption(options()), let symbolName = selectedOption.symbolName {
-                        HStack(spacing: 6) {
-                            Image(systemName: symbolName)
-                                .font(.callout)
-                                .foregroundStyle(row.isEnabled ? Color(.colorSecondary) : ConstantsAppColors.disabledText)
-                            Text(selectedOption.title)
-                                .foregroundStyle(row.isEnabled ? Color(.colorSecondary) : ConstantsAppColors.disabledText)
-                                .lineLimit(1)
-                        }
-                    } else {
-                        Text(selectedMenuTitle(options()))
-                            .foregroundStyle(row.isEnabled ? (row.detailColor ?? ConstantsAppColors.rowDetailText) : ConstantsAppColors.disabledText)
-                            .lineLimit(1)
-                    }
-                    Image(systemName: "chevron.up.chevron.down")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(row.isEnabled ? (row.detailColor ?? ConstantsAppColors.rowDetailText) : ConstantsAppColors.disabledText)
-                }
-                .contentShape(Rectangle())
+                SettingsMenuRowLabel(
+                    title: row.title,
+                    selectionTitle: selectedMenuTitle(options()),
+                    selectionSymbolName: selectedMenuOption(options())?.symbolName,
+                    isEnabled: row.isEnabled,
+                    titleColor: row.titleColor,
+                    detailColor: row.detailColor
+                )
             }
             .buttonStyle(.plain)
             .tint(options().contains { $0.symbolName != nil } ? Color(.colorSecondary) : nil)
@@ -1010,21 +993,13 @@ private struct SettingsNativeRowView: View {
                     }
                 }
             } label: {
-                HStack(spacing: 8) {
-                    Text(row.title)
-                        .foregroundStyle(row.titleColor ?? (row.isEnabled ? ConstantsAppColors.rowTitleText : ConstantsAppColors.disabledText))
-                        .lineLimit(row.keepsControlLabelOnSingleLine ? 1 : 2)
-                        .minimumScaleFactor(0.75)
-                        .allowsTightening(row.keepsControlLabelOnSingleLine)
-                    Spacer(minLength: 8)
-                    Text(selectionTitle())
-                        .foregroundStyle(row.isEnabled ? (row.detailColor ?? ConstantsAppColors.rowDetailText) : ConstantsAppColors.disabledText)
-                        .lineLimit(1)
-                    Image(systemName: "chevron.up.chevron.down")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(row.isEnabled ? (row.detailColor ?? ConstantsAppColors.rowDetailText) : ConstantsAppColors.disabledText)
-                }
-                .contentShape(Rectangle())
+                SettingsMenuRowLabel(
+                    title: row.title,
+                    selectionTitle: selectionTitle(),
+                    isEnabled: row.isEnabled,
+                    titleColor: row.titleColor,
+                    detailColor: row.detailColor
+                )
             }
             .buttonStyle(.plain)
             .disabled(!row.isEnabled)
@@ -1258,6 +1233,74 @@ extension SettingsViewModelProtocol {
         }
 
         return SettingsIndicator(color: color)
+    }
+}
+
+/// Keeps menu values readable without changing the menu's selection or action handling.
+struct SettingsMenuRowLabel: View {
+    let title: String
+    let selectionTitle: String
+    let selectionSymbolName: String?
+    let isEnabled: Bool
+    let titleColor: Color?
+    let detailColor: Color?
+
+    init(title: String, selectionTitle: String, selectionSymbolName: String? = nil,
+         isEnabled: Bool = true, titleColor: Color? = nil, detailColor: Color? = nil) {
+        self.title = title
+        self.selectionTitle = selectionTitle
+        self.selectionSymbolName = selectionSymbolName
+        self.isEnabled = isEnabled
+        self.titleColor = titleColor
+        self.detailColor = detailColor
+    }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 8) {
+                    titleContent.fixedSize(horizontal: true, vertical: true)
+                    Spacer(minLength: 8)
+                    selectionContent.fixedSize(horizontal: true, vertical: true)
+                }
+                VStack(alignment: .leading, spacing: 4) {
+                    titleContent
+                    selectionContent
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            Image(systemName: "chevron.up.chevron.down")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(isEnabled ? (detailColor ?? ConstantsAppColors.rowDetailText) : ConstantsAppColors.disabledText)
+                .fixedSize()
+        }
+        .contentShape(Rectangle())
+    }
+
+    private var titleContent: some View {
+        Text(title)
+            .lineLimit(nil)
+            .foregroundStyle(titleColor ?? (isEnabled ? ConstantsAppColors.rowTitleText : ConstantsAppColors.disabledText))
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private var selectionContent: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            if let selectionSymbolName {
+                Image(systemName: selectionSymbolName)
+                    .font(.callout)
+            }
+            Text(selectionTitle)
+                .lineLimit(nil)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .foregroundStyle(isEnabled
+            ? (selectionSymbolName == nil ? (detailColor ?? ConstantsAppColors.rowDetailText) : Color(.colorSecondary))
+            : ConstantsAppColors.disabledText)
+        .multilineTextAlignment(.leading)
     }
 }
 
