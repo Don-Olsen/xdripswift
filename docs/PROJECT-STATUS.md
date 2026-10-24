@@ -1,3 +1,15 @@
+<!-- testflight-7.1.1-4352:start -->
+### TestFlight 7.1.1 (4352)
+
+- Kildecommit og tag: `72c30604b7fb4ddf08945d730c3aaa60e6b42af4` / `testflight-7.1.1-4352`.
+- Tests: 1854/1854 bestået; 0 fejlet; 0 skipped. iPhone- og Watch-simulatorbuilds bestod.
+- Apple-status (2026-10-24T13:42:24.816321+00:00): [Internal / Testing](https://appstoreconnect.apple.com/apps/6795645396/testflight/ios/4d8d7eb1-c15a-42bc-9506-893c4cc942ec).
+- Eksisterende intern gruppe: Ole Internal er bekræftet tilknyttet.
+- Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
+<!-- testflight-7.1.1-4352:end -->
+
+De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
+
 ## Afgrænset visuel finpudsning — 24. oktober 2026
 
 Fire eksisterende visninger er justeret uden ændringer i dosisberegning,
