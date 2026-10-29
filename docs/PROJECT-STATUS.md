@@ -1,3 +1,15 @@
+<!-- testflight-7.1.1-4354:start -->
+### TestFlight 7.1.1 (4354)
+
+- Kildecommit og tag: `e6d6c930e8f76948555070c955e1de943f8977ba` / `testflight-7.1.1-4354`.
+- Tests: 1864/1864 bestået; 0 fejlet; 0 skipped. iPhone- og Watch-simulatorbuilds bestod.
+- Apple-status (2026-10-29T10:59:17.007856+00:00): [Internal / Testing](https://appstoreconnect.apple.com/apps/6795645396/testflight/ios/89850675-d76e-4def-8eee-e64880d74e4b).
+- Eksisterende intern gruppe: Ole Internal er bekræftet tilknyttet.
+- Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
+<!-- testflight-7.1.1-4354:end -->
+
+De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
+
 ## Genbrug af diagnostikkens målingskvitteringer — 29. oktober 2026
 
 `TransmitterReadSuccessEvidence` genbruger den senest afkodede kvitteringsliste,
