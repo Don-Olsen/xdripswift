@@ -23,15 +23,49 @@ og den eksisterende skrivning for hver ny kvittering bevares.
 Ti nye syntetiske regressionstests dækker afkodningsantal, cacheinvalidering,
 isolerede defaults, tidsgrænser, dubletter, kapacitet, ældre JSON, genindlæsning
 med tom cache samt fejlet kodning og efterfølgende genforsøg. Eksisterende tests
-er bevaret. De indledende 722 XCTest og 198 Python-tests bestod; den fulde
-releasekontrol køres igen på det endelige versionsmærkede Git-træ. Sensorbehandling, målingslagring, alarmer, dosering og brugerflade
-er ikke ændret. Optimeringen fjerner gentagen JSON-afkodning; den reducerer
-ikke antallet af vedvarende skrivninger. Hastighed og batteriforbrug er ikke
+er bevaret. De indledende 722 XCTest og 198 Python-tests bestod. Det endelige
+4354-checkpoint bestod **1.864/1.864 XCTest**, uden fejl eller skipped,
+**198 Python-tests**, alle otte krævede Watch/Libre-suiter og værktøjernes
+30 + 24 syntetiske selvkontroller. Begge simulatorbuilds og unsigned Release
+iPhoneOS/**arm64** bestod. Den faktiske unsigned app blev kontrolleret som
+7.1.1 (4354). Kvitteringer findes i `build/testflight-7.1.1-4354/test/`,
+inklusive `results/iphoneos-unsigned.json`. Sensorbehandling, målingslagring,
+alarmer, dosering og brugerflade er ikke ændret. Optimeringen fjerner gentagen
+JSON-afkodning; den reducerer ikke antallet af vedvarende skrivninger. Hastighed og batteriforbrug er ikke
 målt på fysisk iPhone/Watch. Den indledende testkvittering er bevaret i
 `~/DeveloperBuildData/xDrip/local-runs/xdripswift/20261029T061805Z-18645/`.
 Efter de beståede tests blev kun Xcodes ventende `simctl diagnose` afsluttet;
-testkommandoen og resultatkontrollen afsluttede derefter begge med exit 0. Den læsende enhedskontrol fandt begge fysiske
-enheder utilgængelige; ingen lokal installation er foretaget.
+testkommandoen og resultatkontrollen afsluttede derefter begge med exit 0.
+Den læsende enhedskontrol, også gentaget før upload, fandt både fysisk iPhone
+og Watch utilgængelige; ingen lokal installation er foretaget.
+
+Det første, færdigtestede 4353-arkiv blev bevaret efter en eksportblokering
+på Apples nye Program License Agreement. Efter brugerens personlige accept
+viste den friske Apple-kontrol en `AWAITING_UPLOAD`-reservation for 4353.
+Releaseproceduren valgte derfor automatisk **4354**, ændrede kun versionsfilen
+og gentog hele releasekontrollen på det nye træ. 4353 blev ikke uploadet;
+dets tag, tests og fejlede eksportartefakter er bevaret.
+
+Apples læsende opslag på eksisterende builds gav under genoptagelsen
+HTTP 404 og 500. Konkrete 404-opslag gav efterfølgende gyldige svar ved samme
+URL. En midlertidig, testet driftswrapper uden for Git tillod højst tre forsøg
+på præcis disse fejl for samme `GET /v1/builds/<UUID>/buildBetaDetail` uden
+body eller query. Ti syntetiske kontroller bestod. Andre fejl og alle skrivninger,
+herunder upload, beholdt deres oprindelige adfærd. Alle eksisterende identitets-,
+paginerings-, allokerings-, låse-, signatur- og uploadkontroller blev bevaret;
+ingen manglende Apple-svar blev erstattet med antagelser. Wrapper, hash,
+testkvittering og fejlspor er lokale artefakter under 4353/4354-buildmapperne.
+Dette var en afgrænset driftsmæssig genoptagelse, ikke en appændring.
+
+Det tagbyggede 4354-arkiv og den faktisk eksporterede IPA bestod kontrol af
+kildecommit, alle fem bundles, signaturer, profiler, entitlements, version/build
+og Watch-indlejring. Apple bekræftede `VALID`, `INTERNAL_ONLY`,
+`IN_BETA_TESTING` og den eksisterende **Ole Internal**-relation. Tagget forbliver
+på `e6d6c930e8f76948555070c955e1de943f8977ba`; dokumentationscommits er separate.
+Den automatiske selektive oprydning afsluttede med **31.077** fjernede
+cachefiler, **4.950.089.728 allokerede bytes** (ca. 4,61 GiB). Aktuelt build,
+forrige beskyttede release, kildekode, historiske/fejlede forsøg og testbeviser
+blev bevaret. Rapport: `build/release-automation/cleanup/20261029T110507.428060Z/`.
 
 <!-- testflight-7.1.1-4352:start -->
 ### TestFlight 7.1.1 (4352)
