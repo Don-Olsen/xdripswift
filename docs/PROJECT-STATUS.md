@@ -1,3 +1,26 @@
+## Genbrug af diagnostikkens målingskvitteringer — 29. oktober 2026
+
+`TransmitterReadSuccessEvidence` genbruger den senest afkodede kvitteringsliste,
+når de faktisk gemte UserDefaults-bytes er uændrede. En enkelt låst cache
+omfatter hele den gemte liste; 24-timersfilteret anvendes fortsat ved hvert
+opslag. Erstatning, sletning, nulstilling eller beskadigelse af data kan derfor
+ikke genbruge forældet indhold. Efter en vellykket kodning og skrivning opdateres
+cachen direkte. Lagringsnøgle/JSON-format, 4.000-postersgrænse, dubletidentitet
+og den eksisterende skrivning for hver ny kvittering bevares.
+
+Ti nye syntetiske regressionstests dækker afkodningsantal, cacheinvalidering,
+isolerede defaults, tidsgrænser, dubletter, kapacitet, ældre JSON, genindlæsning
+med tom cache samt fejlet kodning og efterfølgende genforsøg. Eksisterende tests
+er bevaret. De indledende 722 XCTest og 198 Python-tests bestod; den fulde
+releasekontrol køres igen på det endelige versionsmærkede Git-træ. Sensorbehandling, målingslagring, alarmer, dosering og brugerflade
+er ikke ændret. Optimeringen fjerner gentagen JSON-afkodning; den reducerer
+ikke antallet af vedvarende skrivninger. Hastighed og batteriforbrug er ikke
+målt på fysisk iPhone/Watch. Den indledende testkvittering er bevaret i
+`~/DeveloperBuildData/xDrip/local-runs/xdripswift/20261029T061805Z-18645/`.
+Efter de beståede tests blev kun Xcodes ventende `simctl diagnose` afsluttet;
+testkommandoen og resultatkontrollen afsluttede derefter begge med exit 0. Den læsende enhedskontrol fandt begge fysiske
+enheder utilgængelige; ingen lokal installation er foretaget.
+
 <!-- testflight-7.1.1-4352:start -->
 ### TestFlight 7.1.1 (4352)
 

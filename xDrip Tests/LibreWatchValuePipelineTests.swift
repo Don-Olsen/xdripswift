@@ -939,6 +939,233 @@ extension LibreWatchValuePipelineTests {
 }
 
 extension LibreWatchValuePipelineTests {
+    private var readSuccessReceiptKey: String { "transmitterReadSuccess.receipts.v1" }
+
+    private func readSuccessReceipt(_ id: String, sensorID: String = "sensor", measuredAt: Date,
+                                    storedAt: Date? = nil, fromWatch: Bool = false,
+                                    historical: Bool = false) -> TransmitterReadSuccessReceipt {
+        TransmitterReadSuccessReceipt(id: id, sensorID: sensorID, measuredAt: measuredAt,
+            storedAt: storedAt ?? measuredAt, fromWatch: fromWatch, historical: historical)
+    }
+
+    private func readSuccessDefaults() throws -> (UserDefaults, String) {
+        let suite = "ReadSuccessReceiptCacheTests-" + UUID().uuidString
+        return (try XCTUnwrap(UserDefaults(suiteName: suite)), suite)
+    }
+
+    private func assertReadSuccessReceipts(_ actual: [TransmitterReadSuccessReceipt],
+                                          _ expected: [TransmitterReadSuccessReceipt],
+                                          file: StaticString = #filePath, line: UInt = #line) {
+        XCTAssertEqual(actual.map(\.id), expected.map(\.id), file: file, line: line)
+        XCTAssertEqual(actual.map(\.sensorID), expected.map(\.sensorID), file: file, line: line)
+        XCTAssertEqual(actual.map(\.measuredAt), expected.map(\.measuredAt), file: file, line: line)
+        XCTAssertEqual(actual.map(\.storedAt), expected.map(\.storedAt), file: file, line: line)
+        XCTAssertEqual(actual.map(\.fromWatch), expected.map(\.fromWatch), file: file, line: line)
+        XCTAssertEqual(actual.map(\.historical), expected.map(\.historical), file: file, line: line)
+    }
+
+    func testReadSuccessReceiptCacheDecodesUnchangedPersistedDataOnlyOnce() throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let records = [readSuccessReceipt("reading", measuredAt: now, fromWatch: true)]
+        let data = try JSONEncoder().encode(records)
+        var cache = TransmitterReadSuccessEvidence.ReceiptCache()
+        var decodeCount = 0
+        let decode: (Data) throws -> [TransmitterReadSuccessReceipt] = {
+            decodeCount += 1
+            return try JSONDecoder().decode([TransmitterReadSuccessReceipt].self, from: $0)
+        }
+        for _ in 0..<3 {
+            assertReadSuccessReceipts(cache.load(Data(data), decode: decode), records)
+        }
+        XCTAssertEqual(decodeCount, 1)
+    }
+
+    func testReadSuccessReceiptCacheSeededByWriteAvoidsDecode() throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let records = [readSuccessReceipt("stored", measuredAt: now, historical: true)]
+        let data = try JSONEncoder().encode(records)
+        var cache = TransmitterReadSuccessEvidence.ReceiptCache()
+        cache.store(records, encoded: data)
+        var decodeCount = 0
+        let loaded = cache.load(data) {
+            decodeCount += 1
+            return try JSONDecoder().decode([TransmitterReadSuccessReceipt].self, from: $0)
+        }
+        assertReadSuccessReceipts(loaded, records)
+        XCTAssertEqual(decodeCount, 0)
+    }
+
+    func testReadSuccessReceiptCacheInvalidatesChangedMissingAndCorruptData() throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let first = [readSuccessReceipt("first", measuredAt: now)]
+        let second = [readSuccessReceipt("second", measuredAt: now, fromWatch: true)]
+        let firstData = try JSONEncoder().encode(first)
+        let secondData = try JSONEncoder().encode(second)
+        let corruptData = Data("not receipt JSON".utf8)
+        var cache = TransmitterReadSuccessEvidence.ReceiptCache()
+        var decodeCount = 0
+        let decode: (Data) throws -> [TransmitterReadSuccessReceipt] = {
+            decodeCount += 1
+            return try JSONDecoder().decode([TransmitterReadSuccessReceipt].self, from: $0)
+        }
+        assertReadSuccessReceipts(cache.load(firstData, decode: decode), first)
+        assertReadSuccessReceipts(cache.load(secondData, decode: decode), second)
+        assertReadSuccessReceipts(cache.load(secondData, decode: decode), second)
+        XCTAssertEqual(decodeCount, 2)
+        XCTAssertTrue(cache.load(nil, decode: decode).isEmpty)
+        XCTAssertEqual(decodeCount, 2)
+        assertReadSuccessReceipts(cache.load(secondData, decode: decode), second)
+        XCTAssertEqual(decodeCount, 3, "Missing defaults must discard the previous entry")
+        XCTAssertTrue(cache.load(corruptData, decode: decode).isEmpty)
+        XCTAssertTrue(cache.load(corruptData, decode: decode).isEmpty)
+        XCTAssertEqual(decodeCount, 5, "Failed decoding must not become a cached success")
+        assertReadSuccessReceipts(cache.load(secondData, decode: decode), second)
+        XCTAssertEqual(decodeCount, 6, "Valid data must recover after a corrupt replacement")
+    }
+
+    func testReadSuccessReceiptsObserveSameSuiteReplacementRemovalAndReset() throws {
+        let (defaults, suite) = try readSuccessDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let otherInstance = try XCTUnwrap(UserDefaults(suiteName: suite))
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let first = readSuccessReceipt("first", measuredAt: now)
+        let replacement = readSuccessReceipt("replacement", measuredAt: now, historical: true)
+        TransmitterReadSuccessEvidence.record(first, defaults: defaults)
+        assertReadSuccessReceipts(TransmitterReadSuccessEvidence.receipts(at: now, defaults: otherInstance), [first])
+        otherInstance.set(try JSONEncoder().encode([replacement]), forKey: readSuccessReceiptKey)
+        assertReadSuccessReceipts(TransmitterReadSuccessEvidence.receipts(at: now, defaults: defaults), [replacement])
+        otherInstance.removeObject(forKey: readSuccessReceiptKey)
+        XCTAssertTrue(TransmitterReadSuccessEvidence.receipts(at: now, defaults: defaults).isEmpty)
+        TransmitterReadSuccessEvidence.record(first, defaults: otherInstance)
+        assertReadSuccessReceipts(TransmitterReadSuccessEvidence.receipts(at: now, defaults: defaults), [first])
+        defaults.removePersistentDomain(forName: suite)
+        XCTAssertTrue(TransmitterReadSuccessEvidence.receipts(at: now, defaults: otherInstance).isEmpty)
+    }
+
+    func testReadSuccessReceiptsRemainIsolatedAcrossDefaultsSuites() throws {
+        let (firstDefaults, firstSuite) = try readSuccessDefaults()
+        let (secondDefaults, secondSuite) = try readSuccessDefaults()
+        defer {
+            firstDefaults.removePersistentDomain(forName: firstSuite)
+            secondDefaults.removePersistentDomain(forName: secondSuite)
+        }
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let first = readSuccessReceipt("first-suite", measuredAt: now)
+        let second = readSuccessReceipt("second-suite", measuredAt: now, fromWatch: true)
+        TransmitterReadSuccessEvidence.record(first, defaults: firstDefaults)
+        XCTAssertTrue(TransmitterReadSuccessEvidence.receipts(at: now, defaults: secondDefaults).isEmpty)
+        TransmitterReadSuccessEvidence.record(second, defaults: secondDefaults)
+        assertReadSuccessReceipts(TransmitterReadSuccessEvidence.receipts(at: now, defaults: firstDefaults), [first])
+        assertReadSuccessReceipts(TransmitterReadSuccessEvidence.receipts(at: now, defaults: secondDefaults), [second])
+        assertReadSuccessReceipts(TransmitterReadSuccessEvidence.receipts(at: now, defaults: firstDefaults), [first])
+    }
+
+    func testReadSuccessReceiptsFilterBoundariesWithoutPruningStoredHistory() throws {
+        let (defaults, suite) = try readSuccessDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let old = readSuccessReceipt("just-too-old", measuredAt: now.addingTimeInterval(-86_401))
+        let boundary = readSuccessReceipt("exactly-24-hours", measuredAt: now.addingTimeInterval(-86_400))
+        let inside = readSuccessReceipt("inside", measuredAt: now.addingTimeInterval(-60))
+        let current = readSuccessReceipt("current", measuredAt: now)
+        let future = readSuccessReceipt("future", measuredAt: now.addingTimeInterval(1))
+        let data = try JSONEncoder().encode([old, boundary, inside, current, future])
+        defaults.set(data, forKey: readSuccessReceiptKey)
+        assertReadSuccessReceipts(TransmitterReadSuccessEvidence.receipts(at: now, defaults: defaults),
+            [boundary, inside, current])
+        assertReadSuccessReceipts(TransmitterReadSuccessEvidence.receipts(at: now.addingTimeInterval(1), defaults: defaults),
+            [inside, current, future])
+        assertReadSuccessReceipts(TransmitterReadSuccessEvidence.receipts(at: now.addingTimeInterval(-2), defaults: defaults),
+            [old, boundary, inside])
+        assertReadSuccessReceipts(TransmitterReadSuccessEvidence.receipts(at: now, defaults: defaults),
+            [boundary, inside, current])
+        XCTAssertEqual(defaults.data(forKey: readSuccessReceiptKey), data, "Reads must leave persisted evidence intact")
+    }
+
+    func testReadSuccessReceiptsPreserveFirstDuplicateButAllowSameIDOnAnotherSensor() throws {
+        let (defaults, suite) = try readSuccessDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let first = readSuccessReceipt("same-id", sensorID: "first-sensor", measuredAt: now.addingTimeInterval(-60),
+            storedAt: now.addingTimeInterval(-30), fromWatch: true, historical: true)
+        let duplicate = readSuccessReceipt("same-id", sensorID: "first-sensor", measuredAt: now.addingTimeInterval(-20),
+            storedAt: now, fromWatch: false, historical: false)
+        let otherSensor = readSuccessReceipt("same-id", sensorID: "second-sensor", measuredAt: now)
+        TransmitterReadSuccessEvidence.record(first, defaults: defaults)
+        let firstData = try XCTUnwrap(defaults.data(forKey: readSuccessReceiptKey))
+        TransmitterReadSuccessEvidence.record(duplicate, defaults: defaults)
+        XCTAssertEqual(defaults.data(forKey: readSuccessReceiptKey), firstData)
+        assertReadSuccessReceipts(TransmitterReadSuccessEvidence.receipts(at: now, defaults: defaults), [first])
+        TransmitterReadSuccessEvidence.record(otherSensor, defaults: defaults)
+        let stored = try XCTUnwrap(defaults.data(forKey: readSuccessReceiptKey))
+        XCTAssertNotEqual(stored, firstData)
+        assertReadSuccessReceipts(try JSONDecoder().decode([TransmitterReadSuccessReceipt].self, from: stored),
+            [first, otherSensor])
+        assertReadSuccessReceipts(TransmitterReadSuccessEvidence.receipts(at: now, defaults: defaults), [first, otherSensor])
+    }
+
+    func testReadSuccessReceiptsAppendRetainsLatest4000AndReloadsFromPersistence() throws {
+        let (defaults, suite) = try readSuccessDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let seed = (0..<4_000).map {
+            readSuccessReceipt("seed-\($0)", measuredAt: now.addingTimeInterval(-Double(4_000 - $0)))
+        }
+        defaults.set(try JSONEncoder().encode(seed), forKey: readSuccessReceiptKey)
+        XCTAssertEqual(TransmitterReadSuccessEvidence.receipts(at: now, defaults: defaults).count, 4_000)
+        let appended = readSuccessReceipt("appended", measuredAt: now, fromWatch: true, historical: true)
+        TransmitterReadSuccessEvidence.record(appended, defaults: defaults)
+        let expected = Array(seed.dropFirst()) + [appended]
+        let persisted = try XCTUnwrap(defaults.data(forKey: readSuccessReceiptKey))
+        assertReadSuccessReceipts(try JSONDecoder().decode([TransmitterReadSuccessReceipt].self, from: persisted), expected)
+        assertReadSuccessReceipts(TransmitterReadSuccessEvidence.receipts(at: now, defaults: defaults), expected)
+        // An empty cache models a new process and must recover the same durable sequence.
+        var restartedCache = TransmitterReadSuccessEvidence.ReceiptCache()
+        assertReadSuccessReceipts(restartedCache.load(persisted), expected)
+    }
+
+    func testReadSuccessReceiptsAcceptLegacySerializedInput() throws {
+        let (defaults, suite) = try readSuccessDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let legacyData = Data("""
+            [{"id":"legacy-reading","sensorID":"legacy-sensor","measuredAt":800000000,"storedAt":800000060,"fromWatch":true,"historical":true}]
+            """.utf8)
+        let now = Date(timeIntervalSinceReferenceDate: 800_000_060)
+        let legacy = readSuccessReceipt("legacy-reading", sensorID: "legacy-sensor",
+            measuredAt: Date(timeIntervalSinceReferenceDate: 800_000_000), storedAt: now,
+            fromWatch: true, historical: true)
+        defaults.set(legacyData, forKey: readSuccessReceiptKey)
+        assertReadSuccessReceipts(TransmitterReadSuccessEvidence.receipts(at: now, defaults: defaults), [legacy])
+        let appended = readSuccessReceipt("new-reading", measuredAt: now)
+        TransmitterReadSuccessEvidence.record(appended, defaults: defaults)
+        let persisted = try XCTUnwrap(defaults.data(forKey: readSuccessReceiptKey))
+        var restartedCache = TransmitterReadSuccessEvidence.ReceiptCache()
+        assertReadSuccessReceipts(restartedCache.load(persisted), [legacy, appended])
+    }
+
+    func testReadSuccessReceiptEncodingFailurePreservesPersistenceAndCacheThenRecovers() throws {
+        let (defaults, suite) = try readSuccessDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let first = readSuccessReceipt("first", measuredAt: now.addingTimeInterval(-60), storedAt: now)
+        TransmitterReadSuccessEvidence.record(first, defaults: defaults)
+        let originalData = try XCTUnwrap(defaults.data(forKey: readSuccessReceiptKey))
+        let invalid = readSuccessReceipt("retry", measuredAt: now,
+            storedAt: Date(timeIntervalSinceReferenceDate: .infinity))
+        XCTAssertThrowsError(try JSONEncoder().encode([invalid]))
+        TransmitterReadSuccessEvidence.record(invalid, defaults: defaults)
+        XCTAssertEqual(defaults.data(forKey: readSuccessReceiptKey), originalData)
+        assertReadSuccessReceipts(TransmitterReadSuccessEvidence.receipts(at: now, defaults: defaults), [first])
+        let validRetry = readSuccessReceipt("retry", measuredAt: now)
+        TransmitterReadSuccessEvidence.record(validRetry, defaults: defaults)
+        let recoveredData = try XCTUnwrap(defaults.data(forKey: readSuccessReceiptKey))
+        assertReadSuccessReceipts(try JSONDecoder().decode([TransmitterReadSuccessReceipt].self, from: recoveredData),
+            [first, validRetry])
+        assertReadSuccessReceipts(TransmitterReadSuccessEvidence.receipts(at: now, defaults: defaults), [first, validRetry])
+    }
+}
+
+extension LibreWatchValuePipelineTests {
     func testConfiguredReadSuccessCadenceDoesNotShrinkDuringOutageOrBackfill() {
         let start = Date(timeIntervalSince1970: 1_800_000_000)
         let end = start.addingTimeInterval(3600)

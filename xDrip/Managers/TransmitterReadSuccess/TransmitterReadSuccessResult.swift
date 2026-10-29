@@ -49,6 +49,32 @@ struct TransmitterReadSuccessReceipt: Codable {
 enum TransmitterReadSuccessEvidence {
     private static let contextKey = "transmitterReadSuccess.contexts.v1"
     private static let receiptKey = "transmitterReadSuccess.receipts.v1"
+    private static let receiptLock = NSLock()
+    private static var receiptCache = ReceiptCache()
+
+    /// One content-keyed entry, shared across callers without retaining their defaults.
+    /// Keep the complete stored array: a time-filtered read must not prune later reads.
+    struct ReceiptCache {
+        private var data: Data?
+        private var records = [TransmitterReadSuccessReceipt]()
+
+        mutating func load(_ data: Data?,
+                           decode: (Data) throws -> [TransmitterReadSuccessReceipt] = {
+                               try JSONDecoder().decode([TransmitterReadSuccessReceipt].self, from: $0)
+                           }) -> [TransmitterReadSuccessReceipt] {
+            guard let data else { self = Self(); return [] }
+            if self.data == data { return records }
+            self = Self()
+            guard let records = try? decode(data) else { return [] }
+            store(records, encoded: data)
+            return records
+        }
+
+        mutating func store(_ records: [TransmitterReadSuccessReceipt], encoded data: Data) {
+            self.data = data
+            self.records = records
+        }
+    }
 
     static func contexts(defaults: UserDefaults = .standard) -> [TransmitterReadSuccessContext] {
         guard let data = defaults.data(forKey: contextKey) else { return [] }
@@ -73,16 +99,31 @@ enum TransmitterReadSuccessEvidence {
     }
 
     static func receipts(at now: Date = Date(), defaults: UserDefaults = .standard) -> [TransmitterReadSuccessReceipt] {
-        guard let data = defaults.data(forKey: receiptKey),
-              let records = try? JSONDecoder().decode([TransmitterReadSuccessReceipt].self, from: data) else { return [] }
-        return records.filter { $0.measuredAt >= now.addingTimeInterval(-24 * 3600) && $0.measuredAt <= now }
+        receiptLock.lock()
+        defer { receiptLock.unlock() }
+        return retainedReceipts(at: now, defaults: defaults)
+    }
+
+    /// Called only under receiptLock. Compare the effective stored bytes on every read,
+    /// so replacement, removal and separate defaults suites never reuse stale evidence.
+    private static func retainedReceipts(at now: Date, defaults: UserDefaults) -> [TransmitterReadSuccessReceipt] {
+        let records = receiptCache.load(defaults.data(forKey: receiptKey))
+        let cutoff = now.addingTimeInterval(-24 * 3600)
+        return records.filter { $0.measuredAt >= cutoff && $0.measuredAt <= now }
     }
 
     static func record(_ receipt: TransmitterReadSuccessReceipt, defaults: UserDefaults = .standard) {
-        var records = receipts(at: receipt.storedAt, defaults: defaults)
+        receiptLock.lock()
+        defer { receiptLock.unlock() }
+        var records = retainedReceipts(at: receipt.storedAt, defaults: defaults)
         guard !records.contains(where: { $0.id == receipt.id && $0.sensorID == receipt.sensorID }) else { return }
         records.append(receipt)
-        if let data = try? JSONEncoder().encode(Array(records.suffix(4_000))) { defaults.set(data, forKey: receiptKey) }
+        records = Array(records.suffix(4_000))
+        if let data = try? JSONEncoder().encode(records) {
+            // Preserve the existing write on every accepted insertion. Only decoding is cached.
+            defaults.set(data, forKey: receiptKey)
+            receiptCache.store(records, encoded: data)
+        }
     }
 }
 
