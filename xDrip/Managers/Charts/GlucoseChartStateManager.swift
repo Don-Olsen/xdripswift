@@ -1305,28 +1305,35 @@ private struct CachedSensorNoiseSample: Hashable {
 
 // MARK: - Cache Merge Helpers
 
+// Empty incremental ranges leave the already sorted/deduplicated raw caches untouched.
+// Refresh/reset removals happen before merging, including when the reload is empty.
+
 private extension Array where Element == CachedBgReading {
     /// De-duplicates overlapping load ranges and keeps chart data in time order for binary searches
     /// and stable SwiftUI diffing.
     mutating func merge(_ elements: [CachedBgReading]) {
+        guard !elements.isEmpty else { return }
         self = Array(Set(self).union(elements)).sorted { $0.date < $1.date }
     }
 }
 
 private extension Array where Element == CachedCalibration {
     mutating func merge(_ elements: [CachedCalibration]) {
+        guard !elements.isEmpty else { return }
         self = Array(Set(self).union(elements)).sorted { $0.date < $1.date }
     }
 }
 
 private extension Array where Element == CachedTreatment {
     mutating func merge(_ elements: [CachedTreatment]) {
+        guard !elements.isEmpty else { return }
         self = Array(Set(self).union(elements)).sorted { $0.date < $1.date }
     }
 }
 
 private extension Array where Element == CachedSensorNoiseSample {
     mutating func merge(_ elements: [CachedSensorNoiseSample]) {
+        guard !elements.isEmpty else { return }
         self = Array(Set(self).union(elements)).sorted { $0.date < $1.date }
     }
 }

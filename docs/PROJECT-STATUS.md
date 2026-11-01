@@ -1,3 +1,27 @@
+## Tomme grafopdateringer — 31. oktober 2026
+
+Grafens fire rå-cache-sammenlægninger afslutter nu straks, når det indlæste
+interval ikke indeholder nye poster. Dermed undgås gentagen hashing, kopiering
+og sortering af allerede normaliserede glukose-, kalibrerings-, behandlings-
+og støjdata. Timer, databasehentning, cachegrænser, refresh/reset og afledte
+behandlingspunkter bevares. Ingen beregninger, alarmregler eller målinger ændres.
+
+To nye tests gennem den faktiske chart-manager dækker gentagne tomme
+intervaludvidelser, efterfølgende nye målinger, originale/suppressed værdier,
+sletning med tom genindlæsning samt tomt force-reset i både hoved- og minigraf.
+Eksisterende tests er bevaret. De indledende **198 Python-tests** samt
+Watch-værktøjernes 30 + 24 syntetiske selvkontroller bestod. Kvitteringen er
+`~/DeveloperBuildData/xDrip/local-runs/xdripswift/20261031T051102Z-35797/`.
+Releaseprocedurens friske Apple-opslag valgte **4355** og gemte allokeringen;
+XCTest, simulatorbuilds, arm64-build og upload er endnu ikke gennemført.
+Første forsøg var blokeret, fordi Xcode **27.2 (27B52)** ventede på
+macOS-administratorgodkendelse (`AuthorizationCopyRights`) til sine nye
+komponenter. Ved genoptagelsen 1. november var `checkFirstLaunchStatus`
+bestået og XcodeSystemResources 27.2 installeret. Ingen lokal appinstallation
+eller ændring af telefon/Watch er foretaget. Hastighed og batteriforbrug er
+ikke målt på fysisk iPhone/Watch; de endelige releasekontroller registreres
+særskilt efter kørslen på det præcise release-træ.
+
 <!-- testflight-7.1.1-4354:start -->
 ### TestFlight 7.1.1 (4354)
 

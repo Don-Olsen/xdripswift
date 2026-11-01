@@ -751,6 +751,78 @@ final class GlucoseChartYAxisRetentionTests: XCTestCase {
         }
     }
 
+    /// Empty buffered tail loads must retain both series while the viewport still advances.
+    @MainActor
+    func testEmptyTailUpdatesRetainCachesAndStillAcceptNewReadings() async {
+        for mode in [GlucoseChartStateManager.LoadMode.fullChart, .miniChart] {
+            let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+            let end = Date(timeIntervalSince1970: 1_700_000_000)
+            let start = end.addingTimeInterval(-3600)
+            _ = addChartReading(core, at: end.addingTimeInterval(-120), raw: 120,
+                                processed: 140, sensor: nil, suppressed: false)
+            _ = addChartReading(core, at: end.addingTimeInterval(-60), raw: 130,
+                                processed: 150, sensor: nil, suppressed: true)
+            XCTAssertTrue(core.saveChangesSynchronously())
+            let chart = GlucoseChartStateManager(coreDataManager: core,
+                nightscoutSyncManager: NightscoutSyncManager(coreDataManager: core, messageHandler: nil),
+                loadMode: mode)
+            let initial = await loadChart(chart, start: start, end: end)
+            XCTAssertEqual(initial.bgReadingValues, [140])
+            for tick in 1...4 {
+                let advancedEnd = end.addingTimeInterval(Double(tick * 15))
+                let updated = await loadChart(chart, start: start, end: advancedEnd)
+                XCTAssertEqual(updated.bgReadingValues, initial.bgReadingValues)
+                XCTAssertEqual(updated.bgReadingDates, initial.bgReadingDates)
+                XCTAssertEqual(updated.newestBgReadingDate, initial.newestBgReadingDate)
+                XCTAssertEqual(updated.endDate, advancedEnd)
+                XCTAssertGreaterThan(updated.dataEndDate, initial.dataEndDate)
+                let originals = await loadChart(chart, start: start, end: advancedEnd, originalsOnly: true)
+                XCTAssertEqual(originals.additionalBgReadingDataSets.first?.bgReadingValues, [120, 130])
+            }
+            // A subsequent nonempty tail still merges normally, beyond the previously loaded buffer.
+            let appendedDate = chart.state.dataEndDate.addingTimeInterval(1)
+            _ = addChartReading(core, at: appendedDate, raw: 160, processed: 170,
+                                sensor: nil, suppressed: false)
+            XCTAssertTrue(core.saveChangesSynchronously())
+            let appended = await loadChart(chart, start: start, end: end.addingTimeInterval(75))
+            XCTAssertEqual(appended.bgReadingValues, [140, 170])
+            XCTAssertEqual(appended.bgReadingDates.last, appendedDate)
+        }
+    }
+
+    /// An empty refresh replaces its tail, not the older cache; an empty reset clears everything.
+    @MainActor
+    func testEmptyRefreshAndResetRemoveDeletedDataInBothChartModes() async {
+        for mode in [GlucoseChartStateManager.LoadMode.fullChart, .miniChart] {
+            let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+            let end = Date(timeIntervalSince1970: 1_700_000_000)
+            let start = end.addingTimeInterval(-12 * 3600)
+            let older = addChartReading(core, at: end.addingTimeInterval(-8 * 3600), raw: 110,
+                                        processed: 120, sensor: nil, suppressed: false)
+            let recent = addChartReading(core, at: end.addingTimeInterval(-60), raw: 130,
+                                         processed: 140, sensor: nil, suppressed: false)
+            XCTAssertTrue(core.saveChangesSynchronously())
+            let chart = GlucoseChartStateManager(coreDataManager: core,
+                nightscoutSyncManager: NightscoutSyncManager(coreDataManager: core, messageHandler: nil),
+                loadMode: mode)
+            let initial = await loadChart(chart, start: start, end: end)
+            XCTAssertEqual(initial.bgReadingValues, [120, 140])
+            core.mainManagedObjectContext.delete(recent)
+            XCTAssertTrue(core.saveChangesSynchronously())
+            let refreshed = await loadChart(chart, start: start, end: end, refresh: true)
+            XCTAssertEqual(refreshed.bgReadingValues, [120])
+            let originals = await loadChart(chart, start: start, end: end, originalsOnly: true)
+            XCTAssertEqual(originals.additionalBgReadingDataSets.first?.bgReadingValues, [110])
+            core.mainManagedObjectContext.delete(older)
+            XCTAssertTrue(core.saveChangesSynchronously())
+            let reset = await loadChart(chart, start: start, end: end, forceReset: true)
+            XCTAssertTrue(reset.bgReadingValues.isEmpty)
+            XCTAssertNil(reset.newestBgReadingDate)
+            let emptyOriginals = await loadChart(chart, start: start, end: end, originalsOnly: true)
+            XCTAssertTrue(emptyOriginals.additionalBgReadingDataSets.allSatisfy { $0.bgReadingValues.isEmpty })
+        }
+    }
+
     @MainActor
     private func addChartReading(_ core: CoreDataManager, at date: Date, raw: Double,
                                  processed: Double, sensor: Sensor?, suppressed: Bool) -> BgReading {
@@ -765,9 +837,9 @@ final class GlucoseChartYAxisRetentionTests: XCTestCase {
 
     @MainActor
     private func loadChart(_ chart: GlucoseChartStateManager, start: Date, end: Date,
-                           originalsOnly: Bool = false, refresh: Bool = false) async -> GlucoseChartState {
+                           originalsOnly: Bool = false, refresh: Bool = false, forceReset: Bool = false) async -> GlucoseChartState {
         await withCheckedContinuation { continuation in
-            chart.updateState(endDate: end, startDate: start, refreshCachedData: refresh,
+            chart.updateState(endDate: end, startDate: start, forceReset: forceReset, refreshCachedData: refresh,
                               showTreatments: false, showOriginalReadingsOnly: originalsOnly) {
                 continuation.resume(returning: $0)
             }
