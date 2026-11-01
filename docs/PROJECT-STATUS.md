@@ -24,15 +24,35 @@ sletning med tom genindlæsning samt tomt force-reset i både hoved- og minigraf
 Eksisterende tests er bevaret. De indledende **198 Python-tests** samt
 Watch-værktøjernes 30 + 24 syntetiske selvkontroller bestod. Kvitteringen er
 `~/DeveloperBuildData/xDrip/local-runs/xdripswift/20261031T051102Z-35797/`.
-Releaseprocedurens friske Apple-opslag valgte **4355** og gemte allokeringen;
-XCTest, simulatorbuilds, arm64-build og upload er endnu ikke gennemført.
+Releaseprocedurens friske Apple-opslag valgte **4355** og gemte allokeringen.
+Det præcise release-checkpoint `ad7a3b8772315a160b1fdf2cfe181b567fd14b16`
+bestod **1.866/1.866 XCTest** uden fejl eller skipped, **198 Python-tests**,
+alle otte krævede Watch/Libre-suiter og værktøjernes 30 + 24 syntetiske
+selvkontroller. Begge simulatorbuilds samt unsigned Release iPhoneOS/**arm64**
+bestod med Xcode 27.2. De to nye grafregressionstests bestod. Kvitteringer
+findes i `build/testflight-7.1.1-4355/test/`, inklusive
+`results/iphoneos-unsigned.json`; den faktiske unsigned app blev verificeret
+som 7.1.1 (4355), arm64, fra det samme rene Git-checkpoint.
 Første forsøg var blokeret, fordi Xcode **27.2 (27B52)** ventede på
 macOS-administratorgodkendelse (`AuthorizationCopyRights`) til sine nye
 komponenter. Ved genoptagelsen 1. november var `checkFirstLaunchStatus`
-bestået og XcodeSystemResources 27.2 installeret. Ingen lokal appinstallation
-eller ændring af telefon/Watch er foretaget. Hastighed og batteriforbrug er
-ikke målt på fysisk iPhone/Watch; de endelige releasekontroller registreres
-særskilt efter kørslen på det præcise release-træ.
+bestået og XcodeSystemResources 27.2 installeret. Den læsende enhedskontrol
+fandt både fysisk iPhone og Watch tilgængelige; telefonens installerede app
+var 7.1.1 (4354), bundle `com.GFZ896KN66.xdripswift`. Der er ikke installeret
+noget lokalt eller ændret noget på telefon/Watch. Optimeringen er ikke fysisk
+afprøvet på 4355, og hastighed eller batterigevinst er ikke målt.
+
+Det tagbyggede arkiv og den faktiske IPA bestod kilde-, versions-, signatur-,
+profil-, entitlement- og Watch-kontrol for alle fem bundles. Uploaden blev
+kvitteret uden fejl. Apple bekræftede **VALID**, **INTERNAL_ONLY**,
+**IN_BETA_TESTING** og den eksisterende **Ole Internal**-relation den
+1. november 2026. Release-tagget forbliver på det testede kildecommit;
+status og denne afsluttende dokumentation er separate commits.
+
+Den automatiske selektive oprydning afsluttede med **33.672** slettede
+cachefiler og **5.713.670.144 allokerede bytes** (ca. 5,32 GiB). Aktuelt build,
+den beskyttede tidligere release, kildekode og test-/releasebeviser er bevaret.
+Rapport: `build/release-automation/cleanup/20261101T101112.971492Z/`.
 
 <!-- testflight-7.1.1-4354:start -->
 ### TestFlight 7.1.1 (4354)
