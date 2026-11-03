@@ -50,8 +50,31 @@ Regressionskontroller dækker protokollens lagring, konfiguration, tæller,
 genstart, dubletter, forsinkede native callbacks og afviste forberedelser.
 Den indledende Watch/Libre-kørsel gennemførte 741 tests uden fejl; dens
 kvittering blev korrekt afvist, fordi en ny test blev tilføjet under kørslen.
-Den bruges ikke som releasekvittering. Endelige resultater registreres for
-det præcise release-checkpoint nedenfor efter den fulde kontrol.
+Den bruges ikke som releasekvittering.
+
+Apples friske buildoversigt valgte **4356**. Det præcise release-checkpoint
+`6a839ad985a49a4f085818f03f3d0e2c7abb79e0`, tag
+`testflight-7.1.1-4356`, bestod **1.891/1.891 XCTest** uden fejl eller skipped,
+heraf 25 nye regressionstests, **198 Python-tests**, de otte krævede
+Watch/Libre-suiter samt værktøjernes 30 + 24 syntetiske selvkontroller.
+Begge simulatorbuilds og unsigned Release iPhoneOS/**arm64** bestod med
+Xcode 27.2. Første unsigned kontrolbuild kompilerede, men kilde-ID-kontrollen
+afviste standardværdien `untagged`; genkørsel med det eksplicitte checkpoint
+i `XDRIP_SOURCE_COMMIT` bestod også metadata- og arkitekturkontrollen.
+Kildekoden blev ikke ændret mellem disse to arm64-kørsler. Resultater og
+rå logs er bevaret i `build/testflight-7.1.1-4356/test/`, inklusive
+`results/iphoneos-unsigned.json`.
+
+Det tagbyggede arkiv og den faktiske IPA bestod kontrol af kilde, version,
+alle fem bundle-ID'er, signaturer, profiler, entitlements og Watch-indlejring.
+Apple kvitterede for uploaden uden fejl og bekræftede **VALID**,
+**INTERNAL_ONLY**, **IN_BETA_TESTING** samt den eksisterende **Ole Internal**-
+relation den 3. november 2026. Release-tagget forbliver på det testede
+kildecommit; Apple-status og denne afsluttende dokumentation er separate
+commits. Den automatiske selektive oprydning afsluttede med **31.085**
+slettede cachefiler og **4.961.472.512 allokerede bytes** (ca. 4,62 GiB).
+Aktuel og beskyttet tidligere release samt kilde- og testbeviser er bevaret.
+Oprydningsrapport: `build/release-automation/cleanup/20261103T172123.219517Z/`.
 
 Læsende enhedskontrol fandt iPhone 17 Pro Max tilgængelig; appoplysninger
 kunne ikke læses, fordi telefonen var låst ved DDI-montering. Apple Watch
