@@ -8,6 +8,75 @@
 - Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
 <!-- testflight-7.1.1-4355:end -->
 
+
+## Manuel Watch-overtagelse uden telefonkontakt — 3. november 2026
+
+Den eksisterende Watch Direct-knap kan nu forsøge at overtage den aktuelle
+Libre-sensor, efter telefonkontakten er mistet. Telefonen sender automatisk
+sin aktuelle forberedelse gennem den eksisterende WatchConnectivity-sti,
+også når den faktisk anvendte unlock-tæller ændres. Både telefon og ur skal
+have den nye kode, og uret skal tidligere have modtaget en gyldig forberedelse
+til netop denne sensor. Den almindelige overdragelse med telefonkontakt
+bevares; aflevering tilbage til telefonen er fortsat manuel.
+
+En vedvarende, entydig overtagelse gemmes før første Bluetooth-forsøg. Før
+en ny valideret direkte måling tillades kun den normale næste tællerværdi,
+ikke søgning eller gæt i tælleren. Et mislykket første forsøg kræver igen
+telefonkontakt. Efter bekræftet modtagelse bruges den eksisterende
+genopkobling, runtime, lokale lagring og lokale alarmer. Alarmberedskabet
+kontrolleres mod den modtagne konfiguration og urets notifikationstilladelse.
+
+Ved gensyn frigiver telefonen sin faktiske Bluetooth-forbindelse, afstemmer
+session/tæller og bekræfter samme overtagelse, før urets eksisterende kø må
+efterlevere målingerne. Gentagelser, afbrudte svar og genstart genbruger samme
+identitet. Nyere eksplicit overdragelse og sensorskift ophæves ikke af gamle
+beskeder. Afviste, endnu ikke afstemte målinger bevares i én begrænset lokal
+gendannelseskopi med den eksisterende køs grænser; den er ikke en ny
+transportkø og bliver ikke automatisk importeret som godkendte målinger.
+
+Regressionskontroller dækker protokollens lagring, konfiguration, tæller,
+genstart, dubletter, forsinkede native callbacks og afviste forberedelser.
+Den indledende Watch/Libre-kørsel gennemførte 741 tests uden fejl; dens
+kvittering blev korrekt afvist, fordi en ny test blev tilføjet under kørslen.
+Den bruges ikke som releasekvittering. Endelige resultater registreres for
+det præcise release-checkpoint nedenfor efter den fulde kontrol.
+
+Læsende enhedskontrol fandt iPhone 17 Pro Max tilgængelig; appoplysninger
+kunne ikke læses, fordi telefonen var låst ved DDI-montering. Apple Watch
+Ultra var utilgængeligt. Intet blev installeret lokalt, og sensoren blev ikke
+afbrudt. Offline-autentificering med en eventuelt forældet tæller, modtagelse
+med slukket skærm, faktisk alarmlevering og hjemkomst med Bluetooth før
+WatchConnectivity er **ikke fysisk verificeret**. Koden kan ikke garantere,
+at en ældre sensorsession accepteres af Libre. Den afgrænsede fysiske
+afprøvning står i `docs/WATCH-DIRECT-RUNTIME-TEST.md`.
+
+## Tidsindeks undersøgt — ikke udgivet, 1. november 2026
+
+Den foreslåede indeksændring blev afvist før ændring af produktionsmodellen.
+En isoleret Core Data-kontrol brugte det arkiverede v35-modelskema fra 4355
+og 1.000 kunstige målinger med forskellige værdier på samme tidsstempel.
+Kontrollen blev kompileret og kørt på både macOS og iOS 27-simulatoren med
+Xcode 27.2. De genererede SQLite-indeks blev verificeret læsende.
+Genåbning af samme v35-database og en kontrolmigration med alene ændret
+versionshash bevarede alle opslag. Tilføjelse af et almindeligt tidsindeks
+ændrede derimod rækkefølgen i 12 af 24 opslag for hver af de to afprøvede
+indeksretninger (24 af 48 samlet), inklusive valget af første måling.
+ASC-indekset ændrede bl.a. seneste-måling-valget; DESC flyttede problemet
+til ældste-først-opslag. Derfor er indeks alene ikke en dokumenteret
+adfærdsbevarende optimering ved identiske tidsstempler.
+
+Dette er en afgrænset test af den faktiske Core Data/SQLite-mekanisme med
+produktionsskemaet og relevante forespørgselsformer, ikke hele appen eller
+en fysisk iPhone-test. Entity-klasserne blev erstattet med NSManagedObject
+i den selvstændige test. Testens eksplicitte ækvivalenskontrol afsluttede
+med exit 1. Ingen produktionskode, data, modelversion, releaseversion eller
+Apple-status blev ændret. Hele XCTest-suiten og releasebuilds blev derfor
+ikke startet; der findes ingen ny bestået releasekvittering eller upload.
+Før et tidsindeks kan udgives, skal en særskilt afgrænset løsning for valg
+ved ens tidsstempler dokumenteres og testes i de faktiske kaldestier.
+Kode, output, hashes og syntetisk modelkopi er bevaret uden for Git i
+`~/DeveloperBuildData/xDrip/diagnostics/time-index-20261101/`.
+
 De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
 
 ## Tomme grafopdateringer — 31. oktober 2026

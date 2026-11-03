@@ -266,6 +266,30 @@ final class LibreWatchAlarmController: NSObject, UNUserNotificationCenterDelegat
         publishStatus()
     }
 
+    /// The phone's prepared offer explicitly permits this exact cached alarm revision
+    /// during an offline takeover. Observe Watch permission again before granting local
+    /// authority; missing permission remains visible through the existing readiness warning.
+    func prepareOfflineDelegation(settings candidate: LibreWatchAlarmSettings,
+                                  session: LibreWatchDirectSession,
+                                  completion: @escaping (Bool) -> Void) {
+        guard candidate.matches(session) else { completion(false); return }
+        let generation = permissionRefresh.begin(takeover: true)
+        center.getNotificationSettings { [weak self] permissions in
+            DispatchQueue.main.async {
+                guard let self else { completion(false); return }
+                self.applyPermissionResponse(permissions, generation: generation)
+                guard self.offeredSettings?.matches(session) == true,
+                      self.offeredSettings?.revision == candidate.revision else { completion(false); return }
+                self.apply(settings: candidate, session: session)
+                let authority: LibreWatchAlarmDelegation? =
+                    self.readinessPermissionsKnown && self.readinessRevision == candidate.revision
+                        ? .confirmed(for: candidate) : nil
+                self.apply(delegation: authority, session: session)
+                completion(self.readinessPermissionsKnown && self.delegation?.matches(candidate) == true)
+            }
+        }
+    }
+
     func ownershipDidChange(_ ownership: LibreWatchOwnership) {
         let becameWatchOwner = !watchOwnsSensor && ownership == .watch
         watchOwnsSensor = ownership == .watch

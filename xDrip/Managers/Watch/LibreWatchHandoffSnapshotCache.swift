@@ -16,32 +16,47 @@ final class LibreWatchHandoffSnapshotCache {
 
     func resolve(session: LibreWatchDirectSession, calibration: LibreWatchCalibrationSnapshot?,
                  ownership: LibreWatchOwnership, settings: LibreWatchAlarmSettings,
-                 delegation: LibreWatchAlarmDelegation?, at date: Date = Date()) -> LibreWatchHandoffSnapshot? {
+                 delegation: LibreWatchAlarmDelegation?, offlineTakeoverOfferID: UUID? = nil,
+                 ownershipRevision: UInt64? = nil, offlineTakeoverReceipt: LibreWatchOfflineTakeoverReceipt? = nil,
+                 at date: Date = Date()) -> LibreWatchHandoffSnapshot? {
         if let previous = snapshot, previous.isValid,
            previous.session == session, previous.calibration == calibration,
            previous.ownership == ownership, previous.alarmDelegation == delegation,
+           previous.offlineTakeoverOfferID == offlineTakeoverOfferID,
+           previous.ownershipRevision == ownershipRevision,
+           previous.offlineTakeoverReceipt == offlineTakeoverReceipt,
            previous.alarmSettings?.revision == settings.revision,
            previous.alarmSettings?.sameConfiguration(as: settings) == true {
             return previous
         }
         // Validate the candidate before consuming a monotonic authoritative revision.
         var candidate = LibreWatchHandoffSnapshot(session: session, calibration: calibration,
-            ownership: ownership, revision: 1, alarmSettings: settings, alarmDelegation: delegation)
+            ownership: ownership, revision: max(1, max(ownershipRevision ?? 0, offlineTakeoverReceipt?.acceptedRevision ?? 0)),
+            alarmSettings: settings, alarmDelegation: delegation,
+            offlineTakeoverOfferID: offlineTakeoverOfferID, ownershipRevision: ownershipRevision,
+            offlineTakeoverReceipt: offlineTakeoverReceipt)
         guard candidate.isValid else { return nil }
         candidate = LibreWatchHandoffSnapshot(session: session, calibration: calibration,
             ownership: ownership, revision: LibreWatchSessionStore.nextHandoffRevision(at: date, defaults: defaults),
-            alarmSettings: settings, alarmDelegation: delegation)
-        guard let data = try? JSONEncoder().encode(candidate) else { return nil }
+            alarmSettings: settings, alarmDelegation: delegation,
+            offlineTakeoverOfferID: offlineTakeoverOfferID, ownershipRevision: ownershipRevision,
+            offlineTakeoverReceipt: offlineTakeoverReceipt)
+        guard candidate.isValid, let data = try? JSONEncoder().encode(candidate) else { return nil }
         defaults.set(data, forKey: key)
         snapshot = candidate
         return candidate
     }
 
     func current(session: LibreWatchDirectSession?, calibration: LibreWatchCalibrationSnapshot?,
-                 ownership: LibreWatchOwnership, delegation: LibreWatchAlarmDelegation?) -> LibreWatchHandoffSnapshot? {
+                 ownership: LibreWatchOwnership, delegation: LibreWatchAlarmDelegation?,
+                 offlineTakeoverOfferID: UUID? = nil, ownershipRevision: UInt64? = nil,
+                 offlineTakeoverReceipt: LibreWatchOfflineTakeoverReceipt? = nil) -> LibreWatchHandoffSnapshot? {
         guard let snapshot, snapshot.isValid, snapshot.session == session,
               snapshot.calibration == calibration, snapshot.ownership == ownership,
-              snapshot.alarmDelegation == delegation else { return nil }
+              snapshot.alarmDelegation == delegation,
+              snapshot.offlineTakeoverOfferID == offlineTakeoverOfferID,
+              snapshot.ownershipRevision == ownershipRevision,
+              snapshot.offlineTakeoverReceipt == offlineTakeoverReceipt else { return nil }
         return snapshot
     }
 
@@ -56,6 +71,9 @@ final class LibreWatchHandoffSnapshotCache {
         }
         if let settings = snapshot.alarmSettings {
             payload[LibreWatchMessageKey.alarmSettings] = try? JSONEncoder().encode(settings)
+        }
+        if let receipt = snapshot.offlineTakeoverReceipt {
+            payload[LibreWatchMessageKey.offlineTakeoverReceipt] = try? JSONEncoder().encode(receipt)
         }
         return payload
     }

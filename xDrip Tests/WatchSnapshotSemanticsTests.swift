@@ -742,3 +742,275 @@ final class WatchMealQuietTests: XCTestCase {
         XCTAssertFalse(restored.mayStartMealQuiet(at: when, phoneOwnsSensor: true))
     }
 }
+
+extension WatchSnapshotSemanticsTests {
+    func testOfflinePhoneReleaseCoalescesDuplicatesUntilNativeCompletion() {
+        let coordinator = LibreWatchOfflinePhoneReleaseCoordinator()
+        let request = UUID()
+        var responses: [Bool] = []
+        XCTAssertEqual(coordinator.begin(requestID: request) {
+            responses.append($0[LibreWatchMessageKey.success] as? Bool == true)
+        }, .started)
+        XCTAssertEqual(coordinator.begin(requestID: request) {
+            responses.append($0[LibreWatchMessageKey.success] as? Bool == true)
+        }, .joined)
+        XCTAssertEqual(coordinator.begin(requestID: UUID()) { _ in XCTFail("Unrelated claim joined") }, .conflict)
+        XCTAssertTrue(responses.isEmpty, "Submitting/repeating a claim cannot acknowledge Bluetooth release")
+        coordinator.complete(requestID: UUID(), response: [LibreWatchMessageKey.success: true])
+        XCTAssertTrue(responses.isEmpty)
+        coordinator.complete(requestID: request, response: [LibreWatchMessageKey.success: true])
+        XCTAssertEqual(responses, [true, true])
+        XCTAssertNil(coordinator.requestID)
+        coordinator.complete(requestID: request, response: [LibreWatchMessageKey.success: false])
+        XCTAssertEqual(responses, [true, true], "A late duplicate callback cannot deliver a second result")
+    }
+
+    func testOfflinePhoneNativeCompletionRevalidatesOwnershipSessionCalibrationAndAlarms() {
+        let (original, calibration, settings) = fixtures()
+        let transaction = LibreWatchOfflineTakeoverTransaction(originInstallationID: UUID(), offerID: UUID(),
+            session: original, calibration: calibration, alarmSettings: settings,
+            startingRevision: 10, createdAt: date)
+        var session: LibreWatchDirectSession? = original
+        var currentCalibration: LibreWatchCalibrationSnapshot? = calibration
+        var currentSettings: LibreWatchAlarmSettings? = settings
+        var ownership: LibreWatchOwnership = .releasingToWatch
+        var ownershipRevision: UInt64 = 1
+        var receipt = LibreWatchOfflineTakeoverReceipt(transaction: transaction, acceptedRevision: 0, state: .releasing)
+        // This closure represents the delayed native completion; it reads live state at
+        // invocation, using the same production policy that the real callback calls.
+        let completionIsCurrent = {
+            LibreWatchOfflinePhoneReleaseCoordinator.canComplete(transaction: transaction,
+                session: session, calibration: currentCalibration, settings: currentSettings,
+                ownership: ownership, ownershipRevision: ownershipRevision, receipt: receipt, at: self.date)
+        }
+        XCTAssertTrue(completionIsCurrent())
+        session?.unlockCount += 1
+        XCTAssertTrue(completionIsCurrent(), "A real intervening phone unlock is merged after release")
+        session = fixtures().0
+        XCTAssertFalse(completionIsCurrent(), "A sensor/session change invalidates the pending callback")
+        session = original
+        currentCalibration = nil
+        XCTAssertFalse(completionIsCurrent())
+        currentCalibration = LibreWatchCalibrationSnapshot(activeSensorID: calibration.activeSensorID,
+            sensorUID: calibration.sensorUID, sensorSerialNumber: calibration.sensorSerialNumber,
+            watchSessionID: calibration.watchSessionID, calibrationType: calibration.calibrationType,
+            slope: calibration.slope, intercept: calibration.intercept, rawValueDivider: calibration.rawValueDivider,
+            calibratedAt: calibration.calibratedAt, revision: calibration.revision + 1)
+        XCTAssertFalse(completionIsCurrent(), "A new calibration needs a new validated preparation")
+        currentCalibration = calibration
+        currentSettings?.revision += 1
+        XCTAssertFalse(completionIsCurrent(), "A changed alarm offer cannot be silently acknowledged")
+        currentSettings = settings
+        ownership = .iphone
+        ownershipRevision = 11
+        receipt.acceptedRevision = 11
+        receipt.state = .retired
+        XCTAssertFalse(completionIsCurrent(), "Explicit phone return wins over a delayed callback")
+        ownership = .releasingToWatch
+        XCTAssertFalse(completionIsCurrent(), "A retired receipt alone is sufficient to reject the callback")
+    }
+
+    func testOfflinePreparationCounterUpdatePreservesOfferAndExplicitOwnershipEpoch() throws {
+        let name = "WatchSnapshotSemanticsTests.\(UUID())"; let defaults = UserDefaults(suiteName: name)!
+        defer { defaults.removePersistentDomain(forName: name) }
+        var (session, calibration, settings) = fixtures()
+        let cache = LibreWatchHandoffSnapshotCache(defaults: defaults)
+        let offer = UUID()
+        let ownershipRevision = LibreWatchSessionStore.nextHandoffRevision(at: date, defaults: defaults)
+        let first = try XCTUnwrap(cache.resolve(session: session, calibration: calibration, ownership: .iphone,
+            settings: settings, delegation: nil, offlineTakeoverOfferID: offer,
+            ownershipRevision: ownershipRevision, at: date))
+        session.unlockCount += 1
+        let refreshed = try XCTUnwrap(cache.resolve(session: session, calibration: calibration, ownership: .iphone,
+            settings: settings, delegation: nil, offlineTakeoverOfferID: offer,
+            ownershipRevision: ownershipRevision, at: date))
+        XCTAssertGreaterThan(refreshed.revision, first.revision)
+        XCTAssertEqual(refreshed.session.unlockCount, first.session.unlockCount + 1)
+        XCTAssertEqual(refreshed.offlineTakeoverOfferID, first.offlineTakeoverOfferID)
+        XCTAssertEqual(refreshed.ownershipRevision, first.ownershipRevision)
+        XCTAssertEqual(LibreWatchHandoffSnapshotCache(defaults: defaults).snapshot, refreshed)
+        XCTAssertTrue(LibreWatchOfflineTakeoverPolicy.canBegin(snapshot: refreshed, session: session,
+            calibration: calibration, alarmSettings: settings, notificationsAuthorized: true))
+        let revokedRevision = LibreWatchSessionStore.nextHandoffRevision(at: date, defaults: defaults)
+        let replaced = try XCTUnwrap(cache.resolve(session: session, calibration: calibration, ownership: .iphone,
+            settings: settings, delegation: nil, offlineTakeoverOfferID: UUID(),
+            ownershipRevision: revokedRevision, at: date))
+        XCTAssertGreaterThan(replaced.revision, refreshed.revision)
+        XCTAssertNotEqual(replaced.offlineTakeoverOfferID, refreshed.offlineTakeoverOfferID)
+        XCTAssertGreaterThan(try XCTUnwrap(replaced.ownershipRevision), first.revision)
+    }
+
+    func testOfflineAcceptedReceiptIsAtomicWithFreshCounterAndAuthorityPayload() throws {
+        let name = "WatchSnapshotSemanticsTests.\(UUID())"; let defaults = UserDefaults(suiteName: name)!
+        defer { defaults.removePersistentDomain(forName: name) }
+        var (session, calibration, settings) = fixtures()
+        let transaction = LibreWatchOfflineTakeoverTransaction(originInstallationID: UUID(), offerID: UUID(),
+            session: session, calibration: calibration, alarmSettings: settings, startingRevision: 10, createdAt: date)
+        let accepted = LibreWatchOfflineTakeoverReceipt(transaction: transaction, acceptedRevision: 11, state: .accepted)
+        session.unlockCount = 7
+        let cache = LibreWatchHandoffSnapshotCache(defaults: defaults)
+        let snapshot = try XCTUnwrap(cache.resolve(session: session, calibration: calibration, ownership: .watch,
+            settings: settings, delegation: .confirmed(for: settings), ownershipRevision: 1,
+            offlineTakeoverReceipt: accepted, at: date))
+        let payload = try XCTUnwrap(LibreWatchHandoffSnapshotCache.payload(snapshot))
+        let restored = try JSONDecoder().decode(LibreWatchHandoffSnapshot.self,
+            from: XCTUnwrap(payload[LibreWatchMessageKey.handoffSnapshot] as? Data))
+        XCTAssertEqual(restored.session.unlockCount, 7)
+        XCTAssertEqual(restored.ownership, .watch)
+        XCTAssertEqual(restored.offlineTakeoverReceipt, accepted)
+        XCTAssertGreaterThanOrEqual(restored.revision, accepted.acceptedRevision)
+        XCTAssertNil(restored.offlineTakeoverOfferID)
+        XCTAssertEqual(try JSONDecoder().decode(LibreWatchOfflineTakeoverReceipt.self,
+            from: XCTUnwrap(payload[LibreWatchMessageKey.offlineTakeoverReceipt] as? Data)), accepted)
+        XCTAssertNil(cache.current(session: session, calibration: calibration, ownership: .watch,
+            delegation: .confirmed(for: settings), ownershipRevision: 1,
+            offlineTakeoverReceipt: nil), "A pending/retired receipt must not reuse an accepted envelope")
+    }
+}
+
+extension WatchSnapshotSemanticsTests {
+    func testTerminalOfflinePreparationRejectionRevokesOnlyItsExactAuthority() {
+        let (session, calibration, settings) = fixtures()
+        let transaction = LibreWatchOfflineTakeoverTransaction(originInstallationID: UUID(), offerID: UUID(),
+            session: session, calibration: calibration, alarmSettings: settings, startingRevision: 10, createdAt: date)
+        func canRetire(_ decision: LibreWatchOfflineTakeoverPolicy.PhoneDecision = .wrongCalibration,
+                       current: LibreWatchDirectSession? = nil, offer: UUID? = nil,
+                       owner: LibreWatchOwnership = .iphone, epoch: UInt64 = 1,
+                       receipt: LibreWatchOfflineTakeoverReceipt? = nil) -> Bool {
+            LibreWatchOfflinePhoneReleaseCoordinator.canRetireRejectedPreparation(decision: decision,
+                transaction: transaction, session: current ?? session, activeOfferID: offer ?? transaction.offerID,
+                ownership: owner, ownershipRevision: epoch, receipt: receipt)
+        }
+        XCTAssertTrue(canRetire())
+        XCTAssertTrue(canRetire(.wrongAlarmSettings))
+        XCTAssertFalse(canRetire(.invalid))
+        XCTAssertFalse(canRetire(.conflictingRequest))
+        XCTAssertFalse(canRetire(.duplicate))
+        XCTAssertFalse(canRetire(.accept))
+        XCTAssertFalse(canRetire(offer: UUID()))
+        XCTAssertFalse(canRetire(current: fixtures().0))
+        XCTAssertFalse(canRetire(owner: .watch))
+        XCTAssertFalse(canRetire(epoch: 11), "An explicit later return cannot be revoked by rejection")
+        let pending = LibreWatchOfflineTakeoverReceipt(transaction: transaction, acceptedRevision: 0, state: .releasing)
+        XCTAssertTrue(canRetire(owner: .releasingToWatch, receipt: pending))
+        XCTAssertTrue(canRetire(owner: .watch, receipt: pending), "A restarted pending native release can be unwound")
+        let accepted = LibreWatchOfflineTakeoverReceipt(transaction: transaction, acceptedRevision: 11, state: .accepted)
+        XCTAssertFalse(canRetire(owner: .watch, receipt: accepted), "A completed claim is not a rejected preparation")
+        let other = LibreWatchOfflineTakeoverTransaction(originInstallationID: transaction.originInstallationID,
+            offerID: transaction.offerID, session: session, calibration: calibration, alarmSettings: settings,
+            startingRevision: 10, createdAt: date)
+        XCTAssertFalse(canRetire(receipt: LibreWatchOfflineTakeoverReceipt(transaction: other,
+            acceptedRevision: 0, state: .releasing)), "A conflicting claim cannot revoke the persisted first intent")
+    }
+
+    func testTerminalOfflineConfigurationRejectionPublishesARecoverablePhonePreparation() throws {
+        let name = "WatchSnapshotSemanticsTests.\(UUID())"; let defaults = UserDefaults(suiteName: name)!
+        defer { defaults.removePersistentDomain(forName: name) }
+        let (session, calibration, originalSettings) = fixtures()
+        let cache = LibreWatchHandoffSnapshotCache(defaults: defaults)
+        let epoch = LibreWatchSessionStore.nextHandoffRevision(at: date, defaults: defaults)
+        let offer = UUID()
+        let offered = try XCTUnwrap(cache.resolve(session: session, calibration: calibration, ownership: .iphone,
+            settings: originalSettings, delegation: nil, offlineTakeoverOfferID: offer, ownershipRevision: epoch, at: date))
+        let transaction = LibreWatchOfflineTakeoverTransaction(originInstallationID: UUID(), offerID: offer,
+            session: session, calibration: calibration, alarmSettings: originalSettings,
+            startingRevision: offered.revision, createdAt: date)
+        var settings = originalSettings
+        settings.revision += 1
+        let rejection = LibreWatchOfflineTakeoverPolicy.phoneDecision(transaction: transaction,
+            currentSession: session, currentCalibration: calibration, currentAlarmSettings: settings,
+            activeOfferID: offer, ownership: .iphone, ownershipRevision: epoch, receipt: nil, at: date)
+        XCTAssertEqual(rejection, .wrongAlarmSettings)
+        XCTAssertTrue(LibreWatchOfflinePhoneReleaseCoordinator.canRetireRejectedPreparation(decision: rejection,
+            transaction: transaction, session: session, activeOfferID: offer, ownership: .iphone,
+            ownershipRevision: epoch, receipt: nil))
+        let replacementEpoch = LibreWatchSessionStore.nextHandoffRevision(at: date, defaults: defaults)
+        let replacementOffer = UUID()
+        let replacement = try XCTUnwrap(cache.resolve(session: session, calibration: calibration, ownership: .iphone,
+            settings: settings, delegation: nil, offlineTakeoverOfferID: replacementOffer,
+            ownershipRevision: replacementEpoch, at: date))
+        let payload = try XCTUnwrap(LibreWatchHandoffSnapshotCache.payload(replacement))
+        let received = try JSONDecoder().decode(LibreWatchHandoffSnapshot.self,
+            from: XCTUnwrap(payload[LibreWatchMessageKey.handoffSnapshot] as? Data))
+        XCTAssertEqual(received.ownership, .iphone)
+        XCTAssertGreaterThan(try XCTUnwrap(received.ownershipRevision), transaction.startingRevision,
+            "The Watch can stop its pending claim and quarantine the unaccepted readings")
+        XCTAssertTrue(LibreWatchOfflineTakeoverPolicy.canBegin(snapshot: received, session: session,
+            calibration: calibration, alarmSettings: settings, notificationsAuthorized: true))
+        XCTAssertEqual(LibreWatchOfflineTakeoverPolicy.phoneDecision(transaction: transaction,
+            currentSession: session, currentCalibration: calibration, currentAlarmSettings: settings,
+            activeOfferID: replacementOffer, ownership: .iphone, ownershipRevision: replacementEpoch,
+            receipt: nil, at: date), .staleOwnership, "Repeating the rejected claim cannot restore its old offer")
+    }
+}
+
+extension WatchSnapshotSemanticsTests {
+    func testPhoneRestartCompletesInterruptedOfflineRevocationBeforePublishingGrant() throws {
+        let name = "WatchSnapshotSemanticsTests.\(UUID())"; let defaults = UserDefaults(suiteName: name)!
+        defer { defaults.removePersistentDomain(forName: name) }
+        let (session, calibration, settings) = fixtures()
+        let transaction = LibreWatchOfflineTakeoverTransaction(originInstallationID: UUID(), offerID: UUID(),
+            session: session, calibration: calibration, alarmSettings: settings, startingRevision: 10, createdAt: date)
+        let accepted = LibreWatchOfflineTakeoverReceipt(transaction: transaction, acceptedRevision: 11, state: .accepted)
+        LibreWatchSessionStore.saveSession(session, defaults: defaults)
+        LibreWatchSessionStore.saveOwnership(.watch, defaults: defaults)
+        XCTAssertTrue(LibreWatchSessionStore.saveOfflineTakeoverReceipt(accepted, defaults: defaults))
+        LibreWatchSessionStore.saveOwnershipRevision(12, defaults: defaults)
+        // Simulates a process stop after the revocation epoch but before owner/receipt.
+        XCTAssertTrue(LibreWatchOfflinePhoneReleaseCoordinator.recoverInterruptedRevocation(
+            session: session, defaults: defaults))
+        XCTAssertEqual(LibreWatchSessionStore.loadOwnership(defaults: defaults), .iphone)
+        let retired = try XCTUnwrap(LibreWatchSessionStore.loadOfflineTakeoverReceipt(defaults: defaults))
+        XCTAssertEqual(retired.state, .retired)
+        XCTAssertEqual(retired.acceptedRevision, 12)
+        let startup = LibreWatchPhoneStartupDecision.resolve(
+            persistedOwnership: LibreWatchSessionStore.loadOwnership(defaults: defaults), persistedSession: session,
+            activeSensorUID: session.sensorUID, activePatchInfo: session.patchInfo)
+        XCTAssertFalse(startup.phoneConnectionIsBlocked)
+        let snapshot = try XCTUnwrap(LibreWatchHandoffSnapshotCache(defaults: defaults).resolve(
+            session: session, calibration: calibration, ownership: startup.ownership, settings: settings,
+            delegation: nil, offlineTakeoverOfferID: UUID(), ownershipRevision: 12,
+            offlineTakeoverReceipt: retired, at: date))
+        XCTAssertEqual(snapshot.ownership, .iphone)
+        XCTAssertNotNil(LibreWatchHandoffSnapshotCache.payload(snapshot))
+        XCTAssertEqual(LibreWatchOfflineTakeoverPolicy.phoneDecision(transaction: transaction,
+            currentSession: session, currentCalibration: calibration, currentAlarmSettings: settings,
+            activeOfferID: snapshot.offlineTakeoverOfferID, ownership: .iphone, ownershipRevision: 12,
+            receipt: retired, at: date), .staleOwnership)
+        XCTAssertFalse(LibreWatchOfflinePhoneReleaseCoordinator.recoverInterruptedRevocation(
+            session: session, defaults: defaults), "The recovered phone snapshot remains available on repeated startup")
+        // A second stop during the repair, after owner=phone but before retirement,
+        // still has recognizable evidence and finishes without granting Watch again.
+        XCTAssertTrue(LibreWatchSessionStore.saveOfflineTakeoverReceipt(accepted, defaults: defaults))
+        XCTAssertTrue(LibreWatchOfflinePhoneReleaseCoordinator.recoverInterruptedRevocation(
+            session: session, defaults: defaults))
+        XCTAssertEqual(LibreWatchSessionStore.loadOwnership(defaults: defaults), .iphone)
+        XCTAssertEqual(LibreWatchSessionStore.loadOfflineTakeoverReceipt(defaults: defaults)?.state, .retired)
+    }
+
+    func testPhoneRestartRevocationRecoveryPreservesValidWatchAndUnrelatedSessions() {
+        let name = "WatchSnapshotSemanticsTests.\(UUID())"; let defaults = UserDefaults(suiteName: name)!
+        defer { defaults.removePersistentDomain(forName: name) }
+        let (session, calibration, settings) = fixtures()
+        let transaction = LibreWatchOfflineTakeoverTransaction(originInstallationID: UUID(), offerID: UUID(),
+            session: session, calibration: calibration, alarmSettings: settings, startingRevision: 10, createdAt: date)
+        var receipt = LibreWatchOfflineTakeoverReceipt(transaction: transaction, acceptedRevision: 11, state: .accepted)
+        LibreWatchSessionStore.saveOwnership(.watch, defaults: defaults)
+        LibreWatchSessionStore.saveOwnershipRevision(1, defaults: defaults)
+        XCTAssertTrue(LibreWatchSessionStore.saveOfflineTakeoverReceipt(receipt, defaults: defaults))
+        XCTAssertFalse(LibreWatchOfflinePhoneReleaseCoordinator.recoverInterruptedRevocation(
+            session: session, defaults: defaults))
+        XCTAssertEqual(LibreWatchSessionStore.loadOwnership(defaults: defaults), .watch)
+        receipt.state = .releasing; receipt.acceptedRevision = 0
+        XCTAssertTrue(LibreWatchSessionStore.saveOfflineTakeoverReceipt(receipt, defaults: defaults))
+        XCTAssertFalse(LibreWatchOfflinePhoneReleaseCoordinator.recoverInterruptedRevocation(
+            session: session, defaults: defaults), "An ordinary interrupted release still belongs to Watch")
+        LibreWatchSessionStore.saveOwnershipRevision(12, defaults: defaults)
+        XCTAssertFalse(LibreWatchOfflinePhoneReleaseCoordinator.recoverInterruptedRevocation(
+            session: fixtures().0, defaults: defaults), "An unrelated current session cannot be reset by an old receipt")
+        XCTAssertEqual(LibreWatchSessionStore.loadOwnership(defaults: defaults), .watch)
+        XCTAssertTrue(LibreWatchOfflinePhoneReleaseCoordinator.recoverInterruptedRevocation(
+            session: session, defaults: defaults))
+        XCTAssertEqual(LibreWatchSessionStore.loadOwnership(defaults: defaults), .iphone)
+    }
+}

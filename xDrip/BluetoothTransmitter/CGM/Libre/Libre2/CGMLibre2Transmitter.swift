@@ -298,6 +298,9 @@ class CGMLibre2Transmitter: BluetoothTransmitter, CGMTransmitter {
         if !UserDefaults.standard.suppressUnLockPayLoad {
             _ = writeDataToPeripheral(data: unLockPayLoad, type: .withResponse)
         }
+        // Publish the actual counter just consumed by the phone, through the existing
+        // preparation event. No polling or speculative counter reservation is needed.
+        _ = prepareCurrentSensorForWatch()
     }
     
     override func prepareForRelease() {
@@ -424,6 +427,27 @@ class CGMLibre2Transmitter: BluetoothTransmitter, CGMTransmitter {
             )
             completion(true)
         }
+    }
+
+    /// An offline claim may be retried after the phone restarted with a persisted
+    /// release in progress. Even then, confirm the native disconnect before acknowledging.
+    @nonobjc func reconcileOfflineSensorRelease(
+        _ session: LibreWatchDirectSession,
+        completion: @escaping (Bool) -> Void
+    ) {
+        if watchOwnershipSessionID == nil {
+            releaseSensorToWatch(session, completion: completion)
+            return
+        }
+        guard watchOwnershipSessionID == session.id, session.isValid,
+              UserDefaults.standard.libreSensorUID == session.sensorUID,
+              UserDefaults.standard.librePatchInfo == session.patchInfo,
+              sensorSerialNumber?.caseInsensitiveCompare(session.sensorSerialNumber) == .orderedSame
+        else {
+            completion(false)
+            return
+        }
+        pauseConnectionWithoutReconnect(completion: { completion(true) })
     }
 
     /// Restores a persisted Watch owner before the phone's normal reconnect loop can take over.

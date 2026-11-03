@@ -9299,3 +9299,311 @@ extension LibreWatchValuePipelineTests {
         }
     }
 }
+
+extension LibreWatchValuePipelineTests {
+    private func offlineSnapshot(enabledAlarms: Bool = true) -> LibreWatchHandoffSnapshot {
+        LibreWatchHandoffSnapshot(session: session,
+            calibration: calibration(type: .factoryCalibrated, slope: 1, intercept: 0),
+            ownership: .iphone, revision: 31, alarmSettings: alarmSettings(enabled: enabledAlarms),
+            offlineTakeoverOfferID: UUID(uuidString: "00000000-0000-4000-8000-000000000001")!,
+            ownershipRevision: 30)
+    }
+
+    private func offlineTransaction(version: Int = LibreWatchOfflineTakeoverTransaction.currentVersion,
+                                    requestID: UUID = UUID(), originInstallationID: UUID = UUID(),
+                                    createdAt: Date? = nil) -> LibreWatchOfflineTakeoverTransaction {
+        let snapshot = offlineSnapshot()
+        return LibreWatchOfflineTakeoverTransaction(version: version, requestID: requestID,
+            originInstallationID: originInstallationID, offerID: snapshot.offlineTakeoverOfferID!,
+            session: snapshot.session, calibration: snapshot.calibration!, alarmSettings: snapshot.alarmSettings!,
+            startingRevision: snapshot.revision, createdAt: createdAt ?? receivedAt.addingTimeInterval(-1))
+    }
+
+    private func offlinePhoneDecision(_ transaction: LibreWatchOfflineTakeoverTransaction,
+                                      owner: LibreWatchOwnership = .iphone, ownerRevision: UInt64 = 30,
+                                      offerID: UUID? = nil, calibration: LibreWatchCalibrationSnapshot? = nil,
+                                      settings: LibreWatchAlarmSettings? = nil,
+                                      receipt: LibreWatchOfflineTakeoverReceipt? = nil) -> LibreWatchOfflineTakeoverPolicy.PhoneDecision {
+        LibreWatchOfflineTakeoverPolicy.phoneDecision(transaction: transaction, currentSession: session,
+            currentCalibration: calibration ?? transaction.calibration,
+            currentAlarmSettings: settings ?? transaction.alarmSettings,
+            activeOfferID: offerID ?? transaction.offerID, ownership: owner, ownershipRevision: ownerRevision,
+            receipt: receipt, at: receivedAt)
+    }
+
+    func testLegacyHandoffDecodesButDoesNotAuthorizeOfflineTakeover() throws {
+        let snapshot = LibreWatchHandoffSnapshot(session: session,
+            calibration: calibration(type: .factoryCalibrated, slope: 1, intercept: 0),
+            ownership: .iphone, revision: 31, alarmSettings: alarmSettings())
+        let data = try JSONEncoder().encode(snapshot)
+        let restored = try JSONDecoder().decode(LibreWatchHandoffSnapshot.self, from: data)
+        XCTAssertTrue(restored.isValid)
+        XCTAssertNil(restored.offlineTakeoverOfferID)
+        XCTAssertNil(restored.ownershipRevision)
+        XCTAssertNil(restored.offlineTakeoverReceipt)
+        XCTAssertFalse(LibreWatchOfflineTakeoverPolicy.canBegin(snapshot: restored, session: session,
+            calibration: restored.calibration, alarmSettings: restored.alarmSettings, notificationsAuthorized: true))
+    }
+
+    func testOfflineCapabilityRequiresMatchingCachedCalibrationAlarmsAndPermissions() throws {
+        let snapshot = offlineSnapshot()
+        XCTAssertEqual(try JSONDecoder().decode(LibreWatchHandoffSnapshot.self,
+            from: JSONEncoder().encode(snapshot)), snapshot)
+        XCTAssertTrue(LibreWatchOfflineTakeoverPolicy.canBegin(snapshot: snapshot, session: session,
+            calibration: snapshot.calibration, alarmSettings: snapshot.alarmSettings, notificationsAuthorized: true))
+        XCTAssertFalse(LibreWatchOfflineTakeoverPolicy.canBegin(snapshot: snapshot, session: session,
+            calibration: snapshot.calibration, alarmSettings: snapshot.alarmSettings, notificationsAuthorized: false))
+        XCTAssertFalse(LibreWatchOfflineTakeoverPolicy.canBegin(snapshot: snapshot, session: session,
+            calibration: calibration(type: .factoryCalibrated, slope: 1, intercept: 0, revision: 11),
+            alarmSettings: snapshot.alarmSettings, notificationsAuthorized: true))
+        var changed = snapshot.alarmSettings!
+        changed.revision += 1
+        XCTAssertFalse(LibreWatchOfflineTakeoverPolicy.canBegin(snapshot: snapshot, session: session,
+            calibration: snapshot.calibration, alarmSettings: changed, notificationsAuthorized: true))
+        let disabled = offlineSnapshot(enabledAlarms: false)
+        XCTAssertTrue(LibreWatchOfflineTakeoverPolicy.canBegin(snapshot: disabled, session: session,
+            calibration: disabled.calibration, alarmSettings: disabled.alarmSettings, notificationsAuthorized: false))
+    }
+
+    func testOfflineCapabilityCannotBeAddedWithoutAnOwnershipEpochOrMatchingSettings() {
+        var snapshot = offlineSnapshot()
+        snapshot.ownershipRevision = nil
+        XCTAssertFalse(snapshot.isValid)
+        snapshot = offlineSnapshot()
+        snapshot.ownershipRevision = 32
+        XCTAssertFalse(snapshot.isValid)
+        snapshot = offlineSnapshot()
+        snapshot.alarmSettings = nil
+        XCTAssertFalse(snapshot.isValid)
+    }
+
+    func testOfflineTransactionRejectsUnsupportedVersionAndFutureIntent() {
+        XCTAssertEqual(offlinePhoneDecision(offlineTransaction(version: 2)), .invalid)
+        XCTAssertEqual(offlinePhoneDecision(offlineTransaction(createdAt: receivedAt.addingTimeInterval(3_601))), .invalid)
+        XCTAssertEqual(offlinePhoneDecision(offlineTransaction()), .accept)
+    }
+
+    func testOfflineClaimRejectsRetiredOfferNewOwnershipAndChangedCalibrationOrAlarmSettings() {
+        let transaction = offlineTransaction()
+        XCTAssertEqual(offlinePhoneDecision(transaction, offerID: UUID()), .staleOwnership)
+        XCTAssertEqual(offlinePhoneDecision(transaction, ownerRevision: 32), .staleOwnership)
+        XCTAssertEqual(offlinePhoneDecision(transaction, owner: .watch), .staleOwnership)
+        XCTAssertEqual(offlinePhoneDecision(transaction,
+            calibration: calibration(type: .factoryCalibrated, slope: 1, intercept: 0, revision: 11)), .wrongCalibration)
+        var changed = transaction.alarmSettings
+        changed.revision += 1
+        XCTAssertEqual(offlinePhoneDecision(transaction, settings: changed), .wrongAlarmSettings)
+        XCTAssertEqual(LibreWatchOfflineTakeoverPolicy.phoneDecision(transaction: transaction,
+            currentSession: nil, currentCalibration: transaction.calibration,
+            currentAlarmSettings: transaction.alarmSettings, activeOfferID: transaction.offerID,
+            ownership: .iphone, ownershipRevision: 30, receipt: nil, at: receivedAt), .wrongSession)
+    }
+
+    func testOfflineReceiptPersistsIdempotentAcceptanceAndRetirementAcrossRestart() throws {
+        let defaults = isolatedDefaults()
+        let transaction = offlineTransaction()
+        var receipt = LibreWatchOfflineTakeoverReceipt(transaction: transaction, acceptedRevision: 32, state: .accepted)
+        XCTAssertTrue(LibreWatchSessionStore.saveOfflineTakeoverReceipt(receipt, defaults: defaults))
+        let restarted = try XCTUnwrap(LibreWatchSessionStore.loadOfflineTakeoverReceipt(defaults: defaults))
+        XCTAssertEqual(restarted, receipt)
+        XCTAssertEqual(offlinePhoneDecision(transaction, owner: .watch, ownerRevision: 32, receipt: restarted), .duplicate)
+        XCTAssertEqual(offlinePhoneDecision(transaction, owner: .watch, ownerRevision: 33, receipt: restarted), .staleOwnership,
+            "The explicit epoch is persisted before receipt retirement or owner changes")
+        XCTAssertEqual(offlinePhoneDecision(transaction, owner: .iphone, ownerRevision: 32, receipt: restarted), .staleOwnership)
+        receipt.state = .retired
+        XCTAssertTrue(LibreWatchSessionStore.saveOfflineTakeoverReceipt(receipt, defaults: defaults))
+        let retired = try XCTUnwrap(LibreWatchSessionStore.loadOfflineTakeoverReceipt(defaults: defaults))
+        XCTAssertEqual(offlinePhoneDecision(transaction, owner: .watch, receipt: retired), .staleOwnership)
+        XCTAssertEqual(offlinePhoneDecision(transaction, owner: .iphone, receipt: retired), .staleOwnership)
+    }
+
+    func testOfflineReleasingReceiptResumesBothSidesOfDurableOwnershipWrite() throws {
+        let transaction = offlineTransaction()
+        let receipt = LibreWatchOfflineTakeoverReceipt(transaction: transaction, acceptedRevision: 0, state: .releasing)
+        XCTAssertTrue(receipt.isValid)
+        for owner in [LibreWatchOwnership.iphone, .releasingToWatch, .watch] {
+            XCTAssertEqual(offlinePhoneDecision(transaction, owner: owner, receipt: receipt), .resume)
+        }
+        XCTAssertEqual(offlinePhoneDecision(transaction, ownerRevision: 32, receipt: receipt), .staleOwnership)
+        XCTAssertEqual(offlinePhoneDecision(transaction, owner: .releasingToWatch, ownerRevision: 32, receipt: receipt), .staleOwnership)
+        XCTAssertEqual(offlinePhoneDecision(transaction, offerID: UUID(), receipt: receipt), .staleOwnership)
+        XCTAssertEqual(offlinePhoneDecision(transaction, owner: .releasingToPhone, receipt: receipt), .staleOwnership)
+        XCTAssertEqual(offlinePhoneDecision(offlineTransaction(), owner: .iphone, receipt: receipt), .conflictingRequest,
+            "A crash before the owner write must not let a second request replace the durable first intent")
+        var retired = receipt
+        retired.state = .retired
+        XCTAssertFalse(retired.isValid, "Retirement must first record the explicit ownership revision")
+        retired.acceptedRevision = 32
+        XCTAssertTrue(retired.isValid)
+    }
+
+    func testOfflineReceiptCannotAcknowledgeConflictingRequestOrAnotherWatchInstallation() {
+        let transaction = offlineTransaction()
+        let receipt = LibreWatchOfflineTakeoverReceipt(transaction: transaction, acceptedRevision: 32, state: .accepted)
+        let changedOrigin = offlineTransaction(requestID: transaction.requestID, originInstallationID: UUID())
+        XCTAssertFalse(receipt.matches(changedOrigin))
+        XCTAssertEqual(offlinePhoneDecision(changedOrigin, owner: .watch, receipt: receipt), .conflictingRequest)
+        let changedTime = offlineTransaction(requestID: transaction.requestID,
+            originInstallationID: transaction.originInstallationID, createdAt: transaction.createdAt.addingTimeInterval(1))
+        XCTAssertFalse(receipt.matches(changedTime))
+        XCTAssertEqual(offlinePhoneDecision(changedTime, owner: .watch, receipt: receipt), .conflictingRequest)
+    }
+
+    func testOfflineAttemptPersistsAcrossRestartWithoutExpiringOrConsumingAnotherCounter() throws {
+        let defaults = isolatedDefaults()
+        var pending = LibreWatchOfflineTakeoverState(transaction:
+            offlineTransaction(createdAt: receivedAt.addingTimeInterval(-8 * 60 * 60)))
+        XCTAssertTrue(pending.canAttemptInitialUnlock(counter: session.unlockCount + 1))
+        XCTAssertFalse(pending.canAttemptInitialUnlock(counter: session.unlockCount + 2))
+        pending.attemptedUnlockCounter = session.unlockCount + 1
+        XCTAssertTrue(LibreWatchSessionStore.saveOfflineTakeover(pending, defaults: defaults))
+        var restarted = try XCTUnwrap(LibreWatchSessionStore.loadOfflineTakeover(defaults: defaults))
+        XCTAssertEqual(restarted, pending)
+        XCTAssertNil(restarted.confirmedAt)
+        XCTAssertFalse(restarted.canAttemptInitialUnlock(counter: session.unlockCount + 1))
+        XCTAssertFalse(restarted.canAttemptInitialUnlock(counter: session.unlockCount + 2))
+        restarted.initialAttemptFailed = true
+        XCTAssertTrue(LibreWatchSessionStore.saveOfflineTakeover(restarted, defaults: defaults))
+        XCTAssertTrue(try XCTUnwrap(LibreWatchSessionStore.loadOfflineTakeover(defaults: defaults)).initialAttemptFailed)
+        XCTAssertFalse(restarted.isReconciled)
+    }
+
+    func testOfflineStateRejectsCounterJumpAndConfirmationWithoutAnUnlockAttempt() {
+        var pending = LibreWatchOfflineTakeoverState(transaction: offlineTransaction())
+        pending.attemptedUnlockCounter = session.unlockCount + 2
+        XCTAssertFalse(pending.isValid)
+        pending.attemptedUnlockCounter = nil
+        pending.confirmedAt = receivedAt
+        XCTAssertFalse(pending.isValid)
+    }
+
+    func testOfflineConfirmationRequiresANewValidatedFrameNotConnectionOrPriorCache() {
+        var pending = LibreWatchOfflineTakeoverState(transaction: offlineTransaction())
+        let current = payload(raw: 847, previousRaw: 829, domain: .factoryNativeMGDL)
+        XCTAssertFalse(pending.confirmReceivedFrame(current, at: receivedAt))
+        pending.attemptedUnlockCounter = session.unlockCount + 1
+        XCTAssertNil(pending.confirmedAt)
+        XCTAssertFalse(pending.confirmReceivedFrame(payload(raw: 847, previousRaw: 829,
+            domain: .factoryNativeMGDL, at: receivedAt.addingTimeInterval(-2)), at: receivedAt))
+        XCTAssertFalse(pending.confirmReceivedFrame(payload(raw: 847, previousRaw: 829,
+            domain: .factoryNativeMGDL, sessionID: UUID()), at: receivedAt))
+        XCTAssertFalse(pending.confirmReceivedFrame(payload(raw: 847, previousRaw: 829,
+            domain: .factoryNativeMGDL, revision: 9), at: receivedAt))
+        XCTAssertFalse(pending.confirmReceivedFrame(payload(raw: 0, previousRaw: 829,
+            domain: .factoryNativeMGDL), at: receivedAt))
+        XCTAssertTrue(pending.confirmReceivedFrame(current, at: receivedAt))
+        XCTAssertEqual(pending.confirmedAt, receivedAt)
+        XCTAssertFalse(pending.isReconciled, "A direct frame alone does not acknowledge phone persistence")
+    }
+
+    func testOfflinePhoneReceiptAllowsOnlyNormalNextActualCounterAfterFailedCachedAttempt() {
+        let transaction = offlineTransaction()
+        var pending = LibreWatchOfflineTakeoverState(transaction: transaction)
+        pending.attemptedUnlockCounter = session.unlockCount + 1
+        pending.initialAttemptFailed = true
+        pending.receipt = LibreWatchOfflineTakeoverReceipt(transaction: transaction, acceptedRevision: 32, state: .accepted)
+        var current = session
+        current.unlockCount = 12
+        XCTAssertTrue(pending.isReconciled)
+        XCTAssertFalse(pending.canAttemptInitialUnlock(counter: 13))
+        XCTAssertTrue(pending.canAttemptInitialUnlock(counter: 13, currentSession: current))
+        XCTAssertFalse(pending.canAttemptInitialUnlock(counter: 14, currentSession: current))
+        pending.attemptedUnlockCounter = 13
+        XCTAssertTrue(pending.isValid)
+        let changedCalibration = calibration(type: .factoryCalibrated, slope: 1, intercept: 0, revision: 11)
+        XCTAssertTrue(pending.confirmReceivedFrame(payload(raw: 847, previousRaw: 829,
+            domain: .factoryNativeMGDL, revision: 11), currentCalibration: changedCalibration, at: receivedAt))
+        XCTAssertFalse(pending.initialAttemptFailed)
+        XCTAssertEqual(pending.confirmedAt, receivedAt)
+    }
+
+    func testOfflinePersistencePreservesCorruptAndFuturePendingIntentBytes() throws {
+        let defaults = isolatedDefaults()
+        let pending = LibreWatchOfflineTakeoverState(transaction: offlineTransaction())
+        for invalid in [Data("interrupted".utf8), try JSONEncoder().encode(
+            LibreWatchOfflineTakeoverState(transaction: offlineTransaction(version: 2)))] {
+            defaults.set(invalid, forKey: LibreWatchMessageKey.persistedOfflineTakeover)
+            XCTAssertTrue(LibreWatchSessionStore.hasOfflineTakeoverRecord(defaults: defaults))
+            XCTAssertNil(LibreWatchSessionStore.loadOfflineTakeover(defaults: defaults))
+            XCTAssertFalse(LibreWatchSessionStore.saveOfflineTakeover(pending, defaults: defaults))
+            XCTAssertEqual(defaults.data(forKey: LibreWatchMessageKey.persistedOfflineTakeover), invalid)
+        }
+    }
+
+    func testOfflineReceiptCannotArriveAheadOfItsAuthoritativeSnapshotRevision() {
+        let transaction = offlineTransaction()
+        var snapshot = offlineSnapshot()
+        snapshot.offlineTakeoverReceipt = LibreWatchOfflineTakeoverReceipt(
+            transaction: transaction, acceptedRevision: 32, state: .accepted)
+        XCTAssertFalse(snapshot.isValid)
+        snapshot.offlineTakeoverReceipt?.acceptedRevision = 31
+        XCTAssertFalse(snapshot.isValid, "The accepted receipt must follow its starting revision")
+    }
+
+    func testInterruptedOfflineReceiptRetirementCannotPublishAnOldAcceptedGrant() throws {
+        let transaction = offlineTransaction()
+        let receipt = LibreWatchOfflineTakeoverReceipt(transaction: transaction, acceptedRevision: 32, state: .accepted)
+        let defaults = isolatedDefaults()
+        XCTAssertTrue(LibreWatchSessionStore.saveOfflineTakeoverReceipt(receipt, defaults: defaults))
+        LibreWatchSessionStore.saveOwnership(.watch, defaults: defaults)
+        // Simulate stopping after the revocation epoch, before receipt/owner writes.
+        LibreWatchSessionStore.saveOwnershipRevision(33, defaults: defaults)
+        let restarted = try XCTUnwrap(LibreWatchSessionStore.loadOfflineTakeoverReceipt(defaults: defaults))
+        let epoch = LibreWatchSessionStore.loadOwnershipRevision(defaults: defaults)
+        XCTAssertFalse(restarted.isConsistent(withOwnershipRevision: epoch))
+        var snapshot = LibreWatchHandoffSnapshot(session: session, calibration: transaction.calibration,
+            ownership: LibreWatchSessionStore.loadOwnership(defaults: defaults), revision: 34,
+            alarmSettings: transaction.alarmSettings, ownershipRevision: epoch, offlineTakeoverReceipt: restarted)
+        XCTAssertFalse(snapshot.isValid, "A newer envelope cannot revive a receipt revoked by an explicit owner epoch")
+        snapshot.offlineTakeoverReceipt = LibreWatchOfflineTakeoverReceipt(transaction: transaction,
+            acceptedRevision: 0, state: .releasing)
+        XCTAssertFalse(snapshot.isValid)
+        snapshot.offlineTakeoverReceipt = LibreWatchOfflineTakeoverReceipt(transaction: transaction,
+            acceptedRevision: 33, state: .retired)
+        XCTAssertTrue(snapshot.isValid, "The explicit retirement remains usable after safe owner reconciliation")
+    }
+
+    func testOfflineStoreClearRemovesCapabilityPendingIntentAndReceiptTogether() {
+        let defaults = isolatedDefaults()
+        let transaction = offlineTransaction()
+        XCTAssertTrue(LibreWatchSessionStore.saveOfflineTakeover(
+            LibreWatchOfflineTakeoverState(transaction: transaction), defaults: defaults))
+        XCTAssertTrue(LibreWatchSessionStore.saveOfflineTakeoverReceipt(
+            LibreWatchOfflineTakeoverReceipt(transaction: transaction, acceptedRevision: 32, state: .accepted), defaults: defaults))
+        LibreWatchSessionStore.saveOfflineTakeoverOfferID(transaction.offerID, defaults: defaults)
+        LibreWatchSessionStore.saveOwnershipRevision(32, defaults: defaults)
+        LibreWatchSessionStore.clear(defaults: defaults)
+        XCTAssertFalse(LibreWatchSessionStore.hasOfflineTakeoverRecord(defaults: defaults))
+        XCTAssertNil(LibreWatchSessionStore.loadOfflineTakeoverReceipt(defaults: defaults))
+        XCTAssertNil(LibreWatchSessionStore.loadOfflineTakeoverOfferID(defaults: defaults))
+        XCTAssertEqual(LibreWatchSessionStore.loadOwnershipRevision(defaults: defaults), 0)
+    }
+
+    func testCorruptOfflineIntentNeedsExplicitEpochAndSurvivesLostOnlineReply() throws {
+        let old = offlineSnapshot()
+        func allows(_ snapshot: LibreWatchHandoffSnapshot) -> Bool {
+            LibreWatchOfflineTakeoverPolicy.allowsCorruptRecordRecovery(snapshot: snapshot,
+                acceptedRevision: old.revision, currentSession: session)
+        }
+        let metadata = LibreWatchHandoffSnapshot(session: session, calibration: old.calibration,
+            ownership: .iphone, revision: 50, alarmSettings: old.alarmSettings,
+            offlineTakeoverOfferID: old.offlineTakeoverOfferID, ownershipRevision: old.ownershipRevision)
+        XCTAssertFalse(allows(metadata), "A newer context must not erase an unknown consumed counter")
+        let freshPhone = LibreWatchHandoffSnapshot(session: session, calibration: old.calibration,
+            ownership: .iphone, revision: 52, alarmSettings: old.alarmSettings,
+            offlineTakeoverOfferID: UUID(), ownershipRevision: 51)
+        XCTAssertTrue(allows(freshPhone))
+        let onlineGrant = LibreWatchHandoffSnapshot(session: session, calibration: old.calibration,
+            ownership: .watch, revision: 53, alarmSettings: old.alarmSettings, ownershipRevision: 52)
+        let afterRestart = try JSONDecoder().decode(LibreWatchHandoffSnapshot.self,
+            from: JSONEncoder().encode(onlineGrant))
+        XCTAssertTrue(allows(afterRestart), "The explicit native grant survives a lost reply and ephemeral request marker")
+        let ordinaryWatch = LibreWatchHandoffSnapshot(session: session, calibration: old.calibration,
+            ownership: .watch, revision: 53, alarmSettings: old.alarmSettings, ownershipRevision: 30)
+        XCTAssertFalse(allows(ordinaryWatch), "A newer snapshot with the old epoch is not an online repair grant")
+        let uncalibrated = LibreWatchHandoffSnapshot(session: session, calibration: nil,
+            ownership: .watch, revision: 53, alarmSettings: old.alarmSettings, ownershipRevision: 52)
+        XCTAssertFalse(allows(uncalibrated))
+        XCTAssertFalse(allows(old))
+    }
+}

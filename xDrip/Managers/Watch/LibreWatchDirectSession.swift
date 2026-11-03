@@ -437,6 +437,8 @@ enum LibreWatchMessageKey {
     static let alarmsReady = "libreWatchAlarmsReady"
     static let alarmDelegation = "libreWatchAlarmDelegation"
     static let alarmState = "libreWatchAlarmState"
+    static let offlineTakeover = "libreWatchOfflineTakeover"
+    static let offlineTakeoverReceipt = "libreWatchOfflineTakeoverReceipt"
 
     static let persistedSession = "libreWatchDirectPersistedSession.v2"
     static let persistedOwnership = "libreWatchDirectPersistedOwnership.v2"
@@ -449,11 +451,16 @@ enum LibreWatchMessageKey {
     static let persistedRecoveryAttempt = "libreWatchRecoveryAttempt.v1"
     static let persistedReleaseReceipt = "libreWatchReleaseReceipt.v1"
     static let persistedPhoneReturn = "libreWatchPendingPhoneReturn.v1"
+    static let persistedOfflineTakeover = "libreWatchOfflineTakeover.v1"
+    static let persistedOfflineTakeoverReceipt = "libreWatchOfflineTakeoverReceipt.v1"
+    static let persistedOfflineTakeoverOfferID = "libreWatchOfflineTakeoverOfferID.v1"
+    static let persistedOwnershipRevision = "libreWatchOwnershipRevision.v1"
 }
 
 enum LibreWatchCommand: String, Codable {
     case acknowledgeSession
     case requestOwnership
+    case claimOfflineOwnership
     case releaseOwnership
     case updateUnlockCounter
     case submitReading
@@ -1511,7 +1518,7 @@ struct LibreWatchOutboxItem: Codable, Equatable, Identifiable {
                 return unlockCounter != nil && diagnosticEvent == nil
             case .reportDiagnostic:
                 return unlockCounter == nil && diagnosticEvent != nil
-            case .acknowledgeSession, .requestOwnership, .releaseOwnership, .submitReading:
+            case .acknowledgeSession, .requestOwnership, .claimOfflineOwnership, .releaseOwnership, .submitReading:
                 return false
             }
         }
@@ -4349,6 +4356,10 @@ enum LibreWatchSessionStore {
         defaults.removeObject(forKey: LibreWatchMessageKey.persistedRecoveryAttempt)
         defaults.removeObject(forKey: LibreWatchMessageKey.persistedReleaseReceipt)
         defaults.removeObject(forKey: LibreWatchMessageKey.persistedPhoneReturn)
+        defaults.removeObject(forKey: LibreWatchMessageKey.persistedOfflineTakeover)
+        defaults.removeObject(forKey: LibreWatchMessageKey.persistedOfflineTakeoverReceipt)
+        defaults.removeObject(forKey: LibreWatchMessageKey.persistedOfflineTakeoverOfferID)
+        defaults.removeObject(forKey: LibreWatchMessageKey.persistedOwnershipRevision)
     }
 }
 
@@ -4423,6 +4434,274 @@ extension LibreWatchSessionStore {
     }
 }
 
+/// Frozen user intent. The phone-issued offer binds this claim to one ownership epoch;
+/// the request UUID and Watch installation distinguish retries from a later user action.
+/// The collector's actual counters travel separately, never by mutating this identity.
+struct LibreWatchOfflineTakeoverTransaction: Codable, Equatable, Identifiable {
+    static let currentVersion = 1
+    let version: Int
+    let requestID: UUID
+    let originInstallationID: UUID
+    let offerID: UUID
+    let session: LibreWatchDirectSession
+    let calibration: LibreWatchCalibrationSnapshot
+    let alarmSettings: LibreWatchAlarmSettings
+    let startingRevision: UInt64
+    let createdAt: Date
+
+    var id: UUID { requestID }
+
+    init(version: Int = Self.currentVersion, requestID: UUID = UUID(), originInstallationID: UUID,
+         offerID: UUID, session: LibreWatchDirectSession, calibration: LibreWatchCalibrationSnapshot,
+         alarmSettings: LibreWatchAlarmSettings, startingRevision: UInt64, createdAt: Date) {
+        self.version = version
+        self.requestID = requestID
+        self.originInstallationID = originInstallationID
+        self.offerID = offerID
+        self.session = session
+        self.calibration = calibration
+        self.alarmSettings = alarmSettings
+        self.startingRevision = startingRevision
+        self.createdAt = createdAt
+    }
+
+    var isValid: Bool {
+        version == Self.currentVersion && session.isValid && startingRevision > 0 &&
+            calibration.matches(session: session) && alarmSettings.matches(session) &&
+            createdAt.timeIntervalSince1970.isFinite && createdAt.timeIntervalSince1970 > 0 &&
+            alarmSettings.generatedAt.timeIntervalSince1970.isFinite
+    }
+
+    func matches(session current: LibreWatchDirectSession?) -> Bool {
+        guard let current, current.isValid else { return false }
+        return current.id == session.id && current.representsSameSensor(as: session) &&
+            current.unlockCode == session.unlockCode && current.algorithmParameters == session.algorithmParameters
+    }
+}
+
+/// Retain the retired receipt as a tombstone: delayed claims must never reactivate a
+/// completed manual return. Persist `.releasing` before asking native BLE to disconnect.
+struct LibreWatchOfflineTakeoverReceipt: Codable, Equatable {
+    enum State: String, Codable { case releasing, accepted, retired }
+    let transaction: LibreWatchOfflineTakeoverTransaction
+    var acceptedRevision: UInt64
+    var state: State
+
+    var isValid: Bool {
+        transaction.isValid && (state == .releasing || acceptedRevision > transaction.startingRevision)
+    }
+
+    func matches(_ transaction: LibreWatchOfflineTakeoverTransaction) -> Bool {
+        isValid && self.transaction == transaction
+    }
+
+    /// The explicit revocation epoch is written before the receipt and owner. A crash
+    /// between those writes must not let the old accepted receipt become a fresh grant.
+    func isConsistent(withOwnershipRevision revision: UInt64) -> Bool {
+        guard isValid else { return false }
+        switch state {
+        case .releasing: return revision <= transaction.startingRevision
+        case .accepted: return revision <= acceptedRevision
+        case .retired: return true
+        }
+    }
+}
+
+/// This Watch-only record survives transport loss and process restart. A Bluetooth
+/// connection or unlock write is not evidence of reception; only a decoded frame is.
+struct LibreWatchOfflineTakeoverState: Codable, Equatable {
+    let transaction: LibreWatchOfflineTakeoverTransaction
+    var attemptedUnlockCounter: UInt16? = nil
+    var confirmedAt: Date? = nil
+    var initialAttemptFailed = false
+    var receipt: LibreWatchOfflineTakeoverReceipt? = nil
+
+    var isValid: Bool {
+        transaction.isValid &&
+            (attemptedUnlockCounter.map {
+                $0 > transaction.session.unlockCount && (confirmedAt != nil || isReconciled ||
+                    (transaction.session.unlockCount < UInt16.max && $0 == transaction.session.unlockCount + 1))
+            } ?? true) &&
+            (confirmedAt.map { attemptedUnlockCounter != nil && $0.timeIntervalSince1970.isFinite &&
+                $0 >= transaction.createdAt } ?? true) &&
+            (receipt.map { $0.matches(transaction) } ?? true)
+    }
+
+    var isReconciled: Bool { receipt?.state == .accepted && receipt?.matches(transaction) == true }
+
+    /// Before the first frame, allow only the ordinary next counter once. A failed or
+    /// interrupted attempt requires phone reconciliation, never an increment search.
+    func canAttemptInitialUnlock(counter: UInt16, currentSession: LibreWatchDirectSession? = nil) -> Bool {
+        guard isValid, confirmedAt == nil else { return false }
+        if isReconciled {
+            guard let currentSession, transaction.matches(session: currentSession),
+                  currentSession.unlockCount < UInt16.max else { return false }
+            return counter == currentSession.unlockCount + 1
+        }
+        return !initialAttemptFailed && attemptedUnlockCounter == nil &&
+            transaction.session.unlockCount < UInt16.max && counter == transaction.session.unlockCount + 1
+    }
+
+    @discardableResult
+    mutating func confirmReceivedFrame(_ reading: LibreWatchDirectReadingPayload,
+                                      currentCalibration: LibreWatchCalibrationSnapshot? = nil, at now: Date) -> Bool {
+        let calibration = isReconciled ? (currentCalibration ?? transaction.calibration) : transaction.calibration
+        guard isValid, attemptedUnlockCounter != nil,
+              reading.sessionID == transaction.session.id,
+              calibration.matches(session: transaction.session), reading.calibrationRevision == calibration.revision,
+              reading.isValid(for: calibration, at: now),
+              reading.isCurrent(at: now), reading.receivedAt >= transaction.createdAt else { return false }
+        if confirmedAt == nil { confirmedAt = reading.receivedAt }
+        initialAttemptFailed = false
+        return true
+    }
+}
+
+enum LibreWatchOfflineTakeoverPolicy {
+    enum PhoneDecision: Equatable {
+        case accept, resume, duplicate, invalid, wrongSession, wrongCalibration
+        case wrongAlarmSettings, staleOwnership, conflictingRequest
+    }
+
+    static func phoneDecision(transaction: LibreWatchOfflineTakeoverTransaction,
+                              currentSession: LibreWatchDirectSession?,
+                              currentCalibration: LibreWatchCalibrationSnapshot?,
+                              currentAlarmSettings: LibreWatchAlarmSettings?, activeOfferID: UUID?,
+                              ownership: LibreWatchOwnership, ownershipRevision: UInt64,
+                              receipt: LibreWatchOfflineTakeoverReceipt?, at now: Date = Date()) -> PhoneDecision {
+        guard transaction.isValid, transaction.createdAt <= now.addingTimeInterval(60 * 60) else { return .invalid }
+        guard transaction.matches(session: currentSession) else { return .wrongSession }
+        if let receipt, receipt.isValid, receipt.transaction.matches(session: currentSession),
+           receipt.transaction.requestID != transaction.requestID, receipt.state != .retired,
+           ownershipRevision <= (receipt.state == .releasing ? receipt.transaction.startingRevision : receipt.acceptedRevision) {
+            return .conflictingRequest
+        }
+        var isResuming = false
+        if let receipt, receipt.transaction.requestID == transaction.requestID {
+            guard receipt.matches(transaction) else { return .conflictingRequest }
+            switch receipt.state {
+            case .retired: return .staleOwnership
+            case .accepted:
+                guard receipt.isConsistent(withOwnershipRevision: ownershipRevision) else { return .staleOwnership }
+                return [.watch, .releasingToPhone].contains(ownership) ? .duplicate : .staleOwnership
+            case .releasing:
+                guard receipt.isConsistent(withOwnershipRevision: ownershipRevision) else { return .staleOwnership }
+                let interruptedBeforeOwnerWrite = ownership == .iphone && activeOfferID == transaction.offerID &&
+                    ownershipRevision <= transaction.startingRevision
+                guard [.releasingToWatch, .watch].contains(ownership) || interruptedBeforeOwnerWrite
+                else { return .staleOwnership }
+                isResuming = true
+            }
+        }
+        if !isResuming {
+            guard ownership == .iphone, activeOfferID == transaction.offerID,
+                  ownershipRevision <= transaction.startingRevision else { return .staleOwnership }
+        }
+        guard let currentCalibration, currentCalibration.matches(session: transaction.session),
+              currentCalibration.revision == transaction.calibration.revision,
+              currentCalibration.hasSameCalibration(as: transaction.calibration) else { return .wrongCalibration }
+        guard let currentAlarmSettings, currentAlarmSettings.matches(transaction.session),
+              currentAlarmSettings.revision == transaction.alarmSettings.revision,
+              currentAlarmSettings.sameConfiguration(as: transaction.alarmSettings) else { return .wrongAlarmSettings }
+        return isResuming ? .resume : .accept
+    }
+
+    /// Capability and configuration must have arrived together in a modern phone
+    /// snapshot. Notification readiness is the existing permission check, including
+    /// the existing all-alarms-disabled behavior.
+    static func canBegin(snapshot: LibreWatchHandoffSnapshot?, session: LibreWatchDirectSession?,
+                         calibration: LibreWatchCalibrationSnapshot?, alarmSettings: LibreWatchAlarmSettings?,
+                         notificationsAuthorized: Bool) -> Bool {
+        guard let snapshot, snapshot.isValid, snapshot.ownership == .iphone,
+              snapshot.offlineTakeoverOfferID != nil, let session, let calibration, let alarmSettings,
+              snapshot.session.id == session.id, snapshot.session.representsSameSensor(as: session),
+              snapshot.session.unlockCode == session.unlockCode,
+              snapshot.session.algorithmParameters == session.algorithmParameters,
+              snapshot.calibration == calibration, snapshot.alarmSettings == alarmSettings,
+              calibration.matches(session: session), alarmSettings.matches(session),
+              alarmSettings.readinessRevision(notificationsAuthorized: notificationsAuthorized) != nil
+        else { return false }
+        return true
+    }
+
+    /// Unknown pending bytes may include an already-consumed counter. A periodic
+    /// context cannot clear that guard; require a new ownership epoch or a new sensor.
+    static func allowsCorruptRecordRecovery(snapshot: LibreWatchHandoffSnapshot, acceptedRevision: UInt64,
+                                           currentSession: LibreWatchDirectSession?) -> Bool {
+        guard snapshot.canApply(after: acceptedRevision) else { return false }
+        if let currentSession, snapshot.session.id != currentSession.id ||
+            !snapshot.session.representsSameSensor(as: currentSession) { return true }
+        guard (snapshot.ownershipRevision ?? 0) > acceptedRevision else { return false }
+        if snapshot.ownership == .iphone { return snapshot.offlineTakeoverOfferID != nil }
+        // A native online handoff advances this explicit epoch; offline reconciliation
+        // does not. The grant remains sufficient after its reply or local process is lost.
+        return snapshot.ownership == .watch
+    }
+}
+
+extension LibreWatchSessionStore {
+    static func hasOfflineTakeoverRecord(defaults: UserDefaults = .standard) -> Bool {
+        defaults.object(forKey: LibreWatchMessageKey.persistedOfflineTakeover) != nil
+    }
+
+    static func loadOfflineTakeover(defaults: UserDefaults = .standard) -> LibreWatchOfflineTakeoverState? {
+        guard let data = defaults.data(forKey: LibreWatchMessageKey.persistedOfflineTakeover),
+              let state = try? JSONDecoder().decode(LibreWatchOfflineTakeoverState.self, from: data), state.isValid
+        else { return nil }
+        return state
+    }
+
+    @discardableResult
+    static func saveOfflineTakeover(_ state: LibreWatchOfflineTakeoverState?, defaults: UserDefaults = .standard) -> Bool {
+        guard let state else {
+            defaults.removeObject(forKey: LibreWatchMessageKey.persistedOfflineTakeover)
+            return defaults.object(forKey: LibreWatchMessageKey.persistedOfflineTakeover) == nil
+        }
+        guard state.isValid, let data = try? JSONEncoder().encode(state) else { return false }
+        // A newer app or interrupted write may own the only durable intent. Preserve
+        // those bytes and block another counter attempt rather than starting over.
+        guard !hasOfflineTakeoverRecord(defaults: defaults) || loadOfflineTakeover(defaults: defaults) != nil
+        else { return false }
+        defaults.set(data, forKey: LibreWatchMessageKey.persistedOfflineTakeover)
+        return defaults.data(forKey: LibreWatchMessageKey.persistedOfflineTakeover) == data
+    }
+
+    static func loadOfflineTakeoverReceipt(defaults: UserDefaults = .standard) -> LibreWatchOfflineTakeoverReceipt? {
+        guard let data = defaults.data(forKey: LibreWatchMessageKey.persistedOfflineTakeoverReceipt),
+              let receipt = try? JSONDecoder().decode(LibreWatchOfflineTakeoverReceipt.self, from: data), receipt.isValid
+        else { return nil }
+        return receipt
+    }
+
+    @discardableResult
+    static func saveOfflineTakeoverReceipt(_ receipt: LibreWatchOfflineTakeoverReceipt?, defaults: UserDefaults = .standard) -> Bool {
+        guard let receipt else {
+            defaults.removeObject(forKey: LibreWatchMessageKey.persistedOfflineTakeoverReceipt)
+            return defaults.object(forKey: LibreWatchMessageKey.persistedOfflineTakeoverReceipt) == nil
+        }
+        guard receipt.isValid, let data = try? JSONEncoder().encode(receipt) else { return false }
+        defaults.set(data, forKey: LibreWatchMessageKey.persistedOfflineTakeoverReceipt)
+        return defaults.data(forKey: LibreWatchMessageKey.persistedOfflineTakeoverReceipt) == data
+    }
+
+    static func loadOfflineTakeoverOfferID(defaults: UserDefaults = .standard) -> UUID? {
+        defaults.string(forKey: LibreWatchMessageKey.persistedOfflineTakeoverOfferID).flatMap(UUID.init(uuidString:))
+    }
+
+    static func saveOfflineTakeoverOfferID(_ id: UUID?, defaults: UserDefaults = .standard) {
+        if let id { defaults.set(id.uuidString, forKey: LibreWatchMessageKey.persistedOfflineTakeoverOfferID) }
+        else { defaults.removeObject(forKey: LibreWatchMessageKey.persistedOfflineTakeoverOfferID) }
+    }
+
+    static func loadOwnershipRevision(defaults: UserDefaults = .standard) -> UInt64 {
+        defaults.string(forKey: LibreWatchMessageKey.persistedOwnershipRevision).flatMap(UInt64.init) ?? 0
+    }
+
+    static func saveOwnershipRevision(_ revision: UInt64, defaults: UserDefaults = .standard) {
+        defaults.set(String(revision), forKey: LibreWatchMessageKey.persistedOwnershipRevision)
+    }
+}
+
 /// One phone-authored transaction: connection ownership is applied only after its exact
 /// sensor session, highest used unlock counter and calibration have been installed on Watch.
 struct LibreWatchHandoffSnapshot: Codable, Equatable {
@@ -4432,12 +4711,26 @@ struct LibreWatchHandoffSnapshot: Codable, Equatable {
     let revision: UInt64
     var alarmSettings: LibreWatchAlarmSettings? = nil
     var alarmDelegation: LibreWatchAlarmDelegation? = nil
+    /// A phone-issued capability for this explicit ownership epoch. Periodic status and
+    /// counter snapshots retain it; a legacy snapshot cannot authorize offline takeover.
+    var offlineTakeoverOfferID: UUID? = nil
+    /// Changes only for explicit ownership actions, unlike the snapshot revision.
+    var ownershipRevision: UInt64? = nil
+    var offlineTakeoverReceipt: LibreWatchOfflineTakeoverReceipt? = nil
 
     var isValid: Bool {
         session.isValid && revision > 0 &&
             (alarmSettings == nil || alarmSettings?.matches(session) == true) &&
             (calibration == nil || calibration?.matches(session: session) == true) &&
-            (ownership != .watch || calibration?.matches(session: session) == true)
+            (ownership != .watch || calibration?.matches(session: session) == true) &&
+            (ownershipRevision.map { $0 > 0 && $0 <= revision } ?? true) &&
+            (offlineTakeoverOfferID == nil ||
+                (ownership == .iphone && calibration?.matches(session: session) == true &&
+                    alarmSettings?.matches(session) == true && ownershipRevision != nil)) &&
+            (offlineTakeoverReceipt.map {
+                $0.isConsistent(withOwnershipRevision: ownershipRevision ?? 0) &&
+                    $0.acceptedRevision <= revision && $0.transaction.matches(session: session)
+            } ?? true)
     }
 
     func canApply(after acceptedRevision: UInt64) -> Bool {

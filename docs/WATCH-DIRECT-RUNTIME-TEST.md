@@ -52,6 +52,52 @@ to its workout builder.
 
 ## Physical acceptance test
 
+### Offline start after leaving the phone behind
+
+The offline extension uses the same takeover and return buttons. Both updated
+apps must first have exchanged a phone-prepared offer for the current sensor,
+calibration and alarm configuration. No action is required before each trip.
+The Watch persists the user's exact intent before attempting the existing BLE
+connection. It makes only the ordinary next unlock attempt from that prepared
+session; an unconfirmed attempt must not search forward through counters.
+Only a new, validated direct reading confirms reception. Notification permission
+and the matching cached alarm configuration remain prerequisites for offline
+preparation. A rejected or interrupted attempt reports its state explicitly.
+
+When phone contact returns, ownership is reconciled and durably acknowledged
+before the existing reading queue is delivered. An old context cannot reverse
+the pending user action. Manual return still requires phone confirmation; mere
+proximity does not request return. Existing reading retention limits remain.
+Readings from a rejected, superseded offline intent are retained in a bounded
+recovery copy rather than submitted under an unrelated ownership/session; this
+copy is not another delivery queue and is not automatically imported.
+
+Run these physical checks separately from the established online handover test:
+
+1. Begin with iPhone collecting. Lose phone/Watch communication **before**
+   pressing takeover on Watch. Verify newly timestamped direct readings, local
+   storage, notification permission/readiness and actual local alarm delivery.
+2. Repeat after iPhone reconnected to Libre without the newer session reaching
+   Watch. Record whether the sensor accepts the cached unlock; a useful failure
+   message is not a successful takeover.
+3. Continue with the screen asleep using the runtime criteria below.
+4. Return within iPhone Bluetooth range before WatchConnectivity is available.
+   Include a Watch BLE interruption, then restore communication. Check for
+   competing reconnects, successful ownership reconciliation, and preserved
+   reading timestamps/deduplication. The phone cannot know an offline intent
+   until it receives it; software tests do not establish radio arbitration.
+5. Press manual return once, including with a lost acknowledgement. Verify
+   confirmed completion and a subsequent new phone reading. Repeat restart,
+   delayed old context, sensor change and revoked alarm permission cases.
+
+No physical offline-start or reconnect-race result is recorded here yet.
+Successful builds and synthetic protocol tests cannot establish sensor unlock
+acceptance, screen-off delivery, notification delivery or collision-free radio
+behavior. Do not describe this extension as physically verified until the above
+tests have been performed on the installed iPhone and Watch builds.
+
+### Established online handover endurance test
+
 After an installed build is available, start Watch ownership while the Watch
 app is active. Turn off iPhone Bluetooth and Wi-Fi. Leave the Watch owning the
 sensor for 2 hours 15 minutes without touching the Watch app, then restore

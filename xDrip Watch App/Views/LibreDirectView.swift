@@ -73,7 +73,7 @@ struct LibreDirectView: View {
                     .multilineTextAlignment(.center)
                     .foregroundStyle(.secondary)
 
-                if let error = collector.state.lastBluetoothError {
+                if let error = watchState.libreWatchTakeoverIssue ?? collector.state.lastBluetoothError {
                     Text(error)
                         .font(.caption2)
                         .multilineTextAlignment(.center)
@@ -179,10 +179,13 @@ struct LibreDirectView: View {
             .disabled(!watchState.phoneIsReachable)
 
         case .recovery:
-            Button("Return to iPhone") {
-                collector.returnLibreToPhone()
+            if watchState.libreWatchPreparationNeedsRecovery {
+                Button("Watch takes Libre") { collector.takeOverLibre() }
+                    .buttonStyle(.borderedProminent)
+            } else {
+                Button("Return to iPhone") { collector.returnLibreToPhone() }
+                    .tint(.red)
             }
-            .tint(.red)
         }
     }
 }

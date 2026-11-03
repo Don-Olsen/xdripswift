@@ -115,7 +115,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
     }
 
     private var timedRecoveryIsAllowed: Bool {
-        LibreWatchLifecyclePolicy.recoveryIsAllowed(
+        watchState?.offlineTakeoverInitialAttemptFailed != true && LibreWatchLifecyclePolicy.recoveryIsAllowed(
             applicationState: applicationState,
             extendedRuntimeIsRunning: runtimeIsRunning,
             ownership: watchState?.libreWatchOwnership ?? .iphone
@@ -123,7 +123,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
     }
 
     private var eventDrivenRecoveryIsAllowed: Bool {
-        LibreWatchLifecyclePolicy.eventDrivenRecoveryIsAllowed(
+        watchState?.offlineTakeoverInitialAttemptFailed != true && LibreWatchLifecyclePolicy.eventDrivenRecoveryIsAllowed(
             ownership: watchState?.libreWatchOwnership ?? .iphone
         )
     }
@@ -282,7 +282,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
             state.sessionAvailable(nil)
             return
         }
-        guard watchState?.libreWatchOwnership == .iphone else {
+        guard watchState?.libreWatchOwnership == .iphone || watchState?.libreWatchPreparationNeedsRecovery == true else {
             resumeDirectReceptionIfOwned()
             return
         }
@@ -293,7 +293,8 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
     }
 
     private func beginUserInitiatedTakeover() {
-        guard watchState?.libreWatchOwnership == .iphone, preparedSession?.isValid == true else { return }
+        guard (watchState?.libreWatchOwnership == .iphone || watchState?.libreWatchPreparationNeedsRecovery == true),
+              preparedSession?.isValid == true else { return }
         state.beginHandoff()
         watchState?.requestLibreWatchOwnership { [weak self] success, error in
             guard let self else { return }
@@ -320,6 +321,10 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
     }
 
     func resumeDirectReceptionIfOwned(allowsEventDrivenStart: Bool = false) {
+        if watchState?.offlineTakeoverInitialAttemptFailed == true {
+            state.fail(.unlockWriteFailed, error: Self.offlineTakeoverFailure)
+            return
+        }
         guard watchState?.libreWatchOwnership == .watch,
               preparedSession?.isValid == true,
               !systemAutoReconnectIsActive,
@@ -339,6 +344,10 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
 
     func returnLibreToPhone(origin: LibreWatchReturnDiagnostic.Origin = .user) {
         guard let watchState else { return }
+        if watchState.phoneIsReachable,
+           watchState.reconcileOfflineTakeoverBeforeReturn({ [weak self] in self?.returnLibreToPhone(origin: origin) }) {
+            return
+        }
         if watchState.libreWatchOwnership == .releasingToPhone {
             state.beginReturn(awaitingConfirmation: watchState.hasPendingLibrePhoneReturn)
             if watchState.hasPendingLibrePhoneReturn {
@@ -445,7 +454,11 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
     private func finishStoppingForPhoneOwnership() {
         clearTransientBluetoothState()
         invalidateRecoveryAttempt()
-        state.returnedToPhone(session: preparedSession)
+        if watchState?.offlineTakeoverInitialAttemptFailed == true {
+            state.fail(.unlockWriteFailed, error: Self.offlineTakeoverFailure)
+        } else {
+            state.returnedToPhone(session: preparedSession)
+        }
         deliberatelyDisconnecting = false
     }
 
@@ -721,7 +734,8 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
             normalizeObservedLink(sensorPeripheral, at: date)
         }
 
-        guard watchState?.libreWatchOwnership == .watch
+        guard watchState?.libreWatchOwnership == .watch,
+              watchState?.offlineTakeoverInitialAttemptFailed != true
         else {
             if centralManager?.isScanning == true {
                 centralManager?.stopScan()
@@ -1146,7 +1160,7 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
             beginRestoredSetup(at: .notifications, for: peripheral)
             scheduleReconnectFallback(for: peripheral)
         case .preserveActiveStream:
-            state.notificationsActive()
+            markNotificationsActive()
             scheduleReconnectFallback(for: peripheral)
         }
     }
@@ -1246,7 +1260,12 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
             return
         }
 
-        preparedSession.unlockCount += 1
+        let nextCounter = preparedSession.unlockCount + 1
+        guard watchState?.prepareOfflineLibreUnlock(nextCounter) != false else {
+            stopUnconfirmedOfflineTakeover()
+            return
+        }
+        preparedSession.unlockCount = nextCounter
         self.preparedSession = preparedSession
         state.recordUnlockCounter(preparedSession.unlockCount)
         watchState?.updateLibreWatchUnlockCounter(preparedSession.unlockCount)
@@ -1464,6 +1483,10 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
               !scanAfterReconnectCancellation
         else { return }
 
+        if watchState?.offlineTakeoverAttemptWasUsed == true {
+            stopUnconfirmedOfflineTakeover()
+            return
+        }
         knownPeripheralRecovery.prepareForCancellation(
             of: peripheral, context: knownPeripheralRecoveryContext(),
             phase: connectionTiming.phase, systemReconnectIsActive: systemAutoReconnectIsActive
@@ -1721,7 +1744,36 @@ final class LibreWatchDirectCollector: NSObject, ObservableObject {
         return true
     }
 
+    private static let offlineTakeoverFailure = "Kunne ikke overtage uden iPhone. Forbind telefonen for at opdatere sensoroplysningerne."
+
+    private func stopUnconfirmedOfflineTakeover() {
+        _ = watchState?.failOfflineLibreInitialAttempt()
+        deliberatelyDisconnecting = true
+        scanAfterReconnectCancellation = false
+        scanIsPending = false
+        systemAutoReconnectIsActive = false
+        cancelReconnectFallback()
+        centralManager?.stopScan()
+        stopRuntime(reason: "offlineTakeoverUnconfirmed")
+        state.fail(.unlockWriteFailed, error: Self.offlineTakeoverFailure)
+        if let peripheral = peripheralToRelease(), peripheral.state != .disconnected {
+            beginCancellation(of: peripheral)
+        }
+    }
+
+    private func markNotificationsActive() {
+        if watchState?.offlineTakeoverNeedsFreshFrame == true {
+            state.connecting()
+        } else {
+            state.notificationsActive()
+        }
+    }
+
     private func failAndRescan(_ failure: LibreWatchDirectFailure, error: String?) {
+        if watchState?.offlineTakeoverAttemptWasUsed == true {
+            stopUnconfirmedOfflineTakeover()
+            return
+        }
         guard !deliberatelyDisconnecting, !scanAfterReconnectCancellation,
               eventDrivenRecoveryIsAllowed else { return }
         beginRecoveryDiagnosticIfNeeded(trigger: "setupOrBluetoothError")
@@ -3146,7 +3198,7 @@ extension LibreWatchDirectCollector: CBPeripheralDelegate {
                 executionIsAvailable: timedRecoveryIsAllowed,
                 monotonicTime: monotonicNow
             )
-            state.notificationsActive()
+            markNotificationsActive()
             scheduleReconnectFallback(for: peripheral)
         }
     }
@@ -3206,11 +3258,11 @@ extension LibreWatchDirectCollector: CBPeripheralDelegate {
             switch errorAction {
             case .preserveConnectionNearBackgroundLimit:
                 // This is a watchOS background-delivery budget warning, not corrupt Libre data.
-                state.notificationsActive()
+                markNotificationsActive()
             case .preserveConnectionExceededBackgroundLimit:
                 // The system may stop background deliveries until user interaction. Keep the
                 // subscription/link intact; foreground execution-budget recovery remains finite.
-                state.notificationsActive()
+                markNotificationsActive()
             case .recoverBluetoothLink:
                 failAndRescan(.connectionFailed, error: bluetoothErrorDescription(error))
             }
@@ -3277,7 +3329,7 @@ extension LibreWatchDirectCollector: CBPeripheralDelegate {
                 executionIsAvailable: timedRecoveryIsAllowed,
                 monotonicTime: monotonicNow
             )
-            state.notificationsActive()
+            markNotificationsActive()
             reportRecoverySuccessIfNeeded()
             reportFrameProgress(at: now)
             let wasAccepted = watchState?.submitLibreWatchReading(reading, payloadID: payloadID,

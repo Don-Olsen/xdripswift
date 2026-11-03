@@ -15,6 +15,84 @@ import UIKit
 import WatchConnectivity
 import WidgetKit
 
+/// Coalesces only the same already-validated ownership transaction while CoreBluetooth
+/// finishes its disconnect. A receipt cannot escape before the release completion.
+final class LibreWatchOfflinePhoneReleaseCoordinator {
+    enum Start: Equatable { case started, joined, conflict }
+    private(set) var requestID: UUID?
+    private var replies: [([String: Any]) -> Void] = []
+
+    func begin(requestID: UUID, reply: @escaping ([String: Any]) -> Void) -> Start {
+        if let active = self.requestID {
+            guard active == requestID else { return .conflict }
+            replies.append(reply)
+            return .joined
+        }
+        self.requestID = requestID
+        replies = [reply]
+        return .started
+    }
+
+    /// Re-evaluated after the asynchronous native callback and its synchronous
+    /// preparation observers. A result from an older ownership epoch is never authority.
+    static func canComplete(transaction: LibreWatchOfflineTakeoverTransaction,
+                            session: LibreWatchDirectSession?, calibration: LibreWatchCalibrationSnapshot?,
+                            settings: LibreWatchAlarmSettings?, ownership: LibreWatchOwnership,
+                            ownershipRevision: UInt64, receipt: LibreWatchOfflineTakeoverReceipt?,
+                            at date: Date = Date()) -> Bool {
+        guard ownership == .releasingToWatch, receipt?.state == .releasing else { return false }
+        return LibreWatchOfflineTakeoverPolicy.phoneDecision(transaction: transaction,
+            currentSession: session, currentCalibration: calibration, currentAlarmSettings: settings,
+            activeOfferID: nil, ownership: ownership, ownershipRevision: ownershipRevision,
+            receipt: receipt, at: date) == .resume
+    }
+
+    /// A terminal configuration mismatch can revoke only the exact preparation
+    /// that was offered, or its own persisted release. Malformed/unrelated claims
+    /// never gain authority over the current collector by being rejected.
+    static func canRetireRejectedPreparation(decision: LibreWatchOfflineTakeoverPolicy.PhoneDecision,
+                                             transaction: LibreWatchOfflineTakeoverTransaction,
+                                             session: LibreWatchDirectSession?, activeOfferID: UUID?,
+                                             ownership: LibreWatchOwnership, ownershipRevision: UInt64,
+                                             receipt: LibreWatchOfflineTakeoverReceipt?) -> Bool {
+        guard [.wrongCalibration, .wrongAlarmSettings].contains(decision), transaction.isValid,
+              transaction.matches(session: session), ownershipRevision <= transaction.startingRevision else { return false }
+        if let receipt, receipt.state != .retired, receipt.transaction.matches(session: session),
+           ownershipRevision <= max(receipt.transaction.startingRevision, receipt.acceptedRevision) {
+            guard receipt.matches(transaction), receipt.state == .releasing else { return false }
+            if [.releasingToWatch, .watch].contains(ownership) { return true }
+        }
+        return ownership == .iphone && activeOfferID == transaction.offerID
+    }
+
+    /// The explicit epoch is written first when revoking a preparation. If the
+    /// process stopped before the receipt/owner writes, finish that revocation before
+    /// any cached Watch grant can be published. Write phone ownership before the
+    /// retired receipt so another interruption remains recognizable and safe.
+    @discardableResult
+    static func recoverInterruptedRevocation(session: LibreWatchDirectSession?,
+                                             defaults: UserDefaults = .standard) -> Bool {
+        guard var receipt = LibreWatchSessionStore.loadOfflineTakeoverReceipt(defaults: defaults),
+              receipt.transaction.matches(session: session),
+              !receipt.isConsistent(withOwnershipRevision: LibreWatchSessionStore.loadOwnershipRevision(defaults: defaults))
+        else { return false }
+        LibreWatchSessionStore.saveOwnership(.iphone, defaults: defaults)
+        receipt.acceptedRevision = max(receipt.acceptedRevision,
+            LibreWatchSessionStore.loadOwnershipRevision(defaults: defaults))
+        receipt.state = .retired
+        LibreWatchSessionStore.saveOfflineTakeoverReceipt(receipt, defaults: defaults)
+        return true
+    }
+
+    func complete(requestID: UUID, response: [String: Any]) {
+        guard self.requestID == requestID else { return }
+        let callbacks = replies
+        self.requestID = nil
+        replies.removeAll()
+        callbacks.forEach { $0(response) }
+    }
+}
+
 /// The phone is the only writer of manual Watch treatments to the regular treatment
 /// database. A stable Watch UUID identifies a single entry even if WCSession replays it
 /// after a process restart or loses the first acknowledgement.
@@ -522,6 +600,7 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
     private var libreWatchReadingAcceptance = LibreWatchReadingAcceptancePolicy()
     private var libreWatchDiagnosticReceipts = LibreWatchSessionStore.loadDiagnosticReceipts()
     private var libreWatchObservers: [NSObjectProtocol] = []
+    private let offlinePhoneRelease = LibreWatchOfflinePhoneReleaseCoordinator()
     private var lastPenConfigurationSignature = ""
     private var mealQuietState: MealQuietSyncState?
 
@@ -605,7 +684,10 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
         controlSnapshot: { [weak self] in
             guard let self, let snapshot = self.handoffSnapshotCache.current(session: self.libreWatchDirectSession,
                 calibration: self.libreWatchCalibrationSnapshot, ownership: self.libreWatchOwnership,
-                delegation: LibreWatchAlarmStore.delegation()) else { return [:] }
+                delegation: LibreWatchAlarmStore.delegation(),
+                offlineTakeoverOfferID: self.libreWatchOwnership == .iphone ? LibreWatchSessionStore.loadOfflineTakeoverOfferID() : nil,
+                ownershipRevision: LibreWatchSessionStore.loadOwnershipRevision(),
+                offlineTakeoverReceipt: self.currentOfflineTakeoverReceipt()) else { return [:] }
             return LibreWatchHandoffSnapshotCache.payload(snapshot) ?? [:]
         },
         publishContext: { [weak self] in self?.publishPhoneSnapshotContext($0) ?? false },
@@ -642,6 +724,8 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
 
         super.init()
 
+        let recoveredOfflineRevocation = LibreWatchOfflinePhoneReleaseCoordinator.recoverInterruptedRevocation(
+            session: LibreWatchSessionStore.loadSession())
         let persistedOwnership = LibreWatchSessionStore.loadOwnership()
         let startupDecision = LibreWatchPhoneStartupDecision.resolve(
             persistedOwnership: persistedOwnership,
@@ -682,6 +766,7 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
         ) { [weak self] _ in
             guard let self else { return }
             self.cancelLibreWatchReleaseReceipt()
+            self.retireOfflineTakeoverAuthority()
             self.setLibreWatchOwnership(.iphone)
             self.sendLibreWatchSession()
         })
@@ -720,6 +805,11 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
         Task { @MainActor [weak self] in self?.publishMealQuietState() }
 
         if let transmitter = bluetoothPeripheralManager.getCGMTransmitter() as? CGMLibre2Transmitter {
+            if recoveredOfflineRevocation, let libreWatchDirectSession {
+                // The transmitter may have been constructed from the interrupted old
+                // owner before this manager repaired it. Resume its existing native path.
+                _ = transmitter.returnSensorToPhone(sessionID: libreWatchDirectSession.id)
+            }
             if startupDecision.phoneConnectionIsBlocked, let libreWatchDirectSession {
                 transmitter.restoreWatchOwnership(libreWatchDirectSession)
             }
@@ -1080,9 +1170,12 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
         }
     }
 
-    private func setLibreWatchOwnership(_ ownership: LibreWatchOwnership) {
+    private func setLibreWatchOwnership(_ ownership: LibreWatchOwnership, preservingOfflineTakeover: Bool = false) {
         let previousOwnership = libreWatchOwnership
         let ownershipChanged = ownership != libreWatchOwnership
+        if ownershipChanged && !preservingOfflineTakeover {
+            retireOfflineTakeoverAuthority()
+        }
         libreWatchOwnership = ownership
         LibreWatchSessionStore.saveOwnership(ownership)
         if ownership == .iphone, LibreWatchAlarmStore.delegation() != nil {
@@ -1102,6 +1195,219 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
             libreWatchReadingAcceptance.reset(
                 for: ownership == .watch ? libreWatchDirectSession?.id : nil
             )
+        }
+    }
+
+    private func currentOfflineTakeoverReceipt() -> LibreWatchOfflineTakeoverReceipt? {
+        guard let receipt = LibreWatchSessionStore.loadOfflineTakeoverReceipt(),
+              receipt.transaction.matches(session: libreWatchDirectSession) else { return nil }
+        return receipt
+    }
+
+    /// Explicit ownership actions revoke the old preparation, independently of routine
+    /// counter/calibration/alarm snapshots. A delayed offline claim cannot undo them.
+    private func retireOfflineTakeoverAuthority(respondToPending: Bool = true) {
+        LibreWatchSessionStore.saveOfflineTakeoverOfferID(nil)
+        let revision = LibreWatchSessionStore.nextHandoffRevision()
+        LibreWatchSessionStore.saveOwnershipRevision(revision)
+        if var receipt = LibreWatchSessionStore.loadOfflineTakeoverReceipt() {
+            receipt.acceptedRevision = max(revision, receipt.acceptedRevision)
+            receipt.state = .retired
+            LibreWatchSessionStore.saveOfflineTakeoverReceipt(receipt)
+        }
+        if respondToPending, let requestID = offlinePhoneRelease.requestID {
+            offlinePhoneRelease.complete(requestID: requestID, response: [
+                LibreWatchMessageKey.success: false,
+                LibreWatchMessageKey.error: "Libre ownership changed during release",
+                LibreWatchMessageKey.ownership: libreWatchOwnership.rawValue,
+                LibreWatchMessageKey.deliveryOutcome: LibreWatchDeliveryOutcome.wrongOwnership.rawValue
+            ])
+        }
+    }
+
+    private func rejectOfflineLibreWatchRelease(_ transaction: LibreWatchOfflineTakeoverTransaction,
+                                               transmitter: CGMLibre2Transmitter,
+                                               reason: String, outcome: LibreWatchDeliveryOutcome) {
+        // A same-sensor NFC refresh can change algorithm/unlock metadata while this
+        // callback is pending. Match the persisted transaction, not that newer session,
+        // while still respecting a later explicit ownership epoch.
+        if let receipt = LibreWatchSessionStore.loadOfflineTakeoverReceipt(),
+           receipt.matches(transaction), receipt.state != .retired,
+           LibreWatchSessionStore.loadOwnershipRevision() <= max(transaction.startingRevision, receipt.acceptedRevision),
+           [.releasingToWatch, .watch].contains(libreWatchOwnership) {
+            _ = transmitter.returnSensorToPhone(sessionID: transaction.session.id)
+            retireOfflineTakeoverAuthority(respondToPending: false)
+            setLibreWatchOwnership(.iphone, preservingOfflineTakeover: true)
+        }
+        var response = libreWatchSessionPayload() ?? [:]
+        sendLibreWatchSession(payload: response)
+        response[LibreWatchMessageKey.success] = false
+        response[LibreWatchMessageKey.error] = reason
+        response[LibreWatchMessageKey.ownership] = libreWatchOwnership.rawValue
+        response[LibreWatchMessageKey.deliveryOutcome] = outcome.rawValue
+        offlinePhoneRelease.complete(requestID: transaction.requestID, response: response)
+    }
+
+    private func rejectOfflineLibreWatchPreparation(_ transaction: LibreWatchOfflineTakeoverTransaction,
+                                                   decision: LibreWatchOfflineTakeoverPolicy.PhoneDecision,
+                                                   reason: String, outcome: LibreWatchDeliveryOutcome) -> [String: Any] {
+        var response: [String: Any] = [LibreWatchMessageKey.success: false,
+            LibreWatchMessageKey.error: reason, LibreWatchMessageKey.deliveryOutcome: outcome.rawValue,
+            LibreWatchMessageKey.ownership: libreWatchOwnership.rawValue]
+        guard LibreWatchOfflinePhoneReleaseCoordinator.canRetireRejectedPreparation(decision: decision,
+            transaction: transaction, session: libreWatchDirectSession,
+            activeOfferID: LibreWatchSessionStore.loadOfflineTakeoverOfferID(), ownership: libreWatchOwnership,
+            ownershipRevision: LibreWatchSessionStore.loadOwnershipRevision(),
+            receipt: LibreWatchSessionStore.loadOfflineTakeoverReceipt()) else { return response }
+        if libreWatchOwnership != .iphone {
+            guard let transmitter = bluetoothPeripheralManager.getCGMTransmitter() as? CGMLibre2Transmitter,
+                  transmitter.returnSensorToPhone(sessionID: transaction.session.id) else { return response }
+        }
+        retireOfflineTakeoverAuthority(respondToPending: false)
+        setLibreWatchOwnership(.iphone, preservingOfflineTakeover: true)
+        if let payload = libreWatchSessionPayload() {
+            sendLibreWatchSession(payload: payload)
+            response.merge(payload) { _, current in current }
+        }
+        response[LibreWatchMessageKey.ownership] = LibreWatchOwnership.iphone.rawValue
+        offlinePhoneRelease.complete(requestID: transaction.requestID, response: response)
+        return response
+    }
+
+    private func receiveOfflineLibreWatchClaim(_ message: [String: Any],
+                                               preparedSession: LibreWatchDirectSession,
+                                               reply: (([String: Any]) -> Void)?) {
+        let respond: ([String: Any]) -> Void = { reply?($0) }
+        let failure: (String, LibreWatchDeliveryOutcome) -> [String: Any] = { [weak self] reason, outcome in
+            [LibreWatchMessageKey.success: false, LibreWatchMessageKey.error: reason,
+             LibreWatchMessageKey.ownership: self?.libreWatchOwnership.rawValue ?? LibreWatchOwnership.iphone.rawValue,
+             LibreWatchMessageKey.deliveryOutcome: outcome.rawValue]
+        }
+        guard let data = message[LibreWatchMessageKey.offlineTakeover] as? Data,
+              let transaction = try? JSONDecoder().decode(LibreWatchOfflineTakeoverTransaction.self, from: data),
+              message[LibreWatchMessageKey.deliveryItemID] as? String == transaction.requestID.uuidString,
+              transaction.startingRevision <= LibreWatchSessionStore.loadHandoffRevision(),
+              let counter = message[LibreWatchMessageKey.unlockCounter] as? Int,
+              counter >= Int(transaction.session.unlockCount), counter <= Int(UInt16.max)
+        else {
+            respond(failure("Invalid offline Libre ownership transaction", .invalidPayload))
+            return
+        }
+        refreshLibreWatchCalibrationSnapshot(for: preparedSession)
+        let settings = AlertManager.makeLibreWatchAlarmSettings(session: preparedSession, coreDataManager: coreDataManager)
+        let decision = LibreWatchOfflineTakeoverPolicy.phoneDecision(transaction: transaction,
+            currentSession: preparedSession, currentCalibration: libreWatchCalibrationSnapshot,
+            currentAlarmSettings: settings, activeOfferID: LibreWatchSessionStore.loadOfflineTakeoverOfferID(),
+            ownership: libreWatchOwnership, ownershipRevision: LibreWatchSessionStore.loadOwnershipRevision(),
+            receipt: currentOfflineTakeoverReceipt())
+        switch decision {
+        case .duplicate:
+            var current = preparedSession
+            guard updateLibreWatchUnlockCounter(from: message, session: &current),
+                  var response = libreWatchSessionPayload() else {
+                respond(failure("Current Libre ownership receipt is unavailable", .invalidPayload))
+                return
+            }
+            response[LibreWatchMessageKey.success] = true
+            response[LibreWatchMessageKey.durableReceipt] = true
+            response[LibreWatchMessageKey.deliveryReceiptID] = transaction.requestID.uuidString
+            respond(response)
+            return
+        case .accept, .resume:
+            break
+        case .wrongSession:
+            respond(failure("Offline Libre preparation no longer matches the sensor", .wrongSession)); return
+        case .wrongCalibration:
+            respond(rejectOfflineLibreWatchPreparation(transaction, decision: decision,
+                reason: "Offline Libre calibration has changed", outcome: .wrongCalibration)); return
+        case .wrongAlarmSettings:
+            respond(rejectOfflineLibreWatchPreparation(transaction, decision: decision,
+                reason: "Offline Libre alarm settings have changed", outcome: .invalidPayload)); return
+        case .invalid, .conflictingRequest:
+            respond(failure("Invalid offline Libre ownership transaction", .invalidPayload)); return
+        case .staleOwnership:
+            var response = libreWatchSessionPayload() ?? failure("Offline Libre preparation was retired", .wrongOwnership)
+            response[LibreWatchMessageKey.success] = false
+            response[LibreWatchMessageKey.error] = "Offline Libre preparation was retired"
+            response[LibreWatchMessageKey.deliveryOutcome] = LibreWatchDeliveryOutcome.wrongOwnership.rawValue
+            respond(response)
+            return
+        }
+        guard let transmitter = bluetoothPeripheralManager.getCGMTransmitter() as? CGMLibre2Transmitter else {
+            respond(failure("Libre collector is unavailable", .collectorUnavailable))
+            return
+        }
+        switch offlinePhoneRelease.begin(requestID: transaction.requestID, reply: respond) {
+        case .joined: return
+        case .conflict:
+            respond(failure("Another Libre ownership release is pending", .wrongOwnership)); return
+        case .started: break
+        }
+        let pending = LibreWatchOfflineTakeoverReceipt(transaction: transaction, acceptedRevision: 0, state: .releasing)
+        guard LibreWatchSessionStore.saveOfflineTakeoverReceipt(pending) else {
+            offlinePhoneRelease.complete(requestID: transaction.requestID,
+                response: failure("Could not persist offline Libre ownership", .collectorUnavailable))
+            return
+        }
+        cancelLibreWatchReleaseReceipt()
+        setLibreWatchOwnership(.releasingToWatch, preservingOfflineTakeover: true)
+        // The phone may already have reconnected before this intent arrived. Release
+        // that real connection now, and wait for CoreBluetooth's completion callback.
+        transmitter.reconcileOfflineSensorRelease(preparedSession) { [weak self] released in
+            guard let self else { return }
+            guard self.offlinePhoneRelease.requestID == transaction.requestID else { return }
+            guard released, self.libreWatchOwnership == .releasingToWatch,
+                  self.currentOfflineTakeoverReceipt()?.state == .releasing,
+                  self.currentOfflineTakeoverReceipt()?.matches(transaction) == true,
+                  let freshSession = transmitter.prepareCurrentSensorForWatch(),
+                  transaction.matches(session: freshSession) else {
+                self.rejectOfflineLibreWatchRelease(transaction, transmitter: transmitter,
+                    reason: "iPhone could not release the offline Libre session", outcome: .wrongSession)
+                return
+            }
+            self.refreshLibreWatchCalibrationSnapshot(for: freshSession)
+            let currentSettings = AlertManager.makeLibreWatchAlarmSettings(session: freshSession, coreDataManager: self.coreDataManager)
+            guard LibreWatchOfflinePhoneReleaseCoordinator.canComplete(transaction: transaction,
+                session: self.libreWatchDirectSession, calibration: self.libreWatchCalibrationSnapshot,
+                settings: currentSettings, ownership: self.libreWatchOwnership,
+                ownershipRevision: LibreWatchSessionStore.loadOwnershipRevision(),
+                receipt: self.currentOfflineTakeoverReceipt()) else {
+                self.rejectOfflineLibreWatchRelease(transaction, transmitter: transmitter,
+                    reason: "Libre ownership or configuration changed during release", outcome: .wrongOwnership)
+                return
+            }
+            // Only observed counters are merged, after the phone's final BLE callback.
+            var current = freshSession
+            guard self.updateLibreWatchUnlockCounter(from: message, session: &current) else {
+                self.rejectOfflineLibreWatchRelease(transaction, transmitter: transmitter,
+                    reason: "Invalid offline Libre unlock counter", outcome: .invalidPayload)
+                return
+            }
+            let readyRevision = (message[LibreWatchMessageKey.alarmSettingsRevision] as? String).flatMap(UInt64.init)
+            AlertManager.setLibreWatchAlarmDelegation(
+                readyRevision: message[LibreWatchMessageKey.alarmsReady] as? Bool == true ? readyRevision : nil,
+                settings: currentSettings)
+            let revision = LibreWatchSessionStore.nextHandoffRevision()
+            let accepted = LibreWatchOfflineTakeoverReceipt(transaction: transaction,
+                acceptedRevision: revision, state: .accepted)
+            guard LibreWatchSessionStore.saveOfflineTakeoverReceipt(accepted) else {
+                // Retain the blocked release and pending transaction for a later retry.
+                self.offlinePhoneRelease.complete(requestID: transaction.requestID,
+                    response: failure("Could not persist offline Libre ownership receipt", .collectorUnavailable))
+                return
+            }
+            LibreWatchSessionStore.saveOfflineTakeoverOfferID(nil)
+            self.setLibreWatchOwnership(.watch, preservingOfflineTakeover: true)
+            guard var response = self.libreWatchSessionPayload() else {
+                self.rejectOfflineLibreWatchRelease(transaction, transmitter: transmitter,
+                    reason: "Current Libre calibration is unavailable after release", outcome: .wrongCalibration)
+                return
+            }
+            self.sendLibreWatchSession(payload: response)
+            response[LibreWatchMessageKey.success] = true
+            response[LibreWatchMessageKey.durableReceipt] = true
+            response[LibreWatchMessageKey.deliveryReceiptID] = transaction.requestID.uuidString
+            self.offlinePhoneRelease.complete(requestID: transaction.requestID, response: response)
         }
     }
 
@@ -1158,6 +1464,7 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
 
         if sessionChanged {
             cancelLibreWatchReleaseReceipt()
+            retireOfflineTakeoverAuthority()
         }
         libreWatchDirectSession = preparedSession
         LibreWatchSessionStore.saveSession(preparedSession)
@@ -1176,9 +1483,21 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
 
         refreshLibreWatchCalibrationSnapshot(for: libreWatchDirectSession)
         let alarmSettings = AlertManager.makeLibreWatchAlarmSettings(session: libreWatchDirectSession, coreDataManager: coreDataManager)
+        if LibreWatchSessionStore.loadOwnershipRevision() == 0 {
+            LibreWatchSessionStore.saveOwnershipRevision(LibreWatchSessionStore.nextHandoffRevision())
+        }
+        if libreWatchOwnership == .iphone,
+           libreWatchCalibrationSnapshot?.matches(session: libreWatchDirectSession) == true,
+           alarmSettings.matches(libreWatchDirectSession),
+           LibreWatchSessionStore.loadOfflineTakeoverOfferID() == nil {
+            LibreWatchSessionStore.saveOfflineTakeoverOfferID(UUID())
+        }
         guard let snapshot = handoffSnapshotCache.resolve(session: libreWatchDirectSession,
             calibration: libreWatchCalibrationSnapshot, ownership: libreWatchOwnership,
-            settings: alarmSettings, delegation: LibreWatchAlarmStore.delegation()) else { return nil }
+            settings: alarmSettings, delegation: LibreWatchAlarmStore.delegation(),
+            offlineTakeoverOfferID: libreWatchOwnership == .iphone ? LibreWatchSessionStore.loadOfflineTakeoverOfferID() : nil,
+            ownershipRevision: LibreWatchSessionStore.loadOwnershipRevision(),
+            offlineTakeoverReceipt: currentOfflineTakeoverReceipt()) else { return nil }
         return LibreWatchHandoffSnapshotCache.payload(snapshot)
     }
 
@@ -1385,6 +1704,9 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
             }
             reply?(response)
 
+        case .claimOfflineOwnership:
+            self.receiveOfflineLibreWatchClaim(message, preparedSession: preparedSession, reply: reply)
+
         case .requestOwnership:
             self.refreshLibreWatchCalibrationSnapshot(for: preparedSession)
             guard transport == .interactiveMessage,
@@ -1502,6 +1824,10 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
             ])
 
         case .submitReading:
+            guard self.currentOfflineTakeoverReceipt()?.state != .releasing else {
+                fail("Offline Libre ownership has not been confirmed", .wrongOwnership)
+                return
+            }
             guard let data = message[LibreWatchMessageKey.reading] as? Data,
                   let reading = try? JSONDecoder().decode(LibreWatchDirectReadingPayload.self, from: data),
                   reading.sessionID == sessionID,

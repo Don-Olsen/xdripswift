@@ -177,6 +177,7 @@ final class WatchStateModel: NSObject, ObservableObject {
     @Published private(set) var isShowingDirectLibreReading = false
     @Published private(set) var directLibreReadingIsStale = false
     @Published private(set) var libreWatchStorageIssue: String?
+    @Published private(set) var libreWatchTakeoverIssue: String?
     @Published private(set) var localAlarmStatus = "Watch-alarmer: venter på iPhone-indstillinger"
     @Published private(set) var localAlarmReadinessWarning: String?
     @Published private(set) var canRequestLocalAlarmPermission = false
@@ -229,6 +230,12 @@ final class WatchStateModel: NSObject, ObservableObject {
         DispatchQueue.main.async(execute: $0)
     })
     private var outboxSendGate = LibreWatchConnectivitySendAttemptGate()
+    private var offlineTakeover = LibreWatchSessionStore.loadOfflineTakeover()
+    private var offlineTakeoverSendToken: UUID?
+    private var offlineTakeoverPreparationID: UUID?
+    private var offlineReturnContinuation: (() -> Void)?
+    private var offlineTakeoverRecordIsUnreadable = false
+    private var lastOfflineTakeoverSendAt: Date?
     private var pendingPhoneReturn = LibreWatchSessionStore.loadPhoneReturn()
     private var phoneReturnSendToken: UUID?
     private var lastPhoneReturnSendAt: Date?
@@ -275,6 +282,42 @@ final class WatchStateModel: NSObject, ObservableObject {
             watchPenProfileSettings = settings
         }
 
+        offlineTakeoverRecordIsUnreadable = offlineTakeover == nil && LibreWatchSessionStore.hasOfflineTakeoverRecord()
+        if offlineTakeoverRecordIsUnreadable {
+            libreWatchOwnership = .recovery
+            LibreWatchSessionStore.saveOwnership(.recovery)
+            libreWatchTakeoverIssue = "Åbn xDrip på iPhone, og vælg Watch takes Libre igen for at gendanne sensoroplysningerne."
+        }
+        if let pending = offlineTakeover {
+            let superseded = acceptedHandoffSnapshot.map {
+                ($0.ownershipRevision ?? 0) > pending.transaction.startingRevision &&
+                    ($0.offlineTakeoverReceipt?.matches(pending.transaction) != true ||
+                        $0.offlineTakeoverReceipt?.state == .retired)
+            } ?? false
+            // Once a receipt was accepted, a persisted phone owner can only be a later
+            // return. Incomplete cleanup must not resurrect its old Watch ownership.
+            let returnedToPhone = pending.isReconciled && libreWatchOwnership == .iphone
+            if !pending.transaction.matches(session: libreWatchDirectSession) || superseded ||
+                pending.receipt?.state == .retired || returnedToPhone {
+                let safeOwner: LibreWatchOwnership = returnedToPhone ||
+                    (acceptedHandoffSnapshot?.ownership == .iphone &&
+                        acceptedHandoffSnapshot?.session.id == libreWatchDirectSession?.id) ? .iphone : .recovery
+                libreWatchOwnership = safeOwner
+                LibreWatchSessionStore.saveOwnership(safeOwner)
+                if retireOfflineTakeoverForReplacement() {
+                    LibreWatchSessionStore.saveOwnership(safeOwner)
+                    libreWatchTakeoverIssue = "Sensoransvaret er ændret. Eventuelle usynkroniserede målinger er bevaret på uret."
+                } else {
+                    libreWatchTakeoverIssue = "Kunne ikke bevare målingerne fra overtagelsen. Forbind iPhone."
+                }
+            } else if pendingPhoneReturn == nil, libreWatchOwnership != .releasingToPhone {
+                // Intent is written before Bluetooth starts. Restart preserves that exact
+                // request and its single initial unlock attempt, never inventing a new one.
+                libreWatchOwnership = .watch
+                LibreWatchSessionStore.saveOwnership(.watch)
+            }
+        }
+
         if let pending = pendingPhoneReturn {
             if !pending.matches(libreWatchDirectSession) ||
                 (libreWatchOwnership == .iphone && acceptedHandoffRevision > pending.startingRevision) {
@@ -318,9 +361,15 @@ final class WatchStateModel: NSObject, ObservableObject {
         localAlarms.ownershipDidChange(libreWatchOwnership)
         refreshDirectLibreReadingFreshness()
         localAlarms.refreshPermission()
+        if let pending = offlineTakeover, libreWatchOwnership == .watch,
+           let directSession = libreWatchDirectSession {
+            localAlarms.prepareOfflineDelegation(settings: pending.transaction.alarmSettings,
+                session: directSession, completion: { _ in })
+        }
 
         session.delegate = self
         if session.activationState == .activated {
+            retryOfflineTakeoverReconciliation()
             retryPendingPhoneReturn()
             flushWatchConnectivityOutbox()
             flushManualTreatmentQueue()
@@ -704,8 +753,14 @@ final class WatchStateModel: NSObject, ObservableObject {
     var libreWatchConnectivityActivationState: Int { session.activationState.rawValue }
     var libreWatchConnectivityIsReachable: Bool { session.isReachable }
     var hasPendingLibrePhoneReturn: Bool { pendingPhoneReturn != nil }
+    var libreWatchPreparationNeedsRecovery: Bool { offlineTakeoverRecordIsUnreadable }
 
     func requestLibreWatchOwnership(completion: @escaping (Bool, String?) -> Void) {
+        guard !offlineTakeoverRecordIsUnreadable || phoneIsReachable else {
+            completion(false, "Åbn xDrip på iPhone, og vælg Watch takes Libre igen for at gendanne sensoroplysningerne.")
+            return
+        }
+        guard offlineTakeoverPreparationID == nil else { return }
         guard pendingPhoneReturn == nil else {
             retryPendingPhoneReturn()
             completion(false, "Awaiting iPhone confirmation of the previous return")
@@ -716,7 +771,7 @@ final class WatchStateModel: NSObject, ObservableObject {
             return
         }
         guard phoneIsReachable else {
-            completion(false, LibreWatchDirectFailure.phoneUnavailable.rawValue)
+            beginOfflineLibreTakeover(preparedSession: preparedSession, completion: completion)
             return
         }
 
@@ -732,6 +787,204 @@ final class WatchStateModel: NSObject, ObservableObject {
             completion((success || snapshotConfirmed) && self.libreWatchOwnership == .watch,
                        snapshotConfirmed ? nil : error)
         }
+    }
+
+    var offlineTakeoverNeedsFreshFrame: Bool {
+        guard let pending = offlineTakeover,
+              pending.transaction.matches(session: libreWatchDirectSession) else { return false }
+        return pending.confirmedAt == nil
+    }
+
+    var offlineTakeoverAttemptWasUsed: Bool {
+        offlineTakeoverNeedsFreshFrame && offlineTakeover?.isReconciled != true &&
+            offlineTakeover?.attemptedUnlockCounter != nil
+    }
+
+    var offlineTakeoverInitialAttemptFailed: Bool {
+        offlineTakeoverRecordIsUnreadable || (offlineTakeoverNeedsFreshFrame &&
+            offlineTakeover?.isReconciled != true && offlineTakeover?.initialAttemptFailed == true)
+    }
+
+    private var offlineTakeoverNeedsReconciliation: Bool {
+        if offlineTakeoverRecordIsUnreadable { return true }
+        guard let pending = offlineTakeover else { return false }
+        return !pending.isReconciled
+    }
+
+    private func beginOfflineLibreTakeover(preparedSession: LibreWatchDirectSession,
+                                           completion: @escaping (Bool, String?) -> Void) {
+        guard let snapshot = acceptedHandoffSnapshot,
+              snapshot.isValid, snapshot.revision == acceptedHandoffRevision,
+              snapshot.ownership == .iphone,
+              let offerID = snapshot.offlineTakeoverOfferID,
+              snapshot.session.id == preparedSession.id,
+              snapshot.session.representsSameSensor(as: preparedSession),
+              let calibration = snapshot.calibration, calibration.matches(session: preparedSession),
+              calibration == libreWatchCalibrationSnapshot,
+              let settings = snapshot.alarmSettings, settings.matches(preparedSession)
+        else {
+            completion(false, "Kunne ikke overtage uden iPhone. Forbind telefonen for at opdatere sensoroplysningerne.")
+            return
+        }
+        let preparationID = UUID()
+        offlineTakeoverPreparationID = preparationID
+        localAlarms.prepareOfflineDelegation(settings: settings, session: preparedSession) { [weak self] alarmsReady in
+            guard let self, self.offlineTakeoverPreparationID == preparationID else { return }
+            self.offlineTakeoverPreparationID = nil
+            guard alarmsReady, self.libreWatchOwnership == .iphone, self.acceptedHandoffSnapshot == snapshot,
+                  LibreWatchOfflineTakeoverPolicy.canBegin(snapshot: snapshot,
+                    session: self.libreWatchDirectSession, calibration: self.libreWatchCalibrationSnapshot,
+                    alarmSettings: self.localAlarms.offeredSettings,
+                    notificationsAuthorized: self.localAlarms.notificationsAreAuthorized) else {
+                completion(false, "Kunne ikke overtage uden iPhone. Kontrollér sensoroplysninger og alarmtilladelse.")
+                return
+            }
+            let transaction = LibreWatchOfflineTakeoverTransaction(
+                originInstallationID: LibreWatchSessionStore.installationID(), offerID: offerID,
+                session: preparedSession, calibration: calibration, alarmSettings: settings,
+                startingRevision: snapshot.revision, createdAt: Date())
+            let pending = LibreWatchOfflineTakeoverState(transaction: transaction)
+            guard transaction.isValid, LibreWatchSessionStore.saveOfflineTakeover(pending) else {
+                completion(false, "Kunne ikke gemme overtagelsen på uret.")
+                return
+            }
+            self.offlineTakeover = pending
+            self.libreWatchTakeoverIssue = nil
+            self.setLibreWatchOwnership(.watch)
+            self.retryOfflineTakeoverReconciliation()
+            completion(true, nil)
+        }
+    }
+
+    /// Reserve the normal next counter durably before writing it. Until a direct frame
+    /// proves this cached pack works, neither recovery nor restart may try another counter.
+    func prepareOfflineLibreUnlock(_ counter: UInt16) -> Bool {
+        guard var pending = offlineTakeover, offlineTakeoverNeedsFreshFrame else { return true }
+        guard pending.canAttemptInitialUnlock(counter: counter, currentSession: libreWatchDirectSession) else { return false }
+        pending.attemptedUnlockCounter = counter
+        guard LibreWatchSessionStore.saveOfflineTakeover(pending) else {
+            libreWatchTakeoverIssue = "Kunne ikke gemme forbindelsesforsøget på uret."
+            return false
+        }
+        offlineTakeover = pending
+        return true
+    }
+
+    @discardableResult
+    func failOfflineLibreInitialAttempt() -> Bool {
+        guard var pending = offlineTakeover, offlineTakeoverNeedsFreshFrame,
+              !pending.isReconciled else { return false }
+        pending.initialAttemptFailed = true
+        offlineTakeover = pending
+        if !LibreWatchSessionStore.saveOfflineTakeover(pending) {
+            libreWatchTakeoverIssue = "Kunne ikke gemme forbindelsesfejlen på uret."
+        }
+        return true
+    }
+
+    private func confirmOfflineLibreDirectFrame(_ reading: LibreWatchDirectReadingPayload, at date: Date) {
+        guard var pending = offlineTakeover, offlineTakeoverNeedsFreshFrame,
+              pending.confirmReceivedFrame(reading, currentCalibration: libreWatchCalibrationSnapshot, at: date)
+        else { return }
+        guard LibreWatchSessionStore.saveOfflineTakeover(pending) else {
+            libreWatchTakeoverIssue = "Kunne ikke gemme bekræftelsen af sensorforbindelsen."
+            return
+        }
+        offlineTakeover = pending
+        retryOfflineTakeoverReconciliation()
+    }
+
+    /// A user return remains one action when the phone reappears before the claim receipt.
+    /// Keep receiving while that exact claim is reconciled, then use the existing return.
+    func reconcileOfflineTakeoverBeforeReturn(_ continuation: @escaping () -> Void) -> Bool {
+        guard offlineTakeoverNeedsReconciliation else { return false }
+        guard phoneIsReachable, !offlineTakeoverRecordIsUnreadable else { return true }
+        offlineReturnContinuation = continuation
+        lastOfflineTakeoverSendAt = nil
+        retryOfflineTakeoverReconciliation()
+        return true
+    }
+
+    /// Preserve unaccepted readings before an explicit new ownership epoch replaces this
+    /// transaction. They must not be sent as ordinary data and discarded as wrong-owner.
+    private func preserveUnreconciledOfflineOutbox() -> Bool {
+        guard offlineTakeoverNeedsReconciliation, !connectivityOutbox.items.isEmpty else { return true }
+        let key = "libreWatchUnreconciledReadings.v1"
+        var retained = LibreWatchConnectivityOutbox()
+        if let stored = UserDefaults.standard.data(forKey: key) {
+            guard let decoded = try? JSONDecoder().decode(LibreWatchConnectivityOutbox.self, from: stored)
+            else { return false }
+            retained = decoded
+        }
+        // One bounded recovery copy uses the existing six-hour age/count/byte policy.
+        // It is never selected by a transport path and has no retry mechanism.
+        for item in connectivityOutbox.items where item.reading != nil { retained.enqueue(item) }
+        guard let encoded = try? JSONEncoder().encode(retained) else { return false }
+        UserDefaults.standard.set(encoded, forKey: key)
+        return UserDefaults.standard.data(forKey: key) == encoded
+    }
+
+    /// Persist a safe owner before removing intent. A crash at any point must not leave
+    /// `.watch` without the record that constrains its initial unlock attempt.
+    private func retireOfflineTakeoverForReplacement() -> Bool {
+        guard preserveUnreconciledOfflineOutbox() else { return false }
+        if offlineTakeoverNeedsReconciliation {
+            let empty = LibreWatchConnectivityOutbox()
+            guard LibreWatchSessionStore.saveOutbox(empty) else { return false }
+            connectivityOutbox = empty
+            outboxSendGate.invalidate()
+        }
+        LibreWatchSessionStore.saveOwnership(.recovery)
+        guard LibreWatchSessionStore.loadOwnership() == .recovery,
+              LibreWatchSessionStore.saveOfflineTakeover(nil) else { return false }
+        offlineTakeover = nil
+        offlineTakeoverRecordIsUnreadable = false
+        offlineTakeoverPreparationID = nil
+        offlineTakeoverSendToken = nil
+        return true
+    }
+
+    /// Activation, reachability and existing execution opportunities retry the same request.
+    /// A transport reply alone cannot release dependent readings: its exact durable receipt
+    /// and authoritative snapshot must both be accepted first.
+    private func retryOfflineTakeoverReconciliation(at date: Date = Date()) {
+        guard let pending = offlineTakeover, offlineTakeoverNeedsReconciliation,
+              pending.transaction.matches(session: libreWatchDirectSession),
+              phoneIsReachable, offlineTakeoverSendToken == nil,
+              date.timeIntervalSince(lastOfflineTakeoverSendAt ?? .distantPast) >= LibreWatchConnectivityOutbox.retryInterval,
+              let data = try? JSONEncoder().encode(pending.transaction) else { return }
+        let token = UUID()
+        offlineTakeoverSendToken = token
+        lastOfflineTakeoverSendAt = date
+        var message: [String: Any] = [
+            LibreWatchMessageKey.command: LibreWatchCommand.claimOfflineOwnership.rawValue,
+            LibreWatchMessageKey.sessionID: pending.transaction.session.id.uuidString,
+            LibreWatchMessageKey.deliveryItemID: pending.transaction.requestID.uuidString,
+            LibreWatchMessageKey.offlineTakeover: data,
+            LibreWatchMessageKey.unlockCounter: Int(max(libreWatchDirectSession?.unlockCount ?? pending.transaction.session.unlockCount,
+                pending.attemptedUnlockCounter ?? 0)),
+            LibreWatchMessageKey.alarmSettingsRevision: String(pending.transaction.alarmSettings.revision),
+            LibreWatchMessageKey.alarmsReady: localAlarms.readinessRevision == pending.transaction.alarmSettings.revision
+        ]
+        message[LibreWatchMessageKey.alarmState] = try? JSONEncoder().encode(localAlarms.state)
+        session.sendMessage(message, replyHandler: { [weak self] reply in
+            DispatchQueue.main.async {
+                guard let self, self.offlineTakeoverSendToken == token,
+                      self.offlineTakeover?.transaction.id == pending.transaction.id else { return }
+                self.offlineTakeoverSendToken = nil
+                if reply[LibreWatchMessageKey.success] as? Bool != true {
+                    self.libreWatchTakeoverIssue = "iPhone kunne ikke bekræfte overtagelsen. Målingerne er bevaret på uret."
+                }
+                guard self.processLibreWatchPayload(reply) else { return }
+                if self.offlineTakeover?.isReconciled == true { self.libreWatchTakeoverIssue = nil }
+                self.flushWatchConnectivityOutbox()
+            }
+        }, errorHandler: { [weak self] _ in
+            DispatchQueue.main.async {
+                guard let self, self.offlineTakeoverSendToken == token else { return }
+                self.offlineTakeoverSendToken = nil
+            }
+        })
     }
 
     func releaseLibreWatchOwnership(
@@ -822,6 +1075,14 @@ final class WatchStateModel: NSObject, ObservableObject {
         // Persist the resolved owner first. An interrupted cleanup may safely retry the
         // remaining transaction; a missing transaction with .releasingToPhone cannot.
         setLibreWatchOwnership(owner)
+        if owner == .iphone {
+            if LibreWatchSessionStore.saveOfflineTakeover(nil) {
+                offlineTakeover = nil
+                offlineTakeoverSendToken = nil
+            } else {
+                libreWatchTakeoverIssue = "Sensoren er tilbage på iPhone. Oprydning af overtagelsen afventer."
+            }
+        }
         pendingPhoneReturn = nil
         phoneReturnSendToken = nil
         LibreWatchSessionStore.savePhoneReturn(nil)
@@ -839,6 +1100,7 @@ final class WatchStateModel: NSObject, ObservableObject {
         LibreWatchSessionStore.saveSession(preparedSession)
         connectivityOutbox.retain(sessionID: preparedSession.id)
         LibreWatchSessionStore.saveOutbox(connectivityOutbox)
+        guard !offlineTakeoverNeedsReconciliation else { return }
         sendLibreWatchCommand(
             .updateUnlockCounter,
             sessionID: preparedSession.id,
@@ -923,6 +1185,7 @@ final class WatchStateModel: NSObject, ObservableObject {
                 outcome: WatchDeliveryEvidencePipeline.rejection(of: reading, policy: priorAcceptance, at: now))
             return false
         }
+        confirmOfflineLibreDirectFrame(reading, at: now)
         flushWatchConnectivityOutbox()
         // Diagnostic work starts only after this exact payload was durably saved
         // and the existing publication and outbox dispatch have returned. Acceptance
@@ -1045,8 +1308,9 @@ final class WatchStateModel: NSObject, ObservableObject {
     }
 
     func directLibrePresentation(stage: LibreWatchDirectStage, at date: Date) -> LibreWatchConnectionPresentation {
-        LibreWatchConnectionPresentation(ownership: libreWatchOwnership, stage: stage,
-            directReadingAt: isShowingDirectLibreReading ? bgReadingDate() : nil,
+        LibreWatchConnectionPresentation(ownership: libreWatchOwnership,
+            stage: offlineTakeoverNeedsFreshFrame && stage == .receiving ? .connecting : stage,
+            directReadingAt: isShowingDirectLibreReading && !offlineTakeoverNeedsFreshFrame ? bgReadingDate() : nil,
             directReadingIsCurrent: directLibreReadingIsCurrent(at: date), at: date)
     }
 
@@ -1404,10 +1668,40 @@ final class WatchStateModel: NSObject, ObservableObject {
         var payload = incomingPayload
         var handoffRevision: UInt64?
         var applyingSnapshot: LibreWatchHandoffSnapshot?
+        var reconciledOfflineState: LibreWatchOfflineTakeoverState?
+        var invalidatesOfflineTakeover = false
+        var quarantinedOfflineReadings = false
         if let snapshotData = payload[LibreWatchMessageKey.handoffSnapshot] as? Data {
             guard let snapshot = try? JSONDecoder().decode(LibreWatchHandoffSnapshot.self, from: snapshotData),
                   snapshot.isValid
             else { return false }
+            if offlineTakeoverRecordIsUnreadable {
+                // Periodic refreshes of the same offer cannot rearm an unknown consumed
+                // counter. Recovery needs a new sensor, an explicit phone override, or the
+                // fresh native-release grant for the existing online takeover action.
+                guard LibreWatchOfflineTakeoverPolicy.allowsCorruptRecordRecovery(snapshot: snapshot,
+                    acceptedRevision: acceptedHandoffRevision, currentSession: libreWatchDirectSession) else { return false }
+                invalidatesOfflineTakeover = true
+            }
+            if let pending = offlineTakeover {
+                let sameSession = pending.transaction.matches(session: snapshot.session)
+                let receipt = snapshot.offlineTakeoverReceipt
+                let matchingReceipt = receipt?.isValid == true && receipt?.matches(pending.transaction) == true &&
+                    (receipt?.acceptedRevision ?? UInt64.max) <= snapshot.revision
+                let explicitOverride = (snapshot.ownershipRevision ?? 0) > pending.transaction.startingRevision &&
+                    !matchingReceipt
+                if !sameSession || explicitOverride || (matchingReceipt && receipt?.state == .retired) {
+                    invalidatesOfflineTakeover = true
+                } else if matchingReceipt, receipt?.state == .accepted, snapshot.ownership == .watch {
+                    var updated = pending
+                    updated.receipt = receipt
+                    reconciledOfflineState = updated
+                } else if offlineTakeoverNeedsReconciliation {
+                    // A context can be newer only because phone status/settings refreshed.
+                    // It has no authority to erase this explicit offline user transaction.
+                    return false
+                }
+            }
             if snapshot.revision == acceptedHandoffRevision {
                 // An unchanged authoritative snapshot is idempotent. Matching only ID
                 // and owner would also accept conflicting calibration/alarm/unlock data.
@@ -1424,7 +1718,7 @@ final class WatchStateModel: NSObject, ObservableObject {
             payload[LibreWatchMessageKey.alarmsReady] = snapshot.alarmDelegation != nil
             handoffRevision = snapshot.revision
             applyingSnapshot = snapshot
-        } else if acceptedHandoffRevision > 0 {
+        } else if acceptedHandoffRevision > 0 || offlineTakeover != nil {
             // Already-queued contexts from before the atomic snapshot must not roll back
             // a completed takeover or return. Updated phones always include the snapshot.
             return false
@@ -1433,6 +1727,19 @@ final class WatchStateModel: NSObject, ObservableObject {
               var preparedSession = try? JSONDecoder().decode(LibreWatchDirectSession.self, from: data),
               preparedSession.isValid
         else { return false }
+
+        if invalidatesOfflineTakeover {
+            quarantinedOfflineReadings = offlineTakeoverNeedsReconciliation &&
+                connectivityOutbox.items.contains { $0.reading != nil }
+            guard retireOfflineTakeoverForReplacement() else {
+                libreWatchTakeoverIssue = "Kunne ikke bevare målingerne fra overtagelsen. Prøv igen med iPhone."
+                return false
+            }
+        } else if let reconciledOfflineState {
+            guard LibreWatchSessionStore.saveOfflineTakeover(reconciledOfflineState) else { return false }
+            offlineTakeover = reconciledOfflineState
+            offlineTakeoverSendToken = nil
+        }
 
         let sessionChanged = libreWatchDirectSession?.id != preparedSession.id ||
             libreWatchDirectSession?.representsSameSensor(as: preparedSession) == false
@@ -1502,6 +1809,13 @@ final class WatchStateModel: NSObject, ObservableObject {
             sessionID: preparedSession.id,
             completion: nil
         )
+        if quarantinedOfflineReadings {
+            libreWatchTakeoverIssue = "Sensoransvaret er ændret. Usynkroniserede målinger er bevaret på uret."
+        }
+        if !offlineTakeoverNeedsReconciliation, let continuation = offlineReturnContinuation {
+            offlineReturnContinuation = nil
+            DispatchQueue.main.async(execute: continuation)
+        }
         return true
     }
 
@@ -2022,7 +2336,10 @@ final class WatchStateModel: NSObject, ObservableObject {
             refreshDirectLibreReadingFreshness(at: date)
             synchronizeMealQuietEnds(at: date)
         }
-        if executionIsAvailable { retryPendingPhoneReturn(at: date) }
+        if executionIsAvailable {
+            retryOfflineTakeoverReconciliation(at: date)
+            retryPendingPhoneReturn(at: date)
+        }
         if executionIsAvailable, session.activationState == .activated, outboxSendGate.isIdle,
            date.timeIntervalSince(lastDiagnosticReplayAt ?? .distantPast) >= LibreWatchConnectivityOutbox.retryInterval {
             restorePendingDiagnosticJournalToOutbox(at: date)
@@ -2044,7 +2361,7 @@ final class WatchStateModel: NSObject, ObservableObject {
     }
 
     private func retryWatchConnectivityOutbox(at date: Date, opportunity: LibreWatchOutboxDeliveryOpportunity) {
-        guard opportunity.allowsDelivery,
+        guard !offlineTakeoverNeedsReconciliation, opportunity.allowsDelivery,
               LibreWatchSessionStore.prepareOutboxForDelivery(&connectivityOutbox,
                   sessionID: libreWatchDirectSession?.id, at: date) else { return }
         confirmLatestReadingQueuePersistenceIfPossible()
@@ -2140,7 +2457,7 @@ final class WatchStateModel: NSObject, ObservableObject {
     }
 
     private func performWatchConnectivityOutboxFlush() {
-        guard outboxSendGate.isIdle else { return }
+        guard !offlineTakeoverNeedsReconciliation, outboxSendGate.isIdle else { return }
         // A journal entry is persisted before its outbox item. Reconcile that crash/eviction
         // window on every activation/reachability opportunity, not only at process launch.
         connectivityOutbox.prune()
@@ -2413,6 +2730,7 @@ final class WatchStateModel: NSObject, ObservableObject {
     }
 
     private func synchronizeLocalAlarmState() {
+        guard !offlineTakeoverNeedsReconciliation else { return }
         guard let sessionID = libreWatchDirectSession?.id else { return }
         lastAlarmAcknowledgementAttemptAt = Date()
         // The latest snooze state is persisted independently of transport, attached again on
@@ -2421,6 +2739,7 @@ final class WatchStateModel: NSObject, ObservableObject {
     }
 
     private func processLibreWatchAlarmResponse(_ payload: [String: Any]) {
+        guard !offlineTakeoverNeedsReconciliation else { return }
         guard let data = payload[LibreWatchMessageKey.alarmSettings] as? Data,
               let settings = try? JSONDecoder().decode(LibreWatchAlarmSettings.self, from: data),
               let session = libreWatchDirectSession, settings.matches(session)
@@ -2720,6 +3039,7 @@ extension WatchStateModel: WCSessionDelegate {
                 if self.session.activationState != .activated {
                     self.outboxSendGate.invalidate()
                     self.phoneReturnSendToken = nil
+                    self.offlineTakeoverSendToken = nil
                 }
                 if let error {
                     self.log.error("WatchConnectivity activation failed; queued Libre data retained: \(error.localizedDescription, privacy: .public)")
@@ -2728,6 +3048,7 @@ extension WatchStateModel: WCSessionDelegate {
             }
 
             self.phoneRefresh.reachabilityDidChange()
+            self.retryOfflineTakeoverReconciliation()
             self.retryPendingPhoneReturn()
             self.synchronizeLocalAlarmState()
             self.synchronizeMealQuietEnds()
@@ -2739,6 +3060,7 @@ extension WatchStateModel: WCSessionDelegate {
 
     func sessionReachabilityDidChange(_: WCSession) {
         DispatchQueue.main.async {
+            self.retryOfflineTakeoverReconciliation()
             self.retryPendingPhoneReturn()
             self.synchronizeLocalAlarmState()
             self.synchronizeMealQuietEnds()
