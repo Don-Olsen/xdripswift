@@ -1014,3 +1014,262 @@ extension WatchSnapshotSemanticsTests {
         XCTAssertEqual(LibreWatchSessionStore.loadOwnership(defaults: defaults), .iphone)
     }
 }
+
+
+final class WatchPenConfigurationSignatureCacheTests: XCTestCase {
+    private let confirmationDate = Date(timeIntervalSince1970: 1_700_000_000)
+
+    private func isolatedDefaults() -> UserDefaults {
+        let name = "WatchPenConfigurationSignatureCacheTests.\(UUID())"
+        let defaults = UserDefaults(suiteName: name)!
+        addTeardownBlock { defaults.removePersistentDomain(forName: name) }
+        return defaults
+    }
+
+    private func confirmedProfile(maximumUnits: Double = 25,
+                                  confirmedAt: Date? = nil) -> PenDoseProfile {
+        var settings = PenDoseProfile.prefilledUnconfirmed.settings
+        settings.maximumSuggestionUnits = maximumUnits
+        return PenDoseProfile(settings: settings, confirmedSettings: settings,
+            confirmedAt: confirmedAt ?? confirmationDate)
+    }
+
+    // Preserve the original decoding and signature expression as the output oracle.
+    private func uncachedSignature(defaults: UserDefaults) -> String {
+        let profile: PenDoseProfile
+        if let data = defaults.data(forKey: PenDoseProfile.storageKey),
+           let decoded = try? JSONDecoder().decode(PenDoseProfile.self, from: data),
+           decoded.version == PenDoseProfile.schemaVersion, decoded.settings.isValid {
+            profile = decoded
+        } else {
+            profile = .prefilledUnconfirmed
+        }
+        let pizza = PizzaSplitSettings.load(defaults: defaults)
+        return [WatchPenPhoneService.profileSignature(profile), String(pizza.isEnabled),
+            String(pizza.percentageNow), String(pizza.reminderMinutes)].joined(separator: "|")
+    }
+
+    func testRepeatedAndUnrelatedDefaultsChangesReuseTheRealProfileSignature() {
+        let defaults = isolatedDefaults()
+        XCTAssertTrue(confirmedProfile().persist(defaults: defaults))
+        var builds = 0
+        var cache = WatchPenConfigurationSignatureCache { profile in
+            builds += 1
+            return WatchPenPhoneService.profileSignature(profile)
+        }
+        let expected = uncachedSignature(defaults: defaults)
+        for revision in 0..<30 {
+            defaults.set(revision, forKey: "unrelated.settings.revision")
+            XCTAssertEqual(cache.signature(defaults: defaults), expected)
+            XCTAssertEqual(cache.signature(defaults: defaults), expected)
+        }
+        XCTAssertEqual(builds, 1)
+    }
+
+    func testProfileEditsConfirmationRemovalAndReconfirmationInvalidateTheCache() {
+        let defaults = isolatedDefaults()
+        var profile = confirmedProfile()
+        XCTAssertTrue(profile.persist(defaults: defaults))
+        var builds = 0
+        var cache = WatchPenConfigurationSignatureCache { profile in
+            builds += 1
+            return WatchPenPhoneService.profileSignature(profile)
+        }
+        let original = cache.signature(defaults: defaults)
+        XCTAssertEqual(original, uncachedSignature(defaults: defaults))
+        profile.settings.maximumSuggestionUnits = 20
+        XCTAssertFalse(profile.isConfirmed)
+        XCTAssertTrue(profile.persist(defaults: defaults))
+        let edited = cache.signature(defaults: defaults)
+        XCTAssertEqual(edited, uncachedSignature(defaults: defaults))
+        XCTAssertNotEqual(edited, original)
+        XCTAssertEqual(builds, 2)
+
+        profile = confirmedProfile(maximumUnits: 20)
+        XCTAssertTrue(profile.persist(defaults: defaults))
+        let reconfirmed = cache.signature(defaults: defaults)
+        XCTAssertEqual(reconfirmed, uncachedSignature(defaults: defaults))
+        XCTAssertNotEqual(reconfirmed, edited)
+        XCTAssertEqual(builds, 3)
+
+        let unconfirmed = PenDoseProfile(settings: profile.settings)
+        XCTAssertTrue(unconfirmed.persist(defaults: defaults))
+        XCTAssertEqual(cache.signature(defaults: defaults), uncachedSignature(defaults: defaults))
+        XCTAssertEqual(builds, 4)
+        let updatedConfirmation = confirmedProfile(maximumUnits: 20,
+            confirmedAt: confirmationDate.addingTimeInterval(60))
+        XCTAssertTrue(updatedConfirmation.persist(defaults: defaults))
+        let updated = cache.signature(defaults: defaults)
+        XCTAssertEqual(updated, uncachedSignature(defaults: defaults))
+        XCTAssertNotEqual(updated, reconfirmed)
+        XCTAssertEqual(cache.signature(defaults: defaults), updated)
+        XCTAssertEqual(builds, 5)
+    }
+
+    func testEachPizzaSettingInvalidatesWhileEquivalentDefaultsRemainCached() {
+        let defaults = isolatedDefaults()
+        XCTAssertTrue(confirmedProfile().persist(defaults: defaults))
+        var builds = 0
+        var cache = WatchPenConfigurationSignatureCache { profile in
+            builds += 1
+            return WatchPenPhoneService.profileSignature(profile)
+        }
+        let original = cache.signature(defaults: defaults)
+        var pizza = PizzaSplitSettings.load(defaults: defaults)
+        XCTAssertTrue(pizza.persist(defaults: defaults))
+        XCTAssertEqual(cache.signature(defaults: defaults), original,
+            "Explicitly storing fallback values does not change the effective settings")
+        XCTAssertEqual(builds, 1)
+
+        pizza.isEnabled.toggle()
+        XCTAssertTrue(pizza.persist(defaults: defaults))
+        let disabled = cache.signature(defaults: defaults)
+        XCTAssertEqual(disabled, uncachedSignature(defaults: defaults))
+        XCTAssertNotEqual(disabled, original)
+        XCTAssertEqual(builds, 2)
+        pizza.percentageNow = 60
+        XCTAssertTrue(pizza.persist(defaults: defaults))
+        let percentageChanged = cache.signature(defaults: defaults)
+        XCTAssertEqual(percentageChanged, uncachedSignature(defaults: defaults))
+        XCTAssertNotEqual(percentageChanged, disabled)
+        XCTAssertEqual(builds, 3)
+        pizza.reminderMinutes = 120
+        XCTAssertTrue(pizza.persist(defaults: defaults))
+        let reminderChanged = cache.signature(defaults: defaults)
+        XCTAssertEqual(reminderChanged, uncachedSignature(defaults: defaults))
+        XCTAssertNotEqual(reminderChanged, percentageChanged)
+        XCTAssertEqual(cache.signature(defaults: defaults), reminderChanged)
+        XCTAssertEqual(builds, 4)
+    }
+
+    func testMissingCorruptUnsupportedAndInvalidProfilesKeepFallbackSemantics() throws {
+        let defaults = isolatedDefaults()
+        var unsupported = confirmedProfile()
+        unsupported.version = PenDoseProfile.schemaVersion + 1
+        var invalid = confirmedProfile()
+        invalid.settings.maximumSuggestionUnits = 0
+        let payloads: [Data?] = [nil, Data("not JSON".utf8),
+            try JSONEncoder().encode(unsupported), try JSONEncoder().encode(invalid)]
+        var builds = 0
+        var cache = WatchPenConfigurationSignatureCache { profile in
+            builds += 1
+            return WatchPenPhoneService.profileSignature(profile)
+        }
+        for (index, payload) in payloads.enumerated() {
+            defaults.set(payload, forKey: PenDoseProfile.storageKey)
+            XCTAssertEqual(PenDoseProfile.load(data: payload), .prefilledUnconfirmed)
+            XCTAssertEqual(PenDoseProfile.load(defaults: defaults), .prefilledUnconfirmed)
+            let signature = cache.signature(defaults: defaults)
+            XCTAssertEqual(signature, uncachedSignature(defaults: defaults))
+            XCTAssertEqual(signature.components(separatedBy: "|").first, "")
+            XCTAssertEqual(cache.signature(defaults: defaults), signature)
+            XCTAssertEqual(builds, index + 1,
+                "Different stored bytes invalidate even when both decode to the fallback")
+        }
+        XCTAssertTrue(confirmedProfile().persist(defaults: defaults))
+        let recovered = cache.signature(defaults: defaults)
+        XCTAssertEqual(recovered, uncachedSignature(defaults: defaults))
+        XCTAssertFalse(try XCTUnwrap(recovered.components(separatedBy: "|").first).isEmpty)
+        XCTAssertEqual(builds, payloads.count + 1)
+    }
+
+    func testEquivalentProfileJSONReencodingRebuildsWithoutChangingTheSignature() throws {
+        let defaults = isolatedDefaults()
+        let profile = confirmedProfile()
+        let compactEncoder = JSONEncoder()
+        compactEncoder.outputFormatting = [.sortedKeys]
+        let prettyEncoder = JSONEncoder()
+        prettyEncoder.outputFormatting = [.sortedKeys, .prettyPrinted]
+        let compact = try compactEncoder.encode(profile)
+        let pretty = try prettyEncoder.encode(profile)
+        XCTAssertNotEqual(compact, pretty)
+        XCTAssertEqual(PenDoseProfile.load(data: compact), profile)
+        XCTAssertEqual(PenDoseProfile.load(data: pretty), profile)
+        defaults.set(compact, forKey: PenDoseProfile.storageKey)
+        var builds = 0
+        var cache = WatchPenConfigurationSignatureCache { profile in
+            builds += 1
+            return WatchPenPhoneService.profileSignature(profile)
+        }
+        let original = cache.signature(defaults: defaults)
+        defaults.set(pretty, forKey: PenDoseProfile.storageKey)
+        XCTAssertEqual(cache.signature(defaults: defaults), original)
+        XCTAssertEqual(cache.signature(defaults: defaults), uncachedSignature(defaults: defaults))
+        XCTAssertEqual(builds, 2)
+    }
+
+    func testBuilderMutationCannotMixCapturedProfileAndPizzaSettings() throws {
+        let defaults = isolatedDefaults()
+        let originalProfile = confirmedProfile()
+        let updatedProfile = confirmedProfile(maximumUnits: 20)
+        let updatedData = try JSONEncoder().encode(updatedProfile)
+        XCTAssertTrue(originalProfile.persist(defaults: defaults))
+        let original = uncachedSignature(defaults: defaults)
+        var profilesBuilt: [PenDoseProfile] = []
+        var cache = WatchPenConfigurationSignatureCache { profile in
+            profilesBuilt.append(profile)
+            if profilesBuilt.count == 1 {
+                defaults.set(updatedData, forKey: PenDoseProfile.storageKey)
+                defaults.set(false, forKey: PizzaSplitSettings.enabledKey)
+                defaults.set(60, forKey: PizzaSplitSettings.percentageKey)
+                defaults.set(120, forKey: PizzaSplitSettings.reminderKey)
+            }
+            return WatchPenPhoneService.profileSignature(profile)
+        }
+        XCTAssertEqual(cache.signature(defaults: defaults), original,
+            "The result must represent the inputs captured before the signature builder ran")
+        let updated = uncachedSignature(defaults: defaults)
+        XCTAssertNotEqual(updated, original)
+        XCTAssertEqual(cache.signature(defaults: defaults), updated)
+        XCTAssertEqual(cache.signature(defaults: defaults), updated)
+        XCTAssertEqual(profilesBuilt, [originalProfile, updatedProfile])
+    }
+
+    func testIndependentCacheInstancesEachBuildTheirOwnInitialSignature() {
+        let defaults = isolatedDefaults()
+        XCTAssertTrue(confirmedProfile().persist(defaults: defaults))
+        var firstBuilds = 0
+        var secondBuilds = 0
+        var first = WatchPenConfigurationSignatureCache { profile in
+            firstBuilds += 1
+            return WatchPenPhoneService.profileSignature(profile)
+        }
+        var second = WatchPenConfigurationSignatureCache { profile in
+            secondBuilds += 1
+            return WatchPenPhoneService.profileSignature(profile)
+        }
+        let expected = uncachedSignature(defaults: defaults)
+        XCTAssertEqual(first.signature(defaults: defaults), expected)
+        XCTAssertEqual(first.signature(defaults: defaults), expected)
+        XCTAssertEqual(secondBuilds, 0)
+        XCTAssertEqual(second.signature(defaults: defaults), expected)
+        XCTAssertEqual(firstBuilds, 1)
+        XCTAssertEqual(secondBuilds, 1)
+        defaults.removeObject(forKey: PenDoseProfile.storageKey)
+        XCTAssertEqual(first.signature(defaults: defaults), uncachedSignature(defaults: defaults))
+        XCTAssertEqual(secondBuilds, 1)
+        XCTAssertEqual(second.signature(defaults: defaults), uncachedSignature(defaults: defaults))
+        XCTAssertEqual(firstBuilds, 2)
+        XCTAssertEqual(secondBuilds, 2)
+    }
+
+    func testSwitchingDefaultsSuitesNeverReturnsAnotherSuitesConfiguration() {
+        let firstDefaults = isolatedDefaults()
+        let secondDefaults = isolatedDefaults()
+        XCTAssertTrue(confirmedProfile().persist(defaults: firstDefaults))
+        secondDefaults.set(false, forKey: PizzaSplitSettings.enabledKey)
+        var builds = 0
+        var cache = WatchPenConfigurationSignatureCache { profile in
+            builds += 1
+            return WatchPenPhoneService.profileSignature(profile)
+        }
+        let first = cache.signature(defaults: firstDefaults)
+        XCTAssertEqual(first, uncachedSignature(defaults: firstDefaults))
+        let second = cache.signature(defaults: secondDefaults)
+        XCTAssertEqual(second, uncachedSignature(defaults: secondDefaults))
+        XCTAssertNotEqual(first, second)
+        XCTAssertEqual(cache.signature(defaults: firstDefaults), first)
+        XCTAssertEqual(cache.signature(defaults: firstDefaults), first)
+        XCTAssertEqual(builds, 3)
+    }
+}

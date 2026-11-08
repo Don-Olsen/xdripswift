@@ -83,7 +83,12 @@ struct PenDoseProfile: Codable, Equatable, Sendable {
     }
 
     static func load(defaults: UserDefaults = .standard) -> Self {
-        guard let data = defaults.data(forKey: storageKey),
+        load(data: defaults.data(forKey: storageKey))
+    }
+
+    /// Decode the captured bytes so callers never validate one profile and identify another.
+    static func load(data: Data?) -> Self {
+        guard let data,
               let decoded = try? JSONDecoder().decode(Self.self, from: data),
               decoded.version == schemaVersion, decoded.settings.isValid else {
             return .prefilledUnconfirmed

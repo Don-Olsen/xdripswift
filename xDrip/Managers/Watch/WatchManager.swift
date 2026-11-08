@@ -564,6 +564,33 @@ enum WatchManualTreatmentStore {
     }
 }
 
+/// Reuses only the settings identity, not a dose or a transport result. All inputs are
+/// captured before decoding; an unrelated defaults notification needs no JSON/hash work.
+struct WatchPenConfigurationSignatureCache {
+    private struct Inputs: Equatable {
+        let profileData: Data?
+        let pizza: PizzaSplitSettings
+    }
+
+    private var cached: (inputs: Inputs, signature: String)?
+    private let profileSignature: (PenDoseProfile) -> String
+
+    init(profileSignature: @escaping (PenDoseProfile) -> String = WatchPenPhoneService.profileSignature) {
+        self.profileSignature = profileSignature
+    }
+
+    mutating func signature(defaults: UserDefaults = .standard) -> String {
+        let inputs = Inputs(profileData: defaults.data(forKey: PenDoseProfile.storageKey),
+                            pizza: PizzaSplitSettings.load(defaults: defaults))
+        if let cached, cached.inputs == inputs { return cached.signature }
+        let signature = [profileSignature(PenDoseProfile.load(data: inputs.profileData)),
+            String(inputs.pizza.isEnabled), String(inputs.pizza.percentageNow),
+            String(inputs.pizza.reminderMinutes)].joined(separator: "|")
+        cached = (inputs, signature)
+        return signature
+    }
+}
+
 // WatchConnectivity delegate callbacks can trigger async AGP generation
 // mutable watch payloads are still committed back on the main queue
 final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
@@ -602,6 +629,8 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
     private var libreWatchObservers: [NSObjectProtocol] = []
     private let offlinePhoneRelease = LibreWatchOfflinePhoneReleaseCoordinator()
     private var lastPenConfigurationSignature = ""
+    // Seeded before observer registration, then accessed by its MainActor callback.
+    private var penConfigurationSignatureCache = WatchPenConfigurationSignatureCache()
     private var mealQuietState: MealQuietSyncState?
 
     /// Statistics manager used to build compact AGP backgrounds for the Watch chart
@@ -887,10 +916,7 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
     }
 
     private func penConfigurationSignature() -> String {
-        let pizza = PizzaSplitSettings.load()
-        return [WatchPenPhoneService.profileSignature(PenDoseProfile.load()),
-            String(pizza.isEnabled), String(pizza.percentageNow),
-            String(pizza.reminderMinutes)].joined(separator: "|")
+        penConfigurationSignatureCache.signature()
     }
 
     private func activateSessionIfNeeded() {

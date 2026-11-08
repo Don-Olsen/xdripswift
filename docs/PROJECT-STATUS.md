@@ -1,3 +1,24 @@
+## Genbrug af Watch-penprofilens kontrolværdi — 8. november 2026
+
+Telefonens eksisterende Watch-observer modtager også ændringer i indstillinger,
+som ikke vedrører penprofilen. Den afkoder og hasher nu kun profilen igen,
+når de faktisk gemte profilbytes eller de effektive 🍕-indstillinger ændres.
+Kontrolværdien beregnes fra samme indlæste oplysninger som cachens nøgle.
+Den eksisterende sammenligning afgør fortsat, om uret skal have en opdatering;
+semantisk identisk profiltekst sender derfor ingen ekstra opdatering.
+
+Den fælles profillæser har alene fået mulighed for at validere allerede
+indlæste bytes med de samme regler og samme fallback. Doseringsregler,
+beregningsresultater, behandlinger, sensorforbindelse og transport ændres ikke.
+Cachen er lokal for den eksisterende Watch-manager og gemmes ikke på disk.
+
+Målrettede regressionstests bruger isolerede defaults og den rigtige
+profilvalidering/signaturberegning. De kontrollerer genbrug ved uvedkommende
+ændringer, reelle profil-/bekræftelses-/🍕-ændringer, ugyldige og manglende
+profiler, forskelligt serialiseret men ens indhold samt ændringer under
+beregningen. Releasekontrollernes faktiske resultater registreres efter kørsel.
+Der er endnu ikke målt en hastigheds- eller batterigevinst på fysisk hardware.
+
 <!-- testflight-7.1.1-4358:start -->
 ### TestFlight 7.1.1 (4358)
 
