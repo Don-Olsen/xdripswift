@@ -1,3 +1,15 @@
+<!-- testflight-7.1.1-4359:start -->
+### TestFlight 7.1.1 (4359)
+
+- Kildecommit og tag: `5a706ba0c992de0157e655f78dbda5d523c1cda0` / `testflight-7.1.1-4359`.
+- Tests: 1922/1922 bestået; 0 fejlet; 0 skipped. iPhone- og Watch-simulatorbuilds bestod.
+- Apple-status (2026-11-08T13:28:18.969831+00:00): [Internal / Testing](https://appstoreconnect.apple.com/apps/6795645396/testflight/ios/96a957fe-0895-4541-a456-66024e7b3119).
+- Eksisterende intern gruppe: Ole Internal er bekræftet tilknyttet.
+- Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
+<!-- testflight-7.1.1-4359:end -->
+
+De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
+
 ## Genbrug af Watch-penprofilens kontrolværdi — 8. november 2026
 
 Telefonens eksisterende Watch-observer modtager også ændringer i indstillinger,
