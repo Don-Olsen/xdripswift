@@ -10,50 +10,77 @@
 
 De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
 
-## Rettelse af automatisk ML-genforsøg — 8. november 2026 (lokale forprøver)
+## Automatisk ML-genforsøg i 7.1.1 (4360) — 8. november 2026
 
-En afbrudt historikforberedelse efterlod en vedvarende 24-timers ventetid,
-selv om appen tilsigtede et nyt forsøg ved næste brug. Desuden kunne en kontrol
-under ventetiden starte endnu 24 timers blokering i hukommelsen. Den eksisterende
-status “Automatisk træning afventer næste forsøg” stammer fra denne kontrol før
-historiklæsning/træning; den dokumenterer ikke, hvorfor forrige forsøg stoppede.
+Koden kunne efterlade en vedvarende 24-timers ventetid efter afbrudt
+historikforberedelse. En kontrol under ventetiden kunne desuden starte endnu
+24 timers blokering i hukommelsen. Rettelsen fjerner kun det præcise,
+uafsluttede forsøgs markør ved almindelig afbrydelse og bruger den eksisterende
+ventetids faktiske udløb. Reelle registrerede fejl beholder deres ventetid;
+ældre callbacks kan ikke fjerne nyere eller afsluttede forsøg. En allerede
+startberettiget iOS-opgave bevares, når dens oprindelige ønskede dato er passeret.
 
-Rettelsen fjerner kun den præcist identificerede, uafsluttede forsøgsmarkør ved
-almindelig afbrydelse. Reelle registrerede fejl beholder deres ventetid, og ældre
-callbacks kan ikke fjerne nyere eller afsluttede forsøg. Genbrug af færdige
-træningsdata er fortsat begrænset i hukommelsen; en kontrol af ventetiden bruger
-nu dens faktiske udløb. En allerede startberettiget iOS-opgave erstattes heller
-ikke længere blot fordi den oprindelige ønskede dato er passeret.
+Lokale læsefejl bevares som teknisk fejldomæne/kode på afbrydelsestokenet,
+så efterfølgende baggrundsskift ikke ophæver fejlens ventetid. Fejlbeskrivelser
+og helbredsværdier logges ikke. Genbrug af færdige træningsdata er fortsat
+begrænset i hukommelsen. Aktiv model, træner, kompatibilitet,
+historik-/selvtjekkrav og dosisregler er uændrede.
 
-Ændringen er afgrænset til `GlucoseForecastMLTrainingCoordinator`,
-`GlucoseForecastMLPreparedHistoryStore` og baggrundsplanlægningens datokontrol.
-Historikloaderen bevarer desuden en lokal læsefejl som teknisk domæne/kode,
-så en efterfølgende afbrydelse ikke sletter fejlens ventetid. Ingen fejlindhold
-eller helbredsværdier logges. Aktiv model, træner, kompatibilitet,
-historik-/selvtjekkrav og dosisregler er uændrede. Regressionstests dækker de rigtige livscyklusmetoder,
-vedvarende lager med genstart, samtidige fejl/afbrydelser og datoplanlægningen.
-De er ikke en fysisk test af iOS' tildeling af baggrundstid.
+Apple valgte **4360**. Kildecheckpoint
+`eb3032f05e3a7873c240cd6c19d1506022a24480` og det annoterede tag
+`testflight-7.1.1-4360` er pushet. Det præcise release-træ bestod
+**1.935/1.935 XCTest**, **0 fejl og 0 skipped**, **198 Python-tests**,
+Watch-værktøjernes **30 + 24** syntetiske selvkontroller samt begge
+simulatorbuilds. Unsigned Release **iPhoneOS/arm64** bestod på samme checkpoint
+med verificeret kilde-ID, version og buildnummer. Kvitteringer og logs er
+bevaret i `build/testflight-7.1.1-4360/test/`, inklusive
+`results/iphoneos-unsigned.json`.
 
-Faktisk lokal validering: `local-build.sh test-all` og det færdige `.xcresult`
-bekræfter **1.934/1.934 XCTest**, **0 fejl og 0 skipped**, inklusive de 12 nye.
-`local-build.sh python` bestod **198 tests** samt Watch-værktøjernes **30 + 24**
-syntetiske selvkontroller. `git diff --check` bestod. Testappen med indlejrede
-mål blev bygget til simulator som del af XCTest. Separate simulatorbuilds,
-unsigned iPhoneOS, signering og releasekontroller er ikke kørt for denne ændring.
-Testbeviser ligger uden for Git under
-`~/DeveloperBuildData/xDrip/local-runs/xdripswift/20261108T164232Z-80165/`
-og `20261108T163850Z-77046/`. Den sidste releasegennemgang tilføjede yderligere
-én test gennem den rigtige loader med et isoleret testlager, der fremkalder
-en reel læsefejl. Første testopsætning gav kun et tomt svar og fejlede derfor;
-den fejlede kørsel er bevaret under releasens `test/failed-local-read-fixture/`.
-Den korrigerede test bestod særskilt på iOS-simulator (1/1). Releasekontrollerne
-skal gentage hele suiten med denne test og Apples buildnummer.
+De 13 nye regressionstests dækker livscyklus, vedvarende lager med genstart,
+fejl efterfulgt af afbrydelse og datoplanlægning. Den første opsætning af
+loaderens fejltest gav et tomt svar i stedet for den tilsigtede læsefejl og
+fejlede derfor. Kørslen er bevaret i `test/failed-local-read-fixture/` under
+releasen. Den rettede test fremkalder en faktisk Core Data-fejl gennem den
+rigtige loader med et isoleret testlager; den bestod først særskilt og derefter
+i hele suiten. En separat test af koordinatoren bekræfter, at en registreret
+læsefejl bevarer den gemte ventetid ved afbrydelse.
 
-Ingen installation, fysisk natlig træning eller adgang til telefonens konkrete
-forsøgshistorik er udført. Opladning er fortsat en forudsætning for den planlagte
-baggrundskørsel; iOS bestemmer, om og hvornår den får køretid. En ny model skal
-fortsat godkendes, før den overtager. Ingen versionsændring, commit, push eller
-TestFlight-upload er udført som del af denne undersøgelse.
+Efter brugerens særskilte godkendelse blev **48.448** regenererbare filer i
+den delte simulatorcache fjernet: **5.796.945.920 allokerede bytes** (ca. 5,40 GiB).
+Den fælles byggelås, proces-/filkontroller og før/efter-inventarer blev brugt.
+Releasefiler, test-/diagnosebeviser, kildekode og device-builds blev bevaret;
+Git og inventaret over bevarede filer var uændrede. Rapport:
+`build/release-automation/cleanup/approved-shared-20261108T172541.174035Z/report.json`.
+
+Telefonens konkrete forsøgshistorik er ikke undersøgt. Statussen
+“Automatisk træning afventer næste forsøg” kommer fra kontrollen før
+historiklæsning/træning og beviser ikke, hvorfor et tidligere forsøg stoppede.
+De påviste kodefejl dokumenterer derfor ikke årsagen til telefonens observerede
+forløb. Ingen lokal installation eller fysisk natlig træning er udført.
+Opladning er fortsat en forudsætning for planlagt baggrundskørsel, iOS bestemmer
+køretiden, og en ny model skal fortsat godkendes, før den overtager.
+
+Arkivet blev bygget fra det uændrede release-tag, og den faktiske signerede IPA
+bestod kontrol af kildecommit, alle fem bundle-ID'er, versioner, signaturer,
+profiler, entitlements og Watch-indlejring. Apple modtog uploaden uden fejl og
+bekræftede **VALID / INTERNAL_ONLY / IN_BETA_TESTING** samt den eksisterende
+**Ole Internal**-relation. Apple build-ID: `b9eb88bc-ae70-409b-9cd2-81eec8320cce`.
+Release-tagget bevares på kildecheckpointet; denne dokumentation er en separat
+commit efter udgivelsen.
+
+Den normale selektive oprydning efter udgivelsen afsluttede desuden med
+**35.024** slettede cachefiler og **6.245.482.496 allokerede bytes**.
+Aktuel og seneste tidligere release samt alle kilde-, test- og signeringsbeviser
+blev bevaret. Rapport:
+`build/release-automation/cleanup/20261108T175530.024882Z/report.json`.
+Der var cirka **15,7 GiB ledigt** efter begge oprydninger og releasebygningen.
+
+Læsende enhedskontrol fandt iPhone parret/tilgængelig, men forespørgslen efter
+installeret app fejlede, da enheden mistede forbindelsen. Installeret build blev
+derfor ikke verificeret; Watch var utilgængeligt. En allerede gemt ventetid fra
+et tidligere build kan stadig skulle udløbe, og en uændret modeldato er ikke i
+sig selv bevis for, at et nyt træningsforsøg ikke har været kørt eller er blevet
+afvist af de eksisterende godkendelseskrav.
 
 <!-- testflight-7.1.1-4359:start -->
 ### TestFlight 7.1.1 (4359)
