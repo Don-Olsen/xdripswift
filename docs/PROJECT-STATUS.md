@@ -31,10 +31,51 @@ SQLite-opslag, så målinger præcis på grænsen behandles ens.
 
 Produktionsændringen er begrænset til StatisticsManager og StatisticsViewModel.
 Statistikformler, dækningskrav, ML, dosering, behandlinger og sensorforbindelse
-ændres ikke. Regressionerne bruger syntetiske data og en
-isoleret SQLite-database gennem den rigtige manager og viewmodel. Faktiske
-testresultater og releasekontroller registreres efter kørslen; hastighed og
-batteriforbrug på fysisk iPhone er ikke målt for denne ændring.
+ændres ikke. Syv nye regressionstests bruger syntetiske data og en
+isoleret SQLite-database gennem den rigtige manager og viewmodel. De verificerer
+én glukosehentning ved den fælles indlæsning, identiske resultater ved direkte
+opslag, eksklusive tidsgrænser, skjulte/ugyldige målinger, cacheinvalidering ved
+oprettelse/redigering/sletning, begge fallbackforløb, friske senere periodeskift
+og PDF-kald samt hurtige periodeskift/genåbning med et forsinket ældre resultat.
+Ingen eksisterende test er fjernet eller svækket.
+
+Apple valgte **4363**. Det præcise release-checkpoint
+`8b64eef423131254176f60d0fb93434134692cdc` / `testflight-7.1.1-4363`
+bestod **1.953/1.953 XCTest**, **0 fejl og 0 skipped**, **198 Python-tests**,
+Watch-værktøjernes **30 + 24** syntetiske kontroller, begge simulatorbuilds og
+unsigned Release **iPhoneOS/arm64**. Testtræet er
+`8e8083ec5db89648028c0e6be8c82e07eb14fe86`; testoversigtens kildecommit er den
+forudgående base, mens releasekvitteringen knytter det testede staged tree til
+checkpointet. En separat kodegennemgang og `git diff --check` bestod.
+Beviserne ligger uden for Git i `build/testflight-7.1.1-4363/test/`.
+
+Arkivet blev bygget fra tagget. Den faktisk eksporterede IPA bestod kontrollen
+af kildecommit, version/build, fem bundle-id'er, signaturer, profiler,
+entitlements og Watch-indlejring. SHA-256:
+`714137cccd2b714bd033fc84b5731a4424d575bd3cedcbd48deb8637f55178b4`.
+Apple bekræftede **VALID / INTERNAL_ONLY / IN_BETA_TESTING** og den eksisterende
+**Ole Internal**-gruppes faktiske buildtilknytning. Ingen ekstern testgruppe
+eller App Store-publicering er brugt.
+
+En læsende enhedskontrol bekræftede 7.1.1 (4362) på den tilsluttede iPhone.
+4363 er ikke lokalt installeret eller fysisk afprøvet i dette forløb; ingen
+sensorforbindelse er afbrudt. Hurtigere åbning eller lavere batteriforbrug er
+ikke målt. Der er ikke taget nye manuelle UI-skærmbilleder for denne ændring.
+
+Arm64-kontrollen blev først stoppet før Xcode af projektets krav om mindst
+10 GiB ledig plads. Under brugerens eksisterende tilladelse til sikker
+projektoprydning blev **1.656** regenererbare produktfiler fra to ældre delte
+simulatorcaches fjernet (**741.339.136 allokerede bytes**), med frisk
+Apple-kontrol, fælles buildlås, kontrol af åbne filer og filidentitet samt
+uændret Git og bevarede release-/testfiler. Device-produkter, kilde, plist,
+logs, resultater og kvitteringer blev bevaret. Rapporten ligger i
+`build/testflight-7.1.1-4363/maintenance/shared-simulator-cache-cleanup/`.
+Efter bekræftet udgivelse fjernede den normale automatiske oprydning yderligere
+**30.903** klassificerede filer (**4.885.291.008 allokerede bytes**).
+Rapport: `build/release-automation/cleanup/20261108T222707.549682Z/report.json`.
+4363 og seneste tidligere verificerede release 4362 blev bevaret i fuld form;
+arkiver, IPA, dSYMs, XCResult og dokumenteret historik er ikke slettet.
+Allokerede bytes er ikke en måling af den præcise ændring i APFS' ledige plads.
 
 <!-- testflight-7.1.1-4362:start -->
 ### TestFlight 7.1.1 (4362)
