@@ -13,7 +13,7 @@ import Foundation
 final class StatisticsViewModel: ObservableObject {
     @Published var selectedPeriod: GlucoseReportPeriod = .ninety {
         didSet {
-            guard oldValue != selectedPeriod else { return }
+            guard oldValue != selectedPeriod, !isLoadingAvailability else { return }
             loadAnalytics()
         }
     }
@@ -23,29 +23,41 @@ final class StatisticsViewModel: ObservableObject {
     @Published private(set) var lowSoonStatistics: LowSoonStatisticsSummary?
 
     private let statisticsManager: StatisticsManager
+    private let now: () -> Date
+    private var availabilityTask: Task<Void, Never>?
+    private var isLoadingAvailability = false
     private var analyticsTask: Task<Void, Never>?
     private var lowSoonTask: Task<Void, Never>?
 
-    init(statisticsManager: StatisticsManager) {
+    init(statisticsManager: StatisticsManager, now: @escaping () -> Date = Date.init) {
         self.statisticsManager = statisticsManager
+        self.now = now
     }
 
     /// Loads available periods before requesting analytics for the selected period.
     func load() {
+        availabilityTask?.cancel()
+        analyticsTask?.cancel()
         lowSoonTask?.cancel()
-        lowSoonTask = Task {
-            let summary = await statisticsManager.lowSoonStatistics()
+        let referenceDate = now()
+        isLoading = true
+        isLoadingAvailability = true
+        availabilityTask = Task {
             guard !Task.isCancelled else { return }
-            lowSoonStatistics = summary
-        }
-        Task {
-            isLoading = true
-            let availability = await statisticsManager.availableReportPeriods()
+            let availability = await statisticsManager.availableReportPeriods(referenceDate: referenceDate)
+            guard !Task.isCancelled else { return }
             availablePeriods = availability
             if availability[selectedPeriod] != true {
                 selectedPeriod = defaultPeriod(from: availability)
-            } else {
-                loadAnalytics()
+            }
+            isLoadingAvailability = false
+            loadAnalytics(referenceDate: referenceDate)
+            // Reuse the wide glucose window and its exact cutoff for both summaries.
+            lowSoonTask = Task {
+                guard !Task.isCancelled else { return }
+                let summary = await statisticsManager.lowSoonStatistics(now: referenceDate)
+                guard !Task.isCancelled else { return }
+                lowSoonStatistics = summary
             }
         }
     }
@@ -58,7 +70,7 @@ final class StatisticsViewModel: ObservableObject {
         GlucoseReportPeriod.allCases.filter { isPeriodAvailable($0) }
     }
 
-    private func loadAnalytics() {
+    private func loadAnalytics(referenceDate: Date? = nil) {
         analyticsTask?.cancel()
         let requestedPeriod = selectedPeriod
         let configuration = GlucoseReportConfiguration(
@@ -71,8 +83,10 @@ final class StatisticsViewModel: ObservableObject {
         )
 
         analyticsTask = Task {
+            guard !Task.isCancelled else { return }
             isLoading = true
-            let requestedAnalytics = await statisticsManager.reportAnalytics(for: configuration)
+            let requestedAnalytics = await statisticsManager.reportAnalytics(for: configuration,
+                                                                              referenceDate: referenceDate)
             guard !Task.isCancelled, selectedPeriod == requestedPeriod else { return }
             analytics = requestedAnalytics
             isLoading = false

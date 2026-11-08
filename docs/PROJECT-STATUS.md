@@ -1,3 +1,29 @@
+## Fælles indlæsning af Statistik — 8. november 2026
+
+Statistik brugte tidligere forskellige sluttidspunkter til periodekontrol og
+beregning. Ved en frisk åbning kunne de få ekstra millisekunder forkaste det
+netop indlæste årsinterval og udløse en ny glukosehentning. Den afgrænsede
+rettelse bruger ét tidspunkt under samme indlæsning og starter de to
+statistikforbrugere efter periodekontrollen. Lav-varselsstatistikken genbruger
+samme glukosevindue; alarmvurderingen ændres ikke. Eksplicitte tidspunkter
+indgår i cacheidentiteten. Senere manuelle periodeskift og eksisterende
+PDF-kald beholder deres særskilte tidsgrundlag, og gemte dataændringer
+invaliderer fortsat cachen.
+
+Hvis ingen perioder har tilstrækkelig dækning, genindlæses syvdagesfallbacken
+nu også, når den allerede er valgt. Tidligere kunne indlæsningsstatus blive
+stående, mens eksisterende statistik ikke blev opdateret. Ældre afbrudte
+indlæsninger må ikke publicere over en nyere anmodning. Genbrugte udsnit
+anvender desuden samme eksklusive tidsgrænser som det eksisterende
+SQLite-opslag, så målinger præcis på grænsen behandles ens.
+
+Produktionsændringen er begrænset til StatisticsManager og StatisticsViewModel.
+Statistikformler, dækningskrav, ML, dosering, behandlinger og sensorforbindelse
+ændres ikke. Regressionerne bruger syntetiske data og en
+isoleret SQLite-database gennem den rigtige manager og viewmodel. Faktiske
+testresultater og releasekontroller registreres efter kørslen; hastighed og
+batteriforbrug på fysisk iPhone er ikke målt for denne ændring.
+
 <!-- testflight-7.1.1-4362:start -->
 ### TestFlight 7.1.1 (4362)
 

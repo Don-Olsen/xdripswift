@@ -206,4 +206,294 @@ final class GMIStatisticsTests: XCTestCase {
             }
         }
     }
+
+
+    @MainActor
+    func testStatisticsOpeningReusesOneGlucoseWindowAtTheCapturedReference() async throws {
+        try await withStatisticsStore { core in
+            let end = Date(timeIntervalSince1970: 1_800_000_000)
+            let start = end.addingTimeInterval(-7 * 86400)
+            _ = self.addStatisticsReading(core, at: start.addingTimeInterval(-1), value: 260)
+            _ = self.addStatisticsReading(core, at: start, value: 240)
+            _ = self.addStatisticsReading(core, at: start.addingTimeInterval(1), value: 100)
+            _ = self.addStatisticsReading(core, at: end.addingTimeInterval(-1), value: 140)
+            _ = self.addStatisticsReading(core, at: end, value: 220)
+            _ = self.addStatisticsReading(core, at: end.addingTimeInterval(1), value: 280)
+            let suppressed = self.addStatisticsReading(core, at: end.addingTimeInterval(-60), value: 350)
+            suppressed.isSuppressedByFiveMinuteCadence = true
+            _ = self.addStatisticsReading(core, at: end.addingTimeInterval(-120), value: 0)
+            XCTAssertTrue(core.saveChangesSynchronously())
+
+            let manager = StatisticsManager(coreDataManager: core)
+            let fetches = StatisticsFetchProbe()
+            manager.glucoseFetchObserver = { fetches.record(start: $0, end: $1) }
+            let availability = await manager.availableReportPeriods(referenceDate: end)
+            XCTAssertEqual(availability[.seven], false)
+            let configuration = self.statisticsConfiguration(period: .seven)
+            let cached = await manager.reportAnalytics(for: configuration, referenceDate: end)
+            // A separate real manager gives the original direct SQLite population for comparison.
+            let direct = await StatisticsManager(coreDataManager: core)
+                .reportAnalytics(for: configuration, referenceDate: end)
+            XCTAssertEqual(fetches.windows.count, 1)
+            XCTAssertEqual(fetches.windows.first?.end, end)
+            XCTAssertEqual(cached.periodEnd, end)
+            XCTAssertEqual(cached.periodStart, start)
+            XCTAssertEqual(cached.sampleCount, 2)
+            XCTAssertEqual(cached.sampleCount, direct.sampleCount)
+            XCTAssertEqual(cached.firstReading, direct.firstReading)
+            XCTAssertEqual(cached.lastReading, direct.lastReading)
+            XCTAssertEqual(cached.averageMgDl, 120, accuracy: 0.000001)
+            XCTAssertEqual(cached.averageMgDl, direct.averageMgDl, accuracy: 0.000001)
+            XCTAssertEqual(cached.gmiPercentage, direct.gmiPercentage, accuracy: 0.000001)
+            XCTAssertEqual(cached.coefficientOfVariation, direct.coefficientOfVariation, accuracy: 0.000001)
+        }
+    }
+
+    @MainActor
+    func testStatisticsSharedWindowInvalidatesAfterInsertEditAndDelete() async throws {
+        try await withStatisticsStore { core in
+            let end = Date(timeIntervalSince1970: 1_800_000_000)
+            let first = self.addStatisticsReading(core, at: end.addingTimeInterval(-600), value: 100)
+            let second = self.addStatisticsReading(core, at: end.addingTimeInterval(-300), value: 140)
+            XCTAssertTrue(core.saveChangesSynchronously())
+            let manager = StatisticsManager(coreDataManager: core)
+            let fetches = StatisticsFetchProbe()
+            manager.glucoseFetchObserver = { fetches.record(start: $0, end: $1) }
+            let configuration = self.statisticsConfiguration(period: .seven)
+
+            for (step, count, average) in [(0, 2, 120.0), (1, 3, 140.0), (2, 3, 180.0), (3, 2, 200.0)] {
+                if step == 1 {
+                    _ = self.addStatisticsReading(core, at: end.addingTimeInterval(-60), value: 180)
+                } else if step == 2 {
+                    first.calculatedValue = 220
+                } else if step == 3 {
+                    core.mainManagedObjectContext.delete(second)
+                }
+                if step > 0 { XCTAssertTrue(core.saveChangesSynchronously()) }
+                _ = await manager.availableReportPeriods(referenceDate: end)
+                let analytics = await manager.reportAnalytics(for: configuration, referenceDate: end)
+                XCTAssertEqual(analytics.sampleCount, count, "Mutation step \(step)")
+                XCTAssertEqual(analytics.averageMgDl, average, accuracy: 0.000001, "Mutation step \(step)")
+                XCTAssertEqual(fetches.windows.count, step + 1,
+                    "Each committed mutation needs one fresh window, not one fetch per consumer")
+            }
+        }
+    }
+
+    @MainActor
+    func testStatisticsRepeatedOpeningWithInsufficientSevenDayDataFinishesLoading() async throws {
+        try await withStatisticsStore { core in
+            let end = Date(timeIntervalSince1970: 1_800_000_000)
+            _ = self.addStatisticsReading(core, at: end.addingTimeInterval(-300), value: 120)
+            XCTAssertTrue(core.saveChangesSynchronously())
+            let manager = StatisticsManager(coreDataManager: core)
+            let model = StatisticsViewModel(statisticsManager: manager, now: { end })
+            var publications = [GlucoseReportAnalytics]()
+            let subscription = model.$analytics.compactMap { $0 }.sink { publications.append($0) }
+            defer { subscription.cancel() }
+
+            await self.completeStatisticsLoad(model)
+            XCTAssertEqual(model.selectedPeriod, .seven)
+            XCTAssertFalse(model.isPeriodAvailable(.seven))
+            XCTAssertEqual(publications.count, 1)
+            await self.completeStatisticsLoad(model)
+            XCTAssertFalse(model.isLoading)
+            XCTAssertEqual(publications.count, 2, "An unchanged fallback still completes a new load")
+            XCTAssertEqual(model.analytics?.sampleCount, 1)
+            XCTAssertEqual(model.analytics?.periodEnd, end)
+        }
+    }
+
+    @MainActor
+    func testStatisticsChangedFallbackPublishesOnceAndUsesOneWindow() async throws {
+        try await withStatisticsStore { core in
+            let end = Date(timeIntervalSince1970: 1_800_000_000)
+            for index in 0..<2016 {
+                _ = self.addStatisticsReading(core,
+                    at: end.addingTimeInterval(-60 - Double(index) * 300), value: 120)
+            }
+            XCTAssertTrue(core.saveChangesSynchronously())
+            let manager = StatisticsManager(coreDataManager: core)
+            let fetches = StatisticsFetchProbe()
+            manager.glucoseFetchObserver = { fetches.record(start: $0, end: $1) }
+            let model = StatisticsViewModel(statisticsManager: manager, now: { end })
+            var publications = 0
+            let subscription = model.$analytics.compactMap { $0 }.sink { _ in publications += 1 }
+            defer { subscription.cancel() }
+
+            XCTAssertEqual(model.selectedPeriod, .ninety)
+            await self.completeStatisticsLoad(model)
+            XCTAssertEqual(model.selectedPeriod, .seven)
+            XCTAssertTrue(model.isPeriodAvailable(.seven))
+            XCTAssertEqual(publications, 1)
+            XCTAssertEqual(model.analytics?.sampleCount, 2016)
+            XCTAssertEqual(model.analytics?.periodEnd, end)
+            XCTAssertEqual(fetches.windows.count, 1,
+                "Availability, selected analytics and low-warning statistics share the same glucose window")
+        }
+    }
+
+    @MainActor
+    func testStatisticsPDFAnalyticsKeepTheirOwnCurrentCutoffAfterScreenOpening() async throws {
+        try await withStatisticsStore { core in
+            let current = Date()
+            let openingEnd = current.addingTimeInterval(-600)
+            _ = self.addStatisticsReading(core, at: current.addingTimeInterval(-900), value: 120)
+            _ = self.addStatisticsReading(core, at: current.addingTimeInterval(-60), value: 180)
+            XCTAssertTrue(core.saveChangesSynchronously())
+            let manager = StatisticsManager(coreDataManager: core)
+            let configuration = self.statisticsConfiguration(period: .seven)
+            _ = await manager.availableReportPeriods(referenceDate: openingEnd)
+            let screen = await manager.reportAnalytics(for: configuration, referenceDate: openingEnd)
+            XCTAssertEqual(screen.sampleCount, 1)
+            XCTAssertEqual(screen.periodEnd, openingEnd)
+
+            // The existing PDF consumer calls this API without the screen's explicit cutoff.
+            let report = await manager.reportAnalytics(for: configuration)
+            XCTAssertGreaterThan(report.periodEnd, openingEnd)
+            XCTAssertEqual(report.sampleCount, 2)
+            XCTAssertEqual(report.averageMgDl, 150, accuracy: 0.000001)
+        }
+    }
+
+    @MainActor
+    func testStatisticsManualPeriodChangeIncludesReadingsAfterOpeningCutoff() async throws {
+        try await withStatisticsStore { core in
+            let current = Date()
+            let openingEnd = current.addingTimeInterval(-600)
+            _ = self.addStatisticsReading(core, at: current.addingTimeInterval(-900), value: 120)
+            XCTAssertTrue(core.saveChangesSynchronously())
+            let manager = StatisticsManager(coreDataManager: core)
+            let model = StatisticsViewModel(statisticsManager: manager, now: { openingEnd })
+            await self.completeStatisticsLoad(model)
+            XCTAssertEqual(model.analytics?.periodEnd, openingEnd)
+            XCTAssertEqual(model.analytics?.sampleCount, 1)
+
+            let newlyReceivedAt = current.addingTimeInterval(-60)
+            _ = self.addStatisticsReading(core, at: newlyReceivedAt, value: 180)
+            XCTAssertTrue(core.saveChangesSynchronously())
+            let finished = self.expectation(description: "Manual period selection uses current data")
+            let subscription = model.$isLoading.dropFirst().first { !$0 }.sink { _ in finished.fulfill() }
+            model.selectedPeriod = .thirty
+            await self.fulfillment(of: [finished], timeout: 10)
+            subscription.cancel()
+            XCTAssertFalse(model.isLoading)
+            XCTAssertEqual(model.selectedPeriod, .thirty)
+            XCTAssertGreaterThan(try XCTUnwrap(model.analytics?.periodEnd), newlyReceivedAt)
+            XCTAssertEqual(model.analytics?.sampleCount, 2)
+            XCTAssertEqual(model.analytics?.averageMgDl, 150)
+        }
+    }
+
+    @MainActor
+    func testStatisticsRapidPeriodChangesAndReopeningDiscardOldCompletion() async throws {
+        try await withStatisticsStore { core in
+            let firstEnd = Date(timeIntervalSince1970: 1_800_000_000)
+            _ = self.addStatisticsReading(core, at: firstEnd.addingTimeInterval(-300), value: 120)
+            // This row is outside the first request but inside the latest one. A stale result
+            // must neither publish the earlier cutoff nor hide this newly eligible reading.
+            _ = self.addStatisticsReading(core, at: firstEnd.addingTimeInterval(90), value: 180)
+            XCTAssertTrue(core.saveChangesSynchronously())
+            let firstFetch = self.expectation(description: "First real SQLite fetch started")
+            let releaseFirst = DispatchSemaphore(value: 0)
+            defer { releaseFirst.signal() }
+            let fetches = StatisticsFetchProbe(first: {
+                firstFetch.fulfill()
+                _ = releaseFirst.wait(timeout: .now() + 10)
+            })
+            let manager = StatisticsManager(coreDataManager: core)
+            manager.glucoseFetchObserver = { fetches.record(start: $0, end: $1) }
+            var now = firstEnd
+            let model = StatisticsViewModel(statisticsManager: manager, now: { now })
+            var publications = [GlucoseReportAnalytics]()
+            let subscription = model.$analytics.compactMap { $0 }.sink { publications.append($0) }
+            defer { subscription.cancel() }
+            model.load()
+            await self.fulfillment(of: [firstFetch], timeout: 5)
+            model.selectedPeriod = .thirty
+            model.selectedPeriod = .seven
+            now = firstEnd.addingTimeInterval(60)
+            model.load()
+            now = firstEnd.addingTimeInterval(120)
+            let finished = self.expectation(description: "Only newest load completes")
+            let lowSoonFinished = self.expectation(description: "Newest low-warning statistics complete")
+            let loading = model.$isLoading.dropFirst().first { !$0 }.sink { _ in finished.fulfill() }
+            let lowSoon = model.$lowSoonStatistics.dropFirst().compactMap { $0 }.first()
+                .sink { _ in lowSoonFinished.fulfill() }
+            model.load()
+            releaseFirst.signal()
+            await self.fulfillment(of: [finished, lowSoonFinished], timeout: 10)
+            loading.cancel()
+            lowSoon.cancel()
+            XCTAssertFalse(model.isLoading)
+            XCTAssertEqual(model.selectedPeriod, .seven)
+            XCTAssertEqual(publications.count, 1)
+            XCTAssertEqual(model.analytics?.periodEnd, now)
+            XCTAssertEqual(model.analytics?.sampleCount, 2)
+            XCTAssertEqual(model.analytics?.averageMgDl, 150)
+        }
+    }
+
+    @MainActor
+    private func completeStatisticsLoad(_ model: StatisticsViewModel,
+                                        file: StaticString = #filePath, line: UInt = #line) async {
+        let finished = expectation(description: "Statistics load completed")
+        let lowSoonFinished = expectation(description: "Low-warning statistics completed")
+        let subscription = model.$isLoading.dropFirst().first { !$0 }.sink { _ in finished.fulfill() }
+        let lowSoonSubscription = model.$lowSoonStatistics.dropFirst().compactMap { $0 }.first()
+            .sink { _ in lowSoonFinished.fulfill() }
+        model.load()
+        await fulfillment(of: [finished, lowSoonFinished], timeout: 10)
+        subscription.cancel()
+        lowSoonSubscription.cancel()
+        XCTAssertFalse(model.isLoading, file: file, line: line)
+    }
+
+    @MainActor
+    private func withStatisticsStore(_ body: (CoreDataManager) async throws -> Void) async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let core = try CoreDataManager(testModelName: ConstantsCoreData.modelName,
+            persistentStoreURL: directory.appendingPathComponent("Statistics.sqlite"))
+        defer {
+            try? core.disconnectPersistentStoresForTesting()
+            try? FileManager.default.removeItem(at: directory)
+        }
+        try await body(core)
+    }
+
+    @MainActor
+    @discardableResult
+    private func addStatisticsReading(_ core: CoreDataManager, at date: Date, value: Double) -> BgReading {
+        let reading = BgReading(timeStamp: date, sensor: nil, calibration: nil,
+            rawData: value, deviceName: "Statistics regression",
+            nsManagedObjectContext: core.mainManagedObjectContext)
+        reading.calculatedValue = value
+        return reading
+    }
+
+    private func statisticsConfiguration(period: GlucoseReportPeriod) -> GlucoseReportConfiguration {
+        GlucoseReportConfiguration(patientName: "Statistics regression", patientID: "Synthetic data",
+            period: period, aidPeriod: .notIncluded, paperSize: .a4, language: .english, usesIFCC: false)
+    }
+
+    private final class StatisticsFetchProbe: @unchecked Sendable {
+        private let lock = NSLock()
+        private var storedWindows: [DateInterval] = []
+        private let first: (() -> Void)?
+        init(first: (() -> Void)? = nil) { self.first = first }
+        var windows: [DateInterval] {
+            lock.lock()
+            defer { lock.unlock() }
+            return storedWindows
+        }
+        func record(start: Date, end: Date) {
+            lock.lock()
+            storedWindows.append(DateInterval(start: start, end: end))
+            let isFirst = storedWindows.count == 1
+            lock.unlock()
+            if isFirst { first?() }
+        }
+    }
+
 }

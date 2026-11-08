@@ -98,6 +98,7 @@ public final class StatisticsManager: @unchecked Sendable {
         let aidPeriod: GlucoseReportAIDPeriod
         let usesMgDl: Bool
         let aidAnalyticsSource: AIDAnalyticsSource?
+        let referenceDate: Date?
     }
 
     private let operationQueue: OperationQueue
@@ -106,8 +107,12 @@ public final class StatisticsManager: @unchecked Sendable {
     private var contextSaveObservers = [NSObjectProtocol]()
 
     private var sampleCache: CGMWindowCache?
-    private var availableReportPeriodsCache: [GlucoseReportPeriod: Bool]?
+    private var availableReportPeriodsCache: (referenceDate: Date?, periods: [GlucoseReportPeriod: Bool])?
     private var reportAnalyticsCache: [ReportAnalyticsCacheKey: GlucoseReportAnalytics] = [:]
+
+    #if DEBUG
+    var glucoseFetchObserver: ((Date, Date) -> Void)?
+    #endif
 
     init(coreDataManager: CoreDataManager) {
         self.coreDataManager = coreDataManager
@@ -218,7 +223,7 @@ public final class StatisticsManager: @unchecked Sendable {
     ///
     /// The 70% coverage threshold follows the same consensus target used by the report:
     /// https://doi.org/10.2337/dci19-0028
-    func availableReportPeriods() async -> [GlucoseReportPeriod: Bool] {
+    func availableReportPeriods(referenceDate: Date? = nil) async -> [GlucoseReportPeriod: Bool] {
         return await withCheckedContinuation { continuation in
             operationQueue.addOperation { [weak self] in
                 guard let self else {
@@ -226,12 +231,13 @@ public final class StatisticsManager: @unchecked Sendable {
                     return
                 }
 
-                if let cached = self.availableReportPeriodsCache {
-                    continuation.resume(returning: cached)
+                if let cached = self.availableReportPeriodsCache,
+                   cached.referenceDate == referenceDate {
+                    continuation.resume(returning: cached.periods)
                     return
                 }
 
-                let endDate = Date()
+                let endDate = referenceDate ?? Date()
                 let samples = self.cachedSamples(
                     fromDate: endDate.addingTimeInterval(-Double(GlucoseReportPeriod.oneYear.rawValue + 1) * 24 * 60 * 60),
                     toDate: endDate
@@ -243,7 +249,7 @@ public final class StatisticsManager: @unchecked Sendable {
                     return (period, Self.hasEnoughCoverage(sampleCount: sampleCount, period: period))
                 })
 
-                self.availableReportPeriodsCache = availability
+                self.availableReportPeriodsCache = (referenceDate, availability)
                 continuation.resume(returning: availability)
             }
         }
@@ -253,7 +259,8 @@ public final class StatisticsManager: @unchecked Sendable {
     ///
     /// This is intentionally separate from `calculateStatistics` so the home screen never needs to
     /// build AGP percentiles, daily bars, trend points, or device metadata.
-    func reportAnalytics(for configuration: GlucoseReportConfiguration) async -> GlucoseReportAnalytics {
+    func reportAnalytics(for configuration: GlucoseReportConfiguration,
+                         referenceDate: Date? = nil) async -> GlucoseReportAnalytics {
         // Capture the complete policy decision once. The queued calculation, cache identity and
         // provider-specific fetches must all describe the same configuration even if Settings are
         // changed while this request is waiting on the serial statistics queue.
@@ -262,7 +269,7 @@ public final class StatisticsManager: @unchecked Sendable {
         return await withCheckedContinuation { continuation in
             operationQueue.addOperation { [weak self] in
                 guard let self else {
-                    continuation.resume(returning: StatisticsManager.emptyReportAnalytics(for: configuration, periodEnd: Date()))
+                    continuation.resume(returning: StatisticsManager.emptyReportAnalytics(for: configuration, periodEnd: referenceDate ?? Date()))
                     return
                 }
 
@@ -270,7 +277,8 @@ public final class StatisticsManager: @unchecked Sendable {
                     period: configuration.period,
                     aidPeriod: configuration.aidPeriod,
                     usesMgDl: UserDefaults.standard.bloodGlucoseUnitIsMgDl,
-                    aidAnalyticsSource: aidAnalyticsSource
+                    aidAnalyticsSource: aidAnalyticsSource,
+                    referenceDate: referenceDate
                 )
 
                 if let cached = self.reportAnalyticsCache[cacheKey] {
@@ -280,7 +288,8 @@ public final class StatisticsManager: @unchecked Sendable {
 
                 let analytics = self.makeReportAnalytics(
                     for: configuration,
-                    aidAnalyticsSource: aidAnalyticsSource
+                    aidAnalyticsSource: aidAnalyticsSource,
+                    referenceDate: referenceDate
                 )
                 self.reportAnalyticsCache[cacheKey] = analytics
                 continuation.resume(returning: analytics)
@@ -608,9 +617,10 @@ public final class StatisticsManager: @unchecked Sendable {
 
     private func makeReportAnalytics(
         for configuration: GlucoseReportConfiguration,
-        aidAnalyticsSource: AIDAnalyticsSource?
+        aidAnalyticsSource: AIDAnalyticsSource?,
+        referenceDate: Date?
     ) -> GlucoseReportAnalytics {
-        let periodEnd = Date()
+        let periodEnd = referenceDate ?? Date()
         let periodStart = periodEnd.addingTimeInterval(-Double(configuration.period.rawValue) * 24 * 60 * 60)
         let samples = cachedSamples(fromDate: periodStart, toDate: periodEnd)
             .filter { Self.isValidGlucoseMgDl($0.valueMgDl) }
@@ -1178,7 +1188,8 @@ public final class StatisticsManager: @unchecked Sendable {
         if let sampleCache,
            sampleCache.startDate <= fromDate,
            sampleCache.endDate >= toDate {
-            return sampleCache.samples.filter { $0.date >= fromDate && $0.date <= toDate }
+            // Match the exclusive boundaries of the Core Data fetch below.
+            return sampleCache.samples.filter { $0.date > fromDate && $0.date < toDate }
         }
 
         let samples = fetchSamples(fromDate: fromDate, toDate: toDate)
@@ -1206,6 +1217,9 @@ public final class StatisticsManager: @unchecked Sendable {
             fetchRequest.relationshipKeyPathsForPrefetching = ["sensor"]
 
             do {
+                #if DEBUG
+                glucoseFetchObserver?(fromDate, toDate)
+                #endif
                 let readings = try context.fetch(fetchRequest)
                 samples = readings.compactMap { reading in
                     guard reading.finalValue != 0,
