@@ -24,12 +24,39 @@ indlæste bytes med de samme regler og samme fallback. Doseringsregler,
 beregningsresultater, behandlinger, sensorforbindelse og transport ændres ikke.
 Cachen er lokal for den eksisterende Watch-manager og gemmes ikke på disk.
 
-Målrettede regressionstests bruger isolerede defaults og den rigtige
+Otte nye regressionstests bruger isolerede defaults og den rigtige
 profilvalidering/signaturberegning. De kontrollerer genbrug ved uvedkommende
 ændringer, reelle profil-/bekræftelses-/🍕-ændringer, ugyldige og manglende
 profiler, forskelligt serialiseret men ens indhold samt ændringer under
-beregningen. Releasekontrollernes faktiske resultater registreres efter kørsel.
-Der er endnu ikke målt en hastigheds- eller batterigevinst på fysisk hardware.
+beregningen. En test verificerer én signaturberegning ved 60 cacheopslag
+med uændrede relevante oplysninger. Det er en kontrol af fjernet dobbeltarbejde,
+ikke en måling af appens svartid eller batteriforbrug.
+
+Apples buildoversigt valgte **4359**. Det præcise checkpoint
+`5a706ba0c992de0157e655f78dbda5d523c1cda0` bestod **1.922/1.922 XCTest**,
+0 fejl og 0 skipped, **198 Python-tests**, Watch-værktøjernes **30 + 24**
+syntetiske selvkontroller samt begge simulatorbuilds med Xcode 27.2.
+Unsigned Release **iPhoneOS/arm64** bestod på samme checkpoint med verificeret
+indlejret kilde-ID og buildnummer. Kvitteringer og logs er bevaret i
+`build/testflight-7.1.1-4359/test/`, inklusive `results/iphoneos-unsigned.json`.
+
+Arkivet blev bygget fra release-tagget, og den faktiske signerede IPA bestod
+kontrol af kildecommit, alle fem bundle-ID'er, versioner, signaturer, profiler,
+entitlements og Watch-indlejring. Apple modtog uploaden uden fejl og bekræftede
+**VALID / INTERNAL_ONLY / IN_BETA_TESTING** samt den eksisterende **Ole Internal**-
+relation. Release-tagget forbliver på kildecheckpointet; denne afsluttende
+validering er en separat dokumentationscommit.
+
+Læsende enhedskontrol fandt iPhone tilgængelig, men Xcode kunne ikke montere
+sit developer disk image og kunne derfor ikke læse den installerede appversion.
+Watch var utilgængeligt. Intet blev installeret lokalt, og sensoren blev ikke
+afbrudt. Faktisk synkronisering og hastighed/batteriforbrug på telefon og ur er
+**ikke fysisk verificeret**; ændringen tilføjer ingen brugerflade.
+
+Den automatiske selektive oprydning afsluttede med **30.907** slettede,
+regenererbare cachefiler og **4.881.240.064 allokerede bytes** (ca. 4,55 GiB).
+Aktuel og seneste tidligere release samt kilde-, test- og signeringsbeviser er
+bevaret. Rapport: `build/release-automation/cleanup/20261108T133241.983055Z/`.
 
 <!-- testflight-7.1.1-4358:start -->
 ### TestFlight 7.1.1 (4358)
