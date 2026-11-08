@@ -49,11 +49,47 @@ Den separate unsigned-kvittering ligger i
 basecommit samt hash af den lokale diff; det er ikke en releasekvittering.
 `git diff --check` og en separat kodegennemgang bestod.
 
-Brugeren har givet **GO UPLOAD** til denne rettelse. Releaseproceduren vælger
-nummeret hos Apple og gentester det præcise checkpoint. Efter installation
-skal **Træn nu** køres på telefonen: grundlaget skal passere gemning
-og nå træningen. En eventuel ny model skal fortsat bestå det eksisterende
-selvtjek; de automatiske tests beviser ikke en fuldført træning på telefonen.
+Apple valgte **4362**, og det præcise release-checkpoint
+`59f92875de872e71092e51bfe4bbcab5449210ff` / `testflight-7.1.1-4362`
+bestod igen **1.946/1.946 XCTest**, **198 Python-tests**, Watch-værktøjernes
+**30 + 24** syntetiske kontroller og begge simulatorbuilds. Unsigned Release
+**iPhoneOS/arm64** blev bygget og verificeret på samme checkpoint. Beviserne
+ligger i `build/testflight-7.1.1-4362/test/`, inklusive
+`results/iphoneos-unsigned.json`.
+
+Arkivering og eksport blev bygget fra det uændrede tag. Den faktiske IPA blev
+verificeret på ny med alle fem bundles, signaturer, profiler, entitlements,
+versioner, kilde-ID og Watch-indlejring. IPA SHA-256:
+`96a2353cd7ff7be1321f2652d08d2e01f5873efdd3700e58385e23d3c013c9ae`.
+Apple bekræftede **VALID / INTERNAL_ONLY / IN_BETA_TESTING** og den eksisterende
+**Ole Internal**-gruppes faktiske tilknytning til build-ID
+`04121ed9-6c5c-4013-9c8b-1ee590fb3d48`.
+
+Den parrede iPhone blev før upload kontrolleret læsende som **7.1.1 (4361)**,
+bundle `com.GFZ896KN66.xdripswift`. Ingen lokal installation eller afbrydelse af
+CGM blev udført. Efter TestFlight-opdatering til 4362 skal **Træn nu** køres:
+grundlaget skal passere gemning og nå træningen. En gemt gammel fejltekst
+bevares indtil næste vellykkede gemning. En eventuel ny model skal fortsat
+bestå selvtjekket; fysisk træning og hukommelsesforbrug med 4362 er endnu ikke
+verificeret.
+
+Brugeren godkendte sikker oprydning før upload. Den afgrænsede undtagelse for
+delt compiler-cache fjernede **28.603 filer / 3.432.071.168 allokerede bytes**
+under eksisterende lås samt Apple-, proces-, åben-fil-, sti-, Git- og
+bevaringskontroller. Journal og bredere lageroversigt er bevaret under
+`build/testflight-7.1.1-4362/maintenance/`. Ingen kilde-, test-, log-,
+release- eller sundhedsdata blev slettet. Den brede gennemgang fandt ikke
+andre automatisk sikre mål før upload; uafsluttede 4353/4357-områder og
+historiske File Provider-mapper med ufuldstændig læsning blev bevaret.
+
+Efter Internal / Testing afsluttede den normale releaseoprydning med
+**30.911 filer / 4.891.275.264 allokerede bytes**. Aktuel 4362 og foregående
+4361 bevares fuldt; tidligere releasebeviser bevares efter de gældende regler.
+Rapport: `build/release-automation/cleanup/20261108T202408.459605Z/report.json`.
+Samlet er **59.514 regenererbare filer / 8.323.346.432 allokerede bytes** fjernet
+(cirka 7,75 GiB). Efter oprydning og ny arkivering blev cirka **13,96 GiB fri**
+observeret. Git- og releasebevaringskontroller bestod. Denne dokumentation
+committes separat, og release-tagget forbliver på det testede kildecheckpoint.
 
 <!-- testflight-7.1.1-4361:start -->
 ### TestFlight 7.1.1 (4361)
