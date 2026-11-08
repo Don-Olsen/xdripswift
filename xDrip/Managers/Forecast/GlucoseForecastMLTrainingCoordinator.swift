@@ -23,7 +23,8 @@ final class GlucoseForecastMLTrainingCoordinator: @unchecked Sendable {
     private var preparationInProgress = false
     private var preparationTask: Task<Void, Never>?
     private var preparationCancellation: GlucoseForecastMLHistoryCancellation?
-    private var previousAutomaticAttempt: (context: GlucoseForecastMLContext, date: Date)?
+    private var automaticPreparationRetry: (context: GlucoseForecastMLContext, date: Date)?
+    private var preparationAttempt: (context: GlucoseForecastMLContext, date: Date)?
     private var preparationStatus = ""
     private var preparationCoverage = ""
     private var backgroundObservers: [NSObjectProtocol] = []
@@ -170,42 +171,36 @@ final class GlucoseForecastMLTrainingCoordinator: @unchecked Sendable {
         guard let modelDue = manager.automaticTrainingDueDate(context: context, now: now) else { return }
         let due = max(modelDue, preparedStore.nextAutomaticAttempt(context: context, at: now))
         guard force || due <= now.addingTimeInterval(24 * 3600) else { return }
-        let cancellation = GlucoseForecastMLHistoryCancellation()
-        lock.lock()
-        if preparationInProgress || backgroundRun != nil || (!force &&
-            previousAutomaticAttempt?.context == context &&
-            now.timeIntervalSince(previousAutomaticAttempt!.date) < Self.automaticRetryInterval) {
-            lock.unlock()
-            return
-        }
-        preparationInProgress = true
-        preparationCancellation = cancellation
-        if !force { previousAutomaticAttempt = (context, now) }
-        preparationStatus = "Forbereder automatisk træning…"
-        preparationCoverage = ""
-        lock.unlock()
+        guard let cancellation = beginPreparation(context: context, force: force, at: now) else { return }
         NotificationCenter.default.post(name: Self.statusDidChange, object: nil)
         let loader = GlucoseForecastMLHistoryLoader(coreDataManager: coreDataManager)
         let task = Task.detached(priority: .background) { [weak self] in
             guard let self else { return }
             guard await Self.appIsActive(), !Task.isCancelled, !cancellation.isCancelled else {
+                cancellation.cancel()
                 self.finishPreparation(Self.stoppedStatus, cancellation: cancellation)
                 return
             }
             if !force, self.preparedStore.load(context: context, at: now) != nil {
+                self.deferPreparation(context: context, until: now.addingTimeInterval(Self.automaticRetryInterval),
+                                      cancellation: cancellation)
                 self.finishPreparation("Træningsgrundlag klar. Afventer opladning og køretid fra iOS.",
                                        cancellation: cancellation)
                 await GlucoseForecastMLBackgroundScheduler.shared.schedule(earliestBeginDate: due, context: context)
                 return
             }
-            if !force, self.preparedStore.nextPreparationDate(context: context, at: now) > now {
+            let retryDate = self.preparedStore.nextPreparationDate(context: context, at: now)
+            if !force, retryDate > now {
+                self.deferPreparation(context: context, until: retryDate, cancellation: cancellation)
                 self.finishPreparation("Automatisk træning afventer næste forsøg. Den nuværende prognose bevares.",
                                        cancellation: cancellation)
                 return
             }
-            // Persist the retry throttle. Background launches never present authorization.
-            if !force {
-                try? self.preparedStore.recordAttempt(context: context, at: now, completed: false)
+            // A cooldown check is not an attempt. Only actual preparation starts
+            // the throttle; ordinary foreground interruption releases this exact attempt.
+            if !force, !self.recordPreparationAttempt(context: context, at: now, cancellation: cancellation) {
+                self.finishPreparation(Self.stoppedStatus, cancellation: cancellation)
+                return
             }
             if let authorizationFailure = await Self.requestHistoricalReadAccessIfAvailable() {
                 cancellation.recordReadFailure(authorizationFailure)
@@ -215,6 +210,7 @@ final class GlucoseForecastMLTrainingCoordinator: @unchecked Sendable {
             }
             guard await Self.waitForActiveAfterAuthorization(cancellation: cancellation),
                   !Task.isCancelled, !cancellation.isCancelled else {
+                cancellation.cancel()
                 self.finishPreparation(Self.stoppedStatus, cancellation: cancellation)
                 return
             }
@@ -226,6 +222,7 @@ final class GlucoseForecastMLTrainingCoordinator: @unchecked Sendable {
                                                   cancellation: cancellation)
                 })
             guard await Self.appIsActive(), !Task.isCancelled, !cancellation.isCancelled else {
+                cancellation.cancel()
                 self.finishPreparation(Self.stoppedStatus, cancellation: cancellation)
                 return
             }
@@ -233,13 +230,13 @@ final class GlucoseForecastMLTrainingCoordinator: @unchecked Sendable {
                 let reason = cancellation.readFailure.map { "Historiklæsning stoppet: \($0)." }
                     ?? "Historikken kunne ikke læses sikkert."
                 self.finishPreparation("\(reason) Den nuværende prognose bevares.",
-                    cancellation: cancellation, diagnostic: cancellation.readDiagnostic)
+                    cancellation: cancellation, diagnostic: cancellation.readDiagnostic, failed: true)
                 return
             }
             self.updateCoverage(result.coverage, cancellation: cancellation)
             guard result.coverage.usableDays >= GlucoseForecastMLChronology.minimumUsableDays else {
                 self.finishPreparation("Ikke nok brugbare data: \(result.coverage.usableDays) af 60 brugbare dage. Prognosemotoren bruges fortsat.",
-                                       cancellation: cancellation)
+                                       cancellation: cancellation, failed: true)
                 return
             }
             guard await MainActor.run(body: { Self.currentContext() == context }),
@@ -252,7 +249,7 @@ final class GlucoseForecastMLTrainingCoordinator: @unchecked Sendable {
                                                              examples: result.examples)
             guard snapshot.isUsable(context: context, at: Date()) else {
                 self.finishPreparation("Træningsgrundlaget er ikke aktuelt eller komplet. Afventer ny historik.",
-                                       cancellation: cancellation)
+                                       cancellation: cancellation, failed: true)
                 return
             }
             do {
@@ -278,7 +275,7 @@ final class GlucoseForecastMLTrainingCoordinator: @unchecked Sendable {
                 }
             } catch {
                 self.finishPreparation("Træningsgrundlaget kunne ikke gemmes sikkert. Den nuværende prognose bevares.",
-                                       cancellation: cancellation)
+                                       cancellation: cancellation, failed: !(error is CancellationError))
             }
         }
         lock.lock()
@@ -440,11 +437,48 @@ final class GlucoseForecastMLTrainingCoordinator: @unchecked Sendable {
         }
     }
 
-    private func cancelForBackground() {
+    // These lifecycle operations also let regression tests exercise the real
+    // preparation/cancellation path without a HealthKit authorization sheet.
+    func beginPreparation(context: GlucoseForecastMLContext, force: Bool,
+                          at now: Date) -> GlucoseForecastMLHistoryCancellation? {
+        lock.lock(); defer { lock.unlock() }
+        guard !preparationInProgress, backgroundRun == nil,
+              force || automaticPreparationRetry?.context != context ||
+                now >= automaticPreparationRetry!.date
+        else { return nil }
+        let cancellation = GlucoseForecastMLHistoryCancellation()
+        preparationInProgress = true
+        preparationCancellation = cancellation
+        preparationAttempt = nil
+        preparationStatus = "Forbereder automatisk træning…"
+        preparationCoverage = ""
+        return cancellation
+    }
+
+    func recordPreparationAttempt(context: GlucoseForecastMLContext, at date: Date,
+                                  cancellation: GlucoseForecastMLHistoryCancellation) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard preparationCancellation === cancellation, !cancellation.isCancelled else { return false }
+        automaticPreparationRetry = (context, date.addingTimeInterval(Self.automaticRetryInterval))
+        preparationAttempt = (context, date)
+        try? preparedStore.recordAttempt(context: context, at: date, completed: false)
+        return true
+    }
+
+    /// Avoid re-reading a large prepared snapshot on every forecast. A cooldown
+    /// probe keeps the actual deadline, rather than starting another 24-hour wait.
+    func deferPreparation(context: GlucoseForecastMLContext, until date: Date,
+                          cancellation: GlucoseForecastMLHistoryCancellation) {
+        lock.lock(); defer { lock.unlock() }
+        guard preparationCancellation === cancellation, !cancellation.isCancelled else { return }
+        automaticPreparationRetry = (context, date)
+    }
+
+    func cancelForBackground() {
         lock.lock()
         // A canceled training run must be eligible again on the next foreground
         // use, even if history preparation had already handed off to Create ML.
-        previousAutomaticAttempt = nil
+        automaticPreparationRetry = nil
         guard preparationInProgress else { lock.unlock(); return }
         preparationCancellation?.cancel()
         let task = preparationTask
@@ -454,15 +488,21 @@ final class GlucoseForecastMLTrainingCoordinator: @unchecked Sendable {
         NotificationCenter.default.post(name: Self.statusDidChange, object: nil)
     }
 
-    private func finishPreparation(_ status: String,
-                                   cancellation: GlucoseForecastMLHistoryCancellation,
-                                   diagnostic: String? = nil) {
+    func finishPreparation(_ status: String,
+                           cancellation: GlucoseForecastMLHistoryCancellation,
+                           diagnostic: String? = nil, failed: Bool = false) {
         lock.lock()
         guard preparationCancellation === cancellation else { lock.unlock(); return }
+        if cancellation.isCancelled, !failed, cancellation.readFailure == nil, let attempt = preparationAttempt {
+            // Keep real failures on their existing cooldown. A late cancellation
+            // must never remove a newer attempt or a completed weekly run.
+            try? preparedStore.removeInterruptedAttempt(context: attempt.context, at: attempt.date)
+        }
+        preparationAttempt = nil
         preparationInProgress = false
         preparationTask = nil
         preparationCancellation = nil
-        if cancellation.isCancelled { previousAutomaticAttempt = nil }
+        if cancellation.isCancelled { automaticPreparationRetry = nil }
         preparationStatus = cancellation.isCancelled ? Self.stoppedStatus : status
         if let diagnostic { preparationCoverage = diagnostic }
         lock.unlock()

@@ -776,7 +776,11 @@ final class GlucoseForecastMLHistoryLoader {
                     }.map(\.date),
                     insulinDates: replayEligible.filter { $0.treatmentType == .Insulin }.map(\.date),
                     carbohydrateDates: replayEligible.filter { $0.treatmentType == .Carbs }.map(\.date))
-            } catch { result = nil }
+            } catch {
+                let details = error as NSError
+                cancellation.recordReadFailure("Lokal historik: \(details.domain)/\(details.code)")
+                result = nil
+            }
             context.reset()
         }
         return result

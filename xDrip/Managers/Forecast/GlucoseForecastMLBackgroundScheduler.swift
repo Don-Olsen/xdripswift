@@ -299,9 +299,11 @@ enum GlucoseForecastMLBackgroundSchedulePolicy {
     }
 
     static func canKeepPending(_ pending: GlucoseForecastMLPendingRequest,
-                               desired: Date, notBefore: Date?) -> Bool {
+                               desired: Date, notBefore: Date?, now: Date = .now) -> Bool {
         let date = pending.earliestBeginDate ?? .distantPast
+        // Submission clamps an overdue desired date to now. Preserve an already eligible
+        // request instead of replacing it on each later foreground reconciliation.
         return pending.requiresExternalPower && !pending.requiresNetworkConnectivity
-            && date >= (notBefore ?? .distantPast) && date <= desired
+            && date >= (notBefore ?? .distantPast) && date <= max(desired, now)
     }
 }

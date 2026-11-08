@@ -59,16 +59,78 @@ final class GlucoseForecastMLBackgroundSchedulerTests: XCTestCase {
         let policy = GlucoseForecastMLBackgroundSchedulePolicy.self
 
         XCTAssertTrue(policy.canKeepPending(GlucoseForecastMLPendingRequest(request),
-            desired: now.addingTimeInterval(3 * 24 * 60 * 60), notBefore: now))
+            desired: now.addingTimeInterval(3 * 24 * 60 * 60), notBefore: now, now: now))
         XCTAssertFalse(policy.canKeepPending(GlucoseForecastMLPendingRequest(request),
             desired: now.addingTimeInterval(3 * 24 * 60 * 60),
-            notBefore: now.addingTimeInterval(3 * 24 * 60 * 60)))
+            notBefore: now.addingTimeInterval(3 * 24 * 60 * 60), now: now))
         request.requiresNetworkConnectivity = true
         XCTAssertFalse(policy.canKeepPending(GlucoseForecastMLPendingRequest(request),
-            desired: now.addingTimeInterval(3 * 24 * 60 * 60), notBefore: now))
+            desired: now.addingTimeInterval(3 * 24 * 60 * 60), notBefore: now, now: now))
         request.requiresNetworkConnectivity = false
         request.requiresExternalPower = false
         XCTAssertFalse(policy.canKeepPending(GlucoseForecastMLPendingRequest(request),
-            desired: now.addingTimeInterval(3 * 24 * 60 * 60), notBefore: now))
+            desired: now.addingTimeInterval(3 * 24 * 60 * 60), notBefore: now, now: now))
+    }
+
+    @MainActor func testOverdueDesiredDateKeepsAnAlreadyEligiblePendingRequest() {
+        let now = Date(timeIntervalSinceReferenceDate: 1_000_000)
+        let desired = now.addingTimeInterval(-24 * 60 * 60)
+        let request = BGProcessingTaskRequest(
+            identifier: GlucoseForecastMLBackgroundScheduler.taskIdentifier)
+        request.requiresExternalPower = true
+        request.requiresNetworkConnectivity = false
+        // The original submission clamped the overdue desired date to its then-current time.
+        request.earliestBeginDate = now.addingTimeInterval(-60)
+        let policy = GlucoseForecastMLBackgroundSchedulePolicy.self
+
+        XCTAssertTrue(policy.canKeepPending(GlucoseForecastMLPendingRequest(request),
+            desired: desired, notBefore: nil, now: now))
+        XCTAssertTrue(policy.canKeepPending(GlucoseForecastMLPendingRequest(request),
+            desired: desired, notBefore: nil, now: now.addingTimeInterval(60)))
+        request.earliestBeginDate = now
+        XCTAssertTrue(policy.canKeepPending(GlucoseForecastMLPendingRequest(request),
+            desired: desired, notBefore: nil, now: now), "Eligibility includes the current instant")
+    }
+
+    @MainActor func testPendingDateLaterThanTheEffectiveDesiredDateStillRequiresReplacement() {
+        let now = Date(timeIntervalSinceReferenceDate: 1_000_000)
+        let request = BGProcessingTaskRequest(
+            identifier: GlucoseForecastMLBackgroundScheduler.taskIdentifier)
+        request.requiresExternalPower = true
+        request.requiresNetworkConnectivity = false
+        let policy = GlucoseForecastMLBackgroundSchedulePolicy.self
+
+        request.earliestBeginDate = now.addingTimeInterval(1)
+        XCTAssertFalse(policy.canKeepPending(GlucoseForecastMLPendingRequest(request),
+            desired: now.addingTimeInterval(-60), notBefore: nil, now: now))
+        request.earliestBeginDate = now.addingTimeInterval(121)
+        XCTAssertFalse(policy.canKeepPending(GlucoseForecastMLPendingRequest(request),
+            desired: now.addingTimeInterval(120), notBefore: nil, now: now))
+        request.earliestBeginDate = now.addingTimeInterval(120)
+        XCTAssertTrue(policy.canKeepPending(GlucoseForecastMLPendingRequest(request),
+            desired: now.addingTimeInterval(120), notBefore: nil, now: now))
+    }
+
+    @MainActor func testOverduePendingRequestStillHonorsCooldownPowerAndNetworkRequirements() {
+        let now = Date(timeIntervalSinceReferenceDate: 1_000_000)
+        let desired = now.addingTimeInterval(-24 * 60 * 60)
+        let request = BGProcessingTaskRequest(
+            identifier: GlucoseForecastMLBackgroundScheduler.taskIdentifier)
+        request.earliestBeginDate = now.addingTimeInterval(-60)
+        request.requiresExternalPower = true
+        request.requiresNetworkConnectivity = false
+        let policy = GlucoseForecastMLBackgroundSchedulePolicy.self
+
+        XCTAssertTrue(policy.canKeepPending(GlucoseForecastMLPendingRequest(request),
+            desired: desired, notBefore: request.earliestBeginDate, now: now))
+        XCTAssertFalse(policy.canKeepPending(GlucoseForecastMLPendingRequest(request),
+            desired: desired, notBefore: now, now: now))
+        request.requiresNetworkConnectivity = true
+        XCTAssertFalse(policy.canKeepPending(GlucoseForecastMLPendingRequest(request),
+            desired: desired, notBefore: nil, now: now))
+        request.requiresNetworkConnectivity = false
+        request.requiresExternalPower = false
+        XCTAssertFalse(policy.canKeepPending(GlucoseForecastMLPendingRequest(request),
+            desired: desired, notBefore: nil, now: now))
     }
 }

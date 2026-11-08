@@ -917,6 +917,27 @@ tested. No upload or installation on a physical device was performed.
 
 ## Automatic background ML training after 4311
 
+Local correction after 4359 (8 November 2026): cancelling foreground history
+preparation releases only that exact unfinished attempt's persisted retry marker.
+A real read, coverage, validation or storage failure keeps its existing cooldown,
+including a failure overlapping background cancellation. Local fetch failures
+retain only their technical error domain/code on the existing cancellation token,
+so backgrounding cannot make them appear to be an ordinary interruption.
+The compare-and-remove
+checks context, start time and incomplete state under the attempt-file lock;
+newer or completed attempts are preserved. In-memory deferral uses the actual
+retry deadline, so a status check 23 hours after failure does not add another
+24 hours. Cached ready inputs remain throttled to avoid decoding them for every
+forecast. An already eligible pending iOS request is retained when its desired
+date is overdue, subject to the existing power/network/cooldown requirements.
+
+The exact screen message “Automatisk træning afventer næste forsøg” originates
+before preparation/training, after a missing/unusable prepared input and an
+outstanding persisted retry deadline. It does not establish whether iOS denied
+runtime or why the preceding attempt stopped. The active model's date and usable
+day count describe that model, not the latest preparation. These code paths do
+not establish which preceding attempt stopped on the physical device.
+
 Ordinary unlocked foreground use prepares a complete immutable history snapshot
 through the existing HealthKit/app loader and replay. This preparation can start
 one day before a compatible model becomes seven days old. The snapshot contains

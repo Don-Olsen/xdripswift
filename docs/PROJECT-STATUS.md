@@ -1,3 +1,48 @@
+## Rettelse af automatisk ML-genforsøg — 8. november 2026 (lokale forprøver)
+
+En afbrudt historikforberedelse efterlod en vedvarende 24-timers ventetid,
+selv om appen tilsigtede et nyt forsøg ved næste brug. Desuden kunne en kontrol
+under ventetiden starte endnu 24 timers blokering i hukommelsen. Den eksisterende
+status “Automatisk træning afventer næste forsøg” stammer fra denne kontrol før
+historiklæsning/træning; den dokumenterer ikke, hvorfor forrige forsøg stoppede.
+
+Rettelsen fjerner kun den præcist identificerede, uafsluttede forsøgsmarkør ved
+almindelig afbrydelse. Reelle registrerede fejl beholder deres ventetid, og ældre
+callbacks kan ikke fjerne nyere eller afsluttede forsøg. Genbrug af færdige
+træningsdata er fortsat begrænset i hukommelsen; en kontrol af ventetiden bruger
+nu dens faktiske udløb. En allerede startberettiget iOS-opgave erstattes heller
+ikke længere blot fordi den oprindelige ønskede dato er passeret.
+
+Ændringen er afgrænset til `GlucoseForecastMLTrainingCoordinator`,
+`GlucoseForecastMLPreparedHistoryStore` og baggrundsplanlægningens datokontrol.
+Historikloaderen bevarer desuden en lokal læsefejl som teknisk domæne/kode,
+så en efterfølgende afbrydelse ikke sletter fejlens ventetid. Ingen fejlindhold
+eller helbredsværdier logges. Aktiv model, træner, kompatibilitet,
+historik-/selvtjekkrav og dosisregler er uændrede. Regressionstests dækker de rigtige livscyklusmetoder,
+vedvarende lager med genstart, samtidige fejl/afbrydelser og datoplanlægningen.
+De er ikke en fysisk test af iOS' tildeling af baggrundstid.
+
+Faktisk lokal validering: `local-build.sh test-all` og det færdige `.xcresult`
+bekræfter **1.934/1.934 XCTest**, **0 fejl og 0 skipped**, inklusive de 12 nye.
+`local-build.sh python` bestod **198 tests** samt Watch-værktøjernes **30 + 24**
+syntetiske selvkontroller. `git diff --check` bestod. Testappen med indlejrede
+mål blev bygget til simulator som del af XCTest. Separate simulatorbuilds,
+unsigned iPhoneOS, signering og releasekontroller er ikke kørt for denne ændring.
+Testbeviser ligger uden for Git under
+`~/DeveloperBuildData/xDrip/local-runs/xdripswift/20261108T164232Z-80165/`
+og `20261108T163850Z-77046/`. Den sidste releasegennemgang tilføjede yderligere
+én test gennem den rigtige loader med et isoleret testlager, der fremkalder
+en reel læsefejl. Første testopsætning gav kun et tomt svar og fejlede derfor;
+den fejlede kørsel er bevaret under releasens `test/failed-local-read-fixture/`.
+Den korrigerede test bestod særskilt på iOS-simulator (1/1). Releasekontrollerne
+skal gentage hele suiten med denne test og Apples buildnummer.
+
+Ingen installation, fysisk natlig træning eller adgang til telefonens konkrete
+forsøgshistorik er udført. Opladning er fortsat en forudsætning for den planlagte
+baggrundskørsel; iOS bestemmer, om og hvornår den får køretid. En ny model skal
+fortsat godkendes, før den overtager. Ingen versionsændring, commit, push eller
+TestFlight-upload er udført som del af denne undersøgelse.
+
 <!-- testflight-7.1.1-4359:start -->
 ### TestFlight 7.1.1 (4359)
 

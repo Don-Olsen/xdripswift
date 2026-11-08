@@ -1,3 +1,4 @@
+import CoreData
 import HealthKit
 import XCTest
 @testable import xdrip
@@ -1258,6 +1259,53 @@ final class GlucoseForecastMLReplayTests: XCTestCase {
         }
     }
 
+    @MainActor func testFailedLocalHistoryReadRetainsFailureAfterCancellation() async throws {
+        let suite = "MLHistoryLocalReadFailure.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let selected = "com.example.selected.therapy"
+        XCTAssertTrue(TreatmentSourceCutover.persist(.init(cutoff: reference.addingTimeInterval(1800),
+            insulinSourceBundleID: selected, carbohydrateSourceBundleID: selected),
+            defaults: defaults))
+        let importer = HealthKitTherapyImportManager(query: NoopTherapyQuery(), defaults: defaults)
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let manager = TherapyMetricsManager()
+        manager.configure(coreDataManager: core, externalStatus: { nil })
+        let query = FakeHistoryHealthQuery(glucoseSamples: [])
+        let loader = GlucoseForecastMLHistoryLoader(coreDataManager: core,
+            therapyManager: manager, healthImporter: importer, healthQuery: query,
+            defaults: defaults)
+        // An empty coordinator can return an empty fetch. Install a test-only
+        // incremental store that raises an actual error through Core Data instead.
+        try core.disconnectPersistentStoresForTesting()
+        let context = core.privateManagedObjectContext
+        let coordinator = try context.performAndWait {
+            try XCTUnwrap(context.persistentStoreCoordinator)
+        }
+        let storeType = GlucoseForecastMLFailingLocalHistoryStore.storeType
+        NSPersistentStoreCoordinator.registerStoreClass(
+            GlucoseForecastMLFailingLocalHistoryStore.self, forStoreType: storeType)
+        let storeURL = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "MLHistoryLocalReadFailure-\(UUID().uuidString).store")
+        _ = try coordinator.addPersistentStore(ofType: storeType,
+            configurationName: nil, at: storeURL)
+        defer { try? core.disconnectPersistentStoresForTesting() }
+        let cancellation = GlucoseForecastMLHistoryCancellation()
+        let result = await loader.load(days: 1, at: reference.addingTimeInterval(3600),
+            policy: historyPolicy, settings: settings, sensitivityMgdlPerUnit: 40,
+            carbohydrateRatioGramsPerUnit: 10, calendar: utcCalendar,
+            cancellation: cancellation)
+        XCTAssertNil(result)
+        XCTAssertFalse(cancellation.isCancelled)
+        let failure = try XCTUnwrap(cancellation.readFailure)
+        XCTAssertEqual(failure, "Lokal historik: SyntheticMLLocalRead/37",
+            "Only the technical error domain and code are retained")
+        cancellation.cancel()
+        XCTAssertTrue(cancellation.isCancelled)
+        XCTAssertEqual(cancellation.readFailure, failure,
+            "Background cancellation must not turn a failed local fetch into a free retry")
+    }
+
     @MainActor func testTimedOutHealthTherapyReadIsNotACompletedEmptyHistory() async throws {
         let suite = "MLHistoryTimeout.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
@@ -1445,5 +1493,21 @@ final class GlucoseForecastMLReplayTests: XCTestCase {
         }
         func observe(_ kind: HealthTherapyImportKind,
                      onChange: @escaping (@escaping () -> Void) -> Void) {}
+    }
+}
+
+/// Used only by the local-read failure regression; it never opens a database file.
+private final class GlucoseForecastMLFailingLocalHistoryStore: NSIncrementalStore {
+    static let storeType = NSStringFromClass(GlucoseForecastMLFailingLocalHistoryStore.self)
+
+    override func loadMetadata() throws {
+        metadata = [NSStoreUUIDKey: UUID().uuidString,
+                    NSStoreTypeKey: Self.storeType]
+    }
+
+    override func execute(_ request: NSPersistentStoreRequest,
+                          with context: NSManagedObjectContext?) throws -> Any {
+        throw NSError(domain: "SyntheticMLLocalRead", code: 37,
+            userInfo: [NSLocalizedDescriptionKey: "Synthetic detail must stay private"])
     }
 }

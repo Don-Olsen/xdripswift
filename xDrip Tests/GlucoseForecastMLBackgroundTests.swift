@@ -548,3 +548,249 @@ final class GlucoseForecastMLBackgroundTests: XCTestCase {
         XCTAssertGreaterThan(next.timeIntervalSinceNow, 6 * 24 * 3600)
     }
 }
+
+
+extension GlucoseForecastMLBackgroundTests {
+    func testInterruptedPreparationReleasesItsRetryAcrossRestart() throws {
+        let store = temporaryStore()
+        defer { try? FileManager.default.removeItem(at: store.directory) }
+        let source = context()
+        let coordinator = GlucoseForecastMLTrainingCoordinator(
+            preparedStore: store, observeLifecycle: false)
+        let cancellation = try XCTUnwrap(coordinator.beginPreparation(
+            context: source, force: false, at: clock))
+        XCTAssertTrue(coordinator.recordPreparationAttempt(
+            context: source, at: clock, cancellation: cancellation))
+        XCTAssertNil(coordinator.beginPreparation(context: source, force: false, at: clock),
+            "The preparation still owns its single-run claim")
+        let reopenedAt = clock.addingTimeInterval(60)
+        XCTAssertEqual(store.nextPreparationDate(context: source, at: reopenedAt),
+                       clock.addingTimeInterval(24 * 3600))
+
+        coordinator.cancelForBackground()
+        XCTAssertTrue(cancellation.isCancelled)
+        coordinator.finishPreparation("interrupted preparation", cancellation: cancellation)
+        XCTAssertFalse(coordinator.isPreparing)
+        XCTAssertEqual(store.nextPreparationDate(context: source, at: reopenedAt), reopenedAt)
+        let retry = try XCTUnwrap(coordinator.beginPreparation(
+            context: source, force: false, at: reopenedAt))
+        coordinator.finishPreparation("retry eligibility checked", cancellation: retry)
+
+        let restartedStore = GlucoseForecastMLPreparedHistoryStore(directory: store.directory)
+        XCTAssertEqual(restartedStore.nextAutomaticAttempt(context: source, at: reopenedAt), reopenedAt)
+        let restartedCoordinator = GlucoseForecastMLTrainingCoordinator(
+            preparedStore: restartedStore, observeLifecycle: false)
+        let restarted = try XCTUnwrap(restartedCoordinator.beginPreparation(
+            context: source, force: false, at: reopenedAt))
+        XCTAssertTrue(restartedCoordinator.recordPreparationAttempt(
+            context: source, at: reopenedAt, cancellation: restarted))
+        XCTAssertEqual(restartedStore.nextPreparationDate(context: source, at: reopenedAt),
+                       reopenedAt.addingTimeInterval(24 * 3600))
+        restartedCoordinator.finishPreparation("ordinary preparation failure", cancellation: restarted)
+    }
+
+    func testCooldownOnlyPreparationProbeDoesNotStartAnotherTwentyFourHourThrottle() throws {
+        let store = temporaryStore()
+        defer { try? FileManager.default.removeItem(at: store.directory) }
+        let source = context()
+        try store.recordAttempt(context: source, at: clock, completed: false)
+        let coordinator = GlucoseForecastMLTrainingCoordinator(
+            preparedStore: store, observeLifecycle: false)
+        let probeAt = clock.addingTimeInterval(23 * 3600)
+        let probe = try XCTUnwrap(coordinator.beginPreparation(
+            context: source, force: false, at: probeAt))
+        XCTAssertGreaterThan(store.nextPreparationDate(context: source, at: probeAt), probeAt)
+        // This is the coordinator's cooldown early return: no historical read starts.
+        let due = store.nextPreparationDate(context: source, at: probeAt)
+        coordinator.deferPreparation(context: source, until: due, cancellation: probe)
+        coordinator.finishPreparation("awaiting existing retry deadline", cancellation: probe)
+        XCTAssertEqual(due, clock.addingTimeInterval(24 * 3600))
+        XCTAssertNil(coordinator.beginPreparation(context: source, force: false,
+            at: due.addingTimeInterval(-1)), "The existing deadline still applies")
+        XCTAssertEqual(store.nextPreparationDate(context: source, at: due), due)
+        let actualAttempt = try XCTUnwrap(coordinator.beginPreparation(
+            context: source, force: false, at: due),
+            "A cooldown check at hour 23 must not move eligibility to hour 47")
+        XCTAssertTrue(coordinator.recordPreparationAttempt(
+            context: source, at: due, cancellation: actualAttempt))
+        coordinator.finishPreparation("ordinary preparation failure", cancellation: actualAttempt)
+    }
+
+    func testCancellationBeforeAttemptWritePreservesAnEarlierFailure() throws {
+        let store = temporaryStore()
+        defer { try? FileManager.default.removeItem(at: store.directory) }
+        let source = context()
+        try store.recordAttempt(context: source, at: clock, completed: false)
+        let coordinator = GlucoseForecastMLTrainingCoordinator(
+            preparedStore: store, observeLifecycle: false)
+        let attemptAt = clock.addingTimeInterval(60)
+        let cancellation = try XCTUnwrap(coordinator.beginPreparation(
+            context: source, force: false, at: attemptAt))
+        coordinator.cancelForBackground()
+        XCTAssertFalse(coordinator.recordPreparationAttempt(
+            context: source, at: attemptAt, cancellation: cancellation),
+            "A cancelled claim cannot overwrite the durable attempt marker")
+        coordinator.finishPreparation("cancelled before reading", cancellation: cancellation)
+        let restarted = GlucoseForecastMLPreparedHistoryStore(directory: store.directory)
+        XCTAssertEqual(restarted.nextPreparationDate(context: source, at: attemptAt),
+                       clock.addingTimeInterval(24 * 3600),
+            "Cancellation owns no marker here and cannot erase the earlier failure")
+    }
+
+    func testFinishedPreparationFailureKeepsItsCooldownAfterBackgrounding() throws {
+        let store = temporaryStore()
+        defer { try? FileManager.default.removeItem(at: store.directory) }
+        let source = context()
+        let coordinator = GlucoseForecastMLTrainingCoordinator(
+            preparedStore: store, observeLifecycle: false)
+        let cancellation = try XCTUnwrap(coordinator.beginPreparation(
+            context: source, force: false, at: clock))
+        XCTAssertTrue(coordinator.recordPreparationAttempt(
+            context: source, at: clock, cancellation: cancellation))
+        coordinator.finishPreparation("insufficient usable history", cancellation: cancellation)
+        coordinator.cancelForBackground()
+        let reopenedAt = clock.addingTimeInterval(60)
+        let restarted = GlucoseForecastMLPreparedHistoryStore(directory: store.directory)
+        XCTAssertEqual(restarted.nextPreparationDate(context: source, at: reopenedAt),
+                       clock.addingTimeInterval(24 * 3600))
+        XCTAssertEqual(restarted.nextAutomaticAttempt(context: source, at: reopenedAt),
+                       clock.addingTimeInterval(24 * 3600))
+        XCTAssertFalse(coordinator.isPreparing)
+    }
+
+    func testReadFailureFollowedByCancellationBeforeFinishKeepsItsCooldown() throws {
+        let store = temporaryStore()
+        defer { try? FileManager.default.removeItem(at: store.directory) }
+        let source = context()
+        let coordinator = GlucoseForecastMLTrainingCoordinator(
+            preparedStore: store, observeLifecycle: false)
+        let cancellation = try XCTUnwrap(coordinator.beginPreparation(
+            context: source, force: false, at: clock))
+        XCTAssertTrue(coordinator.recordPreparationAttempt(
+            context: source, at: clock, cancellation: cancellation))
+        cancellation.recordReadFailure("synthetic historical read failure")
+        coordinator.cancelForBackground()
+        coordinator.finishPreparation("historical read failed", cancellation: cancellation)
+        let reopenedAt = clock.addingTimeInterval(60)
+        let restarted = GlucoseForecastMLPreparedHistoryStore(directory: store.directory)
+        XCTAssertEqual(restarted.nextPreparationDate(context: source, at: reopenedAt),
+                       clock.addingTimeInterval(24 * 3600),
+            "Backgrounding after a real read failure must not turn it into a free retry")
+        XCTAssertEqual(cancellation.readFailure, "synthetic historical read failure")
+    }
+
+    func testLateCancelledPreparationCallbacksCannotEraseOrReplaceANewerAttempt() throws {
+        let store = temporaryStore()
+        defer { try? FileManager.default.removeItem(at: store.directory) }
+        let source = context()
+        let coordinator = GlucoseForecastMLTrainingCoordinator(
+            preparedStore: store, observeLifecycle: false)
+        let old = try XCTUnwrap(coordinator.beginPreparation(
+            context: source, force: false, at: clock))
+        XCTAssertTrue(coordinator.recordPreparationAttempt(
+            context: source, at: clock, cancellation: old))
+        coordinator.cancelForBackground()
+        coordinator.finishPreparation("old preparation interrupted", cancellation: old)
+        let newDate = clock.addingTimeInterval(60)
+        let current = try XCTUnwrap(coordinator.beginPreparation(
+            context: source, force: false, at: newDate))
+        XCTAssertTrue(coordinator.recordPreparationAttempt(
+            context: source, at: newDate, cancellation: current))
+        let currentStatus = coordinator.statusText
+
+        coordinator.finishPreparation("late old callback", cancellation: old)
+        XCTAssertFalse(coordinator.recordPreparationAttempt(
+            context: source, at: clock, cancellation: old))
+        XCTAssertTrue(coordinator.isPreparing)
+        XCTAssertFalse(current.isCancelled)
+        XCTAssertEqual(coordinator.statusText, currentStatus)
+        XCTAssertEqual(store.nextPreparationDate(context: source, at: newDate),
+                       newDate.addingTimeInterval(24 * 3600))
+        coordinator.finishPreparation("current preparation failed", cancellation: current)
+    }
+
+    func testInterruptedAttemptRemovalPreservesNewerCompletedAndOtherContextRecords() throws {
+        let store = temporaryStore()
+        defer { try? FileManager.default.removeItem(at: store.directory) }
+        let source = context()
+        let newerDate = clock.addingTimeInterval(60)
+        try store.recordAttempt(context: source, at: newerDate, completed: false)
+        try store.removeInterruptedAttempt(context: source, at: clock)
+        XCTAssertEqual(store.nextPreparationDate(context: source, at: newerDate),
+                       newerDate.addingTimeInterval(24 * 3600))
+
+        try store.recordAttempt(context: source, at: clock, completed: true)
+        try store.removeInterruptedAttempt(context: source, at: clock)
+        XCTAssertEqual(store.nextAutomaticAttempt(context: source, at: newerDate),
+                       clock.addingTimeInterval(GlucoseForecastMLChronology.modelAgeLimit))
+
+        let other = context(source: "different-preparation-source")
+        try store.recordAttempt(context: other, at: clock, completed: false)
+        try store.removeInterruptedAttempt(context: source, at: clock)
+        XCTAssertEqual(store.nextPreparationDate(context: other, at: newerDate),
+                       clock.addingTimeInterval(24 * 3600))
+        try store.removeInterruptedAttempt(context: other, at: clock)
+        let restarted = GlucoseForecastMLPreparedHistoryStore(directory: store.directory)
+        XCTAssertEqual(restarted.nextPreparationDate(context: other, at: newerDate), newerDate)
+        // Repeated completion of the same interrupted run is harmless.
+        try restarted.removeInterruptedAttempt(context: other, at: clock)
+        XCTAssertEqual(restarted.nextAutomaticAttempt(context: other, at: newerDate), newerDate)
+    }
+}
+
+
+extension GlucoseForecastMLBackgroundTests {
+    func testReadySnapshotDefersRepeatedReadsWithoutWritingAnAttemptMarker() throws {
+        let store = temporaryStore()
+        defer { try? FileManager.default.removeItem(at: store.directory) }
+        let source = context()
+        let prepared = snapshot()
+        try store.save(prepared)
+        let coordinator = GlucoseForecastMLTrainingCoordinator(
+            preparedStore: store, observeLifecycle: false)
+        let cancellation = try XCTUnwrap(coordinator.beginPreparation(
+            context: source, force: false, at: clock))
+        XCTAssertEqual(store.load(context: source, at: clock)?.id, prepared.id)
+        let due = clock.addingTimeInterval(24 * 3600)
+        coordinator.deferPreparation(context: source, until: due, cancellation: cancellation)
+        coordinator.finishPreparation("prepared snapshot ready", cancellation: cancellation)
+        XCTAssertNil(coordinator.beginPreparation(context: source, force: false,
+            at: clock.addingTimeInterval(15)))
+        XCTAssertNil(coordinator.beginPreparation(context: source, force: false,
+            at: due.addingTimeInterval(-1)))
+        XCTAssertFalse(FileManager.default.fileExists(atPath:
+            store.directory.appendingPathComponent("automatic-attempt.json").path),
+            "Reusing prepared history must not become a durable failed attempt")
+        let restarted = GlucoseForecastMLPreparedHistoryStore(directory: store.directory)
+        XCTAssertEqual(restarted.nextPreparationDate(context: source, at: clock), clock)
+        XCTAssertEqual(restarted.load(context: source, at: clock)?.id, prepared.id)
+        let next = try XCTUnwrap(coordinator.beginPreparation(
+            context: source, force: false, at: due))
+        coordinator.finishPreparation("snapshot can be checked again", cancellation: next)
+    }
+
+    func testStorageFailureFollowedByCancellationKeepsItsDurableCooldown() throws {
+        let store = temporaryStore()
+        defer { try? FileManager.default.removeItem(at: store.directory) }
+        let source = context()
+        let coordinator = GlucoseForecastMLTrainingCoordinator(
+            preparedStore: store, observeLifecycle: false)
+        let cancellation = try XCTUnwrap(coordinator.beginPreparation(
+            context: source, force: false, at: clock))
+        XCTAssertTrue(coordinator.recordPreparationAttempt(
+            context: source, at: clock, cancellation: cancellation))
+        // A snapshot/storage error has already occurred when the app backgrounds.
+        // It has no HealthKit readFailure, so the explicit failure outcome matters.
+        XCTAssertNil(cancellation.readFailure)
+        coordinator.cancelForBackground()
+        coordinator.finishPreparation("prepared history could not be saved",
+            cancellation: cancellation, failed: true)
+        let reopenedAt = clock.addingTimeInterval(60)
+        let restarted = GlucoseForecastMLPreparedHistoryStore(directory: store.directory)
+        XCTAssertEqual(restarted.nextPreparationDate(context: source, at: reopenedAt),
+                       clock.addingTimeInterval(24 * 3600))
+        XCTAssertEqual(restarted.nextAutomaticAttempt(context: source, at: reopenedAt),
+                       clock.addingTimeInterval(24 * 3600))
+        XCTAssertFalse(coordinator.isPreparing)
+    }
+}

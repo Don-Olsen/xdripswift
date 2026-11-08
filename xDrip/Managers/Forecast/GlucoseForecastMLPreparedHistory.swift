@@ -154,6 +154,15 @@ final class GlucoseForecastMLPreparedHistoryStore: @unchecked Sendable {
         try write(AutomaticAttempt(context: context, attemptedAt: date,
                                    completedAt: completed ? date : nil), to: attemptURL)
     }
+    /// Release only the preparation that was interrupted by leaving the foreground.
+    /// A failure, newer attempt or completed run keeps its durable retry deadline.
+    func removeInterruptedAttempt(context: GlucoseForecastMLContext, at date: Date) throws {
+        attemptLock.lock(); defer { attemptLock.unlock() }
+        guard let attempt: AutomaticAttempt = read(attemptURL), attempt.context == context,
+              attempt.attemptedAt == date, attempt.completedAt == nil else { return }
+        try FileManager.default.removeItem(at: attemptURL)
+    }
+
     private func read<T: Decodable>(_ url: URL) -> T? {
         guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
               let size = attributes[.size] as? NSNumber, size.intValue <= 128 * 1024 * 1024,
