@@ -1,3 +1,48 @@
+## Rettelse af dokumenteret ML-størrelsesfejl — 8. november 2026
+
+Brugerens skærmbillede fra **4361**, forsøget kl. **20.18.15**, viser den
+præcise årsag: **størrelseskontrol**, **134.507.654 kodede bytes** mod en grænse
+på **134.217.728 bytes (128 MiB)**. Det er **289.926 bytes** over grænsen.
+Historikforberedelsen nåede dermed gemningen, men appens egen kontrol afviste
+grundlaget før filskrivning og træningsstart. Størrelsesgrænsen er nu bekræftet
+for dette konkrete forsøg; det er ikke længere kun en syntetisk hypotese.
+Skærmbilledet og telefonens data gemmes ikke i Git.
+
+Rettelsen hæver kun grænsen for det forberedte træningsgrundlag til **256 MiB**
+i gemning, læsning og ID-kontrolleret fjernelse. JSON-format, numerisk præcision,
+200.000-rækkersgrænsen, aktualitet, kontekst-/buildkontrol og alle trænings- og
+modelgodkendelseskrav bevares. De små markører for automatiske forsøg beholder
+deres tidligere grænse. Gemte fejl fra 4361 kan fortsat vises med deres faktiske
+128 MiB-grænse; nye fejl bruger den relevante nye grænse.
+
+JSON blev allerede kodet fuldt ud før den tidligere størrelseskontrol. Den nye
+grænse tilføjer derfor ikke en ekstra kodning, men større tilladte filer kræver
+mere plads ved genindlæsning. Syntetiske årsdata understøtter den valgte grænse;
+den garanterer ikke, at alle mulige 200.000 rækker kan rummes, eller at en ny
+model vil bestå selvtjekket. Ingen ny fysisk træning med rettelsen er udført.
+
+Den lokale rettelse bestod **1.946/1.946 XCTest**, **0 fejl og 0 skipped**,
+**198 Python-tests**, Watch-værktøjernes **30 + 24** syntetiske kontroller,
+begge simulatorbuilds og unsigned Release **iPhoneOS/arm64**. Den nye
+regressionstest gemmer og genindlæser 120.000 syntetiske replay-rækker i en
+fil over 128 MiB med identisk fingerprint for alle værdier og tidspunkter.
+ID-kontrolleret fjernelse, afvisning over 256 MiB med bevaret tidligere fil,
+4361-diagnosens oprindelige grænse og forsøgsmarkørens uændrede grænse er
+også verificeret. Ingen eksisterende test er fjernet eller svækket.
+
+Testkvitteringen ligger uden for Git i
+`~/DeveloperBuildData/xDrip/local-runs/xdripswift/20261108T192730Z-20998/`.
+Den separate unsigned-kvittering ligger i
+`/private/tmp/xdrip-ml-size-fix-ios/iphoneos-unsigned.json` og registrerer
+basecommit samt hash af den lokale diff; det er ikke en releasekvittering.
+`git diff --check` og en separat kodegennemgang bestod.
+
+Brugeren har givet **GO UPLOAD** til denne rettelse. Releaseproceduren vælger
+nummeret hos Apple og gentester det præcise checkpoint. Efter installation
+skal **Træn nu** køres på telefonen: grundlaget skal passere gemning
+og nå træningen. En eventuel ny model skal fortsat bestå det eksisterende
+selvtjek; de automatiske tests beviser ikke en fuldført træning på telefonen.
+
 <!-- testflight-7.1.1-4361:start -->
 ### TestFlight 7.1.1 (4361)
 

@@ -96,7 +96,9 @@ enum GlucoseForecastMLTrainingFingerprint {
 }
 
 final class GlucoseForecastMLPreparedHistoryStore: @unchecked Sendable {
-    static let maximumEncodedBytes = 128 * 1024 * 1024
+    // A valid annual replay can exceed the previous 128 MiB JSON limit.
+    static let maximumEncodedBytes = 256 * 1024 * 1024
+    private static let maximumAttemptEncodedBytes = 128 * 1024 * 1024
     static let diagnosticDefaultsKey = "GlucoseForecastMLPreparedHistory.latestSaveDiagnostic.v1"
     private static let maximumDiagnosticBytes = 16 * 1024
 
@@ -157,7 +159,8 @@ final class GlucoseForecastMLPreparedHistoryStore: @unchecked Sendable {
         fileprivate var isValid: Bool {
             schemaVersion == 1 && occurredAt.timeIntervalSinceReferenceDate.isFinite
                 && Self.isValidBuild(appBuild)
-                && maximumBytes == GlucoseForecastMLPreparedHistoryStore.maximumEncodedBytes
+                && [GlucoseForecastMLPreparedHistoryStore.maximumAttemptEncodedBytes,
+                    GlucoseForecastMLPreparedHistoryStore.maximumEncodedBytes].contains(maximumBytes)
                 && (encodedBytes.map { $0 >= 0 } ?? true)
         }
 
@@ -173,10 +176,11 @@ final class GlucoseForecastMLPreparedHistoryStore: @unchecked Sendable {
             formatter.timeStyle = .medium
             var lines = ["Seneste gemmefejl: \(formatter.string(from: occurredAt)) · build \(appBuild)",
                          "Trin: \(stage.displayName)."]
+            let limitText = "\(maximumBytes) bytes (\(maximumBytes / (1024 * 1024)) MiB)."
             if let encodedBytes {
-                lines.append("Kodet størrelse: \(encodedBytes) bytes. Grænse: \(maximumBytes) bytes (128 MiB).")
+                lines.append("Kodet størrelse: \(encodedBytes) bytes. Grænse: \(limitText)")
             } else {
-                lines.append("Kodet størrelse endnu ikke kendt. Grænse: \(maximumBytes) bytes (128 MiB).")
+                lines.append("Kodet størrelse endnu ikke kendt. Grænse: \(limitText)")
             }
             if let errorDomain, let errorCode {
                 let domain = errorDomain == .other ? "andet fejldomæne" : errorDomain.rawValue
@@ -227,7 +231,7 @@ final class GlucoseForecastMLPreparedHistoryStore: @unchecked Sendable {
         var stage = SaveStage.directory
         var encodedBytes: Int?
         do {
-            try write(snapshot, to: snapshotURL) { currentStage, size in
+            try write(snapshot, to: snapshotURL, maximumBytes: Self.maximumEncodedBytes) { currentStage, size in
                 stage = currentStage
                 encodedBytes = size
             }
@@ -264,13 +268,13 @@ final class GlucoseForecastMLPreparedHistoryStore: @unchecked Sendable {
 
     func load(context: GlucoseForecastMLContext, at now: Date) -> GlucoseForecastMLPreparedHistory? {
         snapshotLock.lock(); defer { snapshotLock.unlock() }
-        guard let snapshot: GlucoseForecastMLPreparedHistory = read(snapshotURL),
+        guard let snapshot: GlucoseForecastMLPreparedHistory = read(snapshotURL, maximumBytes: Self.maximumEncodedBytes),
               snapshot.isUsable(context: context, at: now) else { return nil }
         return snapshot
     }
     func remove(id: UUID) {
         snapshotLock.lock(); defer { snapshotLock.unlock() }
-        guard let snapshot: GlucoseForecastMLPreparedHistory = read(snapshotURL),
+        guard let snapshot: GlucoseForecastMLPreparedHistory = read(snapshotURL, maximumBytes: Self.maximumEncodedBytes),
               snapshot.id == id else { return }
         try? FileManager.default.removeItem(at: snapshotURL)
     }
@@ -304,13 +308,15 @@ final class GlucoseForecastMLPreparedHistoryStore: @unchecked Sendable {
         try FileManager.default.removeItem(at: attemptURL)
     }
 
-    private func read<T: Decodable>(_ url: URL) -> T? {
+    private func read<T: Decodable>(_ url: URL,
+                                    maximumBytes: Int = maximumAttemptEncodedBytes) -> T? {
         guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
-              let size = attributes[.size] as? NSNumber, size.intValue <= Self.maximumEncodedBytes,
+              let size = attributes[.size] as? NSNumber, size.intValue <= maximumBytes,
               let data = try? Data(contentsOf: url) else { return nil }
         return try? JSONDecoder().decode(T.self, from: data)
     }
     private func write<T: Encodable>(_ value: T, to url: URL,
+                                      maximumBytes: Int = maximumAttemptEncodedBytes,
                                       stage: ((SaveStage, Int?) -> Void)? = nil) throws {
         stage?(.directory, nil)
         try GlucoseForecastMLStoragePolicy.secureDirectory(directory)
@@ -319,7 +325,7 @@ final class GlucoseForecastMLPreparedHistoryStore: @unchecked Sendable {
         encoder.outputFormatting = [.sortedKeys]
         let data = try encoder.encode(value)
         stage?(.sizeCheck, data.count)
-        guard data.count <= Self.maximumEncodedBytes else { throw GlucoseForecastMLTrainingFailure.io }
+        guard data.count <= maximumBytes else { throw GlucoseForecastMLTrainingFailure.io }
         stage?(.writing, data.count)
         #if os(iOS)
         try data.write(to: url, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])

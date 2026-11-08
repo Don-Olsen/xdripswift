@@ -841,7 +841,7 @@ extension GlucoseForecastMLBackgroundTests {
         let diagnostic = failure.diagnostic
         XCTAssertEqual(diagnostic.stage, .encoding)
         XCTAssertNil(diagnostic.encodedBytes)
-        XCTAssertEqual(diagnostic.maximumBytes, 128 * 1024 * 1024)
+        XCTAssertEqual(diagnostic.maximumBytes, 256 * 1024 * 1024)
         XCTAssertGreaterThanOrEqual(diagnostic.occurredAt, before)
         XCTAssertLessThanOrEqual(diagnostic.occurredAt, Date())
         XCTAssertEqual(store.load(context: context(), at: clock)?.id, previous.id)
@@ -850,23 +850,29 @@ extension GlucoseForecastMLBackgroundTests {
         XCTAssertTrue(diagnostic.summaryText.contains("Seneste gemmefejl:"))
         XCTAssertTrue(diagnostic.summaryText.contains("build "))
         XCTAssertTrue(diagnostic.summaryText.contains("kodning"))
-        XCTAssertTrue(diagnostic.summaryText.contains("134217728 bytes"))
+        XCTAssertTrue(diagnostic.summaryText.contains("268435456 bytes"))
+        XCTAssertTrue(diagnostic.summaryText.contains("(256 MiB)"))
     }
 
-    func testPreparedSaveSizeFailureMeasuresTheActualUnchangedProductionLimit() throws {
+    func testPreparedSaveSizeFailureMeasuresActualHistoryLimitAndPreservesSnapshot() throws {
         let store = temporaryStore()
         defer { try? FileManager.default.removeItem(at: store.directory) }
+        let previous = snapshot()
+        try store.save(previous)
+        let file = store.directory.appendingPathComponent("history.json")
+        let previousBytes = try Data(contentsOf: file)
         // A synthetic context string reaches the real byte guard without creating
         // hundreds of thousands of replay rows or changing the production limit.
-        let oversized = snapshot(context: context(source: String(repeating: "x", count: 128 * 1024 * 1024)))
+        let oversized = snapshot(context: context(source: String(repeating: "x", count: 256 * 1024 * 1024)))
         let failure = try saveFailure(oversized, store: store)
         let diagnostic = failure.diagnostic
         XCTAssertEqual(diagnostic.stage, .sizeCheck)
-        XCTAssertGreaterThan(try XCTUnwrap(diagnostic.encodedBytes), 128 * 1024 * 1024)
-        XCTAssertEqual(diagnostic.maximumBytes, 128 * 1024 * 1024)
+        XCTAssertGreaterThan(try XCTUnwrap(diagnostic.encodedBytes), 256 * 1024 * 1024)
+        XCTAssertEqual(diagnostic.maximumBytes, 256 * 1024 * 1024)
         XCTAssertNil(diagnostic.errorDomain)
         XCTAssertNil(diagnostic.errorCode)
-        XCTAssertFalse(FileManager.default.fileExists(atPath: store.directory.appendingPathComponent("history.json").path))
+        XCTAssertEqual(try Data(contentsOf: file), previousBytes)
+        XCTAssertEqual(makeStore(directory: store.directory).load(context: context(), at: clock)?.id, previous.id)
         let data = try XCTUnwrap(diagnosticDefaults(for: store.directory)
             .data(forKey: GlucoseForecastMLPreparedHistoryStore.diagnosticDefaultsKey))
         XCTAssertLessThan(data.count, 1024)
@@ -998,5 +1004,101 @@ extension GlucoseForecastMLBackgroundTests {
         XCTAssertNil(makeStore(directory: store.directory).latestSaveDiagnostic())
         XCTAssertNil(diagnosticDefaults(for: store.directory)
             .data(forKey: GlucoseForecastMLPreparedHistoryStore.diagnosticDefaultsKey))
+    }
+}
+
+
+extension GlucoseForecastMLBackgroundTests {
+    func testPreparedHistoryAboveOldByteLimitRoundTripsFullPrecisionAndCanBeRemoved() throws {
+        let store = temporaryStore()
+        defer { try? FileManager.default.removeItem(at: store.directory) }
+        let anchorCount = 40_000
+        let sensorID = "health-segment:com.example.synthetic-full-precision:1800000000000"
+        var rows = [GlucoseForecastMLReplayExample]()
+        rows.reserveCapacity(anchorCount * 3)
+        for index in 0..<anchorCount {
+            let reference = clock.addingTimeInterval(Double((index - anchorCount) * 600) - 3 * 3600)
+            let glucose = 150 + 10 * sin(Double(index) / 100)
+            let trajectory = (0..<25).map { glucose + 10 * sin(Double($0) / 25 * .pi) }
+            for horizon in [30, 60, 120] {
+                let engineValue = trajectory[horizon / 5]
+                let values = [glucose, 0.1234567890123456, -0.1234567890123456, engineValue - glucose,
+                              1.1234567890123456, 3.1234567890123456, 2.1234567890123456, 6.1234567890123456,
+                              47.12345678901234, 2.5, 81.12345678901234, 30,
+                              sin(Double(index)), cos(Double(index)), Double(index % 7), 31]
+                let row = GlucoseForecastMLFeatureRow(horizonMinutes: horizon, referenceDate: reference,
+                    engineValue: engineValue, glucose: glucose, sensorID: sensorID, values: values)
+                rows.append(GlucoseForecastMLReplayExample(row: row,
+                    targetDate: reference.addingTimeInterval(Double(horizon * 60)),
+                    targetGlucoseMgdl: glucose + 5, engineTargetGlucoseMgdl: engineValue,
+                    engineTrajectoryMgdl: trajectory, sourceIdentity: "sensor:" + sensorID,
+                    treatmentAvailability: .retrospectiveUnknown, settingsAvailability: .retrospectiveUnknown,
+                    bolusUnitsInWindow: 2.5, carbohydrateGramsInWindow: 30))
+            }
+        }
+        let original = snapshot(examples: rows)
+        XCTAssertTrue(original.isUsable(context: context(), at: clock))
+        let fingerprint = try GlucoseForecastMLTrainingFingerprint.value(context: original.context,
+                                                                          examples: original.examples)
+        try store.save(original)
+        let file = store.directory.appendingPathComponent("history.json")
+        let size = try XCTUnwrap(FileManager.default.attributesOfItem(atPath: file.path)[.size] as? NSNumber).intValue
+        XCTAssertGreaterThan(size, 128 * 1024 * 1024)
+        XCTAssertLessThan(size, 256 * 1024 * 1024)
+        let restarted = makeStore(directory: store.directory)
+        let recovered = try XCTUnwrap(restarted.load(context: context(), at: clock))
+        XCTAssertEqual(recovered.id, original.id)
+        XCTAssertEqual(recovered.preparedAt, original.preparedAt)
+        XCTAssertEqual(recovered.featureNames, original.featureNames)
+        XCTAssertEqual(recovered.examples.count, anchorCount * 3)
+        XCTAssertEqual(try GlucoseForecastMLTrainingFingerprint.value(context: recovered.context,
+            examples: recovered.examples), fingerprint, "Every encoded row, date and floating-point value must survive")
+        restarted.remove(id: UUID())
+        XCTAssertTrue(FileManager.default.fileExists(atPath: file.path))
+        restarted.remove(id: recovered.id)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: file.path))
+        XCTAssertNil(restarted.latestSaveDiagnostic())
+    }
+
+    func testLegacyPreparedSaveDiagnosticKeepsItsRecorded128MiBLimitAfterUpgrade() throws {
+        let store = temporaryStore()
+        defer { try? FileManager.default.removeItem(at: store.directory) }
+        let diagnostic = GlucoseForecastMLPreparedHistoryStore.SaveDiagnostic(stage: .sizeCheck,
+            encodedBytes: 134_507_654, error: GlucoseForecastMLTrainingFailure.io, occurredAt: clock)
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(diagnostic)) as? [String: Any])
+        object["maximumBytes"] = 128 * 1024 * 1024
+        object["appBuild"] = "4361"
+        diagnosticDefaults(for: store.directory).set(try JSONSerialization.data(withJSONObject: object),
+            forKey: GlucoseForecastMLPreparedHistoryStore.diagnosticDefaultsKey)
+        let restarted = makeStore(directory: store.directory)
+        let legacy = try XCTUnwrap(restarted.latestSaveDiagnostic())
+        XCTAssertEqual(legacy.maximumBytes, 128 * 1024 * 1024)
+        XCTAssertEqual(legacy.encodedBytes, 134_507_654)
+        XCTAssertEqual(legacy.appBuild, "4361")
+        XCTAssertEqual(legacy.occurredAt, clock)
+        XCTAssertTrue(legacy.summaryText.contains("134217728 bytes (128 MiB)"))
+        XCTAssertFalse(legacy.summaryText.contains("256 MiB"))
+        let failure = try saveFailure(snapshot(examples: examples(at: clock.addingTimeInterval(-3 * 3600),
+                                                                 featureValue: .nan)), store: restarted)
+        XCTAssertEqual(failure.diagnostic.maximumBytes, 256 * 1024 * 1024)
+        XCTAssertTrue(failure.diagnostic.summaryText.contains("268435456 bytes (256 MiB)"))
+    }
+
+    func testAutomaticAttemptRetainsIts128MiBWriteLimitAndPreviousCooldown() throws {
+        let store = temporaryStore()
+        defer { try? FileManager.default.removeItem(at: store.directory) }
+        let previousContext = context()
+        try store.recordAttempt(context: previousContext, at: clock, completed: false)
+        let file = store.directory.appendingPathComponent("automatic-attempt.json")
+        let previousBytes = try Data(contentsOf: file)
+        // The context is over 128 MiB but well below the new history-only limit.
+        let oversizedContext = context(source: String(repeating: "a", count: 128 * 1024 * 1024))
+        XCTAssertThrowsError(try store.recordAttempt(context: oversizedContext, at: clock, completed: false)) {
+            XCTAssertEqual($0 as? GlucoseForecastMLTrainingFailure, .io)
+        }
+        XCTAssertEqual(try Data(contentsOf: file), previousBytes)
+        XCTAssertEqual(makeStore(directory: store.directory).nextPreparationDate(context: previousContext, at: clock),
+                       clock.addingTimeInterval(24 * 3600))
+        XCTAssertNil(store.latestSaveDiagnostic(), "Attempt I/O must not create a snapshot-save diagnostic")
     }
 }

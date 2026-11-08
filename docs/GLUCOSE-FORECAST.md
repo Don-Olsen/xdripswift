@@ -917,16 +917,35 @@ tested. No upload or installation on a physical device was performed.
 
 ## Automatic background ML training after 4311
 
+The 4361 device diagnostic established a concrete size rejection: 134,507,654
+encoded bytes exceeded the 134,217,728-byte guard. The targeted correction
+permits up to 256 MiB for prepared history, consistently across save, load and
+ID-checked removal. Automatic-attempt records retain their previous 128 MiB
+bound. JSON precision/schema and all existing row, chronology, context, build
+and model-approval requirements stay unchanged. Historical diagnostics retain
+their recorded 128 MiB limit; presentation uses each record's own limit.
+A larger permitted reload can consume more memory; this is not a physical
+training or memory-pressure verification, nor a guarantee that every conceivable
+200,000-row encoding fits the bounded file size.
+Local verification passed 1,946 XCTest, 198 Python tests, 30 + 24 synthetic
+Watch checks, both simulator builds and unsigned Release iPhoneOS/arm64.
+A 120,000-row synthetic snapshot larger than 128 MiB round-trips with an
+identical full-precision training fingerprint and supports ID-checked removal.
+Over-limit rejection preserves the prior file, while legacy diagnostics and
+automatic-attempt limits remain covered. A physical training run after
+installation of the correction is still required.
+
 Prepared-history save diagnostics after 4360 retain the exact failed stage
 (directory setup, encoding, byte-limit check, atomic write or backup exclusion),
-known encoded bytes and the unchanged 128 MiB limit. Only sanitized technical
+known encoded bytes and the applicable limit. Only sanitized technical
 error domain/code, attempt time and app build are retained separately from the
 history file and shown in the existing settings screen. Status/cooldown updates
 and restart do not discard the last failure; a successful later snapshot save
 clears it. No health values, paths or error descriptions are stored there.
 Diagnostic persistence is best effort and never replaces the original failure.
-This is diagnostic instrumentation, not a verified fix for the physical phone's
-save failure. Training, model approval, format and limits remain unchanged.
+The diagnostic itself does not change training or model approval. The later
+size correction addresses the demonstrated guard failure; completion on the
+physical phone still requires a new training attempt.
 
 Local correction after 4359 (8 November 2026): cancelling foreground history
 preparation releases only that exact unfinished attempt's persisted retry marker.
@@ -955,7 +974,7 @@ one day before a compatible model becomes seven days old. The snapshot contains
 value types, frozen settings, feature order, reference/target dates and the exact
 examples used by the existing trainer. No Core Data objects cross queues. The
 protected snapshot is stored locally in Application Support, excluded from
-backup, limited to 128 MiB and 200,000 rows, and rejected after 48 hours or when
+backup, limited to 256 MiB and 200,000 rows, and rejected after 48 hours or when
 the latest reference is over 48 hours old. Source context, engine/features,
 app build and time zone must still match. Historical provenance limitations,
 60-day requirements, chronological splits and all approval gates are unchanged.
