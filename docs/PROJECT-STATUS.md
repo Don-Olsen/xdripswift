@@ -28,6 +28,20 @@ callbacks og Watch-bagudkompatibilitet. Releaseproceduren kører den samlede
 XCTest-suite og builds på det endelige checkpoint; de faktiske resultater
 registreres efter kørslen.
 
+Kandidat **4357** blev testet (1.912/1.912 XCTest), tagget, arkiveret og
+eksporteret, men stoppet **før upload** ved slutgennemgangen. En afventende
+Watch-indstillingsændring kunne gentage identiske snooze-poster og dermed
+fejlagtigt afvise svaret på en allerede startet lavalarm. Den afgrænsede
+rettelse sammenligner disse uændrede poster uden dubletter alene ved kontrollen
+af den igangværende lavalarm; ændrede frister, regler og øvrige gyldighedskrav
+bevares. Nye tests bruger den faktiske propose/confirm-overgang. Tag og
+artefakter for 4357 bevares; den rettede kandidat får nyt Apple-valgt nummer
+og en ny komplet testkvittering.
+
+I Simulator blev appikonets Lydløs-handling, synligt udløb og Afslut kontrolleret.
+Lav, Akut lav og Lavt om lidt stod fortsat uden snooze. Dette var en tom
+simulatorinstallation uden brugerens helbredsdata, ikke en fysisk alarmtest.
+
 Læsende `devicectl`-kontrol fandt fysisk iPhone og Watch utilgængelige.
 Der er ikke installeret noget lokalt eller afbrudt nogen sensorforbindelse.
 Faktisk lyd/notifikationslevering, appikontrykket på telefonen og synkronisering

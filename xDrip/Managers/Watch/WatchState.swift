@@ -292,10 +292,13 @@ struct LibreWatchAlarmSettings: Codable, Equatable {
             }
     }
 
-    func sameConfiguration(as other: Self) -> Bool {
+    func sameConfiguration(as other: Self, ignoringDuplicateSnoozes: Bool = false) -> Bool {
         sessionID == other.sessionID && sensorIdentity == other.sensorIdentity &&
             isMgDl == other.isMgDl && rules == other.rules &&
-            snoozes == other.snoozes && snoozeAllUntil == other.snoozeAllUntil &&
+            (snoozes == other.snoozes || (ignoringDuplicateSnoozes &&
+                snoozes.allSatisfy { other.snoozes.contains($0) } &&
+                other.snoozes.allSatisfy { snoozes.contains($0) })) &&
+            snoozeAllUntil == other.snoozeAllUntil &&
             selectiveSilenceUntil == other.selectiveSilenceUntil
     }
 
@@ -303,11 +306,18 @@ struct LibreWatchAlarmSettings: Codable, Equatable {
     /// current authority, rule and reading is still checked by the caller.
     func matchesPendingGlucoseSettings(_ submitted: Self, kind: LibreWatchAlarmKind) -> Bool {
         if self == submitted { return true }
-        guard kind == .low || kind == .veryLow,
-              selectiveSilenceUntil != submitted.selectiveSilenceUntil else { return false }
+        guard kind == .low || kind == .veryLow else { return false }
+        // A pending merge can duplicate unchanged snoozes. Confirming a known
+        // Lydløs pause changes its revision, not the effective low-alarm settings.
+        if (selectiveSilenceUntil != nil ||
+            (revision == submitted.revision && generatedAt == submitted.generatedAt)),
+           sameConfiguration(as: submitted, ignoringDuplicateSnoozes: true) { return true }
+        guard selectiveSilenceUntil != submitted.selectiveSilenceUntil else { return false }
         var withoutSilenceChange = self
         withoutSilenceChange.selectiveSilenceUntil = submitted.selectiveSilenceUntil
-        return withoutSilenceChange.sameConfiguration(as: submitted)
+        // Pending configuration combines both snooze arrays. Ignore only identical
+        // repeated entries here; any new kind or changed expiry still invalidates the reply.
+        return withoutSilenceChange.sameConfiguration(as: submitted, ignoringDuplicateSnoozes: true)
     }
 
     func readinessRevision(notificationsAuthorized: Bool) -> UInt64? {
