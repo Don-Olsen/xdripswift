@@ -33,12 +33,21 @@ manglende målinger og urets egne snoozes bevares. En allerede modtaget pause
 udløber uden telefonkontakt. En telefonhandling kan ikke nå et offline ur,
 før forbindelsen vender tilbage; begge apps skal være opdateret for funktionen.
 
-Indledende Python-kontroller (198 tests samt Watch-værktøjernes 30 + 24
-syntetiske selvkontroller) bestod. Nye regressionstests dækker menu/koldstart,
-gemning og udløb, individuelle snoozes, de beskyttede alarmtyper, forsinkede
-callbacks og Watch-bagudkompatibilitet. Releaseproceduren kører den samlede
-XCTest-suite og builds på det endelige checkpoint; de faktiske resultater
-registreres efter kørslen.
+Apple valgte **4358** til den rettede kandidat. Det præcise checkpoint
+`26875321f61cb12ae7d3882589cca97c8fdcf00b` bestod **1.914/1.914 XCTest**
+uden fejl eller skipped, **198 Python-tests**, Watch-værktøjernes **30 + 24**
+syntetiske selvkontroller, begge simulatorbuilds og unsigned Release
+**iPhoneOS/arm64**. De 23 nye tests dækker menu/koldstart, gemning og udløb,
+individuelle snoozes, beskyttede alarmtyper, forsinkede callbacks og
+Watch-bagudkompatibilitet, inklusive lavalarmer under start/afslutning af en
+afventende indstillingssynkronisering. Resultater og logs ligger i
+`build/testflight-7.1.1-4358/test/`, herunder `results/iphoneos-unsigned.json`.
+
+Tagbygget arkiv og den faktiske IPA bestod kontrol af kildecommit, alle fem
+bundle-ID'er, versioner, signaturer, profiler, entitlements og Watch-indlejring.
+Apple bekræftede **VALID / INTERNAL_ONLY / IN_BETA_TESTING** og den eksisterende
+**Ole Internal**-relation den 8. november 2026. Release-tagget er uændret på
+kildecheckpointet; denne afsluttende dokumentation er en separat commit.
 
 Kandidat **4357** blev testet (1.912/1.912 XCTest), tagget, arkiveret og
 eksporteret, men stoppet **før upload** ved slutgennemgangen. En afventende
@@ -47,12 +56,21 @@ fejlagtigt afvise svaret på en allerede startet lavalarm. Den afgrænsede
 rettelse sammenligner disse uændrede poster uden dubletter alene ved kontrollen
 af den igangværende lavalarm; ændrede frister, regler og øvrige gyldighedskrav
 bevares. Nye tests bruger den faktiske propose/confirm-overgang. Tag og
-artefakter for 4357 bevares; den rettede kandidat får nyt Apple-valgt nummer
-og en ny komplet testkvittering.
+artefakter for 4357 bevares. Den rettede 4358 blev bygget og testet på ny;
+ingen testkvittering fra 4357 blev genbrugt.
 
-I Simulator blev appikonets Lydløs-handling, synligt udløb og Afslut kontrolleret.
+I Simulator blev appikonets Lydløs-handling, synligt udløb og Afslut kontrolleret
+på 4357; denne telefon-UI er uændret i 4358.
 Lav, Akut lav og Lavt om lidt stod fortsat uden snooze. Dette var en tom
 simulatorinstallation uden brugerens helbredsdata, ikke en fysisk alarmtest.
+
+Diskpladskontrollen standsede først arm64-kørslen før Xcode. Kun verificerede,
+uåbnede OS-compiler- og simulator-shadercaches blev ryddet med lokale manifester;
+projektets kilde, shared buildcache og releasebeviser blev bevaret. Derefter
+bestod arm64-kørslen. Den automatiske oprydning efter den bekræftede release
+fjernede **30.909** regenererbare filer med **4.863.361.024** allokerede bytes
+(ca. 4,53 GiB), med rapport i
+`build/release-automation/cleanup/20261108T080430.313628Z/report.json`.
 
 Læsende `devicectl`-kontrol fandt fysisk iPhone og Watch utilgængelige.
 Der er ikke installeret noget lokalt eller afbrudt nogen sensorforbindelse.
