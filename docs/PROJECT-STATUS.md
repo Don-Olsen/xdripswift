@@ -37,6 +37,7 @@ Otte nye regressionstests dækker reelle kodnings-, mappe- og skrivefejl, den
 uændrede 128 MiB-kontrol, privatlivsfiltrering, genstart, manglende lagring af
 diagnosen, adgang uden ventetid på historiklåsen og bevarelse gennem afbrydelse.
 De eksisterende tests bruger isolerede indstillinger til den nye metadata.
+
 Apple valgte **4361**. Det præcise kildecheckpoint
 `f5edccd1e2d00a247db1ce45a3dc76a1cccacf77` / `testflight-7.1.1-4361`
 bestod **1.943/1.943 XCTest**, **0 fejl og 0 skipped**, **198 Python-tests**,
@@ -61,8 +62,8 @@ og aflæs **Seneste gemmefejl**, hvis forsøget stopper. Den tekniske diagnose
 skal afgøre næste rettelse; en størrelsesfejl på telefonen er stadig ikke bevist.
 
 Den automatiske selektive oprydning afsluttede med **30.905**
-slettede. regenererbare filer og **4.884.787.200 bytes**.
-Aktuel og seneste tidligere release samt kilde-. test- og signeringsbeviser
+slettede, regenererbare filer og **4.884.787.200 bytes**.
+Aktuel og seneste tidligere release samt kilde-, test- og signeringsbeviser
 er bevaret. Rapport: `build/release-automation/cleanup/20261108T191859.023930Z/report.json`.
 
 <!-- testflight-7.1.1-4360:start -->
