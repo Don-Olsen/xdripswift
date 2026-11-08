@@ -92,9 +92,25 @@ final class GlucoseForecastMLBackgroundTests: XCTestCase {
             examples: rows ?? examples(at: reference), timeZone: timeZone)
     }
 
+    private func diagnosticDefaults(for directory: URL) -> UserDefaults {
+        UserDefaults(suiteName: "GlucoseForecastMLBackgroundTests." + directory.lastPathComponent)!
+    }
+
+    private func makeStore(directory: URL, snapshotLock: NSLock = NSLock(),
+                           attemptLock: NSLock = NSLock(), diagnosticDefaults: UserDefaults? = nil)
+        -> GlucoseForecastMLPreparedHistoryStore {
+        GlucoseForecastMLPreparedHistoryStore(directory: directory, snapshotLock: snapshotLock,
+            attemptLock: attemptLock, diagnosticDefaults: diagnosticDefaults ?? self.diagnosticDefaults(for: directory))
+    }
+
     private func temporaryStore() -> GlucoseForecastMLPreparedHistoryStore {
-        GlucoseForecastMLPreparedHistoryStore(directory: FileManager.default.temporaryDirectory
-            .appendingPathComponent("forecast-prepared-\(UUID().uuidString)", isDirectory: true))
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("forecast-prepared-\(UUID().uuidString)", isDirectory: true)
+        let defaults = diagnosticDefaults(for: directory)
+        addTeardownBlock {
+            defaults.removePersistentDomain(forName: "GlucoseForecastMLBackgroundTests." + directory.lastPathComponent)
+        }
+        return makeStore(directory: directory, diagnosticDefaults: defaults)
     }
 
     private func recentSnapshot(context: GlucoseForecastMLContext? = nil)
@@ -137,7 +153,7 @@ final class GlucoseForecastMLBackgroundTests: XCTestCase {
             context: original.context, examples: original.examples)
 
         try store.save(original)
-        let restartedStore = GlucoseForecastMLPreparedHistoryStore(directory: store.directory)
+        let restartedStore = self.makeStore(directory: store.directory)
         let recovered = try XCTUnwrap(restartedStore.load(context: context(), at: clock))
         XCTAssertEqual(recovered.id, original.id)
         XCTAssertEqual(recovered.preparedAt, original.preparedAt)
@@ -218,7 +234,7 @@ final class GlucoseForecastMLBackgroundTests: XCTestCase {
         try Data("{\"schemaVersion\":1,\"examples\":[".utf8).write(to: file, options: .atomic)
         XCTAssertNil(store.load(context: context(), at: clock))
         try Data("not-json".utf8).write(to: file, options: .atomic)
-        XCTAssertNil(GlucoseForecastMLPreparedHistoryStore(directory: store.directory)
+        XCTAssertNil(self.makeStore(directory: store.directory)
             .load(context: context(), at: clock))
     }
 
@@ -243,7 +259,7 @@ final class GlucoseForecastMLBackgroundTests: XCTestCase {
         XCTAssertEqual(store.nextAutomaticAttempt(context: source, at: clock), clock)
         try store.recordAttempt(context: source, at: clock, completed: false)
 
-        let restarted = GlucoseForecastMLPreparedHistoryStore(directory: store.directory)
+        let restarted = self.makeStore(directory: store.directory)
         let oneHourLater = clock.addingTimeInterval(3600)
         XCTAssertEqual(restarted.nextAutomaticAttempt(context: source, at: oneHourLater),
                        clock.addingTimeInterval(24 * 3600))
@@ -251,7 +267,7 @@ final class GlucoseForecastMLBackgroundTests: XCTestCase {
         XCTAssertEqual(restarted.nextAutomaticAttempt(context: source, at: afterRetry), afterRetry)
 
         try restarted.recordAttempt(context: source, at: afterRetry, completed: true)
-        let completedRestart = GlucoseForecastMLPreparedHistoryStore(directory: store.directory)
+        let completedRestart = self.makeStore(directory: store.directory)
         XCTAssertEqual(completedRestart.nextAutomaticAttempt(
             context: source, at: afterRetry.addingTimeInterval(3600)),
             afterRetry.addingTimeInterval(GlucoseForecastMLChronology.modelAgeLimit))
@@ -273,7 +289,7 @@ final class GlucoseForecastMLBackgroundTests: XCTestCase {
         requested.expectedFulfillmentCount = 3
         let acquired = expectation(description: "replacement holds the history lock")
         let snapshotLock = GatedLock(requested: requested, acquired: acquired)
-        let store = GlucoseForecastMLPreparedHistoryStore(directory: initialStore.directory,
+        let store = self.makeStore(directory: initialStore.directory,
                                                           snapshotLock: snapshotLock)
         let finished = expectation(description: "all file operations finish after release")
         finished.expectedFulfillmentCount = 4
@@ -309,7 +325,7 @@ final class GlucoseForecastMLBackgroundTests: XCTestCase {
                 XCTAssertEqual(store.nextPreparationDate(context: source, at: now),
                                now.addingTimeInterval(24 * 3600))
                 try store.recordAttempt(context: source, at: now, completed: true)
-                let restarted = GlucoseForecastMLPreparedHistoryStore(directory: store.directory)
+                let restarted = self.makeStore(directory: store.directory)
                 XCTAssertEqual(restarted.nextAutomaticAttempt(context: source, at: now),
                                now.addingTimeInterval(GlucoseForecastMLChronology.modelAgeLimit))
                 XCTAssertEqual(restarted.nextPreparationDate(context: source, at: now),
@@ -338,7 +354,7 @@ final class GlucoseForecastMLBackgroundTests: XCTestCase {
         requested.expectedFulfillmentCount = 3
         let acquired = expectation(description: "completed attempt holds its file lock")
         let attemptLock = GatedLock(requested: requested, acquired: acquired)
-        let store = GlucoseForecastMLPreparedHistoryStore(directory: initialStore.directory,
+        let store = self.makeStore(directory: initialStore.directory,
                                                           attemptLock: attemptLock)
         let finished = expectation(description: "cooldown operations finish after release")
         finished.expectedFulfillmentCount = 3
@@ -576,7 +592,7 @@ extension GlucoseForecastMLBackgroundTests {
             context: source, force: false, at: reopenedAt))
         coordinator.finishPreparation("retry eligibility checked", cancellation: retry)
 
-        let restartedStore = GlucoseForecastMLPreparedHistoryStore(directory: store.directory)
+        let restartedStore = self.makeStore(directory: store.directory)
         XCTAssertEqual(restartedStore.nextAutomaticAttempt(context: source, at: reopenedAt), reopenedAt)
         let restartedCoordinator = GlucoseForecastMLTrainingCoordinator(
             preparedStore: restartedStore, observeLifecycle: false)
@@ -631,7 +647,7 @@ extension GlucoseForecastMLBackgroundTests {
             context: source, at: attemptAt, cancellation: cancellation),
             "A cancelled claim cannot overwrite the durable attempt marker")
         coordinator.finishPreparation("cancelled before reading", cancellation: cancellation)
-        let restarted = GlucoseForecastMLPreparedHistoryStore(directory: store.directory)
+        let restarted = self.makeStore(directory: store.directory)
         XCTAssertEqual(restarted.nextPreparationDate(context: source, at: attemptAt),
                        clock.addingTimeInterval(24 * 3600),
             "Cancellation owns no marker here and cannot erase the earlier failure")
@@ -650,7 +666,7 @@ extension GlucoseForecastMLBackgroundTests {
         coordinator.finishPreparation("insufficient usable history", cancellation: cancellation)
         coordinator.cancelForBackground()
         let reopenedAt = clock.addingTimeInterval(60)
-        let restarted = GlucoseForecastMLPreparedHistoryStore(directory: store.directory)
+        let restarted = self.makeStore(directory: store.directory)
         XCTAssertEqual(restarted.nextPreparationDate(context: source, at: reopenedAt),
                        clock.addingTimeInterval(24 * 3600))
         XCTAssertEqual(restarted.nextAutomaticAttempt(context: source, at: reopenedAt),
@@ -672,7 +688,7 @@ extension GlucoseForecastMLBackgroundTests {
         coordinator.cancelForBackground()
         coordinator.finishPreparation("historical read failed", cancellation: cancellation)
         let reopenedAt = clock.addingTimeInterval(60)
-        let restarted = GlucoseForecastMLPreparedHistoryStore(directory: store.directory)
+        let restarted = self.makeStore(directory: store.directory)
         XCTAssertEqual(restarted.nextPreparationDate(context: source, at: reopenedAt),
                        clock.addingTimeInterval(24 * 3600),
             "Backgrounding after a real read failure must not turn it into a free retry")
@@ -730,7 +746,7 @@ extension GlucoseForecastMLBackgroundTests {
         XCTAssertEqual(store.nextPreparationDate(context: other, at: newerDate),
                        clock.addingTimeInterval(24 * 3600))
         try store.removeInterruptedAttempt(context: other, at: clock)
-        let restarted = GlucoseForecastMLPreparedHistoryStore(directory: store.directory)
+        let restarted = self.makeStore(directory: store.directory)
         XCTAssertEqual(restarted.nextPreparationDate(context: other, at: newerDate), newerDate)
         // Repeated completion of the same interrupted run is harmless.
         try restarted.removeInterruptedAttempt(context: other, at: clock)
@@ -761,7 +777,7 @@ extension GlucoseForecastMLBackgroundTests {
         XCTAssertFalse(FileManager.default.fileExists(atPath:
             store.directory.appendingPathComponent("automatic-attempt.json").path),
             "Reusing prepared history must not become a durable failed attempt")
-        let restarted = GlucoseForecastMLPreparedHistoryStore(directory: store.directory)
+        let restarted = self.makeStore(directory: store.directory)
         XCTAssertEqual(restarted.nextPreparationDate(context: source, at: clock), clock)
         XCTAssertEqual(restarted.load(context: source, at: clock)?.id, prepared.id)
         let next = try XCTUnwrap(coordinator.beginPreparation(
@@ -786,11 +802,201 @@ extension GlucoseForecastMLBackgroundTests {
         coordinator.finishPreparation("prepared history could not be saved",
             cancellation: cancellation, failed: true)
         let reopenedAt = clock.addingTimeInterval(60)
-        let restarted = GlucoseForecastMLPreparedHistoryStore(directory: store.directory)
+        let restarted = self.makeStore(directory: store.directory)
         XCTAssertEqual(restarted.nextPreparationDate(context: source, at: reopenedAt),
                        clock.addingTimeInterval(24 * 3600))
         XCTAssertEqual(restarted.nextAutomaticAttempt(context: source, at: reopenedAt),
                        clock.addingTimeInterval(24 * 3600))
         XCTAssertFalse(coordinator.isPreparing)
+    }
+}
+
+
+extension GlucoseForecastMLBackgroundTests {
+    private final class DiscardingDiagnosticDefaults: UserDefaults, @unchecked Sendable {
+        override func set(_ value: Any?, forKey defaultName: String) {}
+        override func removeObject(forKey defaultName: String) {}
+    }
+
+    private func saveFailure(_ snapshot: GlucoseForecastMLPreparedHistory,
+                             store: GlucoseForecastMLPreparedHistoryStore,
+                             file: StaticString = #filePath, line: UInt = #line) throws
+        -> GlucoseForecastMLPreparedHistoryStore.SaveFailure {
+        var failure: GlucoseForecastMLPreparedHistoryStore.SaveFailure?
+        XCTAssertThrowsError(try store.save(snapshot), file: file, line: line) {
+            failure = $0 as? GlucoseForecastMLPreparedHistoryStore.SaveFailure
+        }
+        return try XCTUnwrap(failure, file: file, line: line)
+    }
+
+    func testPreparedSaveEncodingFailurePreservesSnapshotAndReloadsSafeDiagnostic() throws {
+        let store = temporaryStore()
+        defer { try? FileManager.default.removeItem(at: store.directory) }
+        let previous = snapshot()
+        try store.save(previous)
+        let invalid = snapshot(examples: examples(at: clock.addingTimeInterval(-3 * 3600),
+                                                  featureValue: .nan))
+        let before = Date()
+        let failure = try saveFailure(invalid, store: store)
+        let diagnostic = failure.diagnostic
+        XCTAssertEqual(diagnostic.stage, .encoding)
+        XCTAssertNil(diagnostic.encodedBytes)
+        XCTAssertEqual(diagnostic.maximumBytes, 128 * 1024 * 1024)
+        XCTAssertGreaterThanOrEqual(diagnostic.occurredAt, before)
+        XCTAssertLessThanOrEqual(diagnostic.occurredAt, Date())
+        XCTAssertEqual(store.load(context: context(), at: clock)?.id, previous.id)
+        let restarted = makeStore(directory: store.directory)
+        XCTAssertEqual(restarted.latestSaveDiagnostic(), diagnostic)
+        XCTAssertTrue(diagnostic.summaryText.contains("Seneste gemmefejl:"))
+        XCTAssertTrue(diagnostic.summaryText.contains("build "))
+        XCTAssertTrue(diagnostic.summaryText.contains("kodning"))
+        XCTAssertTrue(diagnostic.summaryText.contains("134217728 bytes"))
+    }
+
+    func testPreparedSaveSizeFailureMeasuresTheActualUnchangedProductionLimit() throws {
+        let store = temporaryStore()
+        defer { try? FileManager.default.removeItem(at: store.directory) }
+        // A synthetic context string reaches the real byte guard without creating
+        // hundreds of thousands of replay rows or changing the production limit.
+        let oversized = snapshot(context: context(source: String(repeating: "x", count: 128 * 1024 * 1024)))
+        let failure = try saveFailure(oversized, store: store)
+        let diagnostic = failure.diagnostic
+        XCTAssertEqual(diagnostic.stage, .sizeCheck)
+        XCTAssertGreaterThan(try XCTUnwrap(diagnostic.encodedBytes), 128 * 1024 * 1024)
+        XCTAssertEqual(diagnostic.maximumBytes, 128 * 1024 * 1024)
+        XCTAssertNil(diagnostic.errorDomain)
+        XCTAssertNil(diagnostic.errorCode)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: store.directory.appendingPathComponent("history.json").path))
+        let data = try XCTUnwrap(diagnosticDefaults(for: store.directory)
+            .data(forKey: GlucoseForecastMLPreparedHistoryStore.diagnosticDefaultsKey))
+        XCTAssertLessThan(data.count, 1024)
+        XCTAssertEqual(makeStore(directory: store.directory).latestSaveDiagnostic(), diagnostic)
+    }
+
+    func testPreparedSaveDirectoryFailureKeepsTechnicalDomainAndAttemptBehavior() throws {
+        let store = temporaryStore()
+        defer { try? FileManager.default.removeItem(at: store.directory) }
+        try Data("synthetic directory obstruction".utf8).write(to: store.directory)
+        let failure = try saveFailure(snapshot(), store: store)
+        XCTAssertEqual(failure.diagnostic.stage, .directory)
+        XCTAssertNil(failure.diagnostic.encodedBytes)
+        XCTAssertEqual(failure.diagnostic.errorDomain, .cocoa)
+        XCTAssertNotNil(failure.diagnostic.errorCode)
+        XCTAssertEqual(makeStore(directory: store.directory).latestSaveDiagnostic(), failure.diagnostic)
+        XCTAssertThrowsError(try store.recordAttempt(context: context(), at: clock, completed: false)) {
+            XCTAssertFalse($0 is GlucoseForecastMLPreparedHistoryStore.SaveFailure,
+                           "Automatic-attempt writes retain their existing error behavior")
+        }
+        XCTAssertEqual(store.latestSaveDiagnostic(), failure.diagnostic)
+    }
+
+    func testPreparedSaveAtomicWriteFailureReportsEncodedSizeWithoutReplacingDestination() throws {
+        let store = temporaryStore()
+        defer { try? FileManager.default.removeItem(at: store.directory) }
+        let destination = store.directory.appendingPathComponent("history.json", isDirectory: true)
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        let marker = destination.appendingPathComponent("synthetic-marker")
+        try Data("preserve".utf8).write(to: marker)
+        let failure = try saveFailure(snapshot(), store: store)
+        XCTAssertEqual(failure.diagnostic.stage, .writing)
+        XCTAssertGreaterThan(try XCTUnwrap(failure.diagnostic.encodedBytes), 0)
+        XCTAssertEqual(failure.diagnostic.errorDomain, .cocoa)
+        XCTAssertNotNil(failure.diagnostic.errorCode)
+        XCTAssertEqual(try Data(contentsOf: marker), Data("preserve".utf8))
+    }
+
+    func testPreparedSaveDiagnosticExcludesPrivateErrorsAndRejectsInvalidStoredMetadata() throws {
+        let store = temporaryStore()
+        let defaults = diagnosticDefaults(for: store.directory)
+        let privateError = NSError(domain: "private-source-identifier", code: 321,
+            userInfo: [NSLocalizedDescriptionKey: "private health value",
+                       NSFilePathErrorKey: "/private/patient/file",
+                       NSUnderlyingErrorKey: NSError(domain: "private-underlying", code: 7)])
+        let diagnostic = GlucoseForecastMLPreparedHistoryStore.SaveDiagnostic(
+            stage: .backupExclusion, encodedBytes: 1234, error: privateError, occurredAt: clock)
+        XCTAssertEqual(diagnostic.errorDomain, .other)
+        XCTAssertEqual(diagnostic.errorCode, 321)
+        let data = try JSONEncoder().encode(diagnostic)
+        let text = try XCTUnwrap(String(data: data, encoding: .utf8))
+        XCTAssertFalse(text.contains("private"))
+        XCTAssertFalse(diagnostic.summaryText.contains("private"))
+        XCTAssertTrue(diagnostic.summaryText.contains("udelukkelse fra sikkerhedskopi"))
+        let key = GlucoseForecastMLPreparedHistoryStore.diagnosticDefaultsKey
+        for invalid in [Data("not-json".utf8), Data(repeating: 32, count: 16 * 1024 + 1)] {
+            defaults.set(invalid, forKey: key)
+            XCTAssertNil(makeStore(directory: store.directory).latestSaveDiagnostic())
+        }
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        object["schemaVersion"] = 99
+        defaults.set(try JSONSerialization.data(withJSONObject: object), forKey: key)
+        XCTAssertNil(makeStore(directory: store.directory).latestSaveDiagnostic())
+        object["schemaVersion"] = 1
+        object["appBuild"] = "private untrusted text"
+        defaults.set(try JSONSerialization.data(withJSONObject: object), forKey: key)
+        XCTAssertNil(makeStore(directory: store.directory).latestSaveDiagnostic())
+    }
+
+    func testPreparedSaveDiagnosticPersistenceFailureDoesNotMaskStorageFailureOrSuccess() throws {
+        let initial = temporaryStore()
+        defer { try? FileManager.default.removeItem(at: initial.directory) }
+        let defaults = try XCTUnwrap(DiscardingDiagnosticDefaults(suiteName:
+            "GlucoseForecastMLBackgroundTests." + initial.directory.lastPathComponent))
+        let store = makeStore(directory: initial.directory, diagnosticDefaults: defaults)
+        let invalid = snapshot(examples: examples(at: clock.addingTimeInterval(-3 * 3600),
+                                                  featureValue: .nan))
+        let failure = try saveFailure(invalid, store: store)
+        XCTAssertEqual(failure.diagnostic.stage, .encoding)
+        XCTAssertEqual(store.latestSaveDiagnostic(), failure.diagnostic)
+        XCTAssertNil(makeStore(directory: initial.directory, diagnosticDefaults: defaults).latestSaveDiagnostic())
+        let valid = snapshot()
+        XCTAssertNoThrow(try store.save(valid))
+        XCTAssertEqual(store.load(context: context(), at: clock)?.id, valid.id)
+        XCTAssertNil(store.latestSaveDiagnostic())
+    }
+
+    func testPreparedSaveDiagnosticReadsDoNotWaitForSnapshotLock() throws {
+        let initial = temporaryStore()
+        defer { try? FileManager.default.removeItem(at: initial.directory) }
+        let failure = try saveFailure(snapshot(examples: examples(at: clock.addingTimeInterval(-3 * 3600),
+                                                                 featureValue: .nan)), store: initial)
+        let requested = expectation(description: "save requests snapshot lock")
+        let acquired = expectation(description: "save holds snapshot lock")
+        let snapshotLock = GatedLock(requested: requested, acquired: acquired)
+        let store = makeStore(directory: initial.directory, snapshotLock: snapshotLock)
+        let saved = expectation(description: "save completes")
+        let read = expectation(description: "diagnostic reads independently")
+        let valid = snapshot()
+        defer { snapshotLock.resume() }
+        DispatchQueue.global().async {
+            do { try store.save(valid) } catch { XCTFail("Synthetic snapshot save failed") }
+            saved.fulfill()
+        }
+        wait(for: [requested, acquired], timeout: 2)
+        DispatchQueue.global().async {
+            XCTAssertEqual(store.latestSaveDiagnostic(), failure.diagnostic)
+            read.fulfill()
+        }
+        wait(for: [read], timeout: 2)
+        snapshotLock.resume()
+        wait(for: [saved], timeout: 5)
+    }
+
+    func testPreparedSaveDiagnosticSurvivesPreparationLifecycleAndClearsAfterSuccessfulSave() throws {
+        let store = temporaryStore()
+        defer { try? FileManager.default.removeItem(at: store.directory) }
+        let failure = try saveFailure(snapshot(examples: examples(at: clock.addingTimeInterval(-3 * 3600),
+                                                                 featureValue: .nan)), store: store)
+        let coordinator = GlucoseForecastMLTrainingCoordinator(preparedStore: store, observeLifecycle: false)
+        XCTAssertEqual(coordinator.saveDiagnosticText, failure.diagnostic.summaryText)
+        let token = try XCTUnwrap(coordinator.beginPreparation(context: context(), force: true, at: clock))
+        XCTAssertEqual(coordinator.saveDiagnosticText, failure.diagnostic.summaryText)
+        coordinator.cancelForBackground()
+        coordinator.finishPreparation("synthetic interrupted attempt", cancellation: token)
+        XCTAssertEqual(coordinator.saveDiagnosticText, failure.diagnostic.summaryText)
+        try store.save(snapshot())
+        XCTAssertEqual(coordinator.saveDiagnosticText, "")
+        XCTAssertNil(makeStore(directory: store.directory).latestSaveDiagnostic())
+        XCTAssertNil(diagnosticDefaults(for: store.directory)
+            .data(forKey: GlucoseForecastMLPreparedHistoryStore.diagnosticDefaultsKey))
     }
 }

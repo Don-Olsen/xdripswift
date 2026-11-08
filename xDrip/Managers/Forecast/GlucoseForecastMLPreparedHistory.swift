@@ -96,6 +96,100 @@ enum GlucoseForecastMLTrainingFingerprint {
 }
 
 final class GlucoseForecastMLPreparedHistoryStore: @unchecked Sendable {
+    static let maximumEncodedBytes = 128 * 1024 * 1024
+    static let diagnosticDefaultsKey = "GlucoseForecastMLPreparedHistory.latestSaveDiagnostic.v1"
+    private static let maximumDiagnosticBytes = 16 * 1024
+
+    enum SaveStage: String, Codable, Sendable {
+        case directory, encoding, sizeCheck, writing, backupExclusion
+
+        fileprivate var displayName: String {
+            switch self {
+            case .directory: return "klargøring af mappe"
+            case .encoding: return "kodning"
+            case .sizeCheck: return "størrelseskontrol"
+            case .writing: return "skrivning"
+            case .backupExclusion: return "udelukkelse fra sikkerhedskopi"
+            }
+        }
+    }
+
+    enum SaveErrorDomain: String, Codable, Sendable {
+        case cocoa = "NSCocoaErrorDomain"
+        case posix = "NSPOSIXErrorDomain"
+        case osStatus = "NSOSStatusErrorDomain"
+        case mach = "NSMachErrorDomain"
+        case other
+    }
+
+    /// Technical metadata only. Never retain the Error, userInfo, description,
+    /// source identity, file path or any part of the training rows.
+    struct SaveDiagnostic: Codable, Equatable, Sendable {
+        let schemaVersion: Int
+        let occurredAt: Date
+        let appBuild: String
+        let stage: SaveStage
+        let encodedBytes: Int?
+        let maximumBytes: Int
+        let errorDomain: SaveErrorDomain?
+        let errorCode: Int?
+
+        init(stage: SaveStage, encodedBytes: Int?, error: Error,
+             occurredAt: Date = .now) {
+            schemaVersion = 1
+            self.occurredAt = occurredAt
+            let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String
+            appBuild = build.flatMap { Self.isValidBuild($0) ? $0 : nil } ?? "unknown"
+            self.stage = stage
+            self.encodedBytes = encodedBytes
+            maximumBytes = GlucoseForecastMLPreparedHistoryStore.maximumEncodedBytes
+            if stage == .sizeCheck, let failure = error as? GlucoseForecastMLTrainingFailure,
+               failure == .io {
+                errorDomain = nil
+                errorCode = nil
+            } else {
+                let details = error as NSError
+                errorDomain = SaveErrorDomain(rawValue: details.domain) ?? .other
+                errorCode = details.code
+            }
+        }
+
+        fileprivate var isValid: Bool {
+            schemaVersion == 1 && occurredAt.timeIntervalSinceReferenceDate.isFinite
+                && Self.isValidBuild(appBuild)
+                && maximumBytes == GlucoseForecastMLPreparedHistoryStore.maximumEncodedBytes
+                && (encodedBytes.map { $0 >= 0 } ?? true)
+        }
+
+        private static func isValidBuild(_ build: String) -> Bool {
+            build == "unknown" || (!build.isEmpty && build.count <= 32
+                && build.utf8.allSatisfy { (48...57).contains($0) || $0 == 46 })
+        }
+
+        var summaryText: String {
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "da_DK")
+            formatter.dateStyle = .short
+            formatter.timeStyle = .medium
+            var lines = ["Seneste gemmefejl: \(formatter.string(from: occurredAt)) · build \(appBuild)",
+                         "Trin: \(stage.displayName)."]
+            if let encodedBytes {
+                lines.append("Kodet størrelse: \(encodedBytes) bytes. Grænse: \(maximumBytes) bytes (128 MiB).")
+            } else {
+                lines.append("Kodet størrelse endnu ikke kendt. Grænse: \(maximumBytes) bytes (128 MiB).")
+            }
+            if let errorDomain, let errorCode {
+                let domain = errorDomain == .other ? "andet fejldomæne" : errorDomain.rawValue
+                lines.append("Teknisk fejl: \(domain), kode \(errorCode).")
+            }
+            return lines.joined(separator: "\n")
+        }
+    }
+
+    struct SaveFailure: Error, Sendable {
+        let diagnostic: SaveDiagnostic
+    }
+
     struct AutomaticAttempt: Codable {
         let context: GlucoseForecastMLContext
         let attemptedAt: Date
@@ -105,22 +199,69 @@ final class GlucoseForecastMLPreparedHistoryStore: @unchecked Sendable {
     // checks wait for history encoding, decoding or validation.
     private let snapshotLock: NSLock
     private let attemptLock: NSLock
+    private let diagnosticLock = NSLock()
+    private let diagnosticDefaults: UserDefaults
+    private var cachedSaveDiagnostic: SaveDiagnostic?
     let directory: URL
     init(directory: URL = FileManager.default.urls(for: .applicationSupportDirectory,
                                                    in: .userDomainMask)[0]
         .appendingPathComponent("GlucoseForecastML/prepared", isDirectory: true),
-         snapshotLock: NSLock = NSLock(), attemptLock: NSLock = NSLock()) {
+         snapshotLock: NSLock = NSLock(), attemptLock: NSLock = NSLock(),
+         diagnosticDefaults: UserDefaults = .standard) {
         self.directory = directory
         self.snapshotLock = snapshotLock
         self.attemptLock = attemptLock
+        self.diagnosticDefaults = diagnosticDefaults
+        if let data = diagnosticDefaults.data(forKey: Self.diagnosticDefaultsKey),
+           data.count <= Self.maximumDiagnosticBytes,
+           let diagnostic = try? JSONDecoder().decode(SaveDiagnostic.self, from: data),
+           diagnostic.isValid {
+            cachedSaveDiagnostic = diagnostic
+        }
     }
     private var snapshotURL: URL { directory.appendingPathComponent("history.json") }
     private var attemptURL: URL { directory.appendingPathComponent("automatic-attempt.json") }
 
     func save(_ snapshot: GlucoseForecastMLPreparedHistory) throws {
         snapshotLock.lock(); defer { snapshotLock.unlock() }
-        try write(snapshot, to: snapshotURL)
+        var stage = SaveStage.directory
+        var encodedBytes: Int?
+        do {
+            try write(snapshot, to: snapshotURL) { currentStage, size in
+                stage = currentStage
+                encodedBytes = size
+            }
+            publishSaveDiagnostic(nil)
+        } catch {
+            // Keep cancellation's existing meaning for the coordinator.
+            if error is CancellationError { throw error }
+            let diagnostic = SaveDiagnostic(stage: stage, encodedBytes: encodedBytes, error: error)
+            publishSaveDiagnostic(diagnostic)
+            throw SaveFailure(diagnostic: diagnostic)
+        }
     }
+
+    /// UI access never waits for history encoding, decoding or the snapshot lock.
+    func latestSaveDiagnostic() -> SaveDiagnostic? {
+        diagnosticLock.lock(); defer { diagnosticLock.unlock() }
+        return cachedSaveDiagnostic
+    }
+
+    private func publishSaveDiagnostic(_ diagnostic: SaveDiagnostic?) {
+        diagnosticLock.lock()
+        cachedSaveDiagnostic = diagnostic
+        diagnosticLock.unlock()
+        // Best-effort metadata persistence cannot turn a successful save into a
+        // failure, or replace the actual storage error. No forced synchronization.
+        if let diagnostic {
+            if let data = try? JSONEncoder().encode(diagnostic), data.count <= Self.maximumDiagnosticBytes {
+                diagnosticDefaults.set(data, forKey: Self.diagnosticDefaultsKey)
+            }
+        } else {
+            diagnosticDefaults.removeObject(forKey: Self.diagnosticDefaultsKey)
+        }
+    }
+
     func load(context: GlucoseForecastMLContext, at now: Date) -> GlucoseForecastMLPreparedHistory? {
         snapshotLock.lock(); defer { snapshotLock.unlock() }
         guard let snapshot: GlucoseForecastMLPreparedHistory = read(snapshotURL),
@@ -165,21 +306,27 @@ final class GlucoseForecastMLPreparedHistoryStore: @unchecked Sendable {
 
     private func read<T: Decodable>(_ url: URL) -> T? {
         guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
-              let size = attributes[.size] as? NSNumber, size.intValue <= 128 * 1024 * 1024,
+              let size = attributes[.size] as? NSNumber, size.intValue <= Self.maximumEncodedBytes,
               let data = try? Data(contentsOf: url) else { return nil }
         return try? JSONDecoder().decode(T.self, from: data)
     }
-    private func write<T: Encodable>(_ value: T, to url: URL) throws {
+    private func write<T: Encodable>(_ value: T, to url: URL,
+                                      stage: ((SaveStage, Int?) -> Void)? = nil) throws {
+        stage?(.directory, nil)
         try GlucoseForecastMLStoragePolicy.secureDirectory(directory)
+        stage?(.encoding, nil)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         let data = try encoder.encode(value)
-        guard data.count <= 128 * 1024 * 1024 else { throw GlucoseForecastMLTrainingFailure.io }
+        stage?(.sizeCheck, data.count)
+        guard data.count <= Self.maximumEncodedBytes else { throw GlucoseForecastMLTrainingFailure.io }
+        stage?(.writing, data.count)
         #if os(iOS)
         try data.write(to: url, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
         #else
         try data.write(to: url, options: .atomic)
         #endif
+        stage?(.backupExclusion, data.count)
         var protectedURL = url
         var resources = URLResourceValues()
         resources.isExcludedFromBackup = true

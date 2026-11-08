@@ -917,6 +917,17 @@ tested. No upload or installation on a physical device was performed.
 
 ## Automatic background ML training after 4311
 
+Prepared-history save diagnostics after 4360 retain the exact failed stage
+(directory setup, encoding, byte-limit check, atomic write or backup exclusion),
+known encoded bytes and the unchanged 128 MiB limit. Only sanitized technical
+error domain/code, attempt time and app build are retained separately from the
+history file and shown in the existing settings screen. Status/cooldown updates
+and restart do not discard the last failure; a successful later snapshot save
+clears it. No health values, paths or error descriptions are stored there.
+Diagnostic persistence is best effort and never replaces the original failure.
+This is diagnostic instrumentation, not a verified fix for the physical phone's
+save failure. Training, model approval, format and limits remain unchanged.
+
 Local correction after 4359 (8 November 2026): cancelling foreground history
 preparation releases only that exact unfinished attempt's persisted retry marker.
 A real read, coverage, validation or storage failure keeps its existing cooldown,

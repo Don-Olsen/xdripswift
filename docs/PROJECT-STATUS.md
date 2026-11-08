@@ -1,3 +1,32 @@
+## Præcis diagnose af ML-grundlagets gemmefejl — 8. november 2026
+
+Efter udgivelsen af 4360 blev den tilsluttede iPhone undersøgt læsende.
+Installeret version **7.1.1 (4360)** blev verificeret. Brugeren gentog **Træn nu**
+og rapporterede “Træningsgrundlaget kunne ikke gemmes”. Der fandtes derefter
+intet færdigt `history.json` og ingen træningssession; den eksisterende aktive
+model var bevaret. Appens eksisterende traces, fejlfinding og forsøgsmarkør
+indeholdt ikke den præcise gemmefejl. Ingen lokal installation blev foretaget.
+Private telefonfiler og syntetiske undersøgelsesfiler ligger uden for Git.
+
+Den hidtidige catch kasserede fejlen. Den afgrænsede ændring registrerer nu
+fejltrin, kendt kodet byteantal, den uændrede størrelsesgrænse samt sanitiseret
+fejldomæne/-kode. En lille lokal diagnose bevares uafhængigt af historikfilen og
+vises med forsøgstid og build på den eksisterende ML-side. En efterfølgende
+vellykket gemning fjerner den tidligere diagnose. Der gemmes ingen målinger,
+doser, noter, filstier eller rå fejlbeskrivelser i diagnosen.
+
+En syntetisk reproduktion viste, at gyldige årsdata kan overstige den nuværende
+128 MiB-grænse. Det er **ikke** bevis for telefonens konkrete fejl, og denne
+udgivelse ændrer hverken grænsen, historikformatet, træningen eller den aktive
+model. Den skal gøre næste fysiske forsøg diagnostisk entydigt; gemmeproblemet
+på telefonen er endnu ikke dokumenteret løst.
+
+Otte nye regressionstests dækker reelle kodnings-, mappe- og skrivefejl, den
+uændrede 128 MiB-kontrol, privatlivsfiltrering, genstart, manglende lagring af
+diagnosen, adgang uden ventetid på historiklåsen og bevarelse gennem afbrydelse.
+De eksisterende tests bruger isolerede indstillinger til den nye metadata.
+Validering og Apple-status tilføjes efter de faktiske releasekontroller.
+
 <!-- testflight-7.1.1-4360:start -->
 ### TestFlight 7.1.1 (4360)
 

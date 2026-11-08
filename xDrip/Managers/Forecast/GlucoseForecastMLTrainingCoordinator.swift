@@ -95,6 +95,11 @@ final class GlucoseForecastMLTrainingCoordinator: @unchecked Sendable {
         return preparationStatus
     }
 
+    /// The last actual save failure survives status refreshes and app restart.
+    var saveDiagnosticText: String {
+        preparedStore.latestSaveDiagnostic()?.summaryText ?? ""
+    }
+
     var isPreparing: Bool {
         lock.lock()
         defer { lock.unlock() }

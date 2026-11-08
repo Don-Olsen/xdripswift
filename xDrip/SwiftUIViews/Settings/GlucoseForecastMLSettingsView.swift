@@ -88,6 +88,7 @@ struct GlucoseForecastMLSettingsView: View {
     @State private var metadata = GlucoseForecastMLManager.shared.activeModelMetadata
     @State private var preparationStatus = GlucoseForecastMLTrainingCoordinator.shared.statusText
     @State private var coverageText = GlucoseForecastMLTrainingCoordinator.shared.coverageText
+    @State private var saveDiagnosticText = GlucoseForecastMLTrainingCoordinator.shared.saveDiagnosticText
     @State private var isPreparing = GlucoseForecastMLTrainingCoordinator.shared.isPreparing
     @State private var currentContext: GlucoseForecastMLContext?
     @State private var compatibility: GlucoseForecastMLModelCompatibility.Assessment =
@@ -157,6 +158,12 @@ struct GlucoseForecastMLSettingsView: View {
                     status.lastOutcome, report: status.lastSelfCheck,
                     issue: status.lastIssue, localize: t) {
                     Text(outcome).foregroundStyle(.secondary)
+                }
+                if !saveDiagnosticText.isEmpty {
+                    Text(saveDiagnosticText)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
                 }
                 if !coverageText.isEmpty {
                     Text(coverageText)
@@ -245,6 +252,7 @@ struct GlucoseForecastMLSettingsView: View {
         selfCheckCSVURL = GlucoseForecastMLManager.shared.selfCheckCSVURL
         preparationStatus = GlucoseForecastMLTrainingCoordinator.shared.statusText
         coverageText = GlucoseForecastMLTrainingCoordinator.shared.coverageText
+        saveDiagnosticText = GlucoseForecastMLTrainingCoordinator.shared.saveDiagnosticText
         isPreparing = GlucoseForecastMLTrainingCoordinator.shared.isPreparing
         let defaults = UserDefaults.standard
         if let sensitivity = defaults.glucoseForecastManualSensitivityMgdlPerUnit,
