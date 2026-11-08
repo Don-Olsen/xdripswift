@@ -37,7 +37,33 @@ Otte nye regressionstests dækker reelle kodnings-, mappe- og skrivefejl, den
 uændrede 128 MiB-kontrol, privatlivsfiltrering, genstart, manglende lagring af
 diagnosen, adgang uden ventetid på historiklåsen og bevarelse gennem afbrydelse.
 De eksisterende tests bruger isolerede indstillinger til den nye metadata.
-Validering og Apple-status tilføjes efter de faktiske releasekontroller.
+Apple valgte **4361**. Det præcise kildecheckpoint
+`f5edccd1e2d00a247db1ce45a3dc76a1cccacf77` / `testflight-7.1.1-4361`
+bestod **1.943/1.943 XCTest**, **0 fejl og 0 skipped**, **198 Python-tests**,
+Watch-værktøjernes **30 + 24** syntetiske kontroller samt begge simulatorbuilds.
+Unsigned Release **iPhoneOS/arm64** bestod med verificeret kilde-ID, version
+og buildnummer. Kvitteringer ligger under `build/testflight-7.1.1-4361/test/`,
+inklusive `results/iphoneos-unsigned.json`.
+
+Arkivet blev bygget fra det uændrede release-tag. Den faktiske eksporterede IPA
+blev genlæst og kontrolleret for hash, fem bundle-ID'er, versioner, signaturer,
+profiler, entitlements og Watch-indlejring. Apple bekræftede **VALID /
+INTERNAL_ONLY / IN_BETA_TESTING**, og den eksisterende **Ole Internal**-gruppe
+er verificeret tilknyttet build-ID `7aaeb07c-5b30-48e7-9cf8-961ae7bfbef7`.
+Release-tagget forbliver på det testede kildecheckpoint; denne dokumentation
+committes særskilt efter udgivelsen.
+
+Diagnosens indhold og livscyklus er kontrolleret automatisk. Manuel kontrol af
+den nye tekst på en skærm og et nyt gemmeforsøg på fysisk iPhone med **4361**
+er endnu ikke udført. Der er ikke installeret en lokal udviklingsbuild, og
+CGM-forbindelsen er ikke afbrudt. Efter TestFlight-opdateringen: vælg **Træn nu**,
+og aflæs **Seneste gemmefejl**, hvis forsøget stopper. Den tekniske diagnose
+skal afgøre næste rettelse; en størrelsesfejl på telefonen er stadig ikke bevist.
+
+Den automatiske selektive oprydning afsluttede med **30.905**
+slettede. regenererbare filer og **4.884.787.200 bytes**.
+Aktuel og seneste tidligere release samt kilde-. test- og signeringsbeviser
+er bevaret. Rapport: `build/release-automation/cleanup/20261108T191859.023930Z/report.json`.
 
 <!-- testflight-7.1.1-4360:start -->
 ### TestFlight 7.1.1 (4360)
