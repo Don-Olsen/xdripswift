@@ -1,3 +1,15 @@
+<!-- testflight-7.1.1-4361:start -->
+### TestFlight 7.1.1 (4361)
+
+- Kildecommit og tag: `f5edccd1e2d00a247db1ce45a3dc76a1cccacf77` / `testflight-7.1.1-4361`.
+- Tests: 1943/1943 bestået; 0 fejlet; 0 skipped. iPhone- og Watch-simulatorbuilds bestod.
+- Apple-status (2026-11-08T19:14:45.922870+00:00): [Internal / Testing](https://appstoreconnect.apple.com/apps/6795645396/testflight/ios/7aaeb07c-5b30-48e7-9cf8-961ae7bfbef7).
+- Eksisterende intern gruppe: Ole Internal er bekræftet tilknyttet.
+- Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
+<!-- testflight-7.1.1-4361:end -->
+
+De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
+
 ## Præcis diagnose af ML-grundlagets gemmefejl — 8. november 2026
 
 Efter udgivelsen af 4360 blev den tilsluttede iPhone undersøgt læsende.
