@@ -3555,7 +3555,7 @@ extension RootApplicationCoordinator: @preconcurrency UNUserNotificationCenterDe
     func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification, withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
         if notification.request.identifier == HighSoonAdvisoryPolicy.notificationIdentifier {
             MealQuietManager.shared.refreshMeasuredBasis()
-            if MealQuietManager.shared.shouldSuppressHighSoon() {
+            if SelectiveAlarmSilence.isActive() || MealQuietManager.shared.shouldSuppressHighSoon() {
                 center.removePendingNotificationRequests(withIdentifiers: [HighSoonAdvisoryPolicy.notificationIdentifier])
                 center.removeDeliveredNotifications(withIdentifiers: [HighSoonAdvisoryPolicy.notificationIdentifier])
                 completionHandler([])

@@ -823,6 +823,10 @@ final class WatchManager: NSObject, ObservableObject, @unchecked Sendable {
             activateSessionIfNeeded()
         }
 
+        libreWatchObservers.append(NotificationCenter.default.addObserver(
+            forName: SelectiveAlarmSilence.changed, object: UserDefaults.standard, queue: .main
+        ) { [weak self] _ in self?.scheduleAlarmSettingsUpdate() })
+
         // add observer to sync to the watch once the device status was updated
         UserDefaults.standard.addObserver(self, forKeyPath: UserDefaults.Key.nightscoutDeviceStatusWasUpdated.rawValue, options: .new, context: nil)
         UserDefaults.standard.addObserver(self, forKeyPath: UserDefaults.Key.snoozeAllAlertsUntilDate.rawValue, options: .new, context: nil)

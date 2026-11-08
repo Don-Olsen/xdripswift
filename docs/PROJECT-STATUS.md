@@ -1,3 +1,38 @@
+## Lydløs fra appikonet — 8. november 2026
+
+Appikonets eksisterende menu får **Lydløs**, uden undertekst. Ét tryk starter
+en tidsbegrænset pause; et nyt tryk afslutter den. Standard er 60 minutter,
+og varigheden kan vælges i alarmindstillingerne med den eksisterende tidsvælger.
+En ændret varighed gælder næste pause. Absolut udløb gemmes lokalt og kræver
+hverken en timer eller åben Home. Den eksisterende Snooze-skærm viser udløbet.
+
+Lav, Akut lav, Lavt om lidt, manglende målinger og terminale sensorfejl
+påvirkes ikke af genvejen. De øvrige almindelige alarmtyper og Højt om lidt
+sættes på pause før lyd, vibration, notifikation og automatisk gentagelsesfrist.
+Eksisterende individuelle snoozes og Snooze All ændres ikke. Afslutning af
+Lydløs ophæver derfor heller ikke en separat brugerindstillet snooze.
+Notifikationer, hvis svar er forsinket, kan ikke genopstå efter en pause.
+Beregnergenvejen, oplæsning, behandlinger, dosisregler og sensorforbindelse er urørte.
+
+Watch bruger samme absolutte udløb gennem den eksisterende indstillingssynkronisering.
+Det nye valgfrie felt i den eksisterende besked er bagudkompatibelt. Direkte
+Watch-modtagelse dæmper kun Høj/Akut høj; lavalarmer, målingsaccept, alarm for
+manglende målinger og urets egne snoozes bevares. En allerede modtaget pause
+udløber uden telefonkontakt. En telefonhandling kan ikke nå et offline ur,
+før forbindelsen vender tilbage; begge apps skal være opdateret for funktionen.
+
+Indledende Python-kontroller (198 tests samt Watch-værktøjernes 30 + 24
+syntetiske selvkontroller) bestod. Nye regressionstests dækker menu/koldstart,
+gemning og udløb, individuelle snoozes, de beskyttede alarmtyper, forsinkede
+callbacks og Watch-bagudkompatibilitet. Releaseproceduren kører den samlede
+XCTest-suite og builds på det endelige checkpoint; de faktiske resultater
+registreres efter kørslen.
+
+Læsende `devicectl`-kontrol fandt fysisk iPhone og Watch utilgængelige.
+Der er ikke installeret noget lokalt eller afbrudt nogen sensorforbindelse.
+Faktisk lyd/notifikationslevering, appikontrykket på telefonen og synkronisering
+til det fysiske ur kræver fortsat afprøvning via TestFlight.
+
 <!-- testflight-7.1.1-4356:start -->
 ### TestFlight 7.1.1 (4356)
 

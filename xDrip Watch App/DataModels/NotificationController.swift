@@ -110,6 +110,7 @@ final class LibreWatchAlarmController: NSObject, UNUserNotificationCenterDelegat
     private var mealQuiet = WatchMealQuietStore.load()
     private var mealQuietStorageIsHealthy = WatchMealQuietStore.storageIsHealthy()
     private var mealQuietSuppressionGeneration: UInt64 = 0
+    private var selectiveSilenceGeneration: UInt64 = 0
     private var mealQuietGlucose: Double?
     private var mealQuietMeasuredAt: Date?
     var onMealQuietChange: (() -> Void)?
@@ -144,6 +145,7 @@ final class LibreWatchAlarmController: NSObject, UNUserNotificationCenterDelegat
             updated.insert(UNNotificationCategory(identifier: self.category, actions: [action], intentIdentifiers: [], options: []))
             self.center.setNotificationCategories(updated)
         }
+        refreshSelectiveSilence(previous: nil)
         refreshPermission()
     }
 
@@ -220,6 +222,7 @@ final class LibreWatchAlarmController: NSObject, UNUserNotificationCenterDelegat
     }
 
     func apply(settings candidate: LibreWatchAlarmSettings, session: LibreWatchDirectSession) {
+        let previousSettings = settings
         let previousRevision = readinessRevision
         guard configuration.propose(candidate, session: session), let committed = configuration.settings else { return }
         if state.sessionID != committed.sessionID {
@@ -231,6 +234,7 @@ final class LibreWatchAlarmController: NSObject, UNUserNotificationCenterDelegat
         state.acknowledgePhoneSnoozes(committed)
         LibreWatchAlarmStore.save(configuration)
         LibreWatchAlarmStore.save(state)
+        refreshSelectiveSilence(previous: previousSettings)
         refreshMealQuiet()
         // Unconfirmed revisions do not delete the previous missed-reading deadline.
         // Only a confirmed change (or an explicit later snooze) changes its identity.
@@ -254,6 +258,7 @@ final class LibreWatchAlarmController: NSObject, UNUserNotificationCenterDelegat
     }
 
     func apply(delegation: LibreWatchAlarmDelegation?, session: LibreWatchDirectSession) {
+        let previousSettings = settings
         guard configuration.confirm(delegation, session: session) else { return }
         if let committed = configuration.settings {
             state.use(committed)
@@ -262,6 +267,7 @@ final class LibreWatchAlarmController: NSObject, UNUserNotificationCenterDelegat
         LibreWatchAlarmStore.save(configuration)
         LibreWatchAlarmStore.save(state)
         if delegation == nil { cancelScheduledAlarms() }
+        refreshSelectiveSilence(previous: previousSettings)
         scheduleMissedIfNeeded()
         publishStatus()
     }
@@ -369,8 +375,12 @@ final class LibreWatchAlarmController: NSObject, UNUserNotificationCenterDelegat
         guard let rule, !pendingGlucoseAlarm, !mealQuietSuppresses(rule.kind, at: now) else { return }
         pendingGlucoseAlarm = true
         let quietGeneration = mealQuietSuppressionGeneration
+        let silenceGeneration = selectiveSilenceGeneration
         let content = content(for: rule)
         if rule.kind == .high { content.userInfo["mealQuietGeneration"] = String(quietGeneration) }
+        if LibreWatchAlarmSettings.selectivelySilencedKinds.contains(rule.kind) {
+            content.userInfo["selectiveSilenceGeneration"] = String(silenceGeneration)
+        }
         content.body = "\(glucose.mgDlToMmolAndToString(mgDl: settings.isMgDl)) \(settings.isMgDl ? "mg/dL" : "mmol/L") · Direkte fra Libre · \(reading.receivedAt.formatted(date: .omitted, time: .shortened))"
         let request = UNNotificationRequest(identifier: identifier(for: rule.kind), content: content, trigger: nil)
         center.add(request) { [weak self] error in
@@ -378,6 +388,8 @@ final class LibreWatchAlarmController: NSObject, UNUserNotificationCenterDelegat
                 guard let self else { return }
                 self.pendingGlucoseAlarm = false
                 guard (rule.kind != .high || quietGeneration == self.mealQuietSuppressionGeneration),
+                      (!LibreWatchAlarmSettings.selectivelySilencedKinds.contains(rule.kind) ||
+                       silenceGeneration == self.selectiveSilenceGeneration),
                       !self.mealQuietSuppresses(rule.kind),
                       self.state.glucoseNotificationIsCurrent(
                     readingID: reading.id, rule: rule, submittedSettings: settings,
@@ -490,6 +502,18 @@ final class LibreWatchAlarmController: NSObject, UNUserNotificationCenterDelegat
     }
 
     private func identifier(for kind: LibreWatchAlarmKind) -> String { "libreWatchAlarm.\(kind.rawValue)" }
+
+    /// Cancel only high requests. Low and missing-reading deadlines retain their identity.
+    /// The generation also rejects replies that arrive after an early end of this pause.
+    private func refreshSelectiveSilence(previous: LibreWatchAlarmSettings?, at date: Date = Date()) {
+        guard let settings, settings.selectivelySuppresses(.high, at: date) else { return }
+        if settings.selectiveSilenceUntil != previous?.selectiveSilenceUntil {
+            selectiveSilenceGeneration &+= 1
+        }
+        let identifiers = LibreWatchAlarmSettings.selectivelySilencedKinds.map(identifier(for:))
+        center.removePendingNotificationRequests(withIdentifiers: identifiers)
+        center.removeDeliveredNotifications(withIdentifiers: identifiers)
+    }
 
     private func cancelScheduledAlarms() {
         var identifiers = LibreWatchAlarmKind.allCases.map(identifier(for:))
@@ -616,6 +640,8 @@ final class LibreWatchAlarmController: NSObject, UNUserNotificationCenterDelegat
                   let kind = LibreWatchAlarmKind(rawValue: rawKind),
                   (kind != .high || (info["mealQuietGeneration"] as? String ?? "0") == String(self.mealQuietSuppressionGeneration)),
                   !self.mealQuietSuppresses(kind),
+                  (!LibreWatchAlarmSettings.selectivelySilencedKinds.contains(kind) ||
+                   (info["selectiveSilenceGeneration"] as? String ?? "0") == String(self.selectiveSilenceGeneration)),
                   self.state.notificationMayBePresented(kind: kind, notificationSessionID: notificationSessionID,
                     notificationReadingID: (info["libreWatchAlarmReading"] as? String).flatMap(UUID.init(uuidString:)),
                     settings: self.settings, delegation: self.delegation,

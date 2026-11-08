@@ -7408,6 +7408,197 @@ extension LibreWatchValuePipelineTests {
         XCTAssertFalse(legacy.matches(enabled), "Unspecified legacy delegation must not enable local Watch alarms")
     }
 
+    func testSelectiveSilenceSettingsRemainBackwardCompatibleAndPersistExpiry() throws {
+        let original = alarmSettings()
+        let legacyData = try JSONEncoder().encode(original)
+        let legacyObject = try XCTUnwrap(JSONSerialization.jsonObject(with: legacyData) as? [String: Any])
+        XCTAssertNil(legacyObject["selectiveSilenceUntil"])
+        let legacy = try JSONDecoder().decode(LibreWatchAlarmSettings.self, from: legacyData)
+        XCTAssertNil(legacy.selectiveSilenceUntil)
+        XCTAssertEqual(legacy, original)
+
+        var silenced = original
+        silenced.selectiveSilenceUntil = receivedAt.addingTimeInterval(600)
+        XCTAssertFalse(silenced.sameConfiguration(as: original))
+        let restored = try JSONDecoder().decode(LibreWatchAlarmSettings.self,
+            from: JSONEncoder().encode(silenced))
+        XCTAssertEqual(restored, silenced)
+        XCTAssertEqual(restored.rules, original.rules)
+        XCTAssertEqual(restored.snoozes, original.snoozes)
+        XCTAssertNil(restored.snoozeAllUntil)
+    }
+
+    func testSelectiveSilenceSuppressesOnlyHighFamilyAndStillAcceptsReadings() throws {
+        var settings = alarmSettings()
+        settings.selectiveSilenceUntil = receivedAt.addingTimeInterval(600)
+        let lease = alarmDelegation(settings)
+        XCTAssertEqual(LibreWatchAlarmSettings.selectivelySilencedKinds, [.high, .veryHigh])
+        for kind in LibreWatchAlarmKind.allCases {
+            XCTAssertEqual(settings.selectivelySuppresses(kind, at: receivedAt),
+                kind == .high || kind == .veryHigh)
+        }
+        let cases: [(Double, LibreWatchAlarmKind?)] = [
+            (38, .veryLow), (70, .low), (200, nil), (300, nil)
+        ]
+        for (glucose, expected) in cases {
+            var state = LibreWatchAlarmState()
+            state.use(settings)
+            let id = UUID()
+            XCTAssertEqual(state.accept(id: id, measuredAt: receivedAt, glucose: glucose,
+                settings: settings, delegation: lease, watchOwnsSensor: true, now: receivedAt)?.kind,
+                expected)
+            XCTAssertEqual(state.lastReadingID, id)
+            XCTAssertEqual(state.lastReadingAt, receivedAt)
+            XCTAssertTrue(state.snoozes.isEmpty, "A suppressed condition must not add a user snooze")
+            let missed = try XCTUnwrap(state.nextMissedAlarm(settings: settings,
+                delegation: lease, watchOwnsSensor: true, now: receivedAt))
+            XCTAssertEqual(missed.date, receivedAt.addingTimeInterval(300))
+            XCTAssertEqual(missed.rule.kind, .missed)
+        }
+    }
+
+    func testSelectiveSilenceExpiresAtOriginalDeadlineAfterRestartWithoutPhone() throws {
+        let defaults = isolatedDefaults()
+        var settings = alarmSettings()
+        let until = receivedAt.addingTimeInterval(120)
+        settings.selectiveSilenceUntil = until
+        let configuration = LibreWatchAlarmConfiguration(settings: settings,
+            delegation: alarmDelegation(settings))
+        LibreWatchAlarmStore.save(configuration, defaults: defaults)
+        let restored = LibreWatchAlarmStore.configuration(defaults: defaults)
+        let actual = try XCTUnwrap(restored.effectiveSettings)
+        XCTAssertTrue(actual.selectivelySuppresses(.high, at: until.addingTimeInterval(-0.001)))
+        XCTAssertFalse(actual.selectivelySuppresses(.high, at: until))
+        XCTAssertEqual(actual.selectiveSilenceUntil, until)
+        var state = LibreWatchAlarmState()
+        state.use(actual)
+        XCTAssertNil(state.accept(id: UUID(), measuredAt: until.addingTimeInterval(-1), glucose: 300,
+            settings: actual, delegation: restored.delegation, watchOwnsSensor: true,
+            now: until.addingTimeInterval(-1)))
+        XCTAssertEqual(state.accept(id: UUID(), measuredAt: until, glucose: 300,
+            settings: actual, delegation: restored.delegation, watchOwnsSensor: true,
+            now: until)?.kind, .veryHigh)
+    }
+
+    func testSelectiveSilenceDoesNotAcknowledgeOrEraseIndependentWatchSnooze() throws {
+        var settings = alarmSettings()
+        var state = LibreWatchAlarmState()
+        state.use(settings)
+        let manualExpiry = receivedAt.addingTimeInterval(600)
+        state.snooze(.high, until: manualExpiry)
+        let originalSnoozes = state.snoozes
+        settings.selectiveSilenceUntil = receivedAt.addingTimeInterval(1200)
+        state.acknowledgePhoneSnoozes(settings)
+        XCTAssertEqual(state.snoozes, originalSnoozes)
+        settings.selectiveSilenceUntil = nil
+        settings.revision += 1
+        state.acknowledgePhoneSnoozes(settings)
+        let restored = try JSONDecoder().decode(LibreWatchAlarmState.self,
+            from: JSONEncoder().encode(state))
+        XCTAssertEqual(restored.snoozes, originalSnoozes)
+        XCTAssertEqual(restored.snoozedUntil(.high, settings: settings), manualExpiry)
+        XCTAssertEqual(restored.snoozedUntil(.veryHigh, settings: settings), manualExpiry)
+        XCTAssertEqual(restored.snoozedUntil(.low, settings: settings), .distantPast)
+        var actual = restored
+        let now = receivedAt.addingTimeInterval(60)
+        XCTAssertNil(actual.accept(id: UUID(), measuredAt: now, glucose: 300,
+            settings: settings, delegation: alarmDelegation(settings), watchOwnsSensor: true, now: now))
+    }
+
+    func testPendingSelectiveSilenceStartsImmediatelyAndEndingRequiresConfirmation() throws {
+        let initial = alarmSettings()
+        var configuration = LibreWatchAlarmConfiguration(settings: initial,
+            delegation: alarmDelegation(initial))
+        var silenced = initial
+        silenced.revision = 2
+        silenced.selectiveSilenceUntil = receivedAt.addingTimeInterval(600)
+        XCTAssertTrue(configuration.propose(silenced, session: session))
+        let effective = try XCTUnwrap(configuration.effectiveSettings)
+        XCTAssertTrue(effective.selectivelySuppresses(.high, at: receivedAt))
+        XCTAssertFalse(effective.selectivelySuppresses(.low, at: receivedAt))
+        XCTAssertTrue(configuration.delegation?.matches(effective) == true)
+        XCTAssertEqual(effective.rules, initial.rules)
+        XCTAssertEqual(effective.snoozes, initial.snoozes)
+        XCTAssertTrue(configuration.confirm(alarmDelegation(silenced), session: session))
+        var ended = initial
+        ended.revision = 3
+        XCTAssertTrue(configuration.propose(ended, session: session))
+        XCTAssertTrue(configuration.effectiveSettings?.selectivelySuppresses(.high, at: receivedAt) == true)
+        XCTAssertTrue(configuration.confirm(alarmDelegation(ended), session: session))
+        XCTAssertNil(configuration.effectiveSettings?.selectiveSilenceUntil)
+        XCTAssertFalse(configuration.propose(silenced, session: session), "An old offer cannot restart Lydløs")
+        XCTAssertFalse(configuration.confirm(alarmDelegation(silenced), session: session))
+        XCTAssertNil(configuration.effectiveSettings?.selectiveSilenceUntil)
+    }
+
+    func testQueuedWatchHighIsBlockedBySelectiveSilenceButLowAndMissingRemainEligible() throws {
+        var settings = alarmSettings()
+        settings.selectiveSilenceUntil = receivedAt.addingTimeInterval(120)
+        var state = LibreWatchAlarmState()
+        state.use(settings)
+        let id = UUID()
+        state.lastReadingID = id
+        state.lastReadingAt = receivedAt
+        for kind in LibreWatchAlarmKind.allCases {
+            XCTAssertEqual(state.notificationMayBePresented(kind: kind,
+                notificationSessionID: settings.sessionID.uuidString, notificationReadingID: id,
+                settings: settings, delegation: alarmDelegation(settings), watchOwnsSensor: true,
+                notificationsAuthorized: true, at: receivedAt), kind != .high && kind != .veryHigh)
+        }
+        let high = try XCTUnwrap(settings.rule(for: .high, at: receivedAt))
+        XCTAssertFalse(state.glucoseNotificationIsCurrent(readingID: id, rule: high,
+            submittedSettings: settings, currentSettings: settings, delegation: alarmDelegation(settings),
+            watchOwnsSensor: true, notificationsAuthorized: true, now: receivedAt))
+        let low = try XCTUnwrap(settings.rule(for: .low, at: receivedAt))
+        XCTAssertTrue(state.glucoseNotificationIsCurrent(readingID: id, rule: low,
+            submittedSettings: settings, currentSettings: settings, delegation: alarmDelegation(settings),
+            watchOwnsSensor: true, notificationsAuthorized: true, now: receivedAt))
+        var ended = settings
+        ended.selectiveSilenceUntil = nil
+        ended.revision += 1
+        XCTAssertFalse(state.glucoseNotificationIsCurrent(readingID: id, rule: high,
+            submittedSettings: settings, currentSettings: ended, delegation: alarmDelegation(ended),
+            watchOwnsSensor: true, notificationsAuthorized: true, now: receivedAt),
+            "A late reply from before the settings change cannot restore a high notification")
+    }
+
+    func testSelectiveSilenceUpdateCannotCancelAnAlreadySubmittedLow() throws {
+        let initial = alarmSettings()
+        var state = LibreWatchAlarmState()
+        state.use(initial)
+        let id = UUID()
+        state.lastReadingID = id
+        state.lastReadingAt = receivedAt
+        var silenced = initial
+        silenced.selectiveSilenceUntil = receivedAt.addingTimeInterval(600)
+        silenced.revision += 1
+        silenced.generatedAt = receivedAt.addingTimeInterval(1)
+        for kind: LibreWatchAlarmKind in [.low, .veryLow] {
+            let rule = try XCTUnwrap(initial.rule(for: kind, at: receivedAt))
+            func permitted(_ current: LibreWatchAlarmSettings) -> Bool {
+                state.glucoseNotificationIsCurrent(readingID: id, rule: rule,
+                    submittedSettings: initial, currentSettings: current,
+                    delegation: alarmDelegation(current), watchOwnsSensor: true,
+                    notificationsAuthorized: true, now: receivedAt)
+            }
+            XCTAssertTrue(permitted(silenced), "Only high alarms are affected by Lydløs")
+            var globallySnoozed = alarmSettings(snoozeAllUntil: receivedAt.addingTimeInterval(600))
+            globallySnoozed.selectiveSilenceUntil = silenced.selectiveSilenceUntil
+            XCTAssertFalse(permitted(globallySnoozed))
+            var disabled = alarmSettings(enabled: false)
+            disabled.selectiveSilenceUntil = silenced.selectiveSilenceUntil
+            XCTAssertFalse(permitted(disabled))
+            var merelyRevised = initial
+            merelyRevised.revision += 1
+            XCTAssertFalse(permitted(merelyRevised), "The existing general revision check remains")
+        }
+        let high = try XCTUnwrap(initial.rule(for: .high, at: receivedAt))
+        XCTAssertFalse(state.glucoseNotificationIsCurrent(readingID: id, rule: high,
+            submittedSettings: initial, currentSettings: silenced,
+            delegation: alarmDelegation(silenced), watchOwnsSensor: true,
+            notificationsAuthorized: true, now: receivedAt))
+    }
+
     private func alarmSettings(enabled: Bool = true, snoozeAllUntil: Date? = nil) -> LibreWatchAlarmSettings {
         let rules = zip(LibreWatchAlarmKind.allCases, [60.0, 80, 180, 250, 5]).map { kind, value in
             LibreWatchAlarmRule(kind: kind, startMinute: 0, value: value, enabled: enabled,

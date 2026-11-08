@@ -143,6 +143,7 @@ struct AlertsSettingsView: View {
     @ObservedObject var viewModel: AlertsSettingsViewModel
     @AppStorage(HighSoonAdvisoryPolicy.enabledKey) private var highSoonAdvisoryEnabled = true
     @ObservedObject private var mealQuiet = MealQuietManager.shared
+    @AppStorage(SelectiveAlarmSilence.durationKey) private var silenceDuration = SelectiveAlarmSilence.defaultDurationMinutes
     @State private var settingsSelection: SettingsSelectionListContent?
 
     let openAlertEntry: (AlertEntryEditRequest) -> Void
@@ -161,6 +162,12 @@ struct AlertsSettingsView: View {
                         )
                     }
                 }
+            }
+            Section("Lydløs") {
+                SettingsStaticRowView(title: "Varighed",
+                    detail: "\(SelectiveAlarmSilence.durationMinutes()) minutter",
+                    isEnabled: true, showsDisclosure: true,
+                    action: presentSilenceDurationSelection)
             }
             Section {
                 Toggle("Automatisk måltidsro", isOn: Binding(
@@ -207,6 +214,18 @@ struct AlertsSettingsView: View {
         .id(viewModel.reloadToken)
         .settingsPushPresentation(selectionList: $settingsSelection)
         .settingsListStyle(title: Texts_Alerts.alertsScreenTitle, titleDisplayMode: .inline)
+    }
+
+    private func presentSilenceDurationSelection() {
+        let choices = SelectiveAlarmSilence.durationChoices
+        settingsSelection = SettingsSelectionListContent(
+            title: "Lydløs · varighed", data: choices.map { "\($0) minutter" },
+            selectedRow: choices.firstIndex(of: SelectiveAlarmSilence.durationMinutes()),
+            actionTitle: Texts_Common.Ok, cancelTitle: Texts_Common.Cancel,
+            action: { index in
+                guard choices.indices.contains(index) else { return }
+                silenceDuration = choices[index]
+            }, cancel: nil, didSelectRow: nil)
     }
 
     private func presentMealQuietDurationSelection() {

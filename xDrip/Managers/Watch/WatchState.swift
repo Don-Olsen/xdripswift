@@ -274,6 +274,15 @@ struct LibreWatchAlarmSettings: Codable, Equatable {
     let rules: [LibreWatchAlarmRule]
     let snoozes: [LibreWatchAlarmSnooze]
     let snoozeAllUntil: Date?
+    /// Separate from user snoozes: ending Lydløs must not undo a Watch snooze.
+    var selectiveSilenceUntil: Date? = nil
+
+    static let selectivelySilencedKinds: [LibreWatchAlarmKind] = [.high, .veryHigh]
+
+    func selectivelySuppresses(_ kind: LibreWatchAlarmKind, at date: Date) -> Bool {
+        Self.selectivelySilencedKinds.contains(kind) &&
+            (selectiveSilenceUntil ?? .distantPast) > date
+    }
 
     func matches(_ session: LibreWatchDirectSession) -> Bool {
         sessionID == session.id && sensorIdentity == session.redactedIdentity() &&
@@ -286,7 +295,19 @@ struct LibreWatchAlarmSettings: Codable, Equatable {
     func sameConfiguration(as other: Self) -> Bool {
         sessionID == other.sessionID && sensorIdentity == other.sensorIdentity &&
             isMgDl == other.isMgDl && rules == other.rules &&
-            snoozes == other.snoozes && snoozeAllUntil == other.snoozeAllUntil
+            snoozes == other.snoozes && snoozeAllUntil == other.snoozeAllUntil &&
+            selectiveSilenceUntil == other.selectiveSilenceUntil
+    }
+
+    /// Lydløs alone must not invalidate an in-flight low. Every other setting,
+    /// current authority, rule and reading is still checked by the caller.
+    func matchesPendingGlucoseSettings(_ submitted: Self, kind: LibreWatchAlarmKind) -> Bool {
+        if self == submitted { return true }
+        guard kind == .low || kind == .veryLow,
+              selectiveSilenceUntil != submitted.selectiveSilenceUntil else { return false }
+        var withoutSilenceChange = self
+        withoutSilenceChange.selectiveSilenceUntil = submitted.selectiveSilenceUntil
+        return withoutSilenceChange.sameConfiguration(as: submitted)
     }
 
     func readinessRevision(notificationsAuthorized: Bool) -> UInt64? {
@@ -393,7 +414,9 @@ struct LibreWatchAlarmConfiguration: Codable, Equatable {
         return LibreWatchAlarmSettings(sessionID: settings.sessionID, sensorIdentity: settings.sensorIdentity,
             revision: settings.revision, generatedAt: settings.generatedAt, isMgDl: settings.isMgDl,
             rules: settings.rules, snoozes: settings.snoozes + pendingSettings.snoozes,
-            snoozeAllUntil: [settings.snoozeAllUntil, pendingSettings.snoozeAllUntil].compactMap { $0 }.max())
+            snoozeAllUntil: [settings.snoozeAllUntil, pendingSettings.snoozeAllUntil].compactMap { $0 }.max(),
+            selectiveSilenceUntil: [settings.selectiveSilenceUntil, pendingSettings.selectiveSilenceUntil]
+                .compactMap { $0 }.max())
     }
 }
 
@@ -479,11 +502,12 @@ struct LibreWatchAlarmState: Codable, Equatable {
         watchOwnsSensor: Bool, notificationsAuthorized: Bool, now: Date
     ) -> Bool {
         guard watchOwnsSensor, notificationsAuthorized,
-              let currentSettings, currentSettings == submittedSettings,
+              let currentSettings, currentSettings.matchesPendingGlucoseSettings(submittedSettings, kind: rule.kind),
               delegation?.matches(currentSettings) == true,
               sessionID == currentSettings.sessionID, sensorIdentity == currentSettings.sensorIdentity,
               lastReadingID == readingID, let lastReadingAt, now.timeIntervalSince(lastReadingAt) <= 180,
               (currentSettings.snoozeAllUntil ?? .distantPast) <= now,
+              !currentSettings.selectivelySuppresses(rule.kind, at: now),
               snoozedUntil(rule.kind, settings: currentSettings) <= now,
               currentSettings.rule(for: rule.kind, at: now) == rule
         else { return false }
@@ -518,6 +542,7 @@ struct LibreWatchAlarmState: Codable, Equatable {
               sessionID == settings.sessionID, sensorIdentity == settings.sensorIdentity,
               delegation?.matches(settings) == true,
               (settings.snoozeAllUntil ?? .distantPast) <= date,
+              !settings.selectivelySuppresses(kind, at: date),
               settings.rule(for: kind, at: date)?.enabled == true
         else { return false }
         if kind == .missed {
@@ -562,7 +587,8 @@ struct LibreWatchAlarmState: Codable, Equatable {
         guard (settings.snoozeAllUntil ?? .distantPast) <= now else { return nil }
 
         for kind: LibreWatchAlarmKind in [.veryLow, .low, .veryHigh, .high] {
-            guard snoozedUntil(kind, settings: settings) <= now,
+            guard !settings.selectivelySuppresses(kind, at: now),
+                  snoozedUntil(kind, settings: settings) <= now,
                   let rule = settings.rule(for: kind, at: now, calendar: calendar), rule.enabled
             else { continue }
             let value = glucose.bgValueRounded(mgDl: settings.isMgDl)

@@ -9,6 +9,11 @@ class Texts_QuickActions {
                           value: "Bolusberegner", comment: "Home screen action that opens the existing pen bolus calculator")
     }()
     
+    static let silentAlarms: String = {
+        NSLocalizedString("quickactions_silent_alarms", tableName: filename, bundle: Bundle.main,
+                          value: "Lydløs", comment: "One-tap selective alarm pause, without a subtitle")
+    }()
+
     static let speakReadings: String = {
         return NSLocalizedString("quickactions_speak_readings", tableName: filename, bundle: Bundle.main, value: "Speak readings", comment: "Home screen quick action, turns speaking on, available when speaking is off")
     }()

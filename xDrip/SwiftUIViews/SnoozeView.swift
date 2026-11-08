@@ -52,6 +52,9 @@ struct SnoozeView: View {
             .onAppear {
                 viewModel.refresh()
             }
+            .onReceive(NotificationCenter.default.publisher(for: SelectiveAlarmSilence.changed)) { _ in
+                viewModel.refresh()
+            }
         }
         .colorScheme(.dark)
         .overlay {
@@ -88,6 +91,18 @@ struct SnoozeView: View {
                     .listRowBackground(snoozeAllStatusBackgroundColor())
             }
             
+            if let until = SelectiveAlarmSilence.until(), until > now {
+                Section {
+                    HStack {
+                        Text("Lydløs til \(until.formatted(date: .omitted, time: .shortened))")
+                            .fixedSize(horizontal: false, vertical: true)
+                        Spacer()
+                        Button("Afslut") { SelectiveAlarmSilence.end() }
+                            .buttonStyle(.borderless)
+                    }
+                }
+            }
+
             if let period = mealQuiet.activePeriod(at: now) {
                 Section {
                     HStack {

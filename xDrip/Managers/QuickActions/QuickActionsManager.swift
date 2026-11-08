@@ -16,6 +16,7 @@ private let calculatorShortcutLog = OSLog(subsystem: ConstantsLog.subSystem,
 /// This enum defines actions that can be available at app icon's quick actions on iOS home screen
 enum QuickActionType: String, Equatable {
     case penCalculator = "penCalculator"
+    case silentAlarms = "silentAlarms"
     case speakReadings = "speakReadings"
     case stopSpeakingReadings = "stopSpeakingReadings"
     
@@ -23,23 +24,30 @@ enum QuickActionType: String, Equatable {
     private var localizedTitle: String {
         switch self {
             case .penCalculator: return Texts_QuickActions.penCalculator
+            case .silentAlarms: return Texts_QuickActions.silentAlarms
             case .speakReadings: return Texts_QuickActions.speakReadings
             case .stopSpeakingReadings: return Texts_QuickActions.stopSpeakingReadings
         }
     }
     
     /// Icon is displayed nex to the tile in the long-press menu on the iOS home screen
-    private var icon: UIApplicationShortcutIcon {
+    func iconSystemName(silenceIsActive: Bool) -> String {
         switch self {
-            case .penCalculator: return .init(systemImageName: "plus.circle.fill")
-            case .speakReadings: return .init(systemImageName: "speaker.wave.2")
-            case .stopSpeakingReadings: return .init(systemImageName: "speaker.slash")
+            case .penCalculator: return "plus.circle.fill"
+            case .silentAlarms: return silenceIsActive ? "bell.fill" : "bell.slash.fill"
+            case .speakReadings: return "speaker.wave.2"
+            case .stopSpeakingReadings: return "speaker.slash"
         }
     }
     
     /// Make a UIApplicationShortcutItem from the action
     var shortcutItem: UIApplicationShortcutItem {
-        return UIApplicationShortcutItem(type: rawValue, localizedTitle: localizedTitle, localizedSubtitle: nil, icon: icon)
+        shortcutItem(silenceIsActive: false)
+    }
+
+    func shortcutItem(silenceIsActive: Bool) -> UIApplicationShortcutItem {
+        UIApplicationShortcutItem(type: rawValue, localizedTitle: localizedTitle,
+            localizedSubtitle: nil, icon: .init(systemImageName: iconSystemName(silenceIsActive: silenceIsActive)))
     }
 }
 
@@ -51,15 +59,19 @@ enum QuickActionType: String, Equatable {
     private var rootSubscription: AnyCancellable?
     private var homeSubscription: AnyCancellable?
     private var notifications: [NSObjectProtocol] = []
+    private let silenceDefaults: UserDefaults
+    private var publishedSilenceIsActive: Bool?
 
-    override init() {
+    init(silenceDefaults: UserDefaults = .standard) {
+        self.silenceDefaults = silenceDefaults
         super.init()
         
         // add observer for speakReadings to update available quick actions when the setting is changed
         UserDefaults.standard.addObserver(self, forKeyPath: UserDefaults.Key.speakReadings.rawValue, options: .new, context: nil)
 
         for name in [UserDefaults.didChangeNotification, UIApplication.didBecomeActiveNotification,
-                     HealthKitTherapyImportManager.statusDidChange, TherapyMetricsManager.changed] {
+                     HealthKitTherapyImportManager.statusDidChange, TherapyMetricsManager.changed,
+                     SelectiveAlarmSilence.changed] {
             // Delivery on a main OperationQueue can synchronously wait for the main thread.
             // UserDefaults can post from a worker while main is waiting on that worker.
             notifications.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: nil) {
@@ -106,7 +118,7 @@ enum QuickActionType: String, Equatable {
 
     static func availableActions(calculatorVisible: Bool, speakReadings: Bool) -> [QuickActionType] {
         (calculatorVisible ? [.penCalculator] : [])
-            + [speakReadings ? .stopSpeakingReadings : .speakReadings]
+            + [.silentAlarms, speakReadings ? .stopSpeakingReadings : .speakReadings]
     }
 
     private func calculatorSourceIsValid() -> Bool {
@@ -132,8 +144,11 @@ enum QuickActionType: String, Equatable {
     func updateAvailableQuickActions() {
         let actions = Self.availableActions(calculatorVisible: calculatorIsVisible(),
                                             speakReadings: UserDefaults.standard.speakReadings)
-        guard UIApplication.shared.shortcutItems?.map(\.type) != actions.map(\.rawValue) else { return }
-        UIApplication.shared.shortcutItems = actions.map(\.shortcutItem)
+        let silenceIsActive = SelectiveAlarmSilence.isActive(defaults: silenceDefaults)
+        guard UIApplication.shared.shortcutItems?.map(\.type) != actions.map(\.rawValue)
+                || publishedSilenceIsActive != silenceIsActive else { return }
+        UIApplication.shared.shortcutItems = actions.map { $0.shortcutItem(silenceIsActive: silenceIsActive) }
+        publishedSilenceIsActive = silenceIsActive
     }
     
     /// Perform the necessary action when user selects a quick action
@@ -155,6 +170,10 @@ enum QuickActionType: String, Equatable {
                 }
                 trace("calculator shortcut queued", log: calculatorShortcutLog,
                     category: ConstantsLog.categoryAppDelegate, type: .info)
+            case .silentAlarms:
+                // Persist immediately, including a cold start before Home or its dependencies exist.
+                // The label remains Lydløs; a second explicit tap ends this pause only.
+                SelectiveAlarmSilence.toggle(defaults: silenceDefaults)
             case .speakReadings:
                 UserDefaults.standard.speakReadings = true
             case .stopSpeakingReadings:

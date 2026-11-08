@@ -115,6 +115,9 @@ public class AlertManager: NSObject {
     
     /// playSound instance
     private var soundPlayer: SoundPlayer?
+    private var playingAlarmKind: AlertKind?
+    private let silenceDefaults: UserDefaults
+    private var silenceObserver: NSObjectProtocol?
     
     /// snooze parameters
     private var snoozeParameters = [SnoozeParameters]()
@@ -149,7 +152,8 @@ public class AlertManager: NSObject {
     
     // MARK: - initializer
     
-    init(coreDataManager: CoreDataManager, soundPlayer: SoundPlayer?) {
+    init(coreDataManager: CoreDataManager, soundPlayer: SoundPlayer?, silenceDefaults: UserDefaults = .standard) {
+        self.silenceDefaults = silenceDefaults
         // initialize properties
         self.bgReadingsAccessor = BgReadingsAccessor(coreDataManager: coreDataManager)
         self.alertTypesAccessor = AlertTypesAccessor(coreDataManager: coreDataManager)
@@ -192,6 +196,12 @@ public class AlertManager: NSObject {
             self.uNUserNotificationCenter.removePendingNotificationRequests(withIdentifiers: identifiers)
             self.uNUserNotificationCenter.removeDeliveredNotifications(withIdentifiers: identifiers)
         }
+        silenceObserver = NotificationCenter.default.addObserver(
+            forName: SelectiveAlarmSilence.changed, object: silenceDefaults, queue: .main
+        ) { [weak self] _ in
+            self?.clearSelectiveSilenceNotifications()
+        }
+        clearSelectiveSilenceNotifications()
         mealQuietObserver = NotificationCenter.default.addObserver(
             forName: Notification.Name("xdrip.mealQuiet.changed"), object: nil, queue: .main
         ) { [weak self] _ in
@@ -199,9 +209,9 @@ public class AlertManager: NSObject {
             // period ending before iOS replies cannot revive its older request.
             MainActor.assumeIsolated {
                 guard let self else { return }
-                for kind in [AlertKind.high, .fastrise] where self.mealQuietSuppresses(kind) {
+                for kind in [AlertKind.high, .fastrise] where self.quietPeriodSuppresses(kind) {
                     self.mealQuietGenerations[kind, default: 0] &+= 1
-                    _ = self.clearMealQuietNotificationIfSuppressed(kind)
+                    _ = self.clearQuietNotificationIfSuppressed(kind)
                 }
             }
         }
@@ -370,7 +380,7 @@ public class AlertManager: NSObject {
         content.categoryIdentifier = Self.lowSoonNotificationCategory(snoozeAction:
             entry.alertType.snooze ? UNNotificationAction(identifier: snoozeActionIdentifier,
                 title: Texts_Alerts.snooze, options: []) : nil).identifier
-        applyImmediatePresentation(from: entry.alertType, to: content)
+        applyImmediatePresentation(from: entry.alertType, to: content, kind: kind)
         let request = UNNotificationRequest(identifier: kind.notificationIdentifier(),
                                             content: content, trigger: nil)
 
@@ -416,7 +426,9 @@ public class AlertManager: NSObject {
             return (suppressed, mealQuietGenerations[.high, default: 0])
         }
         let quietAtScheduling = quietState()
-        guard !quietAtScheduling.suppressed,
+        let silenceRevision = SelectiveAlarmSilence.revision(defaults: defaults)
+        guard !SelectiveAlarmSilence.isActive(at: now, defaults: defaults),
+              !quietAtScheduling.suppressed,
               HighSoonAdvisoryPolicy.isEnabled(defaults: defaults) else { return }
         let (entry, _) = alertEntriesAccessor.getCurrentAndNextAlertEntry(
             forAlertKind: .high, forWhen: now, alertTypesAccessor: alertTypesAccessor)
@@ -456,7 +468,9 @@ public class AlertManager: NSObject {
                       (defaults.object(forKey: HighSoonAdvisoryPolicy.lastScheduledKey) as? Date) == now
                 else { return }
                 let currentQuiet = quietState()
-                if currentQuiet.suppressed || currentQuiet.revision != quietAtScheduling.revision {
+                if currentQuiet.suppressed || currentQuiet.revision != quietAtScheduling.revision
+                    || SelectiveAlarmSilence.isActive(defaults: defaults)
+                    || SelectiveAlarmSilence.revision(defaults: defaults) != silenceRevision {
                     if let previousReservation {
                         defaults.set(previousReservation, forKey: HighSoonAdvisoryPolicy.lastScheduledKey)
                     } else {
@@ -526,7 +540,7 @@ public class AlertManager: NSObject {
             SensorHealthIssueManager.notificationIsTerminalUserInfoKey: true
         ]
 
-        applyImmediatePresentation(from: alertEntry.alertType, to: content)
+        applyImmediatePresentation(from: alertEntry.alertType, to: content, kind: .sensorTransmitterFailure)
 
         let request = UNNotificationRequest(
             identifier: SensorHealthIssueManager.notificationIdentifierPrefix + issue.id,
@@ -576,11 +590,12 @@ public class AlertManager: NSObject {
 
     /// Applies sound behavior from an Alert Type without adding a snooze notification category.
     /// Terminal failures are episode-deduplicated and never repeat or join Snooze All.
-    private func applyImmediatePresentation(from alertType: AlertType, to content: UNMutableNotificationContent) {
+    func applyImmediatePresentation(from alertType: AlertType, to content: UNMutableNotificationContent, kind: AlertKind) {
         let soundFileName = resolvedSoundFileName(for: alertType)
 
         if alertType.overridemute {
             guard soundFileName != "" else { return }
+            playingAlarmKind = kind
             soundPlayer?.playSound(soundFileName: soundFileName ?? "xdripalert.aif")
         } else if let soundFileName {
             guard !soundFileName.isEmpty else { return }
@@ -748,7 +763,7 @@ public class AlertManager: NSObject {
     /// check if any alerts are currently snoozed and return the correct status
     public func snoozeStatus() -> AlertSnoozeStatus {
         // set the default value to inactive. We'll then only override it as necessary
-        var snoozeStatus: AlertSnoozeStatus = .inactive
+        var snoozeStatus: AlertSnoozeStatus = SelectiveAlarmSilence.isActive(defaults: silenceDefaults) ? .urgent : .inactive
         
         if let snoozeAllAlertsUntilDate = UserDefaults.standard.snoozeAllAlertsUntilDate, snoozeAllAlertsUntilDate > Date() {
             return .allSnoozed
@@ -788,7 +803,7 @@ public class AlertManager: NSObject {
         /// check if it's for one of the alert notification
         loop: for alertKind in AlertKind.allCases {
             if alertKind.notificationIdentifier() == notification.request.identifier {
-                if clearMealQuietNotificationIfSuppressed(alertKind) {
+                if clearQuietNotificationIfSuppressed(alertKind) {
                     completionHandler([])
                     return nil
                 }
@@ -1099,8 +1114,8 @@ public class AlertManager: NSObject {
 
         // Suppression is separate from user snooze state and happens before sound,
         // notification scheduling, automatic repeat suppression or vibration.
-        if alertNeeded, mealQuietSuppresses(alertKind) {
-            trace("alert '%{public}@' suppressed during a verified meal quiet period",
+        if alertNeeded, quietPeriodSuppresses(alertKind) {
+            trace("alert '%{public}@' suppressed during an active quiet period",
                   log: log, category: ConstantsLog.categoryAlertManager, type: .info,
                   alertKind.descriptionForLogging())
             return false
@@ -1345,6 +1360,7 @@ public class AlertManager: NSObject {
                     if applicableAlertType.overridemute && delayInSecondsToUse == 0 {
                         // play the sound
                         if let soundPlayer = soundPlayer {
+                            playingAlarmKind = alertKind
                             soundPlayer.playSound(soundFileName: soundToSet)
                         }
                     } else {
@@ -1368,7 +1384,7 @@ public class AlertManager: NSObject {
             let notificationRequest = UNNotificationRequest(identifier: alertKind.notificationIdentifier(), content: content, trigger: trigger)
             
             // Capture only quietable requests; unrelated alarm replies remain unchanged.
-            let quietRequest = mealQuietRequestContext(for: alertKind)
+            let quietRequest = quietRequestContext(for: alertKind)
             uNUserNotificationCenter.add(notificationRequest) { error in
                 self.handleNotificationReply(for: alertKind, context: quietRequest) {
                     if let error = error {
@@ -1490,27 +1506,30 @@ public class AlertManager: NSObject {
 
     /// Measured high/rise evaluation enters through main-actor checkAlerts. Legacy
     /// missed-reading callers remain nonisolated and must never acquire quiet suppression.
-    private func mealQuietSuppresses(_ kind: AlertKind) -> Bool {
+    func quietPeriodSuppresses(_ kind: AlertKind) -> Bool {
+        if SelectiveAlarmSilence.suppresses(kind, defaults: silenceDefaults) { return true }
         guard kind == .high || kind == .fastrise, Thread.isMainThread else { return false }
         return MainActor.assumeIsolated { MealQuietManager.shared.shouldSuppress(kind) }
     }
 
-    private func mealQuietRequestContext(for kind: AlertKind) -> (id: UUID, generation: Int)? {
-        guard kind == .high || kind == .fastrise, Thread.isMainThread else { return nil }
+    func quietRequestContext(for kind: AlertKind) -> (id: UUID, generation: Int, silenceRevision: String?)? {
+        guard kind == .high || kind == .fastrise || SelectiveAlarmSilence.kinds.contains(kind),
+              Thread.isMainThread else { return nil }
         let id = UUID()
         mealQuietRequestIDs[kind] = id
-        return (id, mealQuietGenerations[kind, default: 0])
+        return (id, mealQuietGenerations[kind, default: 0], SelectiveAlarmSilence.revision(defaults: silenceDefaults))
     }
 
     /// Only quietable notifications need a main-actor recheck before an attachment retry.
     /// An activation also cancels an old reply after quiet has ended; request identity prevents
     /// that old callback from removing a newer notification with the same alarm identifier.
-    private func handleNotificationReply(for kind: AlertKind, context: (id: UUID, generation: Int)?,
+    func handleNotificationReply(for kind: AlertKind, context: (id: UUID, generation: Int, silenceRevision: String?)?,
                                          action: @escaping () -> Void) {
         guard let context else { action(); return }
         DispatchQueue.main.async {
             guard self.mealQuietRequestIDs[kind] == context.id else { return }
-            if self.mealQuietSuppresses(kind) || self.mealQuietGenerations[kind, default: 0] != context.generation {
+            if self.quietPeriodSuppresses(kind) || self.mealQuietGenerations[kind, default: 0] != context.generation
+                || SelectiveAlarmSilence.revision(defaults: self.silenceDefaults) != context.silenceRevision {
                 let identifiers = [kind.notificationIdentifier()]
                 self.uNUserNotificationCenter.removePendingNotificationRequests(withIdentifiers: identifiers)
                 self.uNUserNotificationCenter.removeDeliveredNotifications(withIdentifiers: identifiers)
@@ -1522,12 +1541,23 @@ public class AlertManager: NSObject {
 
     @MainActor
     @discardableResult
-    private func clearMealQuietNotificationIfSuppressed(_ kind: AlertKind) -> Bool {
-        guard mealQuietSuppresses(kind) else { return false }
+    private func clearQuietNotificationIfSuppressed(_ kind: AlertKind) -> Bool {
+        guard quietPeriodSuppresses(kind) else { return false }
         let identifiers = [kind.notificationIdentifier()]
         uNUserNotificationCenter.removePendingNotificationRequests(withIdentifiers: identifiers)
         uNUserNotificationCenter.removeDeliveredNotifications(withIdentifiers: identifiers)
         return true
+    }
+
+    private func clearSelectiveSilenceNotifications() {
+        guard SelectiveAlarmSilence.isActive(defaults: silenceDefaults) else { return }
+        let ids = SelectiveAlarmSilence.notificationIdentifiers
+        uNUserNotificationCenter.removePendingNotificationRequests(withIdentifiers: ids)
+        uNUserNotificationCenter.removeDeliveredNotifications(withIdentifiers: ids)
+        if let playingAlarmKind, SelectiveAlarmSilence.kinds.contains(playingAlarmKind) {
+            soundPlayer?.stopPlaying()
+            self.playingAlarmKind = nil
+        }
     }
 
     private func clearNotLoopingNotifications() {
@@ -1546,6 +1576,7 @@ public class AlertManager: NSObject {
     }
 
     deinit {
+        if let silenceObserver { NotificationCenter.default.removeObserver(silenceObserver) }
         if let watchAlarmDelegationObserver { NotificationCenter.default.removeObserver(watchAlarmDelegationObserver) }
         if let mealQuietObserver { NotificationCenter.default.removeObserver(mealQuietObserver) }
         UserDefaults.standard.removeObserver(self, forKeyPath: UserDefaults.Key.missedReadingAlertChanged.rawValue)
@@ -1582,6 +1613,7 @@ extension AlertManager {
         var settings = LibreWatchAlarmSettings(sessionID: session.id, sensorIdentity: session.redactedIdentity(),
             revision: previous?.revision ?? 1, generatedAt: Date(), isMgDl: UserDefaults.standard.bloodGlucoseUnitIsMgDl,
             rules: rules, snoozes: snoozes, snoozeAllUntil: UserDefaults.standard.snoozeAllAlertsUntilDate)
+        settings.selectiveSilenceUntil = SelectiveAlarmSilence.until()
         if let previous, settings.sameConfiguration(as: previous) { return previous }
         settings.revision = (previous?.revision ?? 0) + 1
         LibreWatchAlarmStore.save(settings)

@@ -1276,12 +1276,72 @@ final class RootHomeInteractionTests: XCTestCase {
 
     @MainActor func testIconCalculatorActionIsFirstAndSpeakingActionStillSwitches() {
         XCTAssertEqual(QuickActionsManager.availableActions(calculatorVisible: true,
-            speakReadings: false), [.penCalculator, .speakReadings])
+            speakReadings: false), [.penCalculator, .silentAlarms, .speakReadings])
         XCTAssertEqual(QuickActionsManager.availableActions(calculatorVisible: true,
-            speakReadings: true), [.penCalculator, .stopSpeakingReadings])
+            speakReadings: true), [.penCalculator, .silentAlarms, .stopSpeakingReadings])
         XCTAssertEqual(QuickActionsManager.availableActions(calculatorVisible: false,
-            speakReadings: false), [.speakReadings])
+            speakReadings: false), [.silentAlarms, .speakReadings])
         XCTAssertNotNil(QuickActionType.penCalculator.shortcutItem.icon)
+    }
+
+    @MainActor func testSilentIconHasOnlyTheRequestedTitleAndReflectsToggleWithoutRenaming() {
+        let action = QuickActionType.silentAlarms
+        XCTAssertEqual(QuickActionType(rawValue: "silentAlarms"), action)
+        for active in [false, true] {
+            let item = action.shortcutItem(silenceIsActive: active)
+            XCTAssertEqual(item.localizedTitle, "Lydløs")
+            XCTAssertNil(item.localizedSubtitle)
+            XCTAssertEqual(item.type, "silentAlarms")
+            XCTAssertNotNil(item.icon)
+        }
+        XCTAssertEqual(action.iconSystemName(silenceIsActive: false), "bell.slash.fill")
+        XCTAssertEqual(action.iconSystemName(silenceIsActive: true), "bell.fill")
+    }
+
+    @MainActor func testSilentIconWorksBeforeHomeExistsAndSurvivesManagerRestart() throws {
+        let suite = "SilentIconTests-" + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        let previousShortcuts = UIApplication.shared.shortcutItems
+        defer {
+            defaults.removePersistentDomain(forName: suite)
+            UIApplication.shared.shortcutItems = previousShortcuts
+        }
+        let manager = QuickActionsManager(silenceDefaults: defaults)
+        XCTAssertFalse(SelectiveAlarmSilence.isActive(defaults: defaults))
+        XCTAssertTrue(manager.handleQuickAction(.silentAlarms))
+        let until = try XCTUnwrap(SelectiveAlarmSilence.until(defaults: defaults))
+        XCTAssertGreaterThan(until, Date())
+        let reopenedDefaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        let reopened = QuickActionsManager(silenceDefaults: reopenedDefaults)
+        XCTAssertEqual(SelectiveAlarmSilence.until(defaults: reopenedDefaults), until)
+        XCTAssertTrue(SelectiveAlarmSilence.isActive(defaults: reopenedDefaults))
+        XCTAssertTrue(reopened.handleQuickAction(.silentAlarms))
+        XCTAssertFalse(SelectiveAlarmSilence.isActive(defaults: reopenedDefaults))
+        XCTAssertEqual(UIApplication.shared.shortcutItems?.map(\.type),
+            QuickActionsManager.availableActions(calculatorVisible: false,
+                speakReadings: UserDefaults.standard.speakReadings).map(\.rawValue))
+    }
+
+    @MainActor func testSilentIconDoesNotConsumeOrCreateCalculatorNavigation() throws {
+        let suite = "SilentIconNavigationTests-" + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        let previousShortcuts = UIApplication.shared.shortcutItems
+        defer {
+            defaults.removePersistentDomain(forName: suite)
+            UIApplication.shared.shortcutItems = previousShortcuts
+        }
+        let root = RootTabStateModel()
+        let manager = QuickActionsManager(silenceDefaults: defaults)
+        manager.attachRoot(root)
+        XCTAssertNil(root.dependencies)
+        XCTAssertTrue(manager.handleQuickAction(.silentAlarms))
+        XCTAssertNil(root.penCalculatorQuickActionRequest)
+        XCTAssertNil(root.dependencies, "Lydløs must not instantiate treatment services")
+        root.requestPenCalculatorQuickAction()
+        let pending = try XCTUnwrap(root.penCalculatorQuickActionRequest)
+        XCTAssertTrue(manager.handleQuickAction(.silentAlarms))
+        XCTAssertEqual(root.penCalculatorQuickActionRequest, pending)
+        XCTAssertNil(root.dependencies)
     }
 
     @MainActor func testIconCalculatorRequestSurvivesStartupAndCoalescesRepeatedTaps() {
