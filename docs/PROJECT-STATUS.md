@@ -1,3 +1,15 @@
+<!-- testflight-7.1.1-4358:start -->
+### TestFlight 7.1.1 (4358)
+
+- Kildecommit og tag: `26875321f61cb12ae7d3882589cca97c8fdcf00b` / `testflight-7.1.1-4358`.
+- Tests: 1914/1914 bestået; 0 fejlet; 0 skipped. iPhone- og Watch-simulatorbuilds bestod.
+- Apple-status (2026-11-08T07:59:57.838040+00:00): [Internal / Testing](https://appstoreconnect.apple.com/apps/6795645396/testflight/ios/b8c5230d-9428-42d2-8120-3b74a0167468).
+- Eksisterende intern gruppe: Ole Internal er bekræftet tilknyttet.
+- Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
+<!-- testflight-7.1.1-4358:end -->
+
+De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
+
 ## Lydløs fra appikonet — 8. november 2026
 
 Appikonets eksisterende menu får **Lydløs**, uden undertekst. Ét tryk starter
