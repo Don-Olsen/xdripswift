@@ -658,13 +658,14 @@ final class LibreWatchAlarmController: NSObject, UNUserNotificationCenterDelegat
         withCompletionHandler completionHandler: @escaping () -> Void) {
         DispatchQueue.main.async { [weak self] in
             defer { completionHandler() }
+            let now = Date()
             guard let self, response.actionIdentifier == self.snoozeAction, let settings = self.settings,
                   response.notification.request.content.userInfo["libreWatchAlarmSession"] as? String == settings.sessionID.uuidString,
                   let rawKind = response.notification.request.content.userInfo["libreWatchAlarmKind"] as? Int,
                   let kind = LibreWatchAlarmKind(rawValue: rawKind),
-                  let rule = settings.rule(for: kind, at: Date()), rule.allowsSnooze
+                  let rule = settings.rule(for: kind, at: now), rule.allowsSnooze
             else { return }
-            self.state.snooze(kind, until: Date().addingTimeInterval(Double(rule.snoozeMinutes) * 60))
+            self.state.snoozeFromUser(kind, until: now.addingTimeInterval(Double(rule.snoozeMinutes) * 60), at: now)
             LibreWatchAlarmStore.save(self.state)
             self.center.removeDeliveredNotifications(withIdentifiers: [response.notification.request.identifier])
             self.scheduleMissedIfNeeded()

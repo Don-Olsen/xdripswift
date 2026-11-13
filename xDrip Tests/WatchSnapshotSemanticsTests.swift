@@ -20,6 +20,103 @@ final class WatchSnapshotSemanticsTests: XCTestCase {
         return (session, calibration, settings)
     }
 
+    @MainActor func testPhoneUsesOnlyExplicitWatchHighSnoozeAndKeepsOriginalDeadline() throws {
+        let suite = "WatchHighSnooze." + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let manager = AlertManager(coreDataManager: core, soundPlayer: nil, silenceDefaults: defaults)
+        let (session, _, _) = fixtures()
+        var state = LibreWatchAlarmState(sessionID: session.id, sensorIdentity: session.redactedIdentity())
+        let expiry = date.addingTimeInterval(1800)
+        state.recordAutomaticThrottle(.high, readingID: UUID(), until: expiry)
+        AlertManager.applyLibreWatchAlarmState(state, session: session, coreDataManager: core,
+            silenceDefaults: defaults, now: date)
+        XCTAssertNil(SelectiveAlarmSilence.until(defaults: defaults), "An alarm ringing is not a user snooze")
+        state.snoozeFromUser(.high, until: expiry, at: date)
+        let transported = try JSONDecoder().decode(LibreWatchAlarmState.self, from: JSONEncoder().encode(state))
+        AlertManager.applyLibreWatchAlarmState(transported, session: session, coreDataManager: core,
+            silenceDefaults: defaults, now: date.addingTimeInterval(120))
+        XCTAssertEqual(SelectiveAlarmSilence.until(defaults: defaults), expiry, "Receipt time cannot extend the pause")
+        XCTAssertTrue(SelectiveAlarmSilence.suppresses(.veryhigh, at: date, defaults: defaults))
+        for kind in [AlertKind.low, .verylow, .lowSoon, .missedreading, .sensorTransmitterFailure] {
+            XCTAssertFalse(SelectiveAlarmSilence.suppresses(kind, at: date, defaults: defaults))
+            XCTAssertEqual(manager.getSnoozeParameters(alertKind: kind).snoozePeriodInMinutes, 0)
+        }
+        let revision = SelectiveAlarmSilence.revision(defaults: defaults)
+        AlertManager.applyLibreWatchAlarmState(transported, session: session, coreDataManager: core,
+            silenceDefaults: defaults, now: date.addingTimeInterval(180))
+        XCTAssertEqual(SelectiveAlarmSilence.revision(defaults: defaults), revision)
+        XCTAssertFalse(SelectiveAlarmSilence.isActive(at: expiry, defaults: defaults))
+    }
+
+    @MainActor func testPhoneEndAndRestartRejectReplayedAndOlderUnseenWatchHighSnoozes() throws {
+        let suite = "WatchHighSnoozeReplay." + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let original = LibreWatchUserHighSnooze(id: UUID(), requestedAt: date,
+            until: date.addingTimeInterval(1800))
+        SelectiveAlarmSilence.applyWatchSnooze(original, at: date, defaults: defaults)
+        SelectiveAlarmSilence.end(at: date.addingTimeInterval(120), defaults: defaults)
+        let reopened = try XCTUnwrap(UserDefaults(suiteName: suite))
+        let endedRevision = SelectiveAlarmSilence.revision(defaults: reopened)
+        let unseenOlder = LibreWatchUserHighSnooze(id: UUID(), requestedAt: date.addingTimeInterval(60),
+            until: date.addingTimeInterval(3600))
+        for request in [original, unseenOlder] {
+            SelectiveAlarmSilence.applyWatchSnooze(request, at: date.addingTimeInterval(180), defaults: reopened)
+            XCTAssertNil(SelectiveAlarmSilence.until(defaults: reopened))
+            XCTAssertEqual(SelectiveAlarmSilence.revision(defaults: reopened), endedRevision)
+        }
+        let fresh = LibreWatchUserHighSnooze(id: UUID(), requestedAt: date.addingTimeInterval(181),
+            until: date.addingTimeInterval(1200))
+        SelectiveAlarmSilence.applyWatchSnooze(fresh, at: fresh.requestedAt, defaults: reopened)
+        XCTAssertEqual(SelectiveAlarmSilence.until(defaults: reopened), fresh.until)
+        SelectiveAlarmSilence.applyWatchSnooze(original, at: fresh.requestedAt, defaults: reopened)
+        XCTAssertEqual(SelectiveAlarmSilence.until(defaults: reopened), fresh.until)
+    }
+
+    @MainActor func testPhoneRejectsInvalidExpiredAndFutureWatchHighSnoozeRequests() throws {
+        let suite = "WatchHighSnoozeInvalid." + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let intervals: [(Date, Date)] = [
+            (date.addingTimeInterval(-1800), date),
+            (date.addingTimeInterval(1), date.addingTimeInterval(601)),
+            (date, date), (date, date.addingTimeInterval(-1)),
+            (date, date.addingTimeInterval(7 * 24 * 3600 + 1)),
+            (Date(timeIntervalSince1970: .nan), date.addingTimeInterval(60)),
+            (date, Date(timeIntervalSince1970: .infinity))
+        ]
+        for (start, end) in intervals {
+            let request = LibreWatchUserHighSnooze(id: UUID(), requestedAt: start, until: end)
+            SelectiveAlarmSilence.applyWatchSnooze(request, at: date, defaults: defaults)
+            XCTAssertNil(defaults.object(forKey: SelectiveAlarmSilence.stateKey))
+        }
+    }
+
+    @MainActor func testWatchReceiptRequiresMatchingSessionAndDoesNotShortenExistingSilence() throws {
+        let suite = "WatchHighSnoozeSession." + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let (session, _, _) = fixtures()
+        var state = LibreWatchAlarmState(sessionID: UUID(), sensorIdentity: session.redactedIdentity())
+        state.snoozeFromUser(.veryHigh, until: date.addingTimeInterval(900), at: date)
+        AlertManager.applyLibreWatchAlarmState(state, session: session, coreDataManager: core,
+            silenceDefaults: defaults, now: date)
+        XCTAssertNil(SelectiveAlarmSilence.until(defaults: defaults))
+        state.sessionID = session.id; state.sensorIdentity = "other-sensor"
+        AlertManager.applyLibreWatchAlarmState(state, session: session, coreDataManager: core,
+            silenceDefaults: defaults, now: date)
+        XCTAssertNil(SelectiveAlarmSilence.until(defaults: defaults))
+        state.sensorIdentity = session.redactedIdentity()
+        let longer = date.addingTimeInterval(3600)
+        SelectiveAlarmSilence.start(until: longer, at: date.addingTimeInterval(-1), defaults: defaults)
+        AlertManager.applyLibreWatchAlarmState(state, session: session, coreDataManager: core,
+            silenceDefaults: defaults, now: date)
+        XCTAssertEqual(SelectiveAlarmSilence.until(defaults: defaults), longer)
+    }
+
     func testOrdinaryRefreshAndRestartReuseHandoffRevision() throws {
         let name = "WatchSnapshotSemanticsTests.\(UUID())"; let defaults = UserDefaults(suiteName: name)!
         defer { defaults.removePersistentDomain(forName: name) }

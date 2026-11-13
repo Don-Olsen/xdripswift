@@ -695,9 +695,7 @@ public class AlertManager: NSObject {
         loop: for alertKind in AlertKind.allCases {
             if response.notification.request.identifier == alertKind.notificationIdentifier() {
                 // user clicked an alert notification, time to stop playing if play
-                if let soundPlayer = soundPlayer {
-                    soundPlayer.stopPlaying()
-                }
+                stopSoundForUserAction(alertKind: alertKind)
                 
                 switch response.actionIdentifier {
                 case snoozeActionIdentifier:
@@ -708,6 +706,7 @@ public class AlertManager: NSObject {
                     trace("in userNotificationCenter, received actionIdentifier : snoozeActionIdentifier, snoozing alert %{public}@ for %{public}@ minutes (3)", log: log, category: ConstantsLog.categoryAlertManager, type: .info, alertKind.descriptionForLogging(), Int(currentAlertEntry.alertType.snoozeperiod).description)
                     
                     snooze(alertKind: alertKind, snoozePeriodInMinutes: Int(currentAlertEntry.alertType.snoozeperiod), response: response)
+                    silenceAfterUserHighSnooze(alertKind: alertKind)
                     
                     // save changes in coredata
                     coreDataManager.saveChanges()
@@ -851,9 +850,7 @@ public class AlertManager: NSObject {
                                   (snoozeIndex: Int) in
             
                                   // if sound is currently playing then stop it
-                                  if let soundPlayer = self.soundPlayer {
-                                      soundPlayer.stopPlaying()
-                                  }
+                                  self.stopSoundForUserAction(alertKind: alertKind)
             
                                   // get snooze period
                                   let snoozePeriod = ConstantsAlerts.snoozeValueMinutes[snoozeIndex]
@@ -875,6 +872,7 @@ public class AlertManager: NSObject {
             
                                   // save changes in coredata
                                   self.coreDataManager.saveChanges()
+                                  self.silenceAfterUserHighSnooze(alertKind: alertKind)
             
                                   // if it's a missed reading alert, then cancel any planned missed reading alerts and reschedule
                                   // if content is not nil, then it means a missed reading alert went off, the user clicked it, app opens, user clicks snooze, snoozing must be set
@@ -897,9 +895,7 @@ public class AlertManager: NSObject {
                                   () in
             
                                   // if sound is currently playing then stop it
-                                  if let soundPlayer = self.soundPlayer {
-                                      soundPlayer.stopPlaying()
-                                  }
+                                  self.stopSoundForUserAction(alertKind: alertKind)
             
                                   // if cancelHandler supplied by caller not nil, then execute it
                                   cancelHandler?()
@@ -907,6 +903,26 @@ public class AlertManager: NSObject {
                               }, didSelectRowHandler: nil, largePresentationTitle: alertKind.largeSnoozeTitle())
     }
     
+    /// A stale high notification/picker must not stop a newer protected alarm's sound.
+    private func stopSoundForUserAction(alertKind: AlertKind) {
+        if (alertKind == .high || alertKind == .veryhigh), let playingAlarmKind,
+           !SelectiveAlarmSilence.kinds.contains(playingAlarmKind) { return }
+        soundPlayer?.stopPlaying()
+    }
+
+    /// Called only from the user's notification action or confirmed Snooze picker.
+    /// Generic snooze()/automatic repeat throttling deliberately never enter this path.
+    private func silenceAfterUserHighSnooze(alertKind: AlertKind) {
+        guard alertKind == .high || alertKind == .veryhigh else { return }
+        let snooze = getSnoozeParameters(alertKind: alertKind)
+        guard let startedAt = snooze.snoozeTimeStamp, snooze.snoozePeriodInMinutes > 0 else { return }
+        let expiry = startedAt.addingTimeInterval(Double(snooze.snoozePeriodInMinutes) * 60)
+        dispatchPrecondition(condition: .onQueue(.main))
+        MainActor.assumeIsolated {
+            SelectiveAlarmSilence.start(until: expiry, at: startedAt, defaults: silenceDefaults)
+        }
+    }
+
     /// - if it's a missed reading alert, then reschedule with a delay of snoozePeriodInMinutes, also with a repeat every snoozePeriodInMinutes
     /// - other alerts are snoozed normal
     /// - parameters:
@@ -1633,10 +1649,16 @@ extension AlertManager {
         return delegation
     }
 
-    static func applyLibreWatchAlarmState(_ state: LibreWatchAlarmState, session: LibreWatchDirectSession, coreDataManager: CoreDataManager) {
+    static func applyLibreWatchAlarmState(_ state: LibreWatchAlarmState, session: LibreWatchDirectSession,
+                                         coreDataManager: CoreDataManager, silenceDefaults: UserDefaults = .standard,
+                                         now: Date = Date()) {
         dispatchPrecondition(condition: .onQueue(.main))
         guard state.sessionID == session.id, state.sensorIdentity == session.redactedIdentity() else { return }
-        let now = Date()
+        if let request = state.userHighSnooze {
+            MainActor.assumeIsolated {
+                SelectiveAlarmSilence.applyWatchSnooze(request, at: now, defaults: silenceDefaults)
+            }
+        }
         let stored = SnoozeParametersAccessor(coreDataManager: coreDataManager).getSnoozeParameters()
         for snooze in state.snoozes where snooze.until > now && snooze.until <= now.addingTimeInterval(7 * 24 * 60 * 60) {
             guard let item = stored.first(where: { Int($0.alertKind) == snooze.kind.rawValue }) else { continue }

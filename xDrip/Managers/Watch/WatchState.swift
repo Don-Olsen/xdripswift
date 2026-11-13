@@ -265,6 +265,19 @@ struct LibreWatchAlarmAutomaticThrottle: Codable, Equatable {
     let until: Date
 }
 
+/// Explicit user action, separate from the automatic repeat throttle in `snoozes`.
+/// The original identity and deadline travel with the existing persisted alarm state.
+struct LibreWatchUserHighSnooze: Codable, Equatable {
+    let id: UUID
+    let requestedAt: Date
+    let until: Date
+
+    var hasValidInterval: Bool {
+        requestedAt.timeIntervalSince1970.isFinite && until.timeIntervalSince1970.isFinite &&
+            until > requestedAt && until.timeIntervalSince(requestedAt) <= 7 * 24 * 60 * 60
+    }
+}
+
 struct LibreWatchAlarmSettings: Codable, Equatable {
     let sessionID: UUID
     let sensorIdentity: String
@@ -292,32 +305,41 @@ struct LibreWatchAlarmSettings: Codable, Equatable {
             }
     }
 
-    func sameConfiguration(as other: Self, ignoringDuplicateSnoozes: Bool = false) -> Bool {
-        sessionID == other.sessionID && sensorIdentity == other.sensorIdentity &&
+    func sameConfiguration(as other: Self, ignoringDuplicateSnoozes: Bool = false,
+                           ignoringHighSnoozes: Bool = false) -> Bool {
+        let ownSnoozes = ignoringHighSnoozes ? snoozes.filter { !Self.selectivelySilencedKinds.contains($0.kind) } : snoozes
+        let otherSnoozes = ignoringHighSnoozes ? other.snoozes.filter { !Self.selectivelySilencedKinds.contains($0.kind) } : other.snoozes
+        return sessionID == other.sessionID && sensorIdentity == other.sensorIdentity &&
             isMgDl == other.isMgDl && rules == other.rules &&
-            (snoozes == other.snoozes || (ignoringDuplicateSnoozes &&
-                snoozes.allSatisfy { other.snoozes.contains($0) } &&
-                other.snoozes.allSatisfy { snoozes.contains($0) })) &&
+            (ownSnoozes == otherSnoozes || (ignoringDuplicateSnoozes &&
+                ownSnoozes.allSatisfy { otherSnoozes.contains($0) } &&
+                otherSnoozes.allSatisfy { ownSnoozes.contains($0) })) &&
             snoozeAllUntil == other.snoozeAllUntil &&
             selectiveSilenceUntil == other.selectiveSilenceUntil
     }
 
     /// Lydløs alone must not invalidate an in-flight low. Every other setting,
     /// current authority, rule and reading is still checked by the caller.
-    func matchesPendingGlucoseSettings(_ submitted: Self, kind: LibreWatchAlarmKind) -> Bool {
+    func matchesPendingGlucoseSettings(_ submitted: Self, kind: LibreWatchAlarmKind, at now: Date) -> Bool {
         if self == submitted { return true }
         guard kind == .low || kind == .veryLow else { return false }
+        // A user high snooze changes both the selective pause and high-group snoozes.
+        // Neither changes an in-flight low; low/missed snoozes and all other inputs still match.
+        let ignoresHighSnoozes = selectiveSilenceUntil != submitted.selectiveSilenceUntil ||
+            (selectiveSilenceUntil ?? .distantPast) > now
         // A pending merge can duplicate unchanged snoozes. Confirming a known
         // Lydløs pause changes its revision, not the effective low-alarm settings.
         if (selectiveSilenceUntil != nil ||
             (revision == submitted.revision && generatedAt == submitted.generatedAt)),
-           sameConfiguration(as: submitted, ignoringDuplicateSnoozes: true) { return true }
+           sameConfiguration(as: submitted, ignoringDuplicateSnoozes: true,
+                             ignoringHighSnoozes: ignoresHighSnoozes) { return true }
         guard selectiveSilenceUntil != submitted.selectiveSilenceUntil else { return false }
         var withoutSilenceChange = self
         withoutSilenceChange.selectiveSilenceUntil = submitted.selectiveSilenceUntil
-        // Pending configuration combines both snooze arrays. Ignore only identical
-        // repeated entries here; any new kind or changed expiry still invalidates the reply.
-        return withoutSilenceChange.sameConfiguration(as: submitted, ignoringDuplicateSnoozes: true)
+        // Pending configuration combines both arrays. Apart from high-group changes during
+        // selective silence, only identical duplicates may be ignored here.
+        return withoutSilenceChange.sameConfiguration(as: submitted, ignoringDuplicateSnoozes: true,
+                                                      ignoringHighSnoozes: ignoresHighSnoozes)
     }
 
     func readinessRevision(notificationsAuthorized: Bool) -> UInt64? {
@@ -443,6 +465,8 @@ struct LibreWatchAlarmState: Codable, Equatable {
     var scheduledMissedInterval: TimeInterval?
     var scheduledMissedConfirmed: Bool?
     var automaticThrottle: LibreWatchAlarmAutomaticThrottle?
+    /// Optional for legacy states. Replay must not be mistaken for a new user action.
+    var userHighSnooze: LibreWatchUserHighSnooze?
     var ownershipStartedAt: Date?
     /// Persist before requesting feedback so wrist wakes and process restarts cannot repeat it.
     var readinessFeedbackOwnershipStartedAt: Date?
@@ -492,6 +516,16 @@ struct LibreWatchAlarmState: Codable, Equatable {
         }
     }
 
+    /// Only the explicit notification action calls this; alarm delivery uses the throttle below.
+    mutating func snoozeFromUser(_ kind: LibreWatchAlarmKind, until: Date, at date: Date) {
+        guard date.timeIntervalSince1970.isFinite, until.timeIntervalSince1970.isFinite,
+              until >= date, until.timeIntervalSince(date) <= 7 * 24 * 60 * 60 else { return }
+        snooze(kind, until: until)
+        guard (kind == .high || kind == .veryHigh), until > date else { return }
+        let effectiveExpiry = snoozes.filter { kind.snoozeGroup.contains($0.kind) }.map(\.until).max() ?? until
+        userHighSnooze = LibreWatchUserHighSnooze(id: UUID(), requestedAt: date, until: effectiveExpiry)
+    }
+
     mutating func recordAutomaticThrottle(_ kind: LibreWatchAlarmKind, readingID: UUID, until: Date) {
         snooze(kind, until: until)
         automaticThrottle = LibreWatchAlarmAutomaticThrottle(kind: kind, readingID: readingID, until: until)
@@ -512,7 +546,7 @@ struct LibreWatchAlarmState: Codable, Equatable {
         watchOwnsSensor: Bool, notificationsAuthorized: Bool, now: Date
     ) -> Bool {
         guard watchOwnsSensor, notificationsAuthorized,
-              let currentSettings, currentSettings.matchesPendingGlucoseSettings(submittedSettings, kind: rule.kind),
+              let currentSettings, currentSettings.matchesPendingGlucoseSettings(submittedSettings, kind: rule.kind, at: now),
               delegation?.matches(currentSettings) == true,
               sessionID == currentSettings.sessionID, sensorIdentity == currentSettings.sensorIdentity,
               lastReadingID == readingID, let lastReadingAt, now.timeIntervalSince(lastReadingAt) <= 180,

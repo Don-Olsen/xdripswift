@@ -38,7 +38,7 @@ extension SnoozeParameters {
 }
 
 
-/// The icon action has its own expiry so ending it cannot erase an independent snooze.
+/// Selective silence has its own expiry so ending it cannot erase an independent snooze.
 /// One defaults record commits expiry and callback identity together; no timer is required.
 enum SelectiveAlarmSilence {
     static let stateKey = "selectiveAlarmSilence.v1"
@@ -82,16 +82,44 @@ enum SelectiveAlarmSilence {
     @MainActor static func toggle(at now: Date = .now, defaults: UserDefaults = .standard) {
         let expiry = isActive(at: now, defaults: defaults) ? nil
             : now.addingTimeInterval(Double(durationMinutes(defaults: defaults)) * 60)
-        store(until: expiry, defaults: defaults)
+        store(until: expiry, changedAt: now, defaults: defaults)
     }
 
-    @MainActor static func end(defaults: UserDefaults = .standard) {
-        store(until: nil, defaults: defaults)
+    /// An explicit high snooze starts or extends the pause; it never toggles an active pause off.
+    @MainActor static func start(until expiry: Date, at now: Date = .now,
+                                 defaults: UserDefaults = .standard) {
+        guard now.timeIntervalSince1970.isFinite, expiry.timeIntervalSince1970.isFinite,
+              expiry > now, expiry.timeIntervalSince(now) <= 7 * 24 * 60 * 60 else { return }
+        store(until: max(until(defaults: defaults) ?? .distantPast, expiry),
+              changedAt: now, defaults: defaults)
     }
 
-    @MainActor private static func store(until: Date?, defaults: UserDefaults) {
-        var record: [String: Any] = ["revision": UUID().uuidString]
-        if let until { record["until"] = until }
+    /// Only the explicit Watch action marker can start this pause. Automatic alarm throttles
+    /// also travel in Watch state, but are not user actions. Preserve the original deadline.
+    @MainActor static func applyWatchSnooze(_ request: LibreWatchUserHighSnooze,
+                                           at now: Date = .now, defaults: UserDefaults = .standard) {
+        let record = defaults.dictionary(forKey: stateKey) ?? [:]
+        guard request.hasValidInterval, now.timeIntervalSince1970.isFinite,
+              request.requestedAt <= now, request.until > now,
+              record["watchRequestID"] as? String != request.id.uuidString,
+              request.requestedAt > (record["changedAt"] as? Date ?? .distantPast) else { return }
+        store(until: max(until(defaults: defaults) ?? .distantPast, request.until),
+              changedAt: request.requestedAt, watchRequestID: request.id, defaults: defaults)
+    }
+
+    @MainActor static func end(at now: Date = .now, defaults: UserDefaults = .standard) {
+        store(until: nil, changedAt: now, defaults: defaults)
+    }
+
+    @MainActor private static func store(until: Date?, changedAt: Date,
+                                         watchRequestID: UUID? = nil, defaults: UserDefaults) {
+        // Retain the last accepted Watch action even after End or an icon toggle. Re-delivery
+        // must not restart a pause, and older Watch actions cannot override a newer local choice.
+        var record = defaults.dictionary(forKey: stateKey) ?? [:]
+        record["revision"] = UUID().uuidString
+        record["changedAt"] = changedAt
+        if let watchRequestID { record["watchRequestID"] = watchRequestID.uuidString }
+        if let until { record["until"] = until } else { record.removeValue(forKey: "until") }
         defaults.set(record, forKey: stateKey)
         NotificationCenter.default.post(name: changed, object: defaults)
         if defaults === UserDefaults.standard { defaults.updateSnoozeStatus.toggle() }

@@ -1,3 +1,67 @@
+## Snooze af højalarm bruger eksisterende Lydløs — 13. november 2026
+
+Et eksplicit tryk på Snooze ved Høj eller Akut høj starter nu også den
+allerede eksisterende Lydløs-periode med samme absolutte udløb som den valgte
+snooze. Det gælder notifikationens handling og bekræftelse i den eksisterende
+snoozevælger, inklusive et manuelt valg fra Snooze-skærmen. En allerede længere
+Lydløs-periode forkortes ikke, og gentagne tryk kan ikke slå den fra.
+Generisk/automatisk snooze og alarmers gentagelsespauser starter ikke Lydløs.
+Højt om lidt dæmpes af den fælles periode; dens egen navigation ændres ikke.
+
+De eksisterende undtagelser bevares: Lav, Akut lav, Lavt om lidt, manglende
+målinger og terminale sensorfejl. Et gammelt højvarsels tryk eller en gammel
+høj-snoozevælger må heller ikke stoppe lyden fra en nyere beskyttet alarm.
+Lydløs afsluttes gennem det eksisterende Afslut eller appikonets toggle;
+afslutning ændrer fortsat ikke selvstændige individuelle snoozes.
+
+Watch genbruger sin gemte alarmtilstand og eksisterende overførsel. Kun et
+faktisk brugertryk gemmer en valgfri markør med ID, oprindeligt handlingstidspunkt
+og fast udløb; automatisk gentagelse gemmer ingen sådan markør. Telefonen
+kontrollerer session/sensor, gyldighed, alder og genlevering. En gammel besked
+må ikke genstarte pausen efter Afslut eller en nyere lokal beslutning. En
+ventende Lav/Akut lav-notifikation bevares også, når høj-snooze og Lydløs
+synkroniseres sammen; ændrede lav-/manglende-måling-snoozes, regler og
+alarmansvar kontrolleres fortsat. Den tidligere test, der afviste ændret
+høj-snooze under Lydløs, er afgrænset til ændret beskyttet snooze, fordi
+høj-snooze nu bevidst må ændres uden at annullere et lavvarsel. Uret
+bevarer sin eksisterende lokale Høj/Akut høj-snooze, også offline. En handling
+på den ene enhed kan først påvirke den anden, når de igen har forbindelse;
+udløbet flyttes ikke ved senere levering. Gamle beskeder kan stadig læses.
+
+Ingen nye menuer, alarmgrænser, beregnerregler, sensorforløb eller capabilities.
+Produktionsændringerne er begrænset til fire eksisterende filer. 18 nye
+regressionstests gennem den eksisterende alarmmanager, snoozevælger,
+Watch-alarmtilstand og telefonens modtagelse kontrollerer udløb, beskyttede
+alarmer/lyd, automatiske gentagelser, genstart, genlevering, ugyldige beskeder
+og ventende notifikationssvar. Ingen eksisterende test er fjernet.
+
+Den lokale ændring bestod **1.971/1.971 XCTest**, **0 fejl og 0 skipped**,
+**198 Python-tests**, Watch-værktøjernes **30 + 24** syntetiske kontroller,
+begge simulatorbuilds og unsigned Release **iPhoneOS/arm64** med Xcode 27.2.
+Separat kodegennemgang og `git diff --check` bestod. Kvitteringer og logs ligger
+uden for Git i
+`~/DeveloperBuildData/xDrip/local-runs/xdripswift/20261113T082351Z-19813/`,
+inklusive `results/stability-summary.json` og `results/iphoneos-unsigned.json`.
+Testene blev kørt på base `96976ff3544b099b33e3bb82b3cf79ede33751a9` med de
+staged ændringer; den separate arm64-kvittering registrerer staged tree og
+diff-hash. Det er lokal validering, ikke en kvittering for en ny release.
+
+Releaseprocedurens første `prepare` blev afvist før nummerallokering med
+HTTP 403 og `FORBIDDEN.REQUIRED_AGREEMENTS_MISSING_OR_EXPIRED`. Brugeren
+accepterede derefter Apple-aftalen. API'et afviste fortsat de første forsøg
+efter accepten, men begyndte at returnere HTTP 200 for app og buildstatus
+13. november kl. 20.36 UTC. Adgangsnøgle, app, team og uploadopsætning er
+uændrede. Releaseproceduren genoptages med frisk Apple-allokering og ny
+validering af det præcise release-checkpoint; den lokale kvittering ovenfor
+genbruges ikke som erstatning.
+
+Den tilsluttede iPhone blev kontrolleret læsende og havde 7.1.1 (4363).
+Der er ikke installeret en lokal build eller fremprovokeret alarmer på brugerens
+enheder. Faktisk notifikationshandling, lyd, Watch-levering og offline/online-
+synkronisering af den nye ændring er ikke fysisk verificeret. Der er ikke
+ændret UI-layout eller taget nye manuelle skærmbilleder. Ingen caches eller
+releaseartefakter er slettet som del af denne ændring.
+
 <!-- testflight-7.1.1-4363:start -->
 ### TestFlight 7.1.1 (4363)
 
