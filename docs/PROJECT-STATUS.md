@@ -1,3 +1,15 @@
+<!-- testflight-7.1.1-4364:start -->
+### TestFlight 7.1.1 (4364)
+
+- Kildecommit og tag: `9a65d019a792500a8f2eda6515a36ace1f2f899b` / `testflight-7.1.1-4364`.
+- Tests: 1971/1971 bestået; 0 fejlet; 0 skipped. iPhone- og Watch-simulatorbuilds bestod.
+- Apple-status (2026-11-13T21:28:31.963429+00:00): [Internal / Testing](https://appstoreconnect.apple.com/apps/6795645396/testflight/ios/963fac07-38e9-450a-b237-d622fb6cbff7).
+- Eksisterende intern gruppe: Ole Internal er bekræftet tilknyttet.
+- Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
+<!-- testflight-7.1.1-4364:end -->
+
+De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
+
 ## Snooze af højalarm bruger eksisterende Lydløs — 13. november 2026
 
 Et eksplicit tryk på Snooze ved Høj eller Akut høj starter nu også den
