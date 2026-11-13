@@ -63,16 +63,54 @@ HTTP 403 og `FORBIDDEN.REQUIRED_AGREEMENTS_MISSING_OR_EXPIRED`. Brugeren
 accepterede derefter Apple-aftalen. API'et afviste fortsat de første forsøg
 efter accepten, men begyndte at returnere HTTP 200 for app og buildstatus
 13. november kl. 20.36 UTC. Adgangsnøgle, app, team og uploadopsætning er
-uændrede. Releaseproceduren genoptages med frisk Apple-allokering og ny
-validering af det præcise release-checkpoint; den lokale kvittering ovenfor
-genbruges ikke som erstatning.
+uændrede. Apple valgte derefter **4364** gennem den normale procedure.
+
+Det præcise release-checkpoint
+`9a65d019a792500a8f2eda6515a36ace1f2f899b` / `testflight-7.1.1-4364`
+bestod **1.971/1.971 XCTest**, **0 fejl og 0 skipped**, **198 Python-tests**,
+Watch-værktøjernes **30 + 24** syntetiske kontroller, begge simulatorbuilds og
+unsigned Release **iPhoneOS/arm64**. Testtræet er
+`c9456c4da12750c989d2c3fdaeb8cced721b7359`; kvitteringerne ligger uden for Git
+under `build/testflight-7.1.1-4364/test/`. Eksisterende simulatorcaches blev
+APFS-klonet for at begrænse ekstra diskforbrug; hele releasevalideringen blev
+kørt på ny. Den tidligere lokale kvittering blev ikke genbrugt som releasebevis.
+En separat kontrol bekræftede ren Git-status og matchende kilde, tag og kvitteringer.
+
+Arkivet blev bygget fra tagget. Den faktisk eksporterede IPA bestod kontrollen
+af kildecommit, version/build, fem bundle-id'er, signaturer, profiler,
+entitlements og Watch-indlejring. SHA-256:
+`1d52a3f4634282848eadacb0c6965b5cb6a05f508190ba99cfbe91939f436915`.
+Apple modtog uploaden og bekræftede **VALID / INTERNAL_ONLY / IN_BETA_TESTING**
+13. november kl. **21.28 UTC**, inklusive den eksisterende **Ole Internal**-gruppes
+faktiske buildtilknytning. Ingen ekstern testgruppe eller App Store-publicering
+blev brugt. Release-tagget forbliver på det testede kildecheckpoint; faktisk
+status og denne valideringsrapport committes separat.
 
 Den tilsluttede iPhone blev kontrolleret læsende og havde 7.1.1 (4363).
 Der er ikke installeret en lokal build eller fremprovokeret alarmer på brugerens
 enheder. Faktisk notifikationshandling, lyd, Watch-levering og offline/online-
 synkronisering af den nye ændring er ikke fysisk verificeret. Der er ikke
-ændret UI-layout eller taget nye manuelle skærmbilleder. Ingen caches eller
-releaseartefakter er slettet som del af denne ændring.
+ændret UI-layout eller taget nye manuelle skærmbilleder.
+
+Efter de præcise release-tests og før arm64-buildet fjernede den kontrollerede
+oprydning **27.421** regenererbare filer fra afsluttede delte simulatorcaches
+(**3.791.155.200 allokerede bytes**). Den brugte frisk Apple-kontrol, fælles
+buildlås, kontrol af åbne filer og filidentitet samt før/efter-kontrol af Git og
+bevarede artefakter. Device-caches, kilde, testresultater, logs, private data og
+alle releasefiler blev bevaret. Rapport og gennemgået hjælpeprogram ligger i
+`build/testflight-7.1.1-4364/maintenance/shared-simulator-cache-cleanup/`,
+med slutrapport `20261113T210340.196920Z/report.json`.
+
+Efter bekræftet udgivelse fjernede den normale automatiske oprydning yderligere
+**30.906** klassificerede filer fra 4362 (**4.888.829.952 allokerede bytes**).
+Rapport: `build/release-automation/cleanup/20261113T213303.150499Z/report.json`.
+4364 og seneste tidligere verificerede release 4363 blev bevaret i fuld form;
+arkiver, IPA, dSYMs, XCResult og dokumenteret historik er ikke slettet.
+Begge oprydninger afsluttedes med bestået bevaringskontrol. De observerede
+ændringer i fri plads var henholdsvis **2.235.117.568** og **5.098.180.608 bytes**;
+APFS-kloner og andet samtidigt diskforbrug gør dem forskellige fra de slettede
+filers allokerede størrelse. Byggeområderne er fortsat over 15 GiB, fordi
+beskyttede eller ikke-klassificerede filer bevares efter den gældende procedure.
 
 <!-- testflight-7.1.1-4363:start -->
 ### TestFlight 7.1.1 (4363)
