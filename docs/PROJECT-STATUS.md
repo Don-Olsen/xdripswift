@@ -34,6 +34,19 @@ Watch Direct viser en streg for ændringen, når der mangler en sammenlignelig
 tidligere måling. Komplikationen udelader ændringen i samme situation.
 To sammenlignelige målinger med samme værdi giver fortsat et synligt nul.
 
+Release 4365 bestod 1.978 XCTest uden fejl eller oversprungne tests, 198
+Python-tests og Watch-værktøjernes 30 + 24 syntetiske kontroller. Begge
+simulatorbuilds og unsigned iPhoneOS/arm64 bestod på releasegrundlaget.
+Testene dækkede blandt andet en ændret alarmtidsplan under koldstart, gentagne
+callbacks, aktive og udløbne pauser samt første Watch-måling efter et hul.
+
+Den eksporterede IPA og alle fem signerede bundles blev verificeret.
+Den tilsluttede iPhone havde 4364 før upload. Snooze fra en rigtig
+låseskærmsnotifikation og Watch Direct med sensor på 4365 afventer fysisk test.
+Under udgivelsen blev 10.196 regenererbare filer fra en afsluttet lokal
+simulatortest ryddet. Den sædvanlige oprydning efter udgivelsen fjernede
+30.897 ældre cachefiler. Kontrollerne af bevarede filer bestod.
+
 ## Snooze af højalarm bruger eksisterende Lydløs — 13. november 2026
 
 Et eksplicit tryk på Snooze ved Høj eller Akut høj starter nu også den
