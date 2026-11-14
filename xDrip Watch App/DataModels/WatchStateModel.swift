@@ -141,7 +141,7 @@ final class WatchStateModel: NSObject, ObservableObject {
 
     @Published var isMgDl: Bool = true
     @Published var slopeOrdinal: Int = 2
-    @Published var deltaValueInUserUnit: Double = 0
+    @Published var deltaValueInUserUnit: Double?
     @Published var urgentLowLimitInMgDl: Double = 60
     @Published var lowLimitInMgDl: Double = 80
     @Published var highLimitInMgDl: Double = 170
@@ -518,26 +518,11 @@ final class WatchStateModel: NSObject, ObservableObject {
         }
     }
 
-    /// convert the optional delta change int (in mg/dL) to a formatted change value in the user chosen unit making sure all zero values are shown as a positive change to follow Nightscout convention
-    /// - Returns: a string holding the formatted delta change value (i.e. +0.4 or -6)
     func deltaChangeStringInUserChosenUnit() -> String {
-        if let bgReadingDate = bgReadingDate(),
-           (!isShowingDirectLibreReading || directLibreReadingIsCurrent()),
-           isShowingDirectLibreReading || bgReadingDate > Date().addingTimeInterval(-60 * 20) {
-            let deltaValueAsString = isMgDl ? deltaValueInUserUnit.mgDlToMmolAndToString(mgDl: isMgDl) : deltaValueInUserUnit.mmolToString()
-
-            var deltaSign = ""
-
-            if deltaValueInUserUnit > 0 {
-                deltaSign = "+"
-            }
-
-            // quickly check "value" and prevent "-0mg/dl" or "-0.0mmol/l" being displayed
-            // show unitized zero deltas as +0 or +0.0 as per Nightscout format
-            return deltaValueInUserUnit == 0.0 ? (isMgDl ? "+0" : "+0.0") : (deltaSign + deltaValueAsString)
-        } else {
-            return "-"
-        }
+        guard let date = bgReadingDate(),
+              isShowingDirectLibreReading ? directLibreReadingIsCurrent() : date > Date().addingTimeInterval(-60 * 20)
+        else { return "-" }
+        return WatchGlucoseDelta.formatted(deltaValueInUserUnit, isMgDl: isMgDl) ?? "-"
     }
 
     /// function to calculate the sensor progress value and return a text color to be used by the view
@@ -1334,7 +1319,7 @@ final class WatchStateModel: NSObject, ObservableObject {
         directLibreReadingIsStale = isStale
         if isStale {
             slopeOrdinal = 0
-            deltaValueInUserUnit = 0
+            deltaValueInUserUnit = nil
         } else if let latest = directReadingHistory.first,
                   let displayed = displayedLibreValues(for: latest) {
             updateDirectDerivedValues(
@@ -1366,11 +1351,7 @@ final class WatchStateModel: NSObject, ObservableObject {
             slopeOrdinal = 0
         }
 
-        if let deltaMGDL = displayedDelta {
-            deltaValueInUserUnit = isMgDl ? deltaMGDL : deltaMGDL / 18.0182
-        } else {
-            deltaValueInUserUnit = 0
-        }
+        deltaValueInUserUnit = WatchGlucoseDelta.inUserUnit(directMgDl: displayedDelta, isMgDl: isMgDl)
 
         updatedDate = reading.receivedAt
         sensorAgeInMinutes = Double(reading.sensorTimeInMinutes)

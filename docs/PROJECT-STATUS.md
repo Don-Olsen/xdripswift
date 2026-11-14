@@ -10,6 +10,18 @@
 
 De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
 
+## Snooze ved koldstart og ændring på Watch Direct — 14. november 2026
+
+Når brugeren vælger Snooze på en Høj- eller Akut høj-notifikation under
+koldstart, skal handlingen vente på, at alarmmanageren er klar. Perioden
+regnes fra trykket. Snooze-listen viser den fælles Lydløs-periodes udløb
+på de berørte rækker, herunder Hurtig stigning. En selvstændig snooze
+har sin egen kontakt og udløbstid.
+
+Watch Direct viser en streg for ændringen, når der mangler en sammenlignelig
+tidligere måling. Komplikationen udelader ændringen i samme situation.
+To sammenlignelige målinger med samme værdi giver fortsat et synligt nul.
+
 ## Snooze af højalarm bruger eksisterende Lydløs — 13. november 2026
 
 Et eksplicit tryk på Snooze ved Høj eller Akut høj starter nu også den

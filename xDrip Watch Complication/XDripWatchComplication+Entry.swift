@@ -147,21 +147,11 @@ extension XDripWatchComplication.Entry {
             }
         }
         
-        /// convert the optional delta change int (in mg/dL) to a formatted change value in the user chosen unit making sure all zero values are shown as a positive change to follow Nightscout convention
-        /// - Returns: a string holding the formatted delta change value (i.e. +0.4 or -6)
         func deltaChangeStringInUserChosenUnit() -> String {
-            if let deltaValueInUserUnit = deltaValueInUserUnit, hasRecentReading {
-                let deltaSign: String = deltaValueInUserUnit > 0 ? "+" : "" 
-                let deltaValueAsString = isMgDl ? deltaValueInUserUnit.mgDlToMmolAndToString(mgDl: isMgDl) : deltaValueInUserUnit.mmolToString()
-                
-                // quickly check "value" and prevent "-0mg/dl" or "-0.0mmol/l" being displayed
-                // show unitized zero deltas as +0 or +0.0 as per Nightscout format
-                return deltaValueInUserUnit == 0.0 ? (isMgDl ? "+0" : "+0.0") : (deltaSign + deltaValueAsString)
-            }
-            return ""
+            guard hasRecentReading else { return "" }
+            return WatchGlucoseDelta.formatted(deltaValueInUserUnit, isMgDl: isMgDl) ?? ""
         }
-        
-        
+
         ///  returns a string holding the trend arrow
         /// - Returns: trend arrow string (i.e.  "↑")
         func trendArrow() -> String {

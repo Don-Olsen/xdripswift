@@ -80,7 +80,7 @@ public class AlertManager: NSObject {
     // MARK: - private properties
   
     /// snoozeActionIdentifier for alert notification
-    private let snoozeActionIdentifier = "snoozeActionIdentifier"
+    static let snoozeActionIdentifier = "snoozeActionIdentifier"
     
     /// snoozeCategoryIdentifier for alert notification
     private let snoozeCategoryIdentifier = "snoozeCategoryIdentifier"
@@ -378,7 +378,7 @@ public class AlertManager: NSObject {
         content.body = Self.lowSoonNotificationBody(validated,
             usesMgDl: UserDefaults.standard.bloodGlucoseUnitIsMgDl)
         content.categoryIdentifier = Self.lowSoonNotificationCategory(snoozeAction:
-            entry.alertType.snooze ? UNNotificationAction(identifier: snoozeActionIdentifier,
+            entry.alertType.snooze ? UNNotificationAction(identifier: Self.snoozeActionIdentifier,
                 title: Texts_Alerts.snooze, options: []) : nil).identifier
         applyImmediatePresentation(from: entry.alertType, to: content, kind: kind)
         let request = UNNotificationRequest(identifier: kind.notificationIdentifier(),
@@ -698,7 +698,7 @@ public class AlertManager: NSObject {
                 stopSoundForUserAction(alertKind: alertKind)
                 
                 switch response.actionIdentifier {
-                case snoozeActionIdentifier:
+                case Self.snoozeActionIdentifier:
 
                     // get the appicable alertEntry so we can find the alertType and default snooze value
                     let (currentAlertEntry, _) = alertEntriesAccessor.getCurrentAndNextAlertEntry(forAlertKind: alertKind, forWhen: Date(), alertTypesAccessor: alertTypesAccessor)
@@ -910,6 +910,20 @@ public class AlertManager: NSObject {
         soundPlayer?.stopPlaying()
     }
 
+    /// The coordinator accepts only explicit High/Very High notification snoozes here.
+    @MainActor func applyHighNotificationSnooze(_ kind: AlertKind, receivedAt: Date, now: Date) {
+        let snooze = getSnoozeParameters(alertKind: kind)
+        guard receivedAt > (snooze.snoozeTimeStamp ?? .distantPast),
+              receivedAt > (SelectiveAlarmSilence.lastChangedAt(defaults: silenceDefaults) ?? .distantPast) else { return }
+        let (entry, _) = alertEntriesAccessor.getCurrentAndNextAlertEntry(
+            forAlertKind: kind, forWhen: receivedAt, alertTypesAccessor: alertTypesAccessor)
+        let minutes = Int(entry.alertType.snoozeperiod)
+        guard receivedAt == now || receivedAt.addingTimeInterval(TimeInterval(minutes) * 60) > now else { return }
+        stopSoundForUserAction(alertKind: kind)
+        self.snooze(alertKind: kind, snoozePeriodInMinutes: minutes, response: nil, notificationActionAt: receivedAt)
+        silenceAfterUserHighSnooze(alertKind: kind)
+    }
+
     /// Called only from the user's notification action or confirmed Snooze picker.
     /// Generic snooze()/automatic repeat throttling deliberately never enter this path.
     private func silenceAfterUserHighSnooze(alertKind: AlertKind) {
@@ -929,11 +943,12 @@ public class AlertManager: NSObject {
     ///     - alertKind
     ///     - snoozePeriodInMinutes
     ///     - response  the UNNotificationResponse received from iOS when user clicks the notification
-    public func snooze(alertKind: AlertKind, snoozePeriodInMinutes: Int, response: UNNotificationResponse?) {
+    public func snooze(alertKind: AlertKind, snoozePeriodInMinutes: Int, response: UNNotificationResponse?,
+                       notificationActionAt: Date? = nil) {
         // A response means the user snoozed a notification that had already fired. Calls without a
         // response prepare the alert ahead of a possible condition, such as the short automatic
         // rise/drop suppression after calibration, and must be described as a pre-snooze.
-        let troubleshootingActivity: TroubleshootingAlertActivity = response == nil
+        let troubleshootingActivity: TroubleshootingAlertActivity = response == nil && notificationActionAt == nil
             ? .preSnoozed(minutes: snoozePeriodInMinutes)
             : .snoozed(minutes: snoozePeriodInMinutes)
         trace(
@@ -954,7 +969,7 @@ public class AlertManager: NSObject {
             
         } else {
             // any other type of alert, set it to snoozed
-            getSnoozeParameters(alertKind: alertKind).snooze(snoozePeriodInMinutes: snoozePeriodInMinutes)
+            getSnoozeParameters(alertKind: alertKind).snooze(snoozePeriodInMinutes: snoozePeriodInMinutes, at: notificationActionAt ?? Date())
             trace("Snoozing alert '%{public}@' for %{public}@ minutes (2)", log: log, category: ConstantsLog.categoryAlertManager, type: .info, alertKind.descriptionForLogging(), snoozePeriodInMinutes.description)
             
             // save changes in coredata
@@ -1486,7 +1501,7 @@ public class AlertManager: NSObject {
         var mutableExistingCategories = existingCategories
         
         // create the snooze action
-        let action = UNNotificationAction(identifier: snoozeActionIdentifier, title: Texts_Alerts.snooze, options: [])
+        let action = UNNotificationAction(identifier: Self.snoozeActionIdentifier, title: Texts_Alerts.snooze, options: [])
         
         // create the category - add option customDismissAction, this to make sure userNotificationCenter with didReceive will be called, which in turn will stop the soundPlayer, otherwise the user would dismiss the notification but in case off override mute, the sound keeps on playing
         let generalCategory = UNNotificationCategory(identifier: snoozeCategoryIdentifier, actions: [action], intentIdentifiers: [], options: [.customDismissAction])

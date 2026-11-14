@@ -110,6 +110,13 @@ struct InitialCalibrationRequestGate {
     
     /// AlertManager instance
     private var alertManager: AlertManager?
+    private struct PendingHighSnooze {
+        let kind: AlertKind
+        let deliveredAt: Date
+        let receivedAt: Date
+        var completions: [() -> Void]
+    }
+    private var pendingHighSnoozes: [PendingHighSnooze] = []
     
     /// LoopManager instance
     private var loopManager: LoopManager?
@@ -1054,7 +1061,7 @@ struct InitialCalibrationRequestGate {
         cgmTransmitterInfoChanged()
         
         // setup alertmanager
-        alertManager = AlertManager(coreDataManager: coreDataManager, soundPlayer: soundPlayer)
+        installAlertManager(AlertManager(coreDataManager: coreDataManager, soundPlayer: soundPlayer))
         if let alertManager {
             sensorHealthIssueManager.configure(oneOffAlarmRaiser: alertManager)
         }
@@ -3641,8 +3648,41 @@ extension RootApplicationCoordinator: @preconcurrency UNUserNotificationCenterDe
         return true
     }
 
+    /// Keep the system completion until Core Data is ready. A repeated callback for the
+    /// same delivered alert shares the first tap's time and completes after the same snooze.
+    func handleHighNotificationSnooze(notificationIdentifier: String, actionIdentifier: String,
+                                      deliveredAt: Date, receivedAt: Date = Date(),
+                                      completion: @escaping () -> Void) -> Bool {
+        guard actionIdentifier == AlertManager.snoozeActionIdentifier,
+              let kind = [AlertKind.high, .veryhigh].first(where: { $0.notificationIdentifier() == notificationIdentifier })
+        else { return false }
+        if let alertManager {
+            alertManager.applyHighNotificationSnooze(kind, receivedAt: receivedAt, now: receivedAt)
+            completion()
+        } else if let index = pendingHighSnoozes.firstIndex(where: { $0.kind == kind && $0.deliveredAt == deliveredAt }) {
+            pendingHighSnoozes[index].completions.append(completion)
+        } else {
+            pendingHighSnoozes.append(PendingHighSnooze(kind: kind, deliveredAt: deliveredAt,
+                receivedAt: receivedAt, completions: [completion]))
+        }
+        return true
+    }
+
+    func installAlertManager(_ manager: AlertManager, at now: Date = Date()) {
+        alertManager = manager
+        let pending = pendingHighSnoozes
+        pendingHighSnoozes.removeAll()
+        for action in pending {
+            manager.applyHighNotificationSnooze(action.kind, receivedAt: action.receivedAt, now: now)
+            action.completions.forEach { $0() }
+        }
+    }
+
     // called when user clicks a notification
     func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse, withCompletionHandler completionHandler: @escaping () -> Void) {
+        if handleHighNotificationSnooze(notificationIdentifier: response.notification.request.identifier,
+            actionIdentifier: response.actionIdentifier, deliveredAt: response.notification.date,
+            completion: completionHandler) { return }
         // call completionHandler when exiting function
         defer {
             // call completionhandler

@@ -2408,6 +2408,58 @@ final class LibreWatchValuePipelineTests: XCTestCase {
         XCTAssertNotNil(presentation.trendMGDLPerMinute)
     }
 
+    func testDirectWatchDisplayAndComplicationDistinguishUnknownDeltaFromMeasuredZero() throws {
+        let snapshot = calibration(type: .factoryCalibrated, slope: 1, intercept: 0)
+        let current = payload(native: 120, previousNative: 118, raw: 850, previousRaw: 840,
+                              domain: .factoryNativeMGDL, sensorTime: 1_000)
+        let previous = payload(native: 120, raw: 850, previousRaw: 840, domain: .factoryNativeMGDL,
+                               sensorTime: 999, at: receivedAt.addingTimeInterval(-60))
+        let beforeGap = payload(native: 160, raw: 900, previousRaw: 890, domain: .factoryNativeMGDL,
+                                sensorTime: 952, at: receivedAt.addingTimeInterval(-48 * 60))
+        let cases: [(String, LibreWatchDirectReadingPayload?, Double?)] = [
+            ("first reading", nil, nil), ("first reading after gap", beforeGap, nil),
+            ("two equal readings one minute apart", previous, 0)
+        ]
+        for isMgDl in [true, false] {
+            var publication = ComplicationPublicationState()
+            var written: Data?
+            for (name, prior, expected) in cases {
+                let sourceDelta = prior.flatMap {
+                    LibreWatchDirectDeltaPolicy.sourceDelta(current: current, previous: $0, calibration: snapshot)
+                }
+                let display = try XCTUnwrap(snapshot.presentation(for: current, sourceDelta: sourceDelta, at: receivedAt))
+                let delta = WatchGlucoseDelta.inUserUnit(directMgDl: display.deltaMGDL, isMgDl: isMgDl)
+                XCTAssertEqual(delta, expected, name)
+                let expectedText: String? = expected == nil ? nil : (isMgDl ? "+0" : "+0.0")
+                XCTAssertEqual(WatchGlucoseDelta.formatted(delta, isMgDl: isMgDl), expectedText, name)
+                XCTAssertEqual(display.glucoseMGDL, 120, name)
+                XCTAssertNotNil(display.trendMGDLPerMinute, name)
+
+                var model = complicationSnapshot(at: receivedAt, source: .directLibre)
+                model.isMgDl = isMgDl
+                model.bgReadingValues = [display.glucoseMGDL]
+                model.bgReadingDatesAsDouble = [receivedAt.timeIntervalSince1970]
+                model.deltaValueInUserUnit = delta
+                _ = publication.publishIfChanged(model, at: receivedAt, write: { written = $0 }, reload: {})
+                let restored = try XCTUnwrap(ComplicationSharedUserDefaultsModel.decodeStoredData(written))
+                XCTAssertEqual(restored.deltaValueInUserUnit, expected, name)
+                XCTAssertEqual(WatchGlucoseDelta.formatted(restored.deltaValueInUserUnit, isMgDl: restored.isMgDl),
+                               expectedText, name)
+            }
+        }
+    }
+
+    func testWatchDeltaUsesTheDirectConversionAndKeepsPhoneValuesInTheirReportedUnit() {
+        for sign in [-1.0, 1.0] {
+            let direct = 18.0182 * sign
+            XCTAssertEqual(WatchGlucoseDelta.inUserUnit(directMgDl: direct, isMgDl: true), direct)
+            XCTAssertEqual(WatchGlucoseDelta.inUserUnit(directMgDl: direct, isMgDl: false), sign)
+        }
+        // Phone snapshots already contain the change in the user-selected unit.
+        XCTAssertEqual(WatchGlucoseDelta.formatted(0.5, isMgDl: false), "+0.5")
+        XCTAssertEqual(WatchGlucoseDelta.formatted(-2.0, isMgDl: true), "-2")
+    }
+
     func testActiveApplicationAllowsRecoveryWithoutExtendedRuntime() {
         XCTAssertTrue(LibreWatchLifecyclePolicy.recoveryIsAllowed(
             applicationIsActive: true,

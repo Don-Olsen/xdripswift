@@ -9,6 +9,20 @@
 import CoreFoundation
 import Foundation
 
+/// Direct Libre readings can have a current glucose value without a comparable previous reading.
+/// Keep a missing change distinct from measured zero across the Watch display and complication.
+enum WatchGlucoseDelta {
+    static func inUserUnit(directMgDl: Double?, isMgDl: Bool) -> Double? {
+        directMgDl.map { isMgDl ? $0 : $0 / 18.0182 }
+    }
+
+    static func formatted(_ valueInUserUnit: Double?, isMgDl: Bool) -> String? {
+        guard let value = valueInUserUnit else { return nil }
+        if value == 0 { return isMgDl ? "+0" : "+0.0" }
+        return (value > 0 ? "+" : "") + value.bgValueToString(mgDl: isMgDl)
+    }
+}
+
 /// model of the data we'll store in the shared app group to pass from the watch app to the widgets
 struct ComplicationSharedUserDefaultsModel: Codable, Equatable {
     var bgReadingValues: [Double]

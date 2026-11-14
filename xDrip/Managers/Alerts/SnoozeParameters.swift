@@ -5,9 +5,9 @@ extension SnoozeParameters {
     // MARK: public functions
     
     /// store snoozeperiod in minutes, snoozetimestamp = now,
-    public func snooze(snoozePeriodInMinutes:Int) {
+    public func snooze(snoozePeriodInMinutes: Int, at date: Date = Date()) {
         self.snoozePeriodInMinutes = Int16(snoozePeriodInMinutes)
-        snoozeTimeStamp = Date()
+        snoozeTimeStamp = date
     }
     
 
@@ -64,6 +64,10 @@ enum SelectiveAlarmSilence {
         guard let date = defaults.dictionary(forKey: stateKey)?["until"] as? Date,
               date.timeIntervalSince1970.isFinite else { return nil }
         return date
+    }
+
+    static func lastChangedAt(defaults: UserDefaults = .standard) -> Date? {
+        defaults.dictionary(forKey: stateKey)?["changedAt"] as? Date
     }
 
     static func revision(defaults: UserDefaults = .standard) -> String? {

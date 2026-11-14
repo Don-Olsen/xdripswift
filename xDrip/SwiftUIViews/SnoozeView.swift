@@ -75,6 +75,7 @@ struct SnoozeView: View {
     }
     
     @ViewBuilder private func contentList(at now: Date) -> some View {
+        let silenceUntil = SelectiveAlarmSilence.until()
         List {
             Section {
                 // This replaces snoozeAllUISwitchAction(_:) from SnoozeViewController.
@@ -91,7 +92,7 @@ struct SnoozeView: View {
                     .listRowBackground(snoozeAllStatusBackgroundColor())
             }
             
-            if let until = SelectiveAlarmSilence.until(), until > now {
+            if let until = silenceUntil, until > now {
                 Section {
                     HStack {
                         Text("Lydløs til \(until.formatted(date: .omitted, time: .shortened))")
@@ -119,12 +120,16 @@ struct SnoozeView: View {
 
             if !viewModel.showAllSnoozedImage {
                 ForEach(viewModel.rows) { row in
+                    let status = row.status(at: now, silenceUntil: silenceUntil)
                     Section(header: alarmSectionHeader(title: row.sectionTitle)) {
-                        alarmRow(for: row)
-                            .listRowBackground(row.isSnoozed ? ConstantsUI.warningSectionBackgroundColor : Color(.secondarySystemGroupedBackground))
+                        alarmRow(for: row, status: status, at: now)
+                            .listRowBackground(status.isMuted ? ConstantsUI.warningSectionBackgroundColor : Color(.secondarySystemGroupedBackground))
                     }
                 }
             }
+        }
+        .onChange(of: (silenceUntil ?? .distantPast) > now) { _ in
+            viewModel.refresh()
         }
     }
     
@@ -146,22 +151,34 @@ struct SnoozeView: View {
         return viewModel.bannerBackgroundColor
     }
     
-    @ViewBuilder private func alarmRow(for row: SnoozeViewModel.Row) -> some View {
-        // Keep the row content focused on current snooze state. The alarm name stays
-        // in the section header so the grouped layout matches the other SwiftUI screens.
-        Toggle(isOn: Binding(
-            get: { row.isSnoozed },
-            set: { isOn in
-                viewModel.handleAlertToggleChanged(alertKind: row.alertKind, isOn: isOn)
+    @ViewBuilder private func alarmRow(for row: SnoozeViewModel.Row, status: SnoozeViewModel.Row.Status, at now: Date) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if let until = status.silenceUntil {
+                Label("Lydløs til \(formattedDeadline(until, at: now))", systemImage: "speaker.slash.fill")
+                    .foregroundStyle(Color(.colorPrimary))
             }
-        )) {
-            Text(row.statusText)
-                .foregroundStyle(row.statusTextColor)
-                .padding(.vertical, 6)
+            Toggle(isOn: Binding(
+                get: { status.individualUntil != nil },
+                set: { viewModel.handleAlertToggleChanged(alertKind: row.alertKind, isOn: $0) }
+            )) {
+                if let until = status.individualUntil {
+                    let prefix = status.silenceUntil == nil ? TextsSnooze.snoozed_until : "Egen snooze til"
+                    Text("\(prefix) \(formattedDeadline(until, at: now))")
+                        .foregroundStyle(Color(.colorPrimary))
+                } else {
+                    Text(status.silenceUntil == nil ? TextsSnooze.not_snoozed : "Egen snooze")
+                        .foregroundStyle(Color(.colorTertiary))
+                }
+            }
+            .tint(.green)
         }
-        .tint(.green)
+        .padding(.vertical, 6)
     }
-    
+
+    private func formattedDeadline(_ date: Date, at now: Date) -> String {
+        date.formatted(date: Calendar.current.isDate(date, inSameDayAs: now) ? .omitted : .numeric, time: .shortened)
+    }
+
     @ViewBuilder private func alarmSectionHeader(title: String) -> some View {
         Text(title)
             .textCase(nil)
@@ -187,11 +204,21 @@ struct SnoozeView: View {
     struct Row: Identifiable {
         let alertKind: AlertKind
         let sectionTitle: String
-        let statusText: String
-        let statusTextColor: Color
-        
+        let individualUntil: Date?
+
         var id: Int { alertKind.rawValue }
-        var isSnoozed: Bool
+
+        struct Status {
+            let individualUntil: Date?
+            let silenceUntil: Date?
+            var isMuted: Bool { individualUntil != nil || silenceUntil != nil }
+        }
+
+        func status(at now: Date, silenceUntil: Date?) -> Status {
+            let shared = SelectiveAlarmSilence.kinds.contains(alertKind) ? silenceUntil : nil
+            return Status(individualUntil: individualUntil.flatMap { $0 > now ? $0 : nil },
+                          silenceUntil: shared.flatMap { $0 > now ? $0 : nil })
+        }
     }
     
     @Published private(set) var rows: [Row] = []
@@ -276,15 +303,11 @@ struct SnoozeView: View {
         // This replaces the UITableView section/row building from
         // SnoozeViewController.cellForRowAt and titleForHeaderInSection.
         return alertManager.enabledAlertKinds().map { alertKind in
-            let snoozeValue = alertManager.getSnoozeParameters(alertKind: alertKind).getSnoozeValue()
-            
-            return Row(
-                alertKind: alertKind,
-                sectionTitle: sectionTitle(for: alertKind),
-                statusText: statusText(for: snoozeValue),
-                statusTextColor: snoozeValue.isSnoozed ? Color(.colorPrimary) : Color(.colorTertiary),
-                isSnoozed: snoozeValue.isSnoozed
-            )
+            let snooze = alertManager.getSnoozeParameters(alertKind: alertKind)
+            let until = snooze.snoozePeriodInMinutes > 0
+                ? snooze.snoozeTimeStamp?.addingTimeInterval(TimeInterval(snooze.snoozePeriodInMinutes) * 60)
+                : nil
+            return Row(alertKind: alertKind, sectionTitle: sectionTitle(for: alertKind), individualUntil: until)
         }
     }
     
@@ -329,20 +352,6 @@ struct SnoozeView: View {
     
     private func sectionTitle(for alertKind: AlertKind) -> String {
         return (alertKind.alertUrgencyType() == .urgent ? "\u{2757}" : "") + alertKind.configurationTitle()
-    }
-    
-    private func statusText(for snoozeValue: (isSnoozed: Bool, remainingSeconds: Int?)) -> String {
-        guard snoozeValue.isSnoozed, let remainingSeconds = snoozeValue.remainingSeconds else {
-            return TextsSnooze.not_snoozed
-        }
-        
-        let snoozedTillDate = Date(timeIntervalSinceNow: Double(remainingSeconds))
-        let showDate = snoozedTillDate.toMidnight() > Date()
-        let formattedDate = showDate
-            ? snoozedTillDate.formatted(date: .numeric, time: .shortened)
-            : snoozedTillDate.formatted(date: .omitted, time: .shortened)
-        
-        return TextsSnooze.snoozed_until + " " + formattedDate
     }
 }
 
