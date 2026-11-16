@@ -162,6 +162,49 @@ class CleanupTests(unittest.TestCase):
             with self.subTest(path=relative):
                 self.assertFalse(c.disposable(Path(relative)))
 
+    def test_old_swift_intermediates_are_planned_and_reclaimed_only_once(self):
+        simulator = Path("test/DerivedData/all-tests/Build/Intermediates.noindex/"
+                         "xdrip.build/Debug-iphonesimulator/xdrip.build/Objects-normal/x86_64")
+        archive = Path("build/DerivedData/archive/Build/Intermediates.noindex/"
+                       "ArchiveIntermediates/xdrip/IntermediateBuildFilesPath/xdrip.build/"
+                       "Release-iphoneos/xdrip.build/Objects-normal/arm64")
+        files = {simulator / "xdrip-primary.priors": b"DDEP", archive / "Home.swiftconstvalues": b"[]"}
+        for release in (self.old, self.previous, self.current):
+            for relative, contents in files.items():
+                path = release / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(contents)
+        planned = c.cleanup(self.root, self.client)
+        paths = {item["path"] for candidate in planned["candidates"] for item in candidate["files"]}
+        for relative, contents in files.items():
+            self.assertIn(str(self.old / relative), paths)
+            self.assertEqual((self.old / relative).read_bytes(), contents)
+        applied = c.cleanup(self.root, self.client, True)
+        self.assertEqual(applied["retainedBefore"], applied["retainedAfter"])
+        for relative, contents in files.items():
+            self.assertFalse((self.old / relative).exists())
+            for protected in (self.previous, self.current):
+                self.assertEqual((protected / relative).read_bytes(), contents)
+        self.assertEqual(c.cleanup(self.root, self.client, True)["deletedFiles"], 0)
+
+    def test_swift_intermediate_rules_require_target_architecture_and_generated_filename(self):
+        build = Path("Build/Intermediates.noindex")
+        target = build / "xdrip.build/Debug-iphonesimulator/xdrip.build"
+        objects = target / "Objects-normal/arm64"
+        for filename in ("xdrip-primary.priors", "Home.swiftconstvalues"):
+            with self.subTest(filename=filename):
+                self.assertTrue(c.disposable(objects / filename, release=True))
+                self.assertFalse(c.disposable(objects / filename))
+            for misplaced in (target, objects / "Nested", target / "Objects-normal/unknown",
+                              build / "Resources/Objects-normal/arm64",
+                              build / "Sources" / "xdrip.app" / "xdrip.build/Objects-normal/arm64",
+                              Path("TestResults/xdrip.build/Objects-normal/arm64")):
+                with self.subTest(path=misplaced / filename):
+                    self.assertFalse(c.disposable(misplaced / filename, release=True))
+        for filename in ("custom.priors", "xdrip-primary.priors.old", "Home.swiftconstvalues.backup"):
+            with self.subTest(filename=filename):
+                self.assertFalse(c.disposable(objects / filename, release=True))
+
     def test_debug_library_incomplete_and_unregistered_releases_are_preserved(self):
         library = self.debug_library()
         unknown = self.debug_library(self.root / "build/unregistered")

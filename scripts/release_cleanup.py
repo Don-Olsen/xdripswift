@@ -132,7 +132,7 @@ PROTECTED_SUFFIXES = {".json", ".jsonl", ".log", ".xcactivitylog", ".xcresult", 
                       ".plist", ".sqlite", ".db", ".yaml", ".yml", ".p8", ".mobileprovision"}
 PROTECTED_NAMES = {"Logs", "TestResults", "Products", ".git", "SourcePackages", "Checkouts", "BuildProductsPath", "InstallationBuildProductsLocation"}
 
-def disposable(relative):
+def disposable(relative, *, release=False):
     parts = relative.parts
     if any(p in PROTECTED_NAMES or Path(p).suffix.lower() in PROTECTED_SUFFIXES for p in parts):
         return False
@@ -140,13 +140,17 @@ def disposable(relative):
         return True
     if parts[:2] != ("Build", "Intermediates.noindex"):
         return False
+    if (release and len(parts) >= 6 and parts[-4].endswith(".build")
+            and parts[-3] == "Objects-normal" and parts[-2] in {"arm64", "x86_64"}
+            and (relative.name.endswith("-primary.priors") or relative.suffix == ".swiftconstvalues")):
+        return True
     # Xcode also leaves generated debug libraries beside intermediate objects.
     # Keep other dylibs and all protected bundles/evidence under the rules above.
     debug_library = (len(parts) >= 7 and parts[-4] == "Objects-normal"
                      and parts[-2] == "Binary" and relative.name.endswith(".debug.dylib"))
     return relative.suffix in OBJECT_SUFFIXES or debug_library
 
-def scan_derived(dd):
+def scan_derived(dd, *, release=False):
     require(dd.is_dir() and not dd.is_symlink(), "Unknown DerivedData root")
     files = []
     for instance in sorted(dd.iterdir()):
@@ -168,7 +172,7 @@ def scan_derived(dd):
             for name in names:
                 p = Path(base) / name
                 require(p.is_file(), "Special file inside DerivedData")
-                if disposable(p.relative_to(instance)):
+                if disposable(p.relative_to(instance), release=release):
                     s = p.stat()
                     require(s.st_nlink == 1, "Hardlinked cache file")
                     files.append({"path": str(p), "fingerprint": fingerprint(p),
@@ -328,7 +332,7 @@ def release_candidates(root, current):
                 require(not any(real == p or p in real.parents or real in p.parents for p in protected),
                         "DerivedData overlaps a protected build")
                 local.append({"build": s["build"], "path": str(real),
-                              "files": scan_derived(real) + scan_generated_products(real),
+                              "files": scan_derived(real, release=True) + scan_generated_products(real),
                               "releaseLinks": release_links})
             extraction_roots = [out / "export-verification"]
             verify_root = folder / "verify"

@@ -207,6 +207,9 @@ objekt-, dependency- og Swift-modulfiler under `Build/Intermediates.noindex`.
 Det omfatter også genererede `*.debug.dylib` præcis under
 `Objects-normal/<arkitektur>/Binary/` i dette mellemproduktområde. Andre
 biblioteker og beskyttede bundles/artefakter omfattes ikke af denne udvidelse.
+I ældre afsluttede releases ryddes også Swift-kompilerens `*-primary.priors`
+og `*.swiftconstvalues` direkte under `<target>.build/Objects-normal/arm64/`
+eller `<target>.build/Objects-normal/x86_64/` i dette mellemproduktområde.
 Den aktuelle og den seneste tidligere verificerede release bevares i fuld form.
 Desuden må genererede filer under `Build/Products` ryddes, mens kilde-, log-,
 JSON-, plist-, database- og releaseartefakter bevares. Udvidede kopier af en IPA
