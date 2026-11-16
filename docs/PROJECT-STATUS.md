@@ -8,6 +8,12 @@
 - Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
 <!-- testflight-7.1.1-4367:end -->
 
+## Faneskift til Treatments i 4367
+
+Ved genåbning af Treatments på en fysisk iPhone 17 Pro Max med 4366 registrerede Instruments fire pauser på hovedtråden på 0,42–0,50 sekunder. I alle fire gennemgik appen gemte måltidspåmindelser og læste de samme filoplysninger flere gange. I 4367 kontrolleres mappens beskyttelse én gang pr. gennemgang. Et uændret måltid kan genbruge det læste indhold og den kontrollerede filbeskyttelse. Ændringer eller usikker beskyttelse udløser den eksisterende kontrol og eventuelle reparation.
+
+Regressionstesten kontrollerer antal filopslag, en redigeret måltidsregistrering og reparation efter mangelfuld eller ukendt beskyttelse. På releasegrundlaget bestod 2.001 XCTest, 200 Python-tests, Watch-værktøjernes 30 + 24 syntetiske kontroller samt begge simulatorbuilds. Faneskiftet i 4367 afventer eftermåling på den fysiske iPhone.
+
 De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
 
 <!-- testflight-7.1.1-4366:start -->
