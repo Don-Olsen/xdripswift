@@ -381,6 +381,7 @@ struct InitialCalibrationRequestGate {
 
             if let coreDataManager = self.coreDataManager {
                 BasalReminderScheduler.shared.configure(coreDataManager: coreDataManager)
+                PenCartridgeMonitor.shared.configure(coreDataManager: coreDataManager)
             }
 
             if let coreDataManager = self.coreDataManager,
@@ -576,6 +577,7 @@ struct InitialCalibrationRequestGate {
         
         // if the Nightscout Follower type changes, update the UI
         UserDefaults.standard.addObserver(self, forKeyPath: UserDefaults.Key.nightscoutFollowType.rawValue, options: .new, context: nil)
+        UserDefaults.standard.addObserver(self, forKeyPath: UserDefaults.Key.nightscoutEnabled.rawValue, options: .new, context: nil)
         UserDefaults.standard.addObserver(self, forKeyPath: UserDefaults.Key.therapyDataSourceType.rawValue, options: .new, context: nil)
         
         // if the Nightscout device status changes, update the UI
@@ -644,11 +646,15 @@ struct InitialCalibrationRequestGate {
             self.loopManager?.shareMetadata()
             self.refreshSelectedFollower(fillNightscoutGaps: true)
             BasalReminderScheduler.shared.refresh()
+            PenCartridgeMonitor.shared.refresh()
         })
 
         NotificationCenter.default.addObserver(forName: UIApplication.significantTimeChangeNotification,
                                                object: nil, queue: .main) { _ in
-            Task { @MainActor in BasalReminderScheduler.shared.refresh() }
+            Task { @MainActor in
+                BasalReminderScheduler.shared.refresh()
+                PenCartridgeMonitor.shared.refresh()
+            }
         }
         
         // add tracing when app will terminate - this only works for non-suspended apps, probably (not tested) also works for apps that crash in the background
@@ -1559,6 +1565,13 @@ struct InitialCalibrationRequestGate {
     
     /// used by observevalue for UserDefaults.Key
     private func evaluateUserDefaultsChange(keyPathEnum: UserDefaults.Key) {
+        switch keyPathEnum {
+        case .isMaster, .followerDataSourceType, .therapyDataSourceType, .nightscoutEnabled, .nightscoutFollowType:
+            Task { @MainActor in PenCartridgeMonitor.shared.refresh() }
+        default:
+            break
+        }
+
         // first check keyValueObserverTimeKeeper
         switch keyPathEnum {
         case UserDefaults.Key.isMaster, UserDefaults.Key.multipleAppBadgeValueWith10, UserDefaults.Key.showReadingInAppBadge, UserDefaults.Key.followerBackgroundKeepAliveType, UserDefaults.Key.bloodGlucoseUnitIsMgDl, UserDefaults.Key.daysToUseStatistics, UserDefaults.Key.showMiniChart, UserDefaults.Key.activeSensorStartDate :
@@ -3606,6 +3619,8 @@ extension RootApplicationCoordinator: @preconcurrency UNUserNotificationCenterDe
             completionHandler([.banner, .list, .sound])
         } else if notification.request.identifier.hasPrefix(PizzaSplitReminder.identifierPrefix) {
             completionHandler([.banner, .list, .sound])
+        } else if notification.request.identifier.hasPrefix(PenCartridgeMonitor.identifierPrefix) {
+            PenCartridgeMonitor.shared.willPresent(notification.request, completion: completionHandler)
         } else if notification.request.identifier.hasPrefix(BasalReminderScheduler.identifierPrefix) {
             completionHandler([.banner, .list, .sound])
             // this will verify if it concerns an alert notification, if not pickerviewData will be nil
@@ -3680,6 +3695,8 @@ extension RootApplicationCoordinator: @preconcurrency UNUserNotificationCenterDe
 
     // called when user clicks a notification
     func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse, withCompletionHandler completionHandler: @escaping () -> Void) {
+        if PenCartridgeMonitor.shared.handleResponse(request: response.notification.request,
+            action: response.actionIdentifier, completion: completionHandler) { return }
         if handleHighNotificationSnooze(notificationIdentifier: response.notification.request.identifier,
             actionIdentifier: response.actionIdentifier, deliveredAt: response.notification.date,
             completion: completionHandler) { return }

@@ -374,6 +374,9 @@ final class BackupService: @unchecked Sendable {
         let context = coreDataManager.privateChildManagedObjectContext()
         let counts = try await context.perform {
             if mode == .replaceRange {
+                if let lastTreatment = payload.treatments.map(\.date).max() {
+                    PenCartridgeInventory().invalidateIfHistoryWasReplaced(through: lastTreatment)
+                }
                 try self.deleteExistingData(in: payload, context: context)
             }
             let bgCounts: (added: Int, skipped: Int, firstAddedAt: Date?)
@@ -412,6 +415,7 @@ final class BackupService: @unchecked Sendable {
                 NotificationCenter.default.post(name: UserDefaults.didChangeNotification,
                                                 object: UserDefaults.standard)
                 TherapyMetricsManager.shared.invalidate()
+                PenCartridgeMonitor.shared.refresh()
             }
         }
 
@@ -1128,6 +1132,7 @@ final class BackupService: @unchecked Sendable {
     static func isPortableSetting(_ key: String) -> Bool {
         !accountKeys.contains(key) && !excludedSettingKeys.contains(key)
             && !key.hasPrefix("healthTherapyImport.v1.")
+            && !key.hasPrefix("penCartridge.")
             && !key.hasPrefix(UserDefaults.Key.dexcomG7PairingCode.rawValue + "-")
             && !key.hasPrefix(UserDefaults.Key.dexcomG7BluetoothSlot.rawValue + "-")
     }

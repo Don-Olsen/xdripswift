@@ -22,6 +22,19 @@ De følgende afsnit bevarer integrations- og testhistorikken før denne udgivels
 
 De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
 
+## Ampul til hurtigvirkende insulin
+
+Under penindstillingerne kan brugeren angive enten en aflæst restmængde eller en ny ampul
+på 300 E og vælge sin egen varslingsgrænse. Hjem viser restmængden som et estimat.
+Grundlaget er én pen og gemte lokale boluser fra iPhone og Watch. Hver injektion bruger
+den loggede dosis plus 2 E til udluftning i ampulregnskabet. Udluftning registreres
+ikke som behandling. Rettelser og forsinkede Watch-poster følger injektionstidspunktet.
+
+Når estimatet når grænsen, kan iPhone vise “Husk en ekstra ampul” én gang pr. ampul.
+“Mind mig senere” udsætter påmindelsen en time. Et nyt ampulskift aflyser tidligere
+ampulpåmindelser. En manuel rettelse kræver en ny fysisk aflæsning. Udlevering af en
+notifikation på låst iPhone og spejling på et fysisk ur kræver fysisk afprøvning.
+
 ## Snooze ved koldstart og ændring på Watch Direct — 14. november 2026
 
 Når brugeren vælger Snooze på en Høj- eller Akut høj-notifikation under

@@ -2324,6 +2324,57 @@ final class RootHomeInteractionTests: XCTestCase {
         XCTAssertNil(root.penCalculatorQuickActionRequest)
     }
 
+    func testPenCartridgeEntryRequiresARealAmountAndHandlesDanishDecimals() {
+        for invalid in ["", " ", "NaN", "-1", "inf", "301", "12,3.4", "2 E", "1e2"] {
+            XCTAssertNil(PenCartridgeDisplay.units(invalid, minimum: 0), invalid)
+        }
+        XCTAssertEqual(PenCartridgeDisplay.units("0", minimum: 0), 0)
+        XCTAssertEqual(PenCartridgeDisplay.units(" 12,5 ", minimum: 0), 12.5)
+        XCTAssertEqual(PenCartridgeDisplay.units("300", minimum: 0), 300)
+        XCTAssertNil(PenCartridgeDisplay.units("0", minimum: 1))
+        XCTAssertEqual(PenCartridgeDisplay.units("1", minimum: 1), 1)
+    }
+
+    func testPenCartridgeDistinguishesZeroUnknownAndNegativeInventory() {
+        XCTAssertEqual(PenCartridgeDisplay.balance(0), "ca. 0 E tilbage")
+        XCTAssertEqual(PenCartridgeDisplay.balance(21.5), "ca. 21,5 E tilbage")
+        XCTAssertEqual(PenCartridgeDisplay.balance(-1), "Tjek restmængden")
+        XCTAssertEqual(PenCartridgeDisplay.balance(nil), "Restmængde ukendt")
+    }
+
+    @MainActor
+    func testPenCartridgeHomeRowAdaptsToWidthAndAccessibilitySizes() throws {
+        let cases: [(name: String, remaining: Double?, low: Bool, history: Bool,
+                     width: CGFloat, size: DynamicTypeSize)] = [
+            ("normal", 274.5, false, false, 320, .large),
+            ("low", 12, true, false, 320, .large),
+            ("unknown", nil, false, false, 320, .large),
+            ("historical", 274.5, false, true, 768, .large),
+            ("check-count-large-text", -1, true, false, 320, .accessibility3),
+        ]
+        for example in cases {
+            let content = PenCartridgeHomeRow(remaining: example.remaining, isLow: example.low,
+                isHistorical: example.history, baselineID: nil, openDetails: {}, replace: { _ in true })
+                .frame(width: example.width)
+                .environment(\.dynamicTypeSize, example.size)
+                .environment(\.colorScheme, .dark)
+            let host = UIHostingController(rootView: content)
+            let size = host.sizeThatFits(in: CGSize(width: example.width, height: 600))
+            XCTAssertEqual(size.width, example.width, accuracy: 1)
+            if example.size.isAccessibilitySize {
+                XCTAssertGreaterThanOrEqual(size.height, 88, "Allow separate lines for both controls")
+            } else {
+                XCTAssertEqual(size.height, 44, accuracy: 1, "Keep the \(example.name) Home row compact")
+            }
+            let renderer = ImageRenderer(content: content)
+            renderer.scale = 2
+            let attachment = XCTAttachment(image: try XCTUnwrap(renderer.uiImage))
+            attachment.name = "Synthetic Home cartridge \(example.name)"
+            attachment.lifetime = .keepAlways
+            add(attachment)
+        }
+    }
+
     @MainActor
     func testHomeCalculatorShortcutReservesFullTouchHeightAtAllTextSizes() {
         var state = RootHomeLoopState()

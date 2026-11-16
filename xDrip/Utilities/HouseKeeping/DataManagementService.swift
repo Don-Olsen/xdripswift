@@ -285,6 +285,9 @@ final class DataManagementService: @unchecked Sendable {
 
             let treatmentCount: Int
             if plan.selection.includesTreatments {
+                if currentTreatmentCount > 0 {
+                    PenCartridgeInventory().invalidateIfHistoryWasReplaced(through: plan.throughDate)
+                }
                 let result = try self.executeBatchDelete(
                     fetchRequest: self.treatmentFetchRequest(
                         fromDate: plan.fromDate,

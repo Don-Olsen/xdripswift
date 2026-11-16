@@ -288,6 +288,8 @@
 		4C1000082F64000100000001 /* TreatmentEditorViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4C1000092F64000100000001 /* TreatmentEditorViewModel.swift */; };
 		4C10000B2F64000100000001 /* MealPlanReminders.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4C10000A2F64000100000001 /* MealPlanReminders.swift */; };
 		BA0510260000000000000001 /* BasalReminderScheduler.swift in Sources */ = {isa = PBXBuildFile; fileRef = BA0510260000000000000002 /* BasalReminderScheduler.swift */; };
+		00FCAB005F4453257823C174 /* PenCartridgeMonitor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 981D7659E7701F2C9CE92CC0 /* PenCartridgeMonitor.swift */; };
+		A256668CCB209CBD05E8CA30 /* PenCartridgeInventory.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2E34DE17D56245126B113211 /* PenCartridgeInventory.swift */; };
 		4C2000012F65000100000001 /* BluetoothPeripheralsViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4C2000022F65000100000001 /* BluetoothPeripheralsViewModel.swift */; };
 		4C2000032F65000100000001 /* BluetoothPeripheralsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4C2000042F65000100000001 /* BluetoothPeripheralsView.swift */; };
 		4C2000052F65000100000001 /* BluetoothPeripheralDetailState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4C2000062F65000100000001 /* BluetoothPeripheralDetailState.swift */; };
@@ -413,7 +415,10 @@
 		BA0000020000000000000001 /* NightscoutFollowerGapFillService.swift in Sources */ = {isa = PBXBuildFile; fileRef = BA0000020000000000000011 /* NightscoutFollowerGapFillService.swift */; };
 		BA0000020000000000000002 /* NightscoutFollowerGapFillTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BA0000020000000000000012 /* NightscoutFollowerGapFillTests.swift */; };
 		BA0709260000000000000001 /* BasalInjectionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BA0709260000000000000002 /* BasalInjectionTests.swift */; };
+		D6CFE4F2C9BF8FCB68768B79 /* PenCartridgeInventoryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 896CB164DA57713D0297C51C /* PenCartridgeInventoryTests.swift */; };
+		5390977C39D00832442A4DA4 /* PenCartridgeMonitorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 837F4BFB1AAEF64FA8912624 /* PenCartridgeMonitorTests.swift */; };
 		C15D80D0E8DB47A6A9BE68DF /* xDrip/SwiftUIViews/Settings/TherapyMetricsSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 05272484BD024BDAAA341C1C /* xDrip/SwiftUIViews/Settings/TherapyMetricsSettingsView.swift */; };
+		A05060872D037A135C9DA4AC /* xDrip/SwiftUIViews/Settings/PenCartridgeView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1F0F55DC1DB633C2CFF82BE7 /* xDrip/SwiftUIViews/Settings/PenCartridgeView.swift */; };
 		C2385D0CA6579919114B060A /* AlertTypesSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 102D337E1C2160C7B03D5184 /* AlertTypesSettingsView.swift */; };
 		C606CA18273EF9F800BA199E /* DexcomG6InitialCalibrationPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = C606CA17273EF9F800BA199E /* DexcomG6InitialCalibrationPolicy.swift */; };
 		C8BA6BBA5746888144511D55 /* GlucoseChartStateManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 685B5F8D633F5492574F0567 /* GlucoseChartStateManager.swift */; };
@@ -1001,6 +1006,7 @@
 		D72500022026092500000002 /* LibreWatchConnectionPresentationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LibreWatchConnectionPresentationTests.swift; sourceTree = "<group>"; };
 		D72500022026092500000003 /* da */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; name = da; path = da.lproj/WatchApp.strings; sourceTree = "<group>"; };
 		05272484BD024BDAAA341C1C /* xDrip/SwiftUIViews/Settings/TherapyMetricsSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = xDrip/SwiftUIViews/Settings/TherapyMetricsSettingsView.swift; sourceTree = SOURCE_ROOT; };
+		1F0F55DC1DB633C2CFF82BE7 /* xDrip/SwiftUIViews/Settings/PenCartridgeView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = xDrip/SwiftUIViews/Settings/PenCartridgeView.swift; sourceTree = SOURCE_ROOT; };
 		102D337E1C2160C7B03D5184 /* AlertTypesSettingsView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = AlertTypesSettingsView.swift; sourceTree = "<group>"; };
 		198D44C4260A3A3300A2B4A2 /* sv */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; name = sv; path = sv.lproj/Alerts.strings; sourceTree = "<group>"; };
 		198D44C5260A3A3300A2B4A2 /* sv */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; name = sv; path = sv.lproj/AlertTypesSettingsView.strings; sourceTree = "<group>"; };
@@ -1260,6 +1266,8 @@
 		4C1000092F64000100000001 /* TreatmentEditorViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TreatmentEditorViewModel.swift; sourceTree = "<group>"; };
 		4C10000A2F64000100000001 /* MealPlanReminders.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MealPlanReminders.swift; sourceTree = "<group>"; };
 		BA0510260000000000000002 /* BasalReminderScheduler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BasalReminderScheduler.swift; sourceTree = "<group>"; };
+		981D7659E7701F2C9CE92CC0 /* PenCartridgeMonitor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PenCartridgeMonitor.swift; sourceTree = "<group>"; };
+		2E34DE17D56245126B113211 /* PenCartridgeInventory.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PenCartridgeInventory.swift; sourceTree = "<group>"; };
 		4C2000022F65000100000001 /* BluetoothPeripheralsViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BluetoothPeripheralsViewModel.swift; sourceTree = "<group>"; };
 		4C2000042F65000100000001 /* BluetoothPeripheralsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BluetoothPeripheralsView.swift; sourceTree = "<group>"; };
 		4C2000062F65000100000001 /* BluetoothPeripheralDetailState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BluetoothPeripheralDetailState.swift; sourceTree = "<group>"; };
@@ -1412,6 +1420,8 @@
 		BA0000020000000000000011 /* NightscoutFollowerGapFillService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NightscoutFollowerGapFillService.swift; sourceTree = "<group>"; };
 		BA0000020000000000000012 /* NightscoutFollowerGapFillTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NightscoutFollowerGapFillTests.swift; sourceTree = "<group>"; };
 		BA0709260000000000000002 /* BasalInjectionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BasalInjectionTests.swift; sourceTree = "<group>"; };
+		896CB164DA57713D0297C51C /* PenCartridgeInventoryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PenCartridgeInventoryTests.swift; sourceTree = "<group>"; };
+		837F4BFB1AAEF64FA8912624 /* PenCartridgeMonitorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PenCartridgeMonitorTests.swift; sourceTree = "<group>"; };
 		C606CA17273EF9F800BA199E /* DexcomG6InitialCalibrationPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DexcomG6InitialCalibrationPolicy.swift; sourceTree = "<group>"; };
 		CA1E00020000000000000001 /* CareLinkTherapyImporter.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = CareLinkTherapyImporter.swift; sourceTree = "<group>"; };
 		CA1E00040000000000000001 /* CareLinkPumpStatusView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = CareLinkPumpStatusView.swift; sourceTree = "<group>"; };
@@ -2662,6 +2672,8 @@
 				4C1000092F64000100000001 /* TreatmentEditorViewModel.swift */,
 				4C10000A2F64000100000001 /* MealPlanReminders.swift */,
 				BA0510260000000000000002 /* BasalReminderScheduler.swift */,
+				981D7659E7701F2C9CE92CC0 /* PenCartridgeMonitor.swift */,
+				2E34DE17D56245126B113211 /* PenCartridgeInventory.swift */,
 				4C1000022F64000100000001 /* TreatmentsView.swift */,
 				4C1000072F64000100000001 /* TreatmentsViewModel.swift */,
 			);
@@ -2814,6 +2826,8 @@
 				D1B720012026090200000001 /* LibreWatchValuePipelineTests.swift */,
 				D72500022026092500000002 /* LibreWatchConnectionPresentationTests.swift */,
 				BA0709260000000000000002 /* BasalInjectionTests.swift */,
+				896CB164DA57713D0297C51C /* PenCartridgeInventoryTests.swift */,
+				837F4BFB1AAEF64FA8912624 /* PenCartridgeMonitorTests.swift */,
 				4F3100153007000100000001 /* BatteryHistoryTests.swift */,
 				4F3200023008000100000001 /* BgReadingTrendTests.swift */,
 				4D7D00013016000200000001 /* BluetoothPeripheralDisplayStatusTests.swift */,
@@ -3245,6 +3259,7 @@
 				4A9B10162F0A000100000001 /* BgAdjustmentsView.swift */,
 				4D20C0012FF1000100000001 /* RootHomeState.swift */,
 				05272484BD024BDAAA341C1C /* xDrip/SwiftUIViews/Settings/TherapyMetricsSettingsView.swift */,
+				1F0F55DC1DB633C2CFF82BE7 /* xDrip/SwiftUIViews/Settings/PenCartridgeView.swift */,
 				5F219EC5BAAF4D5E924415FA /* xDrip/Managers/Therapy/TherapyMetricsManager.swift */,
 				C30000023017000100000003 /* PenBolusCalculator.swift */,
 				318E68ED8AE54E328802EFA0 /* CarbohydrateAdviceJournal.swift */,
@@ -4689,6 +4704,8 @@
 				BA0000020000000000000002 /* NightscoutFollowerGapFillTests.swift in Sources */,
 				B42630000000000000000001 /* NightscoutHistoryWriteTests.swift in Sources */,
 				BA0709260000000000000001 /* BasalInjectionTests.swift in Sources */,
+				D6CFE4F2C9BF8FCB68768B79 /* PenCartridgeInventoryTests.swift in Sources */,
+				5390977C39D00832442A4DA4 /* PenCartridgeMonitorTests.swift in Sources */,
 				4F2600023002000200000001 /* SensorHealthIssueManagerTests.swift in Sources */,
 				4F2800023004000100000001 /* GlucoseChartYAxisRetentionTests.swift in Sources */,
 				4F2800013004000100000001 /* RootHomeInteractionTests.swift in Sources */,
@@ -5015,6 +5032,8 @@
 				4C1000082F64000100000001 /* TreatmentEditorViewModel.swift in Sources */,
 				4C10000B2F64000100000001 /* MealPlanReminders.swift in Sources */,
 				BA0510260000000000000001 /* BasalReminderScheduler.swift in Sources */,
+				00FCAB005F4453257823C174 /* PenCartridgeMonitor.swift in Sources */,
+				A256668CCB209CBD05E8CA30 /* PenCartridgeInventory.swift in Sources */,
 				4C1000032F64000100000001 /* TreatmentEditorView.swift in Sources */,
 				4C1000062F64000100000001 /* TreatmentsViewModel.swift in Sources */,
 				4C1000012F64000100000001 /* TreatmentsView.swift in Sources */,
@@ -5143,6 +5162,7 @@
 				C8BA6BBA5746888144511D55 /* GlucoseChartStateManager.swift in Sources */,
 				4D20C0022FF1000100000001 /* RootHomeState.swift in Sources */,
 				C15D80D0E8DB47A6A9BE68DF /* xDrip/SwiftUIViews/Settings/TherapyMetricsSettingsView.swift in Sources */,
+				A05060872D037A135C9DA4AC /* xDrip/SwiftUIViews/Settings/PenCartridgeView.swift in Sources */,
 				B3DBAE6F4DF8465BBF554DE4 /* xDrip/Managers/Therapy/TherapyMetricsManager.swift in Sources */,
 				FC0303000000000000000001 /* GlucoseForecastEngine.swift in Sources */,
 				FC0303000000000000000002 /* GlucoseForecastDataAdapter.swift in Sources */,

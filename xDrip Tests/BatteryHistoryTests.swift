@@ -30,6 +30,7 @@ final class BatteryHistoryTests: XCTestCase {
                     "healthTherapyImport.v1.insulin.enabled", "healthTherapyImport.v1.carbs.anchor",
                     "healthTherapyImport.v1.insulin.selectedSource",
                     TreatmentSourceCutover.defaultsKey, "therapyRestoreRequiresSourceSetup",
+                    "penCartridge.baseline.v1", "penCartridge.reminder",
                     "dexcomG7PairingCode-ABC", "dexcomG7BluetoothSlot-ABC", "m5StackWiFiPassword1",
                     "m5StackWiFiPassword2", "m5StackWiFiPassword3", "careLinkPassword"] {
             XCTAssertFalse(BackupService.isPortableSetting(key), key)

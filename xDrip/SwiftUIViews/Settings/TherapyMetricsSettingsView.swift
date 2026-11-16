@@ -279,6 +279,9 @@ struct PenDoseSettingsView: View {
             } footer: {
                 Text("Ved at bekræfte gemmer du tallene som din doseringsprofil. De ændrer ikke prognosens separate indstillinger.")
             }
+            Section {
+                NavigationLink("Ampul · hurtigvirkende insulin") { PenCartridgeDetailView() }
+            }
             Section("🍕 Fed/langsom mad") {
                 Toggle("Del forslaget og mind mig om en ny beregning", isOn: $pizza.isEnabled)
                 if pizza.isEnabled {

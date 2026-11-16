@@ -1498,7 +1498,12 @@ public class AlertManager: NSObject {
     ///     - existingCategories : notification categories that currently exist
     private func setAlertNotificationCategories(_ existingCategories: Set<UNNotificationCategory>) {
         // create var equal to existingCategories so we can add new categories
-        var mutableExistingCategories = existingCategories
+        // One writer registers reminder and alarm actions together during startup.
+        var mutableExistingCategories = Set(existingCategories.filter {
+            $0.identifier != BasalReminderScheduler.categoryIdentifier && $0.identifier != PenCartridgeMonitor.categoryID
+        })
+        mutableExistingCategories.insert(BasalReminderScheduler.notificationCategory)
+        mutableExistingCategories.insert(PenCartridgeMonitor.category)
         
         // create the snooze action
         let action = UNNotificationAction(identifier: Self.snoozeActionIdentifier, title: Texts_Alerts.snooze, options: [])

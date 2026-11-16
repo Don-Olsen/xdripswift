@@ -415,9 +415,8 @@ struct RootTabView: View {
                 selectedTab = .settings
             } else if stateModel.penCalculatorQuickActionRequest != nil {
                 selectHomeForCalculatorQuickAction()
-            } else if PlannedMealReminder.pendingOpenUUID != nil || PizzaSplitReminder.pendingOpenUUID != nil ||
-                        BasalReminderScheduler.hasPendingOpen {
-                selectTreatmentsForMealReminder()
+            } else {
+                selectTabForPendingReminder()
             }
             updateSupportedOrientations(for: selectedTab)
         }
@@ -433,7 +432,7 @@ struct RootTabView: View {
                 updateSupportedOrientations(for: selectedTab)
                 selectHomeForCalculatorQuickAction()
                 // Legacy onChange captures the prior view; pass the new phase through.
-                selectTreatmentsForMealReminder(phase: scenePhase)
+                selectTabForPendingReminder(phase: scenePhase)
             }
         }
         .onChange(of: stateModel.penCalculatorQuickActionRequest) { request in
@@ -467,23 +466,26 @@ struct RootTabView: View {
             selectedTab = .home
         }
         .onReceive(NotificationCenter.default.publisher(for: PlannedMealReminder.openRequested)) { _ in
-            selectTreatmentsForMealReminder()
+            selectTabForPendingReminder()
         }
         .onReceive(NotificationCenter.default.publisher(for: PizzaSplitReminder.openRequested)) { _ in
-            selectTreatmentsForMealReminder()
+            selectTabForPendingReminder()
         }
         .onReceive(NotificationCenter.default.publisher(for: MealPlanReminderCoordinator.presentationDidDismiss)) { _ in
-            selectTreatmentsForMealReminder()
+            selectTabForPendingReminder()
         }
         .onChange(of: stateModel.dependencies != nil) { _ in
-            selectTreatmentsForMealReminder()
+            selectTabForPendingReminder()
         }
         .onChange(of: stateModel.alertRequest != nil || stateModel.textInputRequest != nil ||
                   stateModel.incomingBackupRequest != nil || stateModel.isPreparingIncomingBackup) { _ in
-            selectTreatmentsForMealReminder()
+            selectTabForPendingReminder()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: PenCartridgeMonitor.openRequested)) { _ in
+            selectTabForPendingReminder()
         }
         .onReceive(NotificationCenter.default.publisher(for: BasalReminderScheduler.openRequested)) { _ in
-            selectTreatmentsForMealReminder()
+            selectTabForPendingReminder()
         }
         .alert(
             item: Binding(
@@ -662,9 +664,10 @@ struct RootTabView: View {
         }
     }
 
-    private func selectTreatmentsForMealReminder(phase: ScenePhase? = nil) {
-        guard PlannedMealReminder.pendingOpenUUID != nil || PizzaSplitReminder.pendingOpenUUID != nil ||
-                BasalReminderScheduler.hasPendingOpen else { return }
+    private func selectTabForPendingReminder(phase: ScenePhase? = nil) {
+        let opensTreatments = PlannedMealReminder.pendingOpenUUID != nil || PizzaSplitReminder.pendingOpenUUID != nil ||
+            BasalReminderScheduler.hasPendingOpen
+        guard opensTreatments || PenCartridgeMonitor.shared.pendingOpenID != nil else { return }
         // Observe the actual blocking presentation even while a SwiftUI alert binding is set.
         let hasPresentedController = MealPlanReminderCoordinator.hasPresentedController
         guard (phase ?? scenePhase) == .active, stateModel.dependencies != nil,
@@ -673,7 +676,12 @@ struct RootTabView: View {
               stateModel.incomingBackupRequest == nil else { return }
         // Keep any active editor's inputs. Its existing dismiss event retries the durable request.
         guard !hasPresentedController else { return }
-        selectedTab = .treatments
+        if opensTreatments {
+            selectedTab = .treatments
+        } else {
+            selectedTab = .home
+            stateModel.dependencies?.cancelScreenLock()
+        }
     }
 
     private func selectHomeForCalculatorQuickAction() {

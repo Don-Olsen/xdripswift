@@ -140,8 +140,8 @@ enum BasalReminderPendingSnoozes {
     static let identifierPrefix = "xdrip.basalReminder."
     static let dailyPrefix = identifierPrefix + "day."
     static let snoozePrefix = identifierPrefix + "snooze."
-    static let categoryIdentifier = "xdrip.basalReminder.actions"
-    static let snoozeActionIdentifier = "xdrip.basalReminder.snooze30"
+    nonisolated static let categoryIdentifier = "xdrip.basalReminder.actions"
+    nonisolated static let snoozeActionIdentifier = "xdrip.basalReminder.snooze30"
     static let openRequested = Notification.Name("xdrip.basalReminder.openRequested")
     private static let pendingOpenKey = "basalReminderPendingOpen"
     private static let snoozedDaysKey = "basalReminderSnoozedDays"
@@ -157,7 +157,6 @@ enum BasalReminderPendingSnoozes {
 
     func configure(coreDataManager: CoreDataManager) {
         self.coreDataManager = coreDataManager
-        registerCategory()
         processPendingSnoozes()
         refresh()
     }
@@ -364,17 +363,9 @@ enum BasalReminderPendingSnoozes {
         }
     }
 
-    private func registerCategory() {
-        let center = UNUserNotificationCenter.current()
-        center.getNotificationCategories { categories in
-            let action = UNNotificationAction(identifier: Self.snoozeActionIdentifier,
-                                              title: "Udsæt 30 min", options: [])
-            let category = UNNotificationCategory(identifier: Self.categoryIdentifier,
-                                                  actions: [action], intentIdentifiers: [], options: [])
-            var updated = Set(categories.filter { $0.identifier != Self.categoryIdentifier })
-            updated.insert(category)
-            center.setNotificationCategories(updated)
-        }
+    nonisolated static var notificationCategory: UNNotificationCategory {
+        let action = UNNotificationAction(identifier: snoozeActionIdentifier, title: "Udsæt 30 min", options: [])
+        return UNNotificationCategory(identifier: categoryIdentifier, actions: [action], intentIdentifiers: [], options: [])
     }
 
     static func storedInjections(coreDataManager: CoreDataManager) throws -> [BasalReminderInjection] {

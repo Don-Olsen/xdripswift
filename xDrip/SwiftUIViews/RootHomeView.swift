@@ -241,6 +241,8 @@ struct RootHomeView: View {
     @State private var showOriginalBGReadingsOnly = false
     @State private var chartYAxisResetRevision = 0
     @State private var showsExpandedIPadChart = false
+    @ObservedObject private var cartridge = PenCartridgeMonitor.shared
+    @State private var showsCartridgeDetails = false
     @State private var showsPenCalculator = false
     @State private var penCalculatorSheetVisible = false
     @State private var calculatorApplicationIsActive = UIApplication.shared.applicationState == .active
@@ -610,6 +612,21 @@ struct RootHomeView: View {
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in
             calculatorApplicationIsActive = false
         }
+        .task(id: cartridgeOpenRequest) { presentCartridgeIfReady() }
+        .onReceive(NotificationCenter.default.publisher(for: MealPlanReminderCoordinator.presentationDidDismiss)) { _ in
+            presentCartridgeIfReady()
+        }
+        .sheet(isPresented: $showsCartridgeDetails, onDismiss: MealPlanReminderCoordinator.presentationFinished) {
+            NavigationStack {
+                PenCartridgeDetailView()
+                    .toolbar {
+                        ToolbarItem(placement: .confirmationAction) {
+                            Button("Luk") { showsCartridgeDetails = false }
+                        }
+                    }
+            }
+            .colorScheme(.dark)
+        }
         .fullScreenCover(isPresented: $showsExpandedIPadChart, onDismiss: MealPlanReminderCoordinator.presentationFinished) {
             expandedIPadChart
         }
@@ -823,6 +840,8 @@ struct RootHomeView: View {
                         showsCalculatorShortcut: showsCalculatorShortcut(loop),
                         onBolusCalculator: { showsPenCalculator = true })
                 }
+
+                cartridgeRow
 
                 mainChart
                 .frame(maxHeight: .infinity)
@@ -1187,6 +1206,7 @@ struct RootHomeView: View {
     }
 
     @ViewBuilder private var ipadPreChartStatusContent: some View {
+        cartridgeRow
         if state.visibility.showsClock {
             RootHomeClockView(text: state.controls.clockText)
         }
@@ -1396,12 +1416,38 @@ struct RootHomeView: View {
                 && !HealthKitTherapyImportManager.shared.localInputIsIncomplete(.carbohydrates))
     }
 
+    @ViewBuilder private var cartridgeRow: some View {
+        if cartridge.isEnabled && !state.isScreenLocked {
+            PenCartridgeHomeRow(remaining: cartridge.snapshot.remainingUnits,
+                isLow: cartridge.isLow, isHistorical: !scrollCoordinator.isShowingCurrentTimeRange,
+                baselineID: cartridge.snapshot.baselineID, openDetails: { showsCartridgeDetails = true },
+                replace: { expectedBaseline in
+                    guard cartridge.isEnabled, cartridge.snapshot.baselineID == expectedBaseline else { return false }
+                    return cartridge.newCartridge()
+                })
+        }
+    }
+
+    private var cartridgeOpenRequest: UUID? {
+        guard cartridge.isEnabled, forecastHomeIsVisible, allowsCalculatorQuickAction,
+              scenePhase == .active, calculatorApplicationIsActive, !state.isScreenLocked,
+              !state.usesScreenLockNightLayout, !showsPenCalculator, !showsExpandedIPadChart, !showsCartridgeDetails,
+              penCalculatorQuickActionRequest == nil else { return nil }
+        return cartridge.pendingOpenID
+    }
+
+    private func presentCartridgeIfReady() {
+        // The dismissal observer retries when UIKit finishes removing the blocking controller.
+        guard cartridgeOpenRequest != nil, !MealPlanReminderCoordinator.hasPresentedController else { return }
+        showsCartridgeDetails = true
+    }
+
     private var calculatorQuickActionIsReady: Bool {
         RootHomeCalculatorQuickActionPresentation.isReady(
             policy: UserDefaults.standard.dataFlowPolicy,
             cutover: TreatmentSourceCutover.current(),
             sceneIsActive: scenePhase == .active && calculatorApplicationIsActive,
-            allowsPresentation: allowsCalculatorQuickAction,
+            allowsPresentation: allowsCalculatorQuickAction && !showsCartridgeDetails,
             showsExpandedChart: showsExpandedIPadChart,
             usesNightLayout: state.usesScreenLockNightLayout)
     }
