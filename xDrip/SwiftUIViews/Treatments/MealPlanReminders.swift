@@ -55,9 +55,20 @@ struct MealPlanMetadata: Codable, Equatable {
 
     private let directory: URL
     private let fileManager: FileManager
+    private let isProtectedFile: (URL) throws -> Bool
+    private var revision: UInt = 0
 
-    init(directory: URL? = nil, fileManager: FileManager = .default) {
+    fileprivate struct SavedMeal {
+        let metadata: MealPlanMetadata
+        let protectedRevision: UInt?
+    }
+
+    init(directory: URL? = nil, fileManager: FileManager = .default,
+         isProtectedFile: @escaping (URL) throws -> Bool = { url in
+             try url.resourceValues(forKeys: [.fileProtectionKey]).fileProtection == .completeUntilFirstUserAuthentication
+         }) {
         self.fileManager = fileManager
+        self.isProtectedFile = isProtectedFile
         let root = directory ?? fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         self.directory = root.appendingPathComponent("PenDose/MealPlans", isDirectory: true)
     }
@@ -95,6 +106,8 @@ struct MealPlanMetadata: Codable, Equatable {
                 return
             }
 
+            // Invalidate earlier reads even when part of the following write fails.
+            revision &+= 1
             try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
             try fileManager.setAttributes([.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
                                           ofItemAtPath: directory.path)
@@ -107,21 +120,40 @@ struct MealPlanMetadata: Codable, Equatable {
         } catch { throw StoreError.writeFailed }
     }
 
+    fileprivate func replace(_ metadata: MealPlanMetadata, previouslyRead: SavedMeal?) throws {
+        if let previouslyRead, previouslyRead.protectedRevision == revision,
+           previouslyRead.metadata == metadata { return }
+        try replace(metadata)
+    }
+
     func remove(uuid: String) throws {
         let url = try fileURL(for: uuid)
         guard fileManager.fileExists(atPath: url.path) else { return }
+        revision &+= 1
         try fileManager.removeItem(at: url)
     }
 
     func allMetadata() throws -> [MealPlanMetadata] {
+        try readMeals(checkingProtection: false).map(\.metadata)
+    }
+
+    fileprivate func readMeals(checkingProtection: Bool) throws -> [SavedMeal] {
         guard fileManager.fileExists(atPath: directory.path) else { return [] }
-        let urls = try fileManager.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+        let keys: [URLResourceKey]? = checkingProtection ? [.fileProtectionKey] : nil
+        let urls = try fileManager.contentsOfDirectory(at: directory, includingPropertiesForKeys: keys)
             .filter { $0.pathExtension == "json" }
+        guard !urls.isEmpty else { return [] }
+        // Capture fresh protection once per directory and use each listed URL's prefetched value.
+        let directoryIsProtected = checkingProtection &&
+            (try? fileManager.attributesOfItem(atPath: directory.path)[.protectionKey] as? FileProtectionType)
+                == .completeUntilFirstUserAuthentication
+        let readRevision = revision
         return try urls.map { url in
             guard let value = try metadata(for: url.deletingPathExtension().lastPathComponent) else {
                 throw StoreError.unreadable
             }
-            return value
+            let verified = directoryIsProtected && (try? isProtectedFile(url)) == true
+            return SavedMeal(metadata: value, protectedRevision: verified ? readRevision : nil)
         }
     }
 
@@ -297,7 +329,7 @@ struct MealPlanMetadata: Codable, Equatable {
                         onIssue: ((String) -> Void)? = nil) -> String? {
         refresh(coreDataManager: coreDataManager, mealUUID: mealUUID,
                 confirmedAt: confirmedAt, now: now, store: store ?? .shared,
-                onIssue: onIssue, metadata: nil) {
+                onIssue: onIssue, savedMeal: nil) {
             try storedTreatments(coreDataManager: coreDataManager, uuids: $0)
         }
     }
@@ -306,7 +338,7 @@ struct MealPlanMetadata: Codable, Equatable {
     /// Standalone refreshes and asynchronous notification guards still read the store afresh.
     private static func refresh(coreDataManager: CoreDataManager, mealUUID: String,
         confirmedAt: Date? = nil, now: Date, store: MealPlanMetadataStore,
-        onIssue: ((String) -> Void)?, metadata: MealPlanMetadata?,
+        onIssue: ((String) -> Void)?, savedMeal: MealPlanMetadataStore.SavedMeal?,
         readTreatments: ([String]) throws -> [StoredTreatment]) -> String? {
         do {
             let rows = try readTreatments([mealUUID])
@@ -316,7 +348,7 @@ struct MealPlanMetadata: Codable, Equatable {
                 try store.remove(uuid: mealUUID)
                 return nil
             }
-            var metadata = try metadata ?? store.metadata(for: mealUUID) ?? MealPlanMetadata(
+            var metadata = try savedMeal?.metadata ?? store.metadata(for: mealUUID) ?? MealPlanMetadata(
                 mealUUID: mealUUID, bolusUUID: nil, loggedAt: meal.date,
                 plannedAt: meal.isPlannedMeal ? meal.date : nil, grams: meal.value,
                 pizzaSettings: nil, mealKind: meal.mealKind)
@@ -341,7 +373,7 @@ struct MealPlanMetadata: Codable, Equatable {
                 metadata.pizzaReminderAt = nil
                 metadata.lastStoredMealDate = meal.date
                 metadata.lastStoredMealGrams = meal.value
-                try store.replace(metadata)
+                try store.replace(metadata, previouslyRead: savedMeal)
                 PizzaSplitReminder.cancel(uuid: mealUUID)
                 if meal.date > now, let request = PlannedMealReminder.request(
                     uuid: mealUUID, grams: meal.value, bolusUnits: linkedBolus?.value,
@@ -387,7 +419,7 @@ struct MealPlanMetadata: Codable, Equatable {
                         metadata.pizzaReminderAt = MealPlanMetadata.pizzaDueAt(
                             actualMealAt: meal.date, confirmedAt: confirmedAt, intervalMinutes: interval)
                     }
-                    try store.replace(metadata)
+                    try store.replace(metadata, previouslyRead: savedMeal)
                     if let due = metadata.pizzaReminderAt, due > now,
                        let request = PizzaSplitReminder.request(uuid: mealUUID, at: due, now: now) {
                         PizzaSplitReminder.schedule(request, mealUUID: mealUUID,
@@ -402,7 +434,7 @@ struct MealPlanMetadata: Codable, Equatable {
                         metadata.pizzaReminderEligible = false
                         metadata.pizzaReminderAt = nil
                     }
-                    try store.replace(metadata)
+                    try store.replace(metadata, previouslyRead: savedMeal)
                 }
             }
             return nil
@@ -431,14 +463,16 @@ struct MealPlanMetadata: Codable, Equatable {
                           onIssue: ((String) -> Void)? = nil) {
         let journal = journal ?? .shared
         let store = store ?? .shared
-        guard let metadata = try? store.allMetadata() else {
+        guard let meals = try? store.readMeals(checkingProtection: true) else {
             onIssue?("Måltidsplanernes metadata kunne ikke læses.")
             return
         }
-        guard !metadata.isEmpty else { return }
+        guard !meals.isEmpty else { return }
         let rows: [StoredTreatment]
         do {
-            let uuids = Array(Set(metadata.flatMap { [$0.mealUUID] + ($0.bolusUUID.map { [$0] } ?? []) }))
+            let uuids = Array(Set(meals.flatMap { meal in
+                [meal.metadata.mealUUID] + (meal.metadata.bolusUUID.map { [$0] } ?? [])
+            }))
             rows = try readTreatments?(uuids) ?? storedTreatments(coreDataManager: coreDataManager, uuids: uuids)
         } catch {
             // A failed read is not evidence of deletion. Keep all metadata and requests.
@@ -447,7 +481,8 @@ struct MealPlanMetadata: Codable, Equatable {
         }
         let rowsByUUID = Dictionary(grouping: rows, by: \.uuid)
         let journalIsReady = journal.recoveryState(coreDataManager: coreDataManager) == .ready
-        for item in metadata {
+        for meal in meals {
+            let item = meal.metadata
             let mealRows = rowsByUUID[item.mealUUID] ?? []
             let bolusRows = item.bolusUUID.flatMap { rowsByUUID[$0] } ?? []
             let hasMeal = mealRows.contains(where: { $0.type == .Carbs && !$0.deleted })
@@ -460,7 +495,7 @@ struct MealPlanMetadata: Codable, Equatable {
             // An unacknowledged operation can still become durable after this read.
             if !journalIsReady && !hasMeal { continue }
             if let warning = refresh(coreDataManager: coreDataManager, mealUUID: item.mealUUID,
-                now: now, store: store, onIssue: onIssue, metadata: item,
+                now: now, store: store, onIssue: onIssue, savedMeal: meal,
                 readTreatments: { $0.flatMap { rowsByUUID[$0] ?? [] } }) { onIssue?(warning) }
         }
     }

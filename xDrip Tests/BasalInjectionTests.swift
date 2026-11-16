@@ -1863,6 +1863,25 @@ private final class MealMetadataProtectionFileManager: FileManager, @unchecked S
     private let protectionLock = NSLock()
     private var protections: [String: (fileNumber: NSNumber, value: FileProtectionType)] = [:]
 
+    private(set) var attributeReads = [String: Int]()
+    private(set) var jsonExistenceChecks = [String: Int]()
+
+    func resetReadCounts() {
+        protectionLock.lock()
+        defer { protectionLock.unlock() }
+        attributeReads = [:]
+        jsonExistenceChecks = [:]
+    }
+
+    override func fileExists(atPath path: String) -> Bool {
+        if path.hasSuffix(".json") {
+            protectionLock.lock()
+            jsonExistenceChecks[path, default: 0] += 1
+            protectionLock.unlock()
+        }
+        return super.fileExists(atPath: path)
+    }
+
     override func setAttributes(_ attributes: [FileAttributeKey: Any], ofItemAtPath path: String) throws {
         try super.setAttributes(attributes, ofItemAtPath: path)
         if let protection = attributes[.protectionKey] as? FileProtectionType,
@@ -1876,6 +1895,7 @@ private final class MealMetadataProtectionFileManager: FileManager, @unchecked S
     override func attributesOfItem(atPath path: String) throws -> [FileAttributeKey: Any] {
         var attributes = try super.attributesOfItem(atPath: path)
         protectionLock.lock()
+        attributeReads[path, default: 0] += 1
         let protection = protections[path]
         protectionLock.unlock()
         if let protection, attributes[.systemFileNumber] as? NSNumber == protection.fileNumber {
@@ -2800,6 +2820,77 @@ extension BasalInjectionTests {
             XCTAssertEqual(TreatmentEntryAccessor(coreDataManager: core).getLatestTreatments(howOld: nil).count,
                            count == 0 ? 0 : count + 1)
         }
+    }
+
+    @MainActor func testMealReconcileReusesProtectionAndMetadataOnlyWithinOnePass() throws {
+        let now = Date(timeIntervalSince1970: 1_788_804_000)
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let files = MealMetadataProtectionFileManager()
+        let directory = files.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? files.removeItem(at: directory) }
+        let metadataDirectory = directory.appendingPathComponent("PenDose/MealPlans")
+        let journal = PenDoseLogJournal(directory: directory)
+        var checkedFiles = [String]()
+        var unprotectedPath: String?
+        var unreadablePath: String?
+        let store = MealPlanMetadataStore(directory: directory, fileManager: files, isProtectedFile: { url in
+            checkedFiles.append(url.path)
+            if url.path == unreadablePath { throw CocoaError(.fileReadUnknown) }
+            return url.path != unprotectedPath
+        })
+        var meals = [TreatmentEntry]()
+        var paths = [String]()
+        for _ in 0..<3 {
+            let meal = reminderEntry(core, date: now)
+            let uuid = try XCTUnwrap(meal.localTreatmentUUID)
+            try store.stage(MealPlanMetadata(mealUUID: uuid, bolusUUID: nil, loggedAt: now,
+                plannedAt: nil, grams: meal.value, pizzaSettings: nil, mealKind: .normal))
+            meals.append(meal)
+            paths.append(metadataDirectory.appendingPathComponent(uuid + ".json").path)
+        }
+        XCTAssertTrue(core.saveChangesSynchronously())
+
+        func reconcile() {
+            checkedFiles.removeAll()
+            files.resetReadCounts()
+            MealPlanReminderCoordinator.reconcile(coreDataManager: core, journal: journal,
+                store: store, now: now, onIssue: { XCTFail($0) })
+        }
+        func assertStablePass() {
+            reconcile()
+            XCTAssertEqual(checkedFiles.sorted(), paths.sorted())
+            XCTAssertEqual(files.attributeReads[metadataDirectory.path], 1)
+            for path in paths {
+                XCTAssertNil(files.attributeReads[path])
+                XCTAssertLessThanOrEqual(files.jsonExistenceChecks[path, default: 0], 1)
+            }
+        }
+        assertStablePass()
+
+        meals[0].value = 42
+        XCTAssertTrue(core.saveChangesSynchronously())
+        reconcile()
+        let editedUUID = try XCTUnwrap(meals[0].localTreatmentUUID)
+        XCTAssertEqual(try store.metadata(for: editedUUID)?.lastStoredMealGrams, 42)
+
+        // Check each fallback in a fresh pass, without an earlier repair invalidating it.
+        for path in paths.dropFirst() {
+            unreadablePath = path == paths[2] ? path : nil
+            unprotectedPath = path == paths[1] ? path : nil
+            try files.setAttributes([.protectionKey: FileProtectionType.none], ofItemAtPath: path)
+            reconcile()
+            XCTAssertTrue(checkedFiles.contains(path))
+            XCTAssertEqual(try files.attributesOfItem(atPath: path)[.protectionKey] as? FileProtectionType,
+                           .completeUntilFirstUserAuthentication)
+        }
+
+        unprotectedPath = nil
+        unreadablePath = nil
+        try files.setAttributes([.protectionKey: FileProtectionType.none], ofItemAtPath: metadataDirectory.path)
+        reconcile()
+        XCTAssertEqual(try files.attributesOfItem(atPath: metadataDirectory.path)[.protectionKey] as? FileProtectionType,
+                       .completeUntilFirstUserAuthentication)
+        assertStablePass()
     }
 
     @MainActor func testMealReconcileBatchMatchesFreshRefreshForEditsDeletionAndReminderTimes() throws {
