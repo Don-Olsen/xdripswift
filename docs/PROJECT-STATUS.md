@@ -44,8 +44,17 @@ ikke som behandling. Rettelser og forsinkede Watch-poster følger injektionstids
 
 Når estimatet når grænsen, kan iPhone vise “Husk en ekstra ampul” én gang pr. ampul.
 “Mind mig senere” udsætter påmindelsen en time. Et nyt ampulskift aflyser tidligere
-ampulpåmindelser. En manuel rettelse kræver en ny fysisk aflæsning. Udlevering af en
+ampulpåmindelser. En manuel rettelse kræver en ny fysisk aflæsning. Levering af en
 notifikation på låst iPhone og spejling på et fysisk ur kræver fysisk afprøvning.
+
+Release 4366 bestod alle 2.000 XCTest, 200 Python-tests, Watch-værktøjernes 30 + 24
+syntetiske kontroller, begge simulatorbuilds og unsigned iPhoneOS/arm64. Forsøg ét
+afslørede, at status for ukendt rest brugte to linjer ved 320 punkter. Med teksten
+“Ampul · ukendt” bestod den uændrede højdekontrol og hele suiten på det endelige
+releasegrundlag. På en iPhone 17e-simulator blev Hjem med normal og lav syntetisk
+beholdning samt åbning af oversigten efter koldstart kontrolleret. XCTest dækkede
+også ukendt rest, tilgængelighedstekst og iPad-bredde. En fuld visuel sammenligning
+på Pro Max og iPad samt fysisk levering og lyd indgår ikke i disse resultater.
 
 ## Snooze ved koldstart og ændring på Watch Direct — 14. november 2026
 
