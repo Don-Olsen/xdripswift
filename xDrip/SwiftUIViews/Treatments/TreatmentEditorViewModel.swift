@@ -51,6 +51,8 @@ import UserNotifications
     private let localSaveStartedAt = Date()
     private let localSaveOverride: (() -> Bool)?
     private let considerMealQuiet: ((String, String, Date, Date, Bool) -> Void)?
+    private let cartridgeMonitor: PenCartridgeMonitor
+    @Published private var cartridgeRevision = 0
     private var requestedExistingMealState: TreatmentMealState?
     private let log = OSLog(subsystem: ConstantsLog.subSystem, category: ConstantsLog.categoryApplicationDataTreatments)
 
@@ -61,7 +63,8 @@ import UserNotifications
          localSaveOverride: (() -> Bool)? = nil, mealMetadataStore: MealPlanMetadataStore? = nil,
          carbohydrateAdviceEvidence: CarbohydrateAdviceEvidence? = nil,
          carbohydrateAdviceJournal: CarbohydrateAdviceJournal = .shared,
-         considerMealQuiet: ((String, String, Date, Date, Bool) -> Void)? = nil) {
+         considerMealQuiet: ((String, String, Date, Date, Bool) -> Void)? = nil,
+         cartridgeMonitor: PenCartridgeMonitor = .shared) {
         self.carbohydrateAdviceEvidence = carbohydrateAdviceEvidence
         self.carbohydrateAdviceJournal = carbohydrateAdviceJournal
         let localSaveJournal = localSaveJournal ?? .shared
@@ -73,6 +76,7 @@ import UserNotifications
         self.mealMetadataStore = mealMetadataStore ?? .shared
         self.localSaveOverride = localSaveOverride
         self.considerMealQuiet = considerMealQuiet
+        self.cartridgeMonitor = cartridgeMonitor
         self.localSaveGateState = coreDataManager.map { localSaveJournal.recoveryState(coreDataManager: $0) } ?? .ready
         self.originalTreatment = treatmentToEdit
         self.initialTreatmentState = treatmentToEdit.map {
@@ -114,6 +118,46 @@ import UserNotifications
         } else {
             self.enteredValue = ""
         }
+    }
+
+    private var cartridgeBolusID: String? {
+        guard let entry = originalTreatment, !entry.isDeleted, !entry.treatmentdeleted,
+              entry.treatmentType == .Insulin, entry.isAppLocalTreatment,
+              selectedType == .Insulin, selectedDate == entry.date,
+              normalizedValue() == entry.value else { return nil }
+        return [entry.watchSourceUUID, entry.localTreatmentUUID].compactMap { $0 }
+            .first { UUID(uuidString: $0) != nil }
+    }
+
+    var canAdjustCartridgeAllocation: Bool {
+        cartridgeMonitor.isEnabled && cartridgeBolusID != nil && localSaveGateState == .ready
+    }
+
+    var cartridgeAllocationSummary: String? {
+        guard let id = cartridgeBolusID, let allocation = cartridgeMonitor.allocation,
+              allocation.normalizedBolusID == UUID(uuidString: id)?.uuidString else { return nil }
+        guard allocation.totalUnits == originalTreatment?.value else {
+            return "Dosis er ændret. Kontrollér ampulfordelingen."
+        }
+        return "Fra gammel \(PenDoseDisplayFormatter.insulin(allocation.oldUnits)) E · fra ny \(PenDoseDisplayFormatter.insulin(allocation.totalUnits - allocation.oldUnits)) E"
+    }
+
+    func cartridgeAllocationRequest() -> PenCartridgeAllocationRequest? {
+        guard canAdjustCartridgeAllocation, let id = cartridgeBolusID, let coreDataManager,
+              let units = try? PenCartridgeMonitor.storedDose(id, coreDataManager: coreDataManager),
+              units == originalTreatment?.value else { return nil }
+        return cartridgeMonitor.allocationRequest(bolusID: id, total: units,
+            penStep: PenDoseProfile.load().settings.penStepUnits, existingTreatment: true)
+    }
+
+    func saveCartridgeAllocation(_ request: PenCartridgeAllocationRequest, oldUnits: Double,
+                                 startsNewCartridge: Bool) -> Bool {
+        guard let current = cartridgeAllocationRequest(), current.bolusID == request.bolusID,
+              current.totalUnits == request.totalUnits, current.baselineID == request.baselineID,
+              cartridgeMonitor.saveAllocation(request, oldUnits: oldUnits,
+                                                startsNewCartridge: startsNewCartridge) else { return false }
+        cartridgeRevision += 1
+        return true
     }
 
     // MARK: - public computed properties
@@ -1006,6 +1050,10 @@ struct YesterdayMealShortcut: Equatable {
     private let enablesCarbohydrateAdvice: Bool
     private let carbohydrateAdviceJournal: CarbohydrateAdviceJournal
     private let forecastDefaults: UserDefaults
+    private let cartridgeMonitor: PenCartridgeMonitor
+    @Published private var cartridgeAllocation: PenCartridgeAllocation?
+    private var cartridgeBaselineID: UUID?
+    private var cartridgeSaveWarning: String?
     private var hasManualInsulinEntry = false
     private var isUpdatingAutomaticInsulin = false
     private let mealShortcutDefaults: UserDefaults
@@ -1040,7 +1088,8 @@ struct YesterdayMealShortcut: Equatable {
          forecastDefaults: UserDefaults = .standard,
          mealShortcutDefaults: UserDefaults = .standard,
          mealShortcutTherapyManager: TherapyMetricsManager = .shared,
-         mealShortcutCalendar: @escaping () -> Calendar = { .current }) {
+         mealShortcutCalendar: @escaping () -> Calendar = { .current },
+         cartridgeMonitor: PenCartridgeMonitor = .shared) {
         let logJournal = logJournal ?? .shared
         self.coreDataManager = coreDataManager
         self.reminderMealUUID = reminderMealUUID
@@ -1057,6 +1106,7 @@ struct YesterdayMealShortcut: Equatable {
         self.mealShortcutDefaults = mealShortcutDefaults
         self.mealShortcutTherapyManager = mealShortcutTherapyManager
         self.mealShortcutCalendar = mealShortcutCalendar
+        self.cartridgeMonitor = cartridgeMonitor
         self.storageGateState = logJournal.recoveryState(coreDataManager: coreDataManager)
         if storageGateState != .ready { statusMessage = storageGateState.message }
     }
@@ -1115,6 +1165,69 @@ struct YesterdayMealShortcut: Equatable {
         return TherapyMetricsManager.doseSourceIsReady(defaults.dataFlowPolicy,
             cutover: TreatmentSourceCutover.current(defaults: defaults), defaults: defaults)
     }
+    var canAdjustCartridgeAllocation: Bool {
+        cartridgeMonitor.isEnabled && localLoggingIsActive && !isSaving && confirmationDraft == nil &&
+            storageGateState == .ready && (parsedUnits ?? 0) > 0 && profile.settings.isValid
+    }
+
+    var cartridgeAllocationSummary: String? {
+        guard let allocation = cartridgeAllocation, let total = parsedUnits else { return nil }
+        guard cartridgeMonitor.snapshot.baselineID == cartridgeBaselineID else {
+            return "Ampullen er ændret. Kontrollér fordelingen."
+        }
+        guard total >= allocation.oldUnits else { return "Dosis er mindre end delen fra den gamle ampul. Ret fordelingen." }
+        return "Fra gammel \(PenDoseDisplayFormatter.insulin(allocation.oldUnits)) E · fra ny \(PenDoseDisplayFormatter.insulin(total - allocation.oldUnits)) E"
+    }
+
+    func cartridgeAllocationRequest() -> PenCartridgeAllocationRequest? {
+        guard canAdjustCartridgeAllocation, let total = parsedUnits else { return nil }
+        if logOperation == nil { logOperation = PenDoseLogOperation() }
+        guard let operation = logOperation else { return nil }
+        return cartridgeMonitor.allocationRequest(bolusID: operation.bolusUUID, total: total,
+            penStep: profile.settings.penStepUnits, existingTreatment: false)
+    }
+
+    func saveCartridgeAllocation(_ request: PenCartridgeAllocationRequest, oldUnits: Double,
+                                 startsNewCartridge: Bool) -> Bool {
+        guard canAdjustCartridgeAllocation, request.totalUnits == parsedUnits,
+              logOperation?.bolusUUID == request.bolusID,
+              cartridgeMonitor.saveAllocation(request, oldUnits: oldUnits,
+                                                startsNewCartridge: startsNewCartridge) else { return false }
+        cartridgeAllocation = PenCartridgeAllocation(bolusID: request.bolusID,
+            oldUnits: oldUnits, totalUnits: request.totalUnits)
+        cartridgeBaselineID = cartridgeMonitor.snapshot.baselineID
+        // The user has started this injection. New calculations can update the review,
+        // while their actual dose field remains under their control.
+        hasManualInsulinEntry = true
+        return true
+    }
+
+    var cartridgeNeedsReplacement: Bool {
+        guard cartridgeAllocation == nil, cartridgeMonitor.isEnabled,
+              let remaining = cartridgeMonitor.snapshot.remainingUnits,
+              let total = parsedUnits, total > 0 else { return false }
+        return remaining < total + 2
+    }
+
+    private func updateCartridgeAllocationBeforeLog(total: Double) {
+        cartridgeSaveWarning = nil
+        guard let allocation = cartridgeAllocation else { return }
+        if let baselineID = cartridgeBaselineID,
+           let request = cartridgeMonitor.allocationRequest(bolusID: allocation.bolusID, total: total,
+               penStep: profile.settings.penStepUnits, existingTreatment: false),
+           request.baselineID == baselineID, !request.startsNewCartridge,
+           cartridgeMonitor.saveAllocation(request, oldUnits: allocation.oldUnits, startsNewCartridge: false) {
+            cartridgeBaselineID = cartridgeMonitor.snapshot.baselineID
+            cartridgeAllocation = PenCartridgeAllocation(bolusID: allocation.bolusID,
+                oldUnits: allocation.oldUnits, totalUnits: total)
+        } else {
+            // Saving the actual dose has priority over a stock estimate. Do not let a
+            // later physical count or failed allocation write silently debit the full dose.
+            cartridgeMonitor.invalidateAllocationEstimate()
+            cartridgeSaveWarning = "Kontrollér ampulresten. Fordelingen kunne ikke afstemmes med den aktuelle ampul."
+        }
+    }
+
     var logValidationMessage: String? {
         if isSaving || confirmationDraft != nil { return "Registrerer…" }
         guard storageGateState == .ready,
@@ -1126,6 +1239,9 @@ struct YesterdayMealShortcut: Equatable {
         guard settings.isValid else { return "Kontrollér pen-trin og maksimum" }
         guard let units = parsedUnits else { return "Ugyldig insulinmængde" }
         guard units >= 0 else { return "Ugyldig insulinmængde" }
+        if let allocation = cartridgeAllocation, units < allocation.oldUnits {
+            return "Ret ampulfordelingen til den faktiske dosis"
+        }
         guard units <= settings.maximumSuggestionUnits else {
             return "Max \(settings.maximumSuggestionUnits) E"
         }
@@ -1458,7 +1574,7 @@ struct YesterdayMealShortcut: Equatable {
     /// A user edit owns the field until an explicit selection of the current suggestion.
     func copySuggestion() {
         guard !isSaving, confirmationDraft == nil, let units = suggestedUnits else { return }
-        if automaticallyFillMealDose, reminderMealUUID == nil, (parsedCarbs ?? 0) > 0 {
+        if automaticallyFillMealDose, cartridgeAllocation == nil, reminderMealUUID == nil, (parsedCarbs ?? 0) > 0 {
             hasManualInsulinEntry = false
             setAutomaticInsulin(PenDoseDisplayFormatter.insulinInput(units))
         } else {
@@ -1494,8 +1610,9 @@ struct YesterdayMealShortcut: Equatable {
     @discardableResult func requestLog() -> Bool {
         guard confirmationDraft == nil, !isSaving, logValidationMessage == nil,
               let units = parsedUnits, let carbs = parsedCarbs else { return false }
-        let operation = PenDoseLogOperation()
+        let operation = logOperation ?? PenDoseLogOperation()
         logOperation = operation
+        updateCartridgeAllocationBeforeLog(total: units)
         confirmationDraft = PenDoseLogDraft(loggedAt: Date(), insulinUnits: units,
             carbohydrateGrams: reminderMealUUID == nil ? carbs : 0,
             mealKind: mealKind, plannedDate: isPlannedMeal ? plannedDate : nil,
@@ -1513,7 +1630,7 @@ struct YesterdayMealShortcut: Equatable {
         guard !isSaving else { return }
         confirmationDraft = nil
         requiresLogConfirmation = false
-        logOperation = nil
+        if cartridgeAllocation == nil { logOperation = nil }
         refreshAutomaticInsulin()
     }
 
@@ -1567,12 +1684,16 @@ struct YesterdayMealShortcut: Equatable {
             confirmationDraft = nil
             requiresLogConfirmation = false
             logOperation = nil
+            cartridgeAllocation = nil
+            cartridgeBaselineID = nil
             hasManualInsulinEntry = false
             setAutomaticInsulin("")
             carbohydratesText = ""
-            postSaveReminderWarning = receipt.reminderWarning
+            postSaveReminderWarning = [receipt.reminderWarning, cartridgeSaveWarning].compactMap { $0 }.joined(separator: "\n")
+            if postSaveReminderWarning?.isEmpty == true { postSaveReminderWarning = nil }
             statusMessage = postSaveReminderWarning == nil
-                ? "Behandlingen er registreret." : "Registreret – påmindelsen kunne ikke oprettes"
+                ? "Behandlingen er registreret." : "Registreret – kontrollér den viste besked"
+            cartridgeSaveWarning = nil
             return true
         case .failure(.invalidInput):
             statusMessage = "Registreringen er ikke gyldig. Kontrollér mængder og spisetid."

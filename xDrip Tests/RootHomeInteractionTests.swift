@@ -3520,3 +3520,67 @@ extension RootHomeInteractionTests {
         }
     }
 }
+
+
+extension RootHomeInteractionTests {
+    /// Render the actual split sheet with synthetic quantities; opening it must not confirm a cartridge or dose.
+    @MainActor
+    func testRenderCartridgeSplitAtSmallAndLargeWidthWithKnownAndUnknownBalance() async throws {
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }.first { $0.activationState == .foregroundActive })
+        let previous = scene.windows.first { $0.isKeyWindow }
+        defer { previous?.makeKey() }
+        var confirmations = 0
+        for width in [320.0, 430.0] {
+            for size in [DynamicTypeSize.large, .accessibility3] {
+                for known in [true, false] {
+                    let request = PenCartridgeAllocationRequest(baselineID: UUID(), bolusID: UUID().uuidString,
+                        totalUnits: 6, suggestedOldUnits: known ? 3 : nil,
+                        startsNewCartridge: known, allowsCartridgeChoice: !known, penStepUnits: 0.5)
+                    let appeared = expectation(description: "Synthetic cartridge split appears")
+                    let screen = PenCartridgeSplitEditor(request: request) { _, _ in
+                        confirmations += 1
+                        return true
+                    }
+                    .environment(\.dynamicTypeSize, size)
+                    .environment(\.locale, Locale(identifier: "da_DK"))
+                    .onAppear { appeared.fulfill() }
+                    let host = UIHostingController(rootView: screen)
+                    let window = UIWindow(windowScene: scene)
+                    window.frame = CGRect(x: 0, y: 0, width: width, height: width == 320 ? 680 : 932)
+                    window.rootViewController = host
+                    window.makeKeyAndVisible()
+                    defer {
+                        window.isHidden = true
+                        window.rootViewController = nil
+                    }
+                    await fulfillment(of: [appeared], timeout: 2)
+                    try await Task.sleep(nanoseconds: 150_000_000)
+                    host.view.layoutIfNeeded()
+                    let scroll = try XCTUnwrap(calculatorScrollView(in: host.view))
+                    XCTAssertLessThanOrEqual(scroll.contentSize.width, scroll.bounds.width + 1,
+                        "The actual Form must not require horizontal scrolling")
+                    if size == .large {
+                        let input = try XCTUnwrap(calculatorTextFields(in: host.view)
+                            .first { $0.placeholder == "Indtast enheder" })
+                        XCTAssertEqual(input.text ?? "", known ? PenDoseDisplayFormatter.insulinInput(3) : "")
+                        XCTAssertGreaterThanOrEqual(input.bounds.width, 44)
+                    }
+                    let label = "Synthetic cartridge split \(Int(width))pt \(size) \(known ? "known" : "unknown")"
+                    addCalculatorLayoutAttachment(host.view, name: label)
+                    if size.isAccessibilitySize {
+                        scroll.setContentOffset(CGPoint(x: 0,
+                            y: max(0, scroll.contentSize.height - scroll.bounds.height + scroll.adjustedContentInset.bottom)),
+                            animated: false)
+                        try await Task.sleep(nanoseconds: 150_000_000)
+                        host.view.layoutIfNeeded()
+                        addCalculatorLayoutAttachment(host.view, name: label + " confirmation")
+                    }
+                    XCTAssertEqual(confirmations, 0, "Presentation, scrolling and closing must not save anything")
+                    window.isHidden = true
+                    window.rootViewController = nil
+                }
+            }
+        }
+    }
+}

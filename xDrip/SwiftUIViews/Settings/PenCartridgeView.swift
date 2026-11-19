@@ -17,6 +17,124 @@ enum PenCartridgeDisplay {
     }
 }
 
+/// One explicit cartridge change or allocation edit, shared by the live dose and history.
+struct PenCartridgeSplitEditor: View {
+    let request: PenCartridgeAllocationRequest
+    let onSave: (Double, Bool) -> Bool
+    @Environment(\.dismiss) private var dismiss
+    @FocusState private var editsOldUnits: Bool
+    @State private var oldUnitsText: String
+    @State private var startsNewCartridge: Bool
+    @State private var saveFailed = false
+
+    init(request: PenCartridgeAllocationRequest, onSave: @escaping (Double, Bool) -> Bool) {
+        self.request = request
+        self.onSave = onSave
+        _oldUnitsText = State(initialValue: request.suggestedOldUnits
+            .map(PenDoseDisplayFormatter.insulinInput) ?? "")
+        _startsNewCartridge = State(initialValue: request.startsNewCartridge)
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                if request.allowsCartridgeChoice {
+                    Section {
+                        Picker("Ampul til resten", selection: $startsNewCartridge) {
+                            Text("Nuværende ampul").tag(false)
+                            Text("Ny ampul").tag(true)
+                        }
+                    } footer: {
+                        Text("Vælg nuværende ampul, hvis du allerede har registreret skiftet.")
+                    }
+                }
+                Section {
+                    amountRow("Samlet insulin", value: request.totalUnits)
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Fra gammel ampul").font(.subheadline).foregroundStyle(.secondary)
+                        HStack(alignment: .firstTextBaseline, spacing: 8) {
+                            TextField("Indtast enheder", text: $oldUnitsText)
+                                .font(.title2).monospacedDigit()
+                                .keyboardType(.decimalPad)
+                                .focused($editsOldUnits)
+                                .accessibilityLabel("Insulin taget fra gammel ampul, enheder")
+                                .accessibilityIdentifier("penCartridge.split.oldUnits")
+                            Text("E").foregroundStyle(.secondary)
+                        }
+                        .frame(minHeight: 44)
+                    }
+                    if let old = validOldUnits {
+                        amountRow("Fra ny ampul", value: request.totalUnits - old)
+                            .accessibilityIdentifier("penCartridge.split.newUnits")
+                    } else {
+                        Text("Angiv 0–\(PenDoseDisplayFormatter.insulinInput(request.totalUnits)) E fra den gamle ampul i pennens trin på \(PenDoseDisplayFormatter.insulinInput(request.penStepUnits)) E.")
+                            .font(.footnote).foregroundStyle(.secondary)
+                    }
+                } footer: {
+                    Text(request.suggestedOldUnits == nil
+                         ? "Angiv den mængde, du faktisk tog fra den gamle ampul."
+                         : "Kontrollér fordelingen, og ret mængden, hvis du tog noget andet fra den gamle ampul.")
+                }
+                Section {
+                    Button {
+                        editsOldUnits = false
+                        guard let units = validOldUnits else { return }
+                        if onSave(units, startsNewCartridge) { dismiss() }
+                        else { saveFailed = true }
+                    } label: {
+                        Text(startsNewCartridge ? "Bekræft ny ampul og fordeling" : "Gem fordeling")
+                            .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                            .multilineTextAlignment(.leading)
+                    }
+                    .disabled(validOldUnits == nil)
+                    .accessibilityIdentifier("penCartridge.split.confirm")
+                } footer: {
+                    Text(startsNewCartridge
+                         ? "Bekræft, når du har sat en ny ampul på 300 E i pennen. Ampulforbruget medregner 2 E til udluftning pr. anvendt ampul."
+                         : "Ampulforbruget medregner 2 E til udluftning pr. anvendt ampul.")
+                }
+                if saveFailed {
+                    Section {
+                        Text("Fordelingen kunne ikke gemmes. Kontrollér mængderne og den aktuelle ampul, og prøv igen.")
+                            .foregroundStyle(.orange)
+                    }
+                }
+            }
+            .ipadReadableContentWidth(720)
+            .navigationTitle("Fordel dosis")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Annuller") { dismiss() }
+                }
+                ToolbarItemGroup(placement: .keyboard) {
+                    Spacer()
+                    Button("Færdig") { editsOldUnits = false }
+                }
+            }
+        }
+        .colorScheme(.dark)
+    }
+
+    private var validOldUnits: Double? {
+        guard let units = PenCartridgeDisplay.units(oldUnitsText, minimum: 0),
+              request.totalUnits.isFinite, units <= request.totalUnits,
+              request.penStepUnits.isFinite, request.penStepUnits > 0 else { return nil }
+        let steps = units / request.penStepUnits
+        guard abs(steps - steps.rounded()) < 0.000001 else { return nil }
+        return units
+    }
+
+    private func amountRow(_ title: String, value: Double) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title).font(.subheadline).foregroundStyle(.secondary)
+            Text("\(PenDoseDisplayFormatter.insulinInput(value)) E")
+                .font(.title2).monospacedDigit()
+        }
+        .accessibilityElement(children: .combine)
+    }
+}
+
 /// The cartridge is always live, including while glucose history is being browsed.
 struct PenCartridgeHomeRow: View {
     let remaining: Double?

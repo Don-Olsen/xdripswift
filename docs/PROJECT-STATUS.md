@@ -1,3 +1,30 @@
+## Dosis fordelt ved ampulskift — 19. november 2026
+
+Beregneren kan knytte én faktisk dosis til et ampulskift. “Skift ampul under dosis”
+foreslår den gamle ampuls andel ud fra anslået rest minus udluftning, afrundet ned
+til pennens trin. Brugeren retter om nødvendigt mængden og bekræfter det fysiske
+skift. Den nye ampuls andel beregnes automatisk. Ukendt rest kræver en indtastet
+fordeling. Den samlede dosis gemmes fortsat én gang gennem den eksisterende Log;
+ampularket registrerer ingen behandling. Fordelingen kan også rettes på den
+konkrete gemte iPhone-/Watch-bolus i Behandlinger. Ny ampul på Hjem bevarer sin
+almindelige funktion.
+
+Kun lagerestimatet bruger fordelingen og de 2 E udluftning pr. anvendt ampul.
+IOB, dosisberegning, eksport og behandlingsmængde ændres ikke. En bekræftet fysisk
+udskiftning uden gemt dosis overlever genstart, men viser ukendt rest indtil den
+konkrete behandling er gemt/tilknyttet eller brugeren har korrigeret restmængden.
+En ændret dosis eller et andet ampulskift må ikke give et tilsyneladende korrekt
+lagerestimat ud fra en gammel fordeling. Gemning af faktisk insulin har fortsat
+prioritet; uafklaret ampulregnskab vises med forklaring. Efterfølgende beregninger
+må ikke automatisk ændre den indtastede insulin efter en bekræftet fordeling.
+
+Regressionerne dækker lagerregning, gamle data, Watch-identitet, efterlevering,
+rettelse/sletning, genstart, gentagne forsøg og fejl under lagring samt de faktiske
+viewmodellers gemmeforløb. UIHosting-kontrollen bruger syntetiske data på 320 og
+430 punkter med almindelig og stor tekst. Resultater registreres ved release.
+Fysisk betjening og lagerforbrug på iPhone/pen samt ny Watch-registrering efter
+opdateringen kræver afprøvning; ingen app er installeret lokalt på brugerens enheder.
+
 <!-- testflight-7.1.1-4367:start -->
 ### TestFlight 7.1.1 (4367)
 

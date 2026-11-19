@@ -213,6 +213,7 @@ struct TreatmentEditorView: View {
     // MARK: - private properties
 
     @ObservedObject var viewModel: TreatmentEditorViewModel
+    @State private var cartridgeAllocation: PenCartridgeAllocationRequest?
 
     let onDelete: (() -> Void)?
     var onConfirmMeal: (() -> Void)?
@@ -268,6 +269,22 @@ struct TreatmentEditorView: View {
                         }
                         .fixedSize(horizontal: true, vertical: false)
                     }
+                }
+
+                if viewModel.canAdjustCartridgeAllocation {
+                    Button {
+                        cartridgeAllocation = viewModel.cartridgeAllocationRequest()
+                    } label: {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(viewModel.cartridgeAllocationSummary == nil
+                                 ? "Fordel mellem ampuller" : "Ret ampulfordeling")
+                            if let summary = viewModel.cartridgeAllocationSummary {
+                                Text(summary).font(.footnote).foregroundStyle(.secondary)
+                            }
+                        }
+                        .frame(minHeight: 44, alignment: .leading)
+                    }
+                    .accessibilityIdentifier("treatment.cartridgeAllocation")
                 }
 
                 if viewModel.selectedType == .Carbs {
@@ -366,6 +383,12 @@ struct TreatmentEditorView: View {
                 dismissButton: .default(Text(Texts_Common.Ok))
             )
         }
+        .sheet(item: $cartridgeAllocation) { request in
+            PenCartridgeSplitEditor(request: request) { oldUnits, startsNew in
+                viewModel.saveCartridgeAllocation(request, oldUnits: oldUnits,
+                                                  startsNewCartridge: startsNew)
+            }
+        }
         .onAppear {
             viewModel.validateSelectedDateIfNeeded()
         }
@@ -434,6 +457,7 @@ struct PenDoseCalculatorScreen: View {
     @StateObject private var viewModel: PenDoseCalculatorViewModel
     @State private var information: PenDoseInformationSnapshot?
     @State private var carbohydrateEditor: CarbohydrateAdviceEditorRequest?
+    @State private var cartridgeAllocation: PenCartridgeAllocationRequest?
     @State private var showsLogConfirmation = false
     @State private var showsReminderWarning = false
     @State private var didSetInitialFocus = false
@@ -520,6 +544,12 @@ struct PenDoseCalculatorScreen: View {
                         carbohydrateEditor = nil
                         viewModel.scheduleCalculation(debounce: false)
                     }, onCancel: { carbohydrateEditor = nil })
+            }
+            .sheet(item: $cartridgeAllocation) { request in
+                PenCartridgeSplitEditor(request: request) { oldUnits, startsNew in
+                    viewModel.saveCartridgeAllocation(request, oldUnits: oldUnits,
+                                                      startsNewCartridge: startsNew)
+                }
             }
             .alert(logConfirmationTitle, isPresented: Binding(
                 get: { showsLogConfirmation && viewModel.confirmationDraft != nil },
@@ -774,6 +804,30 @@ struct PenDoseCalculatorScreen: View {
                     .monospacedDigit().focused($focusedField, equals: .insulin)
                     .accessibilityLabel("Insulin, enheder")
                 Text("E").font(.title3).foregroundStyle(.secondary)
+            }
+            if viewModel.canAdjustCartridgeAllocation {
+                Button {
+                    focusedField = nil
+                    cartridgeAllocation = viewModel.cartridgeAllocationRequest()
+                } label: {
+                    VStack(alignment: .leading, spacing: 4) {
+                        if viewModel.cartridgeNeedsReplacement {
+                            Text("Ampullen rækker muligvis ikke")
+                                .font(.footnote).foregroundStyle(.orange)
+                        }
+                        Text(viewModel.cartridgeAllocationSummary == nil
+                             ? "Skift ampul under dosis" : "Ret ampulfordeling")
+                        if let summary = viewModel.cartridgeAllocationSummary {
+                            Text(summary).font(.footnote).foregroundStyle(.secondary)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                    .contentShape(Rectangle())
+                }
+                .font(.subheadline)
+                .buttonStyle(.plain)
+                .foregroundStyle(ConstantsAppColors.accent)
+                .accessibilityIdentifier("calculator.cartridgeAllocation")
             }
             if viewModel.usesAutomaticMealDose {
                 Text("Forslaget udfyldes automatisk. Du kan rette mængden før Log.")

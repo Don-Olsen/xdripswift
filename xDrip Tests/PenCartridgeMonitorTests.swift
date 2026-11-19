@@ -51,6 +51,45 @@ import XCTest
             return monitor
         }
 
+        func calculator(_ monitor: PenCartridgeMonitor, automatic: Bool = false) -> PenDoseCalculatorViewModel {
+            var profile = PenDoseProfile.prefilledUnconfirmed
+            XCTAssertTrue(profile.confirm())
+            let confirmed = profile
+            return PenDoseCalculatorViewModel(coreDataManager: core,
+                logJournal: PenDoseLogJournal(directory: directory.appendingPathComponent("journal")),
+                metadataStore: MealPlanMetadataStore(directory: directory.appendingPathComponent("meals")),
+                profileProvider: { confirmed }, sourceReadyOverride: { true },
+                snapshotProvider: { date, _ in
+                    let samples = stride(from: -30, through: 0, by: 5).map {
+                        GlucoseForecastSample(date: date.addingTimeInterval(Double($0) * 60),
+                            glucoseMgdl: 140, sensorID: "synthetic-cartridge-sensor")
+                    }
+                    return PenDoseInputSnapshot.make(capturedAt: date, glucose: samples, treatments: [],
+                        therapySettings: TherapyModelSettings(), treatmentRevision: 1,
+                        sourceSignature: "synthetic-local-source")
+                }, automaticallyFillMealDose: automatic, forecastDefaults: defaults,
+                mealShortcutDefaults: defaults, cartridgeMonitor: monitor)
+        }
+
+        func editor(_ entry: TreatmentEntry, monitor: PenCartridgeMonitor) -> TreatmentEditorViewModel {
+            TreatmentEditorViewModel(coreDataManager: core, treatmentToEdit: entry,
+                localSaveJournal: PenDoseLogJournal(directory: directory.appendingPathComponent("editor-journal")),
+                cartridgeMonitor: monitor)
+        }
+
+        var entries: [TreatmentEntry] {
+            TreatmentEntryAccessor(coreDataManager: core).getLatestTreatments(howOld: nil)
+        }
+
+        @discardableResult func dose(_ units: Double, at date: Date, watch: Bool = false) -> TreatmentEntry {
+            let entry = TreatmentEntry(date: date, value: units, treatmentType: .Insulin,
+                nightscoutEventType: nil, enteredBy: nil, nsManagedObjectContext: core.mainManagedObjectContext)
+            if watch { entry.watchSourceUUID = UUID().uuidString }
+            else { entry.localTreatmentUUID = UUID().uuidString }
+            XCTAssertTrue(core.saveChangesSynchronously())
+            return entry
+        }
+
         func clean() {
             defaults.removePersistentDomain(forName: suite)
             try? FileManager.default.removeItem(at: directory)
@@ -315,6 +354,344 @@ import XCTest
         XCTAssertEqual(repaired.identifier, original.identifier)
         XCTAssertEqual(repaired.content.userInfo["snooze"] as? String, original.content.userInfo["snooze"] as? String)
         XCTAssertEqual((repaired.trigger as? UNTimeIntervalNotificationTrigger)?.timeInterval, 3100)
+    }
+
+    func testCalculatorSplitPersistsBeforeLoggingAndLogsSixUnitsExactlyOnceAfterCancelledConfirmation() async throws {
+        let f = Fixture()
+        defer { f.clean() }
+        f.now = Date().addingTimeInterval(-60)
+        let monitor = f.monitor()
+        XCTAssertTrue(monitor.start(remaining: 5, threshold: 1))
+        await monitor.refresh()?.value
+        let originalCartridge = monitor.snapshot.cartridgeID
+        f.now.addTimeInterval(30)
+        let calculator = f.calculator(monitor)
+        defer { calculator.stop() }
+        calculator.insulinToLogText = "6"
+        let request = try XCTUnwrap(calculator.cartridgeAllocationRequest())
+        XCTAssertEqual(request.suggestedOldUnits, 3, "The old cartridge must first cover its own priming")
+        XCTAssertTrue(calculator.saveCartridgeAllocation(request, oldUnits: 3, startsNewCartridge: true))
+        await monitor.refresh()?.value
+        XCTAssertNotEqual(monitor.snapshot.cartridgeID, originalCartridge)
+        XCTAssertNil(monitor.snapshot.remainingUnits, "The physical switch is durable but the dose is still unlogged")
+        XCTAssertTrue(f.entries.isEmpty)
+        XCTAssertTrue(calculator.requestLog())
+        XCTAssertEqual(calculator.confirmationDraft?.operation.bolusUUID, request.bolusID)
+        calculator.cancelLogConfirmation()
+        XCTAssertTrue(f.entries.isEmpty)
+        XCTAssertTrue(calculator.requestLog())
+        XCTAssertEqual(calculator.confirmationDraft?.operation.bolusUUID, request.bolusID)
+        let logged = await calculator.confirmLog()
+        XCTAssertTrue(logged)
+        let repeated = await calculator.confirmLog()
+        XCTAssertFalse(repeated)
+        f.now = Date().addingTimeInterval(1)
+        await monitor.refresh()?.value
+        XCTAssertEqual(f.entries.count, 1)
+        XCTAssertEqual(f.entries.first?.value, 6)
+        XCTAssertEqual(f.entries.first?.localTreatmentUUID, request.bolusID)
+        XCTAssertEqual(monitor.snapshot.remainingUnits, 295)
+        let reopened = f.monitor()
+        await reopened.refresh()?.value
+        XCTAssertEqual(reopened.snapshot.remainingUnits, 295)
+        XCTAssertEqual(reopened.allocation?.oldUnits, 3)
+    }
+
+    func testCalculatorSplitKeepsOldPortionWhenTotalChangesAndCanCorrectItBeforeLogging() async throws {
+        let f = Fixture()
+        defer { f.clean() }
+        f.now = Date().addingTimeInterval(-60)
+        let monitor = f.monitor()
+        XCTAssertTrue(monitor.start(remaining: 5, threshold: 1))
+        await monitor.refresh()?.value
+        let calculator = f.calculator(monitor)
+        defer { calculator.stop() }
+        calculator.insulinToLogText = "6"
+        let request = try XCTUnwrap(calculator.cartridgeAllocationRequest())
+        XCTAssertTrue(calculator.saveCartridgeAllocation(request, oldUnits: 3, startsNewCartridge: true))
+        calculator.insulinToLogText = "2"
+        XCTAssertFalse(calculator.canLog)
+        calculator.insulinToLogText = "7"
+        let correction = try XCTUnwrap(calculator.cartridgeAllocationRequest())
+        XCTAssertFalse(correction.startsNewCartridge)
+        XCTAssertEqual(correction.suggestedOldUnits, 3)
+        XCTAssertEqual(correction.totalUnits, 7)
+        XCTAssertTrue(calculator.saveCartridgeAllocation(correction, oldUnits: 2, startsNewCartridge: false))
+        XCTAssertTrue(calculator.requestLog())
+        let logged = await calculator.confirmLog()
+        XCTAssertTrue(logged)
+        f.now = Date().addingTimeInterval(1)
+        await monitor.refresh()?.value
+        XCTAssertEqual(f.entries.count, 1)
+        XCTAssertEqual(f.entries.first?.value, 7)
+        XCTAssertEqual(monitor.allocation?.oldUnits, 2)
+        XCTAssertEqual(monitor.snapshot.remainingUnits, 293)
+    }
+
+    func testStaleCartridgeSheetCannotReplaceANewerPhysicalCount() async throws {
+        let f = Fixture()
+        defer { f.clean() }
+        f.now = Date().addingTimeInterval(-60)
+        let monitor = f.monitor()
+        XCTAssertTrue(monitor.start(remaining: 5, threshold: 1))
+        await monitor.refresh()?.value
+        let calculator = f.calculator(monitor)
+        defer { calculator.stop() }
+        calculator.insulinToLogText = "6"
+        let stale = try XCTUnwrap(calculator.cartridgeAllocationRequest())
+        XCTAssertTrue(monitor.setRemaining(4))
+        let correctedBaseline = monitor.snapshot.baselineID
+        XCTAssertFalse(calculator.saveCartridgeAllocation(stale, oldUnits: 3, startsNewCartridge: true))
+        await monitor.refresh()?.value
+        XCTAssertEqual(monitor.snapshot.baselineID, correctedBaseline)
+        XCTAssertEqual(monitor.snapshot.remainingUnits, 4)
+        XCTAssertNil(monitor.allocation)
+        XCTAssertTrue(f.entries.isEmpty)
+    }
+
+    func testNewPhysicalCountAfterSplitDoesNotBlockActualDoseOrSilentlyGuessTheStock() async throws {
+        let f = Fixture()
+        defer { f.clean() }
+        f.now = Date().addingTimeInterval(-60)
+        let monitor = f.monitor()
+        XCTAssertTrue(monitor.start(remaining: 5, threshold: 1))
+        await monitor.refresh()?.value
+        let calculator = f.calculator(monitor)
+        defer { calculator.stop() }
+        calculator.insulinToLogText = "6"
+        XCTAssertTrue(calculator.cartridgeNeedsReplacement)
+        let request = try XCTUnwrap(calculator.cartridgeAllocationRequest())
+        XCTAssertTrue(calculator.saveCartridgeAllocation(request, oldUnits: 3, startsNewCartridge: true))
+        XCTAssertFalse(calculator.cartridgeNeedsReplacement)
+        XCTAssertTrue(monitor.setRemaining(280))
+        XCTAssertTrue(calculator.requestLog())
+        let saved = await calculator.confirmLog()
+        XCTAssertTrue(saved, "The actual injection must still be saved when its stock allocation is stale")
+        f.now = Date().addingTimeInterval(1)
+        await monitor.refresh()?.value
+        XCTAssertEqual(f.entries.count, 1)
+        XCTAssertEqual(f.entries.first?.value, 6)
+        XCTAssertNil(monitor.snapshot.remainingUnits)
+        XCTAssertTrue(calculator.postSaveReminderWarning?.contains("Kontrollér ampulresten") == true)
+    }
+
+    func testSavedLocalAndWatchDosesCanBindToAnAlreadyReplacedCartridgeAcrossTheTimestampBoundary() async throws {
+        for doseBeforeSwitch in [true, false] {
+            let f = Fixture()
+            defer { f.clean() }
+            f.now = Date().addingTimeInterval(-120)
+            let monitor = f.monitor()
+            XCTAssertTrue(monitor.start(remaining: 5, threshold: 1))
+            f.now.addTimeInterval(60)
+            XCTAssertTrue(monitor.newCartridge())
+            let entry = f.dose(6, at: f.now.addingTimeInterval(doseBeforeSwitch ? -1 : 1), watch: doseBeforeSwitch)
+            f.now.addTimeInterval(2)
+            await monitor.refresh()?.value
+            let currentCartridge = monitor.snapshot.cartridgeID
+            let editor = f.editor(entry, monitor: monitor)
+            let request = try XCTUnwrap(editor.cartridgeAllocationRequest())
+            XCTAssertEqual(request.bolusID, doseBeforeSwitch ? entry.watchSourceUUID : entry.localTreatmentUUID)
+            XCTAssertNil(request.suggestedOldUnits, "History alone does not reveal the actual split")
+            XCTAssertFalse(request.startsNewCartridge)
+            XCTAssertTrue(request.allowsCartridgeChoice)
+            XCTAssertTrue(editor.saveCartridgeAllocation(request, oldUnits: 3, startsNewCartridge: false))
+            await monitor.refresh()?.value
+            XCTAssertEqual(monitor.snapshot.cartridgeID, currentCartridge)
+            XCTAssertEqual(monitor.snapshot.remainingUnits, 295)
+            XCTAssertEqual(f.entries.count, 1)
+            XCTAssertEqual(entry.value, 6)
+        }
+    }
+
+    func testSavedDoseCanEstablishThePhysicalSwitchAndEditsAndDeletionRemainExplicit() async throws {
+        let f = Fixture()
+        defer { f.clean() }
+        f.now = Date().addingTimeInterval(-120)
+        let monitor = f.monitor()
+        XCTAssertTrue(monitor.start(remaining: 5, threshold: 1))
+        let entry = f.dose(6, at: f.now.addingTimeInterval(1))
+        f.now.addTimeInterval(30)
+        let editor = f.editor(entry, monitor: monitor)
+        let request = try XCTUnwrap(editor.cartridgeAllocationRequest())
+        XCTAssertTrue(request.startsNewCartridge)
+        XCTAssertFalse(request.allowsCartridgeChoice)
+        XCTAssertTrue(editor.saveCartridgeAllocation(request, oldUnits: 3, startsNewCartridge: true))
+        await monitor.refresh()?.value
+        XCTAssertEqual(monitor.snapshot.remainingUnits, 295)
+        entry.value = 7
+        XCTAssertTrue(f.core.saveChangesSynchronously())
+        await monitor.refresh()?.value
+        XCTAssertNil(monitor.snapshot.remainingUnits, "An edited total must not silently move insulin between cartridges")
+        let revisedEditor = f.editor(entry, monitor: monitor)
+        let revised = try XCTUnwrap(revisedEditor.cartridgeAllocationRequest())
+        XCTAssertTrue(revisedEditor.saveCartridgeAllocation(revised, oldUnits: 3, startsNewCartridge: false))
+        await monitor.refresh()?.value
+        XCTAssertEqual(monitor.snapshot.remainingUnits, 294)
+        entry.treatmentdeleted = true
+        XCTAssertTrue(f.core.saveChangesSynchronously())
+        await monitor.refresh()?.value
+        XCTAssertEqual(monitor.snapshot.remainingUnits, 300)
+        XCTAssertFalse(revisedEditor.canAdjustCartridgeAllocation)
+    }
+
+    func testAbandonedCalculatorSplitSurvivesRestartAndCanBeLinkedToTheActualSavedDose() async throws {
+        let f = Fixture()
+        defer { f.clean() }
+        f.now = Date().addingTimeInterval(-120)
+        let monitor = f.monitor()
+        XCTAssertTrue(monitor.start(remaining: 5, threshold: 1))
+        let calculator = f.calculator(monitor)
+        calculator.insulinToLogText = "6"
+        let pending = try XCTUnwrap(calculator.cartridgeAllocationRequest())
+        XCTAssertTrue(calculator.saveCartridgeAllocation(pending, oldUnits: 3, startsNewCartridge: true))
+        calculator.stop()
+        XCTAssertTrue(f.entries.isEmpty)
+        let reopened = f.monitor()
+        await reopened.refresh()?.value
+        XCTAssertNil(reopened.snapshot.remainingUnits)
+        XCTAssertEqual(reopened.allocation?.bolusID, pending.bolusID)
+        let actual = f.dose(6, at: f.now, watch: true)
+        let editor = f.editor(actual, monitor: reopened)
+        let request = try XCTUnwrap(editor.cartridgeAllocationRequest())
+        XCTAssertFalse(request.startsNewCartridge, "A pending split belongs to the cartridge that is already physically installed")
+        XCTAssertTrue(editor.saveCartridgeAllocation(request, oldUnits: 3, startsNewCartridge: false))
+        await reopened.refresh()?.value
+        XCTAssertEqual(reopened.snapshot.remainingUnits, 295)
+        XCTAssertEqual(reopened.allocation?.bolusID, actual.watchSourceUUID)
+        XCTAssertEqual(f.entries.count, 1)
+    }
+
+    func testSplitPreventsAutomaticDoseChangesIncludingAfterExplicitSuggestionCopy() async throws {
+        let f = Fixture()
+        defer { f.clean() }
+        f.now = Date().addingTimeInterval(-60)
+        let monitor = f.monitor()
+        XCTAssertTrue(monitor.start(remaining: 5, threshold: 1))
+        let calculator = f.calculator(monitor, automatic: true)
+        defer { calculator.stop() }
+        calculator.carbohydratesText = "20"
+        calculator.start()
+        await calculator.calculate()
+        calculator.insulinToLogText = "6"
+        let request = try XCTUnwrap(calculator.cartridgeAllocationRequest())
+        XCTAssertTrue(calculator.saveCartridgeAllocation(request, oldUnits: 1, startsNewCartridge: true))
+        calculator.carbohydratesText = "60"
+        await calculator.calculate()
+        XCTAssertEqual(calculator.insulinToLogText, "6")
+        XCTAssertFalse(calculator.usesAutomaticMealDose)
+        let copied = try XCTUnwrap(calculator.suggestedUnits)
+        calculator.copySuggestion()
+        XCTAssertEqual(calculator.insulinToLogText, PenDoseDisplayFormatter.insulinInput(copied))
+        XCTAssertFalse(calculator.usesAutomaticMealDose)
+        calculator.carbohydratesText = "80"
+        await calculator.calculate()
+        XCTAssertEqual(calculator.insulinToLogText, PenDoseDisplayFormatter.insulinInput(copied))
+        XCTAssertEqual(monitor.allocation?.oldUnits, 1)
+        XCTAssertTrue(f.entries.isEmpty)
+    }
+
+    func testRetrospectiveNewCartridgeUsesSavedDoseTimeAndCountsLaterInjections() async throws {
+        let f = Fixture()
+        defer { f.clean() }
+        f.now = Date().addingTimeInterval(-120)
+        let monitor = f.monitor()
+        XCTAssertTrue(monitor.start(remaining: 5, threshold: 1))
+        f.now.addTimeInterval(10)
+        let split = f.dose(6, at: f.now)
+        f.now.addTimeInterval(10)
+        f.dose(2, at: f.now)
+        f.now.addTimeInterval(10)
+        let editor = f.editor(split, monitor: monitor)
+        let request = try XCTUnwrap(editor.cartridgeAllocationRequest())
+        XCTAssertTrue(request.startsNewCartridge)
+        XCTAssertEqual(request.committedTreatmentDate, split.date)
+        XCTAssertTrue(editor.saveCartridgeAllocation(request, oldUnits: 3, startsNewCartridge: true))
+        await monitor.refresh()?.value
+        XCTAssertEqual(monitor.snapshot.remainingUnits, 291, "Both the split share and the later injection consume the new cartridge")
+        let reopened = f.monitor()
+        await reopened.refresh()?.value
+        XCTAssertEqual(reopened.snapshot.remainingUnits, 291)
+        XCTAssertEqual(f.entries.count, 2)
+        XCTAssertEqual(split.value, 6)
+    }
+
+    func testRetrospectiveAllocationRejectsChangedCommittedTimeAmountOrDeletion() async throws {
+        let f = Fixture()
+        defer { f.clean() }
+        f.now = Date().addingTimeInterval(-120)
+        let monitor = f.monitor()
+        XCTAssertTrue(monitor.start(remaining: 5, threshold: 1))
+        f.now.addTimeInterval(10)
+        let split = f.dose(6, at: f.now)
+        f.now.addTimeInterval(10)
+        let request = try XCTUnwrap(monitor.allocationRequest(bolusID: try XCTUnwrap(split.localTreatmentUUID),
+            total: 6, penStep: 0.5, existingTreatment: true))
+        let originalDate = split.date
+        let baseline = monitor.snapshot.baselineID
+        split.date = originalDate.addingTimeInterval(1)
+        XCTAssertTrue(f.core.saveChangesSynchronously())
+        XCTAssertFalse(monitor.saveAllocation(request, oldUnits: 3, startsNewCartridge: true))
+        split.date = originalDate
+        split.value = 7
+        XCTAssertTrue(f.core.saveChangesSynchronously())
+        XCTAssertFalse(monitor.saveAllocation(request, oldUnits: 3, startsNewCartridge: true))
+        split.value = 6
+        split.treatmentdeleted = true
+        XCTAssertTrue(f.core.saveChangesSynchronously())
+        XCTAssertFalse(monitor.saveAllocation(request, oldUnits: 3, startsNewCartridge: true))
+        await monitor.refresh()?.value
+        XCTAssertEqual(monitor.snapshot.baselineID, baseline)
+        XCTAssertEqual(monitor.snapshot.remainingUnits, 5)
+        XCTAssertNil(monitor.allocation)
+    }
+
+    func testRetrospectiveNewCartridgeCannotReplaceANewerPhysicalCount() async throws {
+        let f = Fixture()
+        defer { f.clean() }
+        f.now = Date().addingTimeInterval(-120)
+        let monitor = f.monitor()
+        XCTAssertTrue(monitor.start(remaining: 5, threshold: 1))
+        f.now.addTimeInterval(10)
+        let split = f.dose(6, at: f.now)
+        f.now.addTimeInterval(10)
+        XCTAssertTrue(monitor.setRemaining(280))
+        let baseline = monitor.snapshot.baselineID
+        f.now.addTimeInterval(10)
+        let editor = f.editor(split, monitor: monitor)
+        let request = try XCTUnwrap(editor.cartridgeAllocationRequest())
+        XCTAssertTrue(request.startsNewCartridge)
+        XCTAssertFalse(editor.saveCartridgeAllocation(request, oldUnits: 3, startsNewCartridge: true))
+        await monitor.refresh()?.value
+        XCTAssertEqual(monitor.snapshot.baselineID, baseline)
+        XCTAssertEqual(monitor.snapshot.remainingUnits, 280)
+        XCTAssertNil(monitor.allocation)
+        XCTAssertEqual(split.value, 6)
+    }
+
+    func testRetrospectiveAttachmentPreservesKnownSwitchTimeForOtherInjections() async throws {
+        let f = Fixture()
+        defer { f.clean() }
+        f.now = Date().addingTimeInterval(-120)
+        let monitor = f.monitor()
+        XCTAssertTrue(monitor.start(remaining: 5, threshold: 1))
+        f.now.addTimeInterval(10)
+        let split = f.dose(6, at: f.now)
+        f.now.addTimeInterval(5)
+        f.dose(1, at: f.now) // The later known physical switch already accounts for this dose.
+        f.now.addTimeInterval(5)
+        XCTAssertTrue(monitor.newCartridge())
+        let cartridge = monitor.snapshot.cartridgeID
+        f.now.addTimeInterval(10)
+        f.dose(2, at: f.now)
+        f.now.addTimeInterval(10)
+        let editor = f.editor(split, monitor: monitor)
+        let request = try XCTUnwrap(editor.cartridgeAllocationRequest())
+        XCTAssertFalse(request.startsNewCartridge)
+        XCTAssertTrue(editor.saveCartridgeAllocation(request, oldUnits: 3, startsNewCartridge: false))
+        await monitor.refresh()?.value
+        XCTAssertEqual(monitor.snapshot.cartridgeID, cartridge)
+        XCTAssertEqual(monitor.snapshot.remainingUnits, 291)
+        XCTAssertEqual(f.entries.count, 3)
     }
 
     private func waitFor(_ condition: () -> Bool, file: StaticString = #filePath, line: UInt = #line) async {

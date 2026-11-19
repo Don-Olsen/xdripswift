@@ -30,6 +30,19 @@ private struct SystemCartridgeNotifications: PenCartridgeNotificationDelivery {
     }
 }
 
+struct PenCartridgeAllocationRequest: Identifiable {
+    let id = UUID()
+    let baselineID: UUID
+    let bolusID: String
+    let totalUnits: Double
+    let suggestedOldUnits: Double?
+    let startsNewCartridge: Bool
+    let allowsCartridgeChoice: Bool
+    let penStepUnits: Double
+    // Nil for a live injection; a retrospective choice freezes the committed event time.
+    var committedTreatmentDate: Date? = nil
+}
+
 @MainActor final class PenCartridgeMonitor: ObservableObject {
     static let shared = PenCartridgeMonitor()
     static let openRequested = Notification.Name("xdrip.penCartridge.openRequested")
@@ -208,6 +221,116 @@ private struct SystemCartridgeNotifications: PenCartridgeNotificationDelivery {
         return true
     }
 
+    var allocation: PenCartridgeAllocation? { inventory.allocation }
+
+    /// Read from the committed store. A child-context draft cannot establish stock use.
+    static func storedDose(_ id: String, coreDataManager: CoreDataManager) throws -> Double? {
+        try storedDoseDetails(id, coreDataManager: coreDataManager)?.units
+    }
+
+    private static func storedDoseDetails(_ id: String, coreDataManager: CoreDataManager) throws -> (units: Double, date: Date)? {
+        guard UUID(uuidString: id) != nil,
+              let coordinator = coreDataManager.privateManagedObjectContext.persistentStoreCoordinator,
+              !coordinator.persistentStores.isEmpty else { throw CocoaError(.fileReadUnknown) }
+        let context = NSManagedObjectContext(concurrencyType: .privateQueueConcurrencyType)
+        context.persistentStoreCoordinator = coordinator
+        return try context.performAndWait {
+            let request: NSFetchRequest<TreatmentEntry> = TreatmentEntry.fetchRequest()
+            request.predicate = NSPredicate(format: "localTreatmentUUID ==[c] %@ OR watchSourceUUID ==[c] %@", id, id)
+            let entries = try context.fetch(request)
+            guard !entries.isEmpty else { return nil }
+            if entries.allSatisfy({ $0.treatmentdeleted }) { return nil }
+            guard entries.allSatisfy({ !$0.treatmentdeleted }) else { throw CocoaError(.fileReadCorruptFile) }
+            guard let first = entries.first,
+                  entries.allSatisfy({ $0.treatmentType == .Insulin && $0.isAppLocalTreatment &&
+                      $0.healthKitSourceBundleIdentifier == nil && $0.careLinkSourceIdentifier == nil &&
+                      $0.nightscoutEventType == nil && $0.value == first.value && $0.date == first.date }),
+                  first.value.isFinite, first.value > 0,
+                  first.date.timeIntervalSinceReferenceDate.isFinite else { throw CocoaError(.fileReadCorruptFile) }
+            return (first.value, first.date)
+        }
+    }
+
+    func allocationRequest(bolusID: String, total: Double, penStep: Double,
+                           existingTreatment: Bool) -> PenCartridgeAllocationRequest? {
+        guard isEnabled, total.isFinite, total > 0, penStep.isFinite, penStep > 0,
+              let coreDataManager, let baselineID = inventory.baselineID else { return nil }
+        let committedDate: Date?
+        if existingTreatment {
+            do {
+                guard let dose = try Self.storedDoseDetails(bolusID, coreDataManager: coreDataManager),
+                      dose.units == total, dose.date <= clock() else { return nil }
+                committedDate = dose.date
+            } catch { return nil }
+        } else { committedDate = nil }
+        let current = inventory.allocation
+        let matches = current?.normalizedBolusID == UUID(uuidString: bolusID)?.uuidString
+        let fresh = inventory.snapshot(coreDataManager: coreDataManager, now: clock())
+        let suggestion = matches ? current?.oldUnits : (existingTreatment ? nil :
+            PenCartridgeInventory.suggestedOldUnits(total: total, remaining: fresh.remainingUnits, penStep: penStep))
+        var canUseCurrent = inventory.canAllocateCurrentCartridge
+        if let current, !matches {
+            do {
+                if canUseCurrent {
+                    canUseCurrent = try Self.storedDose(current.bolusID, coreDataManager: coreDataManager) == nil
+                }
+            }
+            catch { return nil }
+        }
+        return PenCartridgeAllocationRequest(baselineID: baselineID, bolusID: bolusID,
+            totalUnits: total, suggestedOldUnits: suggestion,
+            startsNewCartridge: !matches && !(existingTreatment && canUseCurrent),
+            allowsCartridgeChoice: existingTreatment && canUseCurrent && !matches,
+            penStepUnits: penStep, committedTreatmentDate: committedDate)
+    }
+
+    @discardableResult
+    func saveAllocation(_ request: PenCartridgeAllocationRequest, oldUnits: Double,
+                        startsNewCartridge: Bool) -> Bool {
+        guard isEnabled, inventory.baselineID == request.baselineID,
+              startsNewCartridge == request.startsNewCartridge || request.allowsCartridgeChoice,
+              request.penStepUnits.isFinite, request.penStepUnits > 0 else { return false }
+        if let committedDate = request.committedTreatmentDate {
+            guard let coreDataManager else { return false }
+            do {
+                guard let dose = try Self.storedDoseDetails(request.bolusID, coreDataManager: coreDataManager),
+                      dose.units == request.totalUnits, dose.date == committedDate,
+                      dose.date <= clock() else { return false }
+            } catch { return false }
+        }
+        let allocation = PenCartridgeAllocation(bolusID: request.bolusID,
+            oldUnits: oldUnits, totalUnits: request.totalUnits)
+        guard allocation.isValid,
+              abs(oldUnits / request.penStepUnits - (oldUnits / request.penStepUnits).rounded()) < 0.000001 else { return false }
+        // A completed split must never be reassigned to an unrelated treatment. A pending
+        // split can be explicitly linked to the saved dose from its treatment editor.
+        if !startsNewCartridge, let prior = inventory.allocation,
+           prior.normalizedBolusID != allocation.normalizedBolusID {
+            guard let coreDataManager else { return false }
+            do { guard try Self.storedDose(prior.bolusID, coreDataManager: coreDataManager) == nil else { return false } }
+            catch { return false }
+        }
+        // A retrospective switch belongs to the saved injection, so later doses still
+        // debit the new cartridge. The inventory rejects dates before a newer physical count.
+        let switchDate = request.committedTreatmentDate ?? clock()
+        let saved = startsNewCartridge
+            ? inventory.newCartridge(allocation: allocation, expectedBaselineID: request.baselineID, at: switchDate)
+            : inventory.updateAllocation(allocation, expectedBaselineID: request.baselineID)
+        guard saved else { return false }
+        invalidateRequests()
+        snapshot = PenCartridgeSnapshot(cartridgeID: inventory.cartridgeID, baselineID: inventory.baselineID,
+                                        remainingUnits: nil, isConfigured: true)
+        refresh()
+        return true
+    }
+
+    func invalidateAllocationEstimate() {
+        inventory.invalidateEstimate()
+        snapshot = PenCartridgeSnapshot(cartridgeID: inventory.cartridgeID, baselineID: inventory.baselineID,
+                                        remainingUnits: nil, isConfigured: true)
+        refresh()
+    }
+
     private func didSetBaseline(remaining: Double) {
         invalidateRequests()
         snapshot = PenCartridgeSnapshot(cartridgeID: inventory.cartridgeID, baselineID: inventory.baselineID,
@@ -254,7 +377,8 @@ private struct SystemCartridgeNotifications: PenCartridgeNotificationDelivery {
         guard let cartridgeID = snapshot.cartridgeID, let baselineID = snapshot.baselineID,
               snapshot.remainingUnits != nil else {
             invalidateRequests()
-            issueMessage = "Ampulens restmængde kunne ikke beregnes."
+            issueMessage = inventory.allocation == nil ? "Ampulens restmængde kunne ikke beregnes." :
+                "Kontrollér dosisfordelingen i Behandlinger. En manglende eller ændret registrering gør ampulresten usikker."
             return
         }
         issueMessage = nil

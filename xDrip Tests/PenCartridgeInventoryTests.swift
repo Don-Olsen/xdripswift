@@ -250,4 +250,279 @@ final class PenCartridgeInventoryTests: XCTestCase {
         XCTAssertTrue(core.saveChangesSynchronously())
         XCTAssertNil(inventory.snapshot(coreDataManager: core, now: now).remainingUnits)
     }
+
+    func testSplitSuggestionUsesInventoryAfterPrimingAndTheActualPenStep() {
+        XCTAssertEqual(PenCartridgeInventory.suggestedOldUnits(total: 6, remaining: 5, penStep: 0.5), 3)
+        XCTAssertEqual(PenCartridgeInventory.suggestedOldUnits(total: 6, remaining: 3, penStep: 0.5), 1)
+        XCTAssertEqual(PenCartridgeInventory.suggestedOldUnits(total: 6, remaining: 5.4, penStep: 0.5), 3)
+        XCTAssertEqual(PenCartridgeInventory.suggestedOldUnits(total: 6, remaining: 50, penStep: 0.5), 6)
+        XCTAssertEqual(PenCartridgeInventory.suggestedOldUnits(total: 6, remaining: 1, penStep: 0.5), 0)
+        XCTAssertEqual(PenCartridgeInventory.suggestedOldUnits(total: 0.3, remaining: 2.3, penStep: 0.1), 0.3)
+        let invalidRemaining: [Double?] = [nil, -.infinity, .infinity, .nan, -1, 301]
+        for remaining in invalidRemaining {
+            XCTAssertNil(PenCartridgeInventory.suggestedOldUnits(total: 6, remaining: remaining, penStep: 0.5))
+        }
+        XCTAssertNil(PenCartridgeInventory.suggestedOldUnits(total: 6, remaining: 5, penStep: 0))
+        XCTAssertNil(PenCartridgeInventory.suggestedOldUnits(total: .infinity, remaining: 5, penStep: 0.5))
+    }
+
+    @MainActor func testSameSplitDebitsNewShareOnceBeforeAtAndAfterCartridgeChange() throws {
+        let defaults = isolatedDefaults()
+        let inventory = PenCartridgeInventory(defaults: defaults, fileURL: fileURL)
+        for recordedSeconds in [5.0, 10.0, 15.0] {
+            let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+            XCTAssertTrue(inventory.setRemaining(5, at: start))
+            let id = UUID().uuidString
+            let allocation = PenCartridgeAllocation(bolusID: id, oldUnits: 3, totalUnits: 6)
+            let origin = try XCTUnwrap(inventory.baselineID)
+            XCTAssertTrue(inventory.newCartridge(allocation: allocation, expectedBaselineID: origin,
+                                                at: start.addingTimeInterval(10)))
+            let dose = entry(core, seconds: recordedSeconds, units: 6, id: id.lowercased())
+            entry(core, seconds: recordedSeconds, units: 6, id: id)
+            entry(core, seconds: 20, units: 2)
+            XCTAssertTrue(core.saveChangesSynchronously())
+            let now = start.addingTimeInterval(30)
+            XCTAssertEqual(inventory.snapshot(coreDataManager: core, now: now).remainingUnits, 291)
+            XCTAssertEqual(dose.value, 6, "Inventory attribution preserves the complete administered treatment")
+            let reopened = PenCartridgeInventory(defaults: defaults, fileURL: fileURL)
+            XCTAssertEqual(reopened.snapshot(coreDataManager: core, now: now),
+                           inventory.snapshot(coreDataManager: core, now: now))
+        }
+    }
+
+    @MainActor func testPhysicalSplitIsUnknownUntilItsExactDoseIsDurablyCommitted() throws {
+        let defaults = isolatedDefaults()
+        let inventory = PenCartridgeInventory(defaults: defaults, fileURL: fileURL)
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        XCTAssertTrue(inventory.setRemaining(5, at: start))
+        let allocation = PenCartridgeAllocation(bolusID: UUID().uuidString, oldUnits: 3, totalUnits: 6)
+        XCTAssertTrue(inventory.newCartridge(allocation: allocation,
+            expectedBaselineID: try XCTUnwrap(inventory.baselineID), at: start.addingTimeInterval(10)))
+        let now = start.addingTimeInterval(30)
+        let reopened = PenCartridgeInventory(defaults: defaults, fileURL: fileURL)
+        XCTAssertEqual(reopened.allocation, allocation)
+        XCTAssertNil(reopened.snapshot(coreDataManager: core, now: now).remainingUnits)
+        entry(core, seconds: 15, units: 6) // An unrelated dose cannot complete the pending split.
+        XCTAssertTrue(core.saveChangesSynchronously())
+        XCTAssertNil(reopened.snapshot(coreDataManager: core, now: now).remainingUnits)
+        entry(core, seconds: 5, units: 6, id: allocation.bolusID)
+        XCTAssertNil(reopened.snapshot(coreDataManager: core, now: now).remainingUnits)
+        XCTAssertTrue(core.saveChangesSynchronously())
+        XCTAssertEqual(reopened.snapshot(coreDataManager: core, now: now).remainingUnits, 287)
+    }
+
+    @MainActor func testRepeatedPhysicalSplitPreservesCartridgeAndRejectsConflictingOrStaleChanges() throws {
+        let inventory = PenCartridgeInventory(defaults: isolatedDefaults(), fileURL: fileURL)
+        XCTAssertTrue(inventory.setRemaining(5, at: start))
+        let origin = try XCTUnwrap(inventory.baselineID)
+        let allocation = PenCartridgeAllocation(bolusID: UUID().uuidString, oldUnits: 3, totalUnits: 6)
+        XCTAssertTrue(inventory.newCartridge(allocation: allocation, expectedBaselineID: origin,
+                                            at: start.addingTimeInterval(10)))
+        let persisted = try Data(contentsOf: fileURL)
+        XCTAssertTrue(inventory.newCartridge(allocation: allocation, expectedBaselineID: origin,
+                                            at: start.addingTimeInterval(20)))
+        XCTAssertEqual(try Data(contentsOf: fileURL), persisted)
+        let conflicting = PenCartridgeAllocation(bolusID: allocation.bolusID, oldUnits: 2, totalUnits: 6)
+        XCTAssertFalse(inventory.newCartridge(allocation: conflicting, expectedBaselineID: origin,
+                                             at: start.addingTimeInterval(20)))
+        XCTAssertFalse(inventory.updateAllocation(conflicting, expectedBaselineID: origin))
+        XCTAssertEqual(try Data(contentsOf: fileURL), persisted)
+        for invalid in [PenCartridgeAllocation(bolusID: "", oldUnits: 3, totalUnits: 6),
+                        PenCartridgeAllocation(bolusID: allocation.bolusID, oldUnits: -1, totalUnits: 6),
+                        PenCartridgeAllocation(bolusID: allocation.bolusID, oldUnits: 7, totalUnits: 6),
+                        PenCartridgeAllocation(bolusID: allocation.bolusID, oldUnits: .nan, totalUnits: 6),
+                        PenCartridgeAllocation(bolusID: allocation.bolusID, oldUnits: 0, totalUnits: 0)] {
+            XCTAssertFalse(inventory.updateAllocation(invalid, expectedBaselineID: try XCTUnwrap(inventory.baselineID)))
+        }
+    }
+
+    @MainActor func testEditedSplitRequiresExplicitNewAllocationAndDeletionRemovesItsDebit() throws {
+        let inventory = PenCartridgeInventory(defaults: isolatedDefaults(), fileURL: fileURL)
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        XCTAssertTrue(inventory.newCartridge(at: start.addingTimeInterval(10)))
+        let dose = entry(core, seconds: 5, units: 6)
+        XCTAssertTrue(core.saveChangesSynchronously())
+        let id = try XCTUnwrap(dose.localTreatmentUUID)
+        XCTAssertTrue(inventory.updateAllocation(PenCartridgeAllocation(bolusID: id, oldUnits: 3, totalUnits: 6),
+            expectedBaselineID: try XCTUnwrap(inventory.baselineID)))
+        let now = start.addingTimeInterval(30)
+        XCTAssertEqual(inventory.snapshot(coreDataManager: core, now: now).remainingUnits, 295)
+        dose.value = 7
+        XCTAssertEqual(inventory.snapshot(coreDataManager: core, now: now).remainingUnits, 295)
+        XCTAssertTrue(core.saveChangesSynchronously())
+        XCTAssertNil(inventory.snapshot(coreDataManager: core, now: now).remainingUnits)
+        let revision = try XCTUnwrap(inventory.baselineID)
+        let corrected = PenCartridgeAllocation(bolusID: id, oldUnits: 3, totalUnits: 7)
+        XCTAssertTrue(inventory.updateAllocation(corrected, expectedBaselineID: revision))
+        XCTAssertEqual(inventory.snapshot(coreDataManager: core, now: now).remainingUnits, 294)
+        let revised = try XCTUnwrap(inventory.baselineID)
+        XCTAssertTrue(inventory.updateAllocation(corrected, expectedBaselineID: revised))
+        XCTAssertEqual(inventory.baselineID, revised)
+        dose.treatmentdeleted = true
+        XCTAssertTrue(core.saveChangesSynchronously())
+        XCTAssertEqual(inventory.snapshot(coreDataManager: core, now: now).remainingUnits, 300)
+    }
+
+    @MainActor func testSplitWithAllUnitsFromOldCartridgeDoesNotPrimeUnusedNewCartridge() throws {
+        let inventory = PenCartridgeInventory(defaults: isolatedDefaults(), fileURL: fileURL)
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        XCTAssertTrue(inventory.newCartridge(at: start))
+        let dose = entry(core, units: 6)
+        XCTAssertTrue(core.saveChangesSynchronously())
+        let id = try XCTUnwrap(dose.localTreatmentUUID)
+        XCTAssertTrue(inventory.updateAllocation(PenCartridgeAllocation(bolusID: id, oldUnits: 6, totalUnits: 6),
+            expectedBaselineID: try XCTUnwrap(inventory.baselineID)))
+        XCTAssertEqual(inventory.snapshot(coreDataManager: core, now: start.addingTimeInterval(2)).remainingUnits, 300)
+        XCTAssertTrue(inventory.updateAllocation(PenCartridgeAllocation(bolusID: id, oldUnits: 0, totalUnits: 6),
+            expectedBaselineID: try XCTUnwrap(inventory.baselineID)))
+        XCTAssertEqual(inventory.snapshot(coreDataManager: core, now: start.addingTimeInterval(2)).remainingUnits, 292)
+    }
+
+    @MainActor func testManualCorrectionClearsAllocationAndCannotBeReopenedByAnOldCallback() throws {
+        let inventory = PenCartridgeInventory(defaults: isolatedDefaults(), fileURL: fileURL)
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        XCTAssertTrue(inventory.newCartridge(at: start))
+        let id = UUID().uuidString
+        let allocation = PenCartridgeAllocation(bolusID: id, oldUnits: 3, totalUnits: 6)
+        XCTAssertTrue(inventory.updateAllocation(allocation, expectedBaselineID: try XCTUnwrap(inventory.baselineID)))
+        let oldRevision = try XCTUnwrap(inventory.baselineID)
+        entry(core, seconds: 1, units: 6, id: id)
+        XCTAssertTrue(core.saveChangesSynchronously())
+        XCTAssertTrue(inventory.setRemaining(280, at: start.addingTimeInterval(5)))
+        XCTAssertNil(inventory.allocation)
+        XCTAssertFalse(inventory.canAllocateCurrentCartridge)
+        XCTAssertFalse(inventory.updateAllocation(allocation, expectedBaselineID: oldRevision))
+        XCTAssertFalse(inventory.updateAllocation(allocation, expectedBaselineID: try XCTUnwrap(inventory.baselineID)))
+        XCTAssertEqual(inventory.snapshot(coreDataManager: core, now: start.addingTimeInterval(10)).remainingUnits, 280)
+    }
+
+    @MainActor func testLegacyBaselineReadsWithoutInventingAnAllocationOrAConfirmedPhysicalChange() throws {
+        let inventory = PenCartridgeInventory(defaults: isolatedDefaults(), fileURL: fileURL)
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        XCTAssertTrue(inventory.newCartridge(at: start))
+        var legacy = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: fileURL)) as? [String: Any])
+        legacy.removeValue(forKey: "isNewCartridge")
+        legacy.removeValue(forKey: "allocation")
+        legacy.removeValue(forKey: "allocationSourceBaselineID")
+        try JSONSerialization.data(withJSONObject: legacy).write(to: fileURL)
+        entry(core, units: 6)
+        XCTAssertTrue(core.saveChangesSynchronously())
+        XCTAssertNil(inventory.allocation)
+        XCTAssertFalse(inventory.canAllocateCurrentCartridge)
+        XCTAssertEqual(inventory.snapshot(coreDataManager: core, now: start.addingTimeInterval(10)).remainingUnits, 292)
+    }
+
+    @MainActor func testSplitCannotTrustForeignBasalFutureOrConflictingLinkedTreatment() throws {
+        let inventory = PenCartridgeInventory(defaults: isolatedDefaults(), fileURL: fileURL)
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        XCTAssertTrue(inventory.newCartridge(at: start.addingTimeInterval(10)))
+        let dose = entry(core, seconds: 5, units: 6)
+        let id = try XCTUnwrap(dose.localTreatmentUUID)
+        XCTAssertTrue(inventory.updateAllocation(PenCartridgeAllocation(bolusID: id, oldUnits: 3, totalUnits: 6),
+            expectedBaselineID: try XCTUnwrap(inventory.baselineID)))
+        let now = start.addingTimeInterval(20)
+        dose.healthKitSampleUUID = UUID().uuidString
+        XCTAssertTrue(core.saveChangesSynchronously())
+        XCTAssertNil(inventory.snapshot(coreDataManager: core, now: now).remainingUnits)
+        dose.healthKitSampleUUID = nil
+        dose.treatmentType = .BasalInjection
+        XCTAssertTrue(core.saveChangesSynchronously())
+        XCTAssertNil(inventory.snapshot(coreDataManager: core, now: now).remainingUnits)
+        dose.treatmentType = .Insulin
+        dose.date = now.addingTimeInterval(1)
+        XCTAssertTrue(core.saveChangesSynchronously())
+        XCTAssertNil(inventory.snapshot(coreDataManager: core, now: now).remainingUnits)
+        dose.date = start.addingTimeInterval(5)
+        let duplicate = entry(core, seconds: 5, units: 6, id: id)
+        duplicate.treatmentdeleted = true
+        XCTAssertTrue(core.saveChangesSynchronously())
+        XCTAssertNil(inventory.snapshot(coreDataManager: core, now: now).remainingUnits)
+    }
+
+    @MainActor func testHistoryReplacementBeforeSwitchInvalidatesAllocation() throws {
+        let defaults = isolatedDefaults()
+        let inventory = PenCartridgeInventory(defaults: defaults, fileURL: fileURL)
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        XCTAssertTrue(inventory.newCartridge(at: start.addingTimeInterval(10)))
+        let dose = entry(core, seconds: 5, units: 6)
+        XCTAssertTrue(core.saveChangesSynchronously())
+        let allocation = PenCartridgeAllocation(bolusID: try XCTUnwrap(dose.localTreatmentUUID), oldUnits: 3, totalUnits: 6)
+        XCTAssertTrue(inventory.updateAllocation(allocation, expectedBaselineID: try XCTUnwrap(inventory.baselineID)))
+        let now = start.addingTimeInterval(30)
+        XCTAssertEqual(inventory.snapshot(coreDataManager: core, now: now).remainingUnits, 295)
+        inventory.invalidateIfHistoryWasReplaced(through: start.addingTimeInterval(5))
+        XCTAssertNil(PenCartridgeInventory(defaults: defaults, fileURL: fileURL)
+            .snapshot(coreDataManager: core, now: now).remainingUnits)
+        XCTAssertFalse(inventory.updateAllocation(allocation, expectedBaselineID: try XCTUnwrap(inventory.baselineID)))
+    }
+
+
+    @MainActor func testOfflineWatchSplitUsesBoundIdentityAndOriginalTimeAcrossRedelivery() async throws {
+        let inventory = PenCartridgeInventory(defaults: isolatedDefaults(), fileURL: fileURL)
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let operation = WatchManualTreatment(id: UUID(), recordedAt: start.addingTimeInterval(5),
+                                            kind: .insulin, amount: 6)
+        XCTAssertTrue(inventory.newCartridge(at: start.addingTimeInterval(10)))
+        XCTAssertTrue(inventory.updateAllocation(PenCartridgeAllocation(bolusID: operation.id.uuidString,
+            oldUnits: 3, totalUnits: 6), expectedBaselineID: try XCTUnwrap(inventory.baselineID)))
+        let delivery = start.addingTimeInterval(30)
+        XCTAssertNil(inventory.snapshot(coreDataManager: core, now: delivery).remainingUnits)
+        func receive() async -> WatchManualTreatmentStore.Outcome {
+            await withCheckedContinuation { continuation in
+                WatchManualTreatmentStore.save(operation, coreDataManager: core, at: delivery) {
+                    continuation.resume(returning: $0)
+                }
+            }
+        }
+        let first = await receive()
+        let duplicate = await receive()
+        XCTAssertEqual(first, .stored)
+        XCTAssertEqual(duplicate, .alreadyStored)
+        XCTAssertEqual(inventory.snapshot(coreDataManager: core, now: delivery).remainingUnits, 295)
+    }
+
+    @MainActor func testFailedPhysicalSplitWritePreservesThePriorBaseline() throws {
+        let inventory = PenCartridgeInventory(defaults: isolatedDefaults(), fileURL: fileURL)
+        XCTAssertTrue(inventory.setRemaining(5, at: start))
+        let origin = try XCTUnwrap(inventory.baselineID)
+        let original = try Data(contentsOf: fileURL)
+        let allocation = PenCartridgeAllocation(bolusID: UUID().uuidString, oldUnits: 3, totalUnits: 6)
+        // The blocked storage path cannot establish a new physical-change record.
+        let folder = fileURL.deletingLastPathComponent()
+        let saved = folder.appendingPathExtension("saved")
+        try FileManager.default.moveItem(at: folder, to: saved)
+        defer { try? FileManager.default.removeItem(at: saved) }
+        try Data().write(to: folder)
+        XCTAssertFalse(inventory.newCartridge(allocation: allocation, expectedBaselineID: origin,
+                                             at: start.addingTimeInterval(10)))
+        try FileManager.default.removeItem(at: folder)
+        try FileManager.default.moveItem(at: saved, to: folder)
+        XCTAssertEqual(try Data(contentsOf: fileURL), original)
+        XCTAssertEqual(inventory.baselineID, origin)
+        XCTAssertNil(inventory.allocation)
+    }
+
+
+    @MainActor func testStaleSplitInvalidatesCurrentCountAcrossRestartUntilPhysicalCorrection() throws {
+        let defaults = isolatedDefaults()
+        let inventory = PenCartridgeInventory(defaults: defaults, fileURL: fileURL)
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        XCTAssertTrue(inventory.newCartridge(at: start))
+        entry(core, seconds: 1, units: 6)
+        XCTAssertTrue(core.saveChangesSynchronously())
+        XCTAssertTrue(inventory.setRemaining(280, at: start.addingTimeInterval(5)))
+        let priorFile = try Data(contentsOf: fileURL)
+        let cartridge = inventory.cartridgeID
+        inventory.invalidateEstimate()
+        let reopened = PenCartridgeInventory(defaults: defaults, fileURL: fileURL)
+        let now = start.addingTimeInterval(10)
+        XCTAssertEqual(reopened.cartridgeID, cartridge)
+        XCTAssertNil(reopened.snapshot(coreDataManager: core, now: now).remainingUnits)
+        // Even an unreadable/failed baseline update cannot reactivate the previous count.
+        try priorFile.write(to: fileURL)
+        XCTAssertNil(reopened.snapshot(coreDataManager: core, now: now).remainingUnits)
+        XCTAssertTrue(reopened.setRemaining(270, at: now))
+        XCTAssertEqual(reopened.snapshot(coreDataManager: core, now: now).remainingUnits, 270)
+    }
+
 }
