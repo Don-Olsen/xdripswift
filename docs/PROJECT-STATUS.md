@@ -32,10 +32,21 @@ må ikke automatisk ændre den indtastede insulin efter en bekræftet fordeling.
 
 Regressionerne dækker lagerregning, gamle data, Watch-identitet, efterlevering,
 rettelse/sletning, genstart, gentagne forsøg og fejl under lagring samt de faktiske
-viewmodellers gemmeforløb. UIHosting-kontrollen bruger syntetiske data på 320 og
-430 punkter med almindelig og stor tekst. Resultater registreres ved release.
-Fysisk betjening og lagerforbrug på iPhone/pen samt ny Watch-registrering efter
-opdateringen kræver afprøvning; ingen app er installeret lokalt på brugerens enheder.
+viewmodellers gemmeforløb. På det præcise releasegrundlag for 4368 bestod 2.027
+XCTest, 200 Python-tests, Watch-værktøjernes 30 + 24 syntetiske kontroller,
+iPhone-/Watch-simulatorbuilds og unsigned iPhoneOS/arm64. Den signerede IPA blev
+verificeret med kildecommit, alle fem bundles og indlejret Watch-app.
+UIHosting-kontrollen renderede det faktiske fordelingsark med syntetiske data på
+320 og 430 punkter med almindelig og stor tekst; 12 billeder er gemt uden for Git.
+Det er ikke en manuel ende-til-ende-test af hele appen. Fysisk betjening og
+lagerforbrug på iPhone/pen samt ny Watch-registrering efter opdateringen kræver
+fortsat afprøvning; ingen app er installeret lokalt på brugerens enheder.
+
+Efter bekræftet Internal / Testing gennemførte den eksisterende oprydning fjernelse
+af 33.299 gendannelige cachefiler fra godkendte ældre builds. Den observerede ledige
+plads steg med cirka 3,21 GB; 4368 og beskyttede release-/testartefakter blev bevaret.
+Kvitteringen ligger lokalt under
+`build/release-automation/cleanup/20261119T092435.842468Z/report.json`.
 
 <!-- testflight-7.1.1-4367:start -->
 ### TestFlight 7.1.1 (4367)
