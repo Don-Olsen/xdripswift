@@ -1,3 +1,15 @@
+<!-- testflight-7.1.1-4368:start -->
+### TestFlight 7.1.1 (4368)
+
+- Kildecommit og tag: `6ebee27dff63714cae16e450fcad070f9bc9a055` / `testflight-7.1.1-4368`.
+- Tests: 2027/2027 bestået; 0 fejlet; 0 skipped. iPhone- og Watch-simulatorbuilds bestod.
+- Apple-status (2026-11-19T09:19:45.018926+00:00): [Internal / Testing](https://appstoreconnect.apple.com/apps/6795645396/testflight/ios/f0153d58-d63e-4251-940f-4c8f9ea0bc46).
+- Eksisterende intern gruppe: Ole Internal er bekræftet tilknyttet.
+- Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
+<!-- testflight-7.1.1-4368:end -->
+
+De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
+
 ## Dosis fordelt ved ampulskift — 19. november 2026
 
 Beregneren kan knytte én faktisk dosis til et ampulskift. “Skift ampul under dosis”
