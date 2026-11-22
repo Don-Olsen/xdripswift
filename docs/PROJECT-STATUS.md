@@ -22,7 +22,7 @@ De følgende afsnit bevarer integrations- og testhistorikken før denne udgivels
 
 De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
 
-## Rettelse og opdatering af “I går” — 22. november 2026 (releasekandidat)
+## Rettelse og opdatering af “I går” — 22. november 2026 (4369)
 
 Måltidsgenvejen valgte også gemte hurtige kulhydrater fra dagen før. Udvælgelsen
 udelader nu både typen Hurtig og registreringer med den eksisterende hurtige
@@ -47,8 +47,30 @@ bestod med 2.031/2.031 tests og nul fejl, herunder
 alle 14 tests for “I går”. iPhone-simulatorappen blev bygget af testkørslen.
 Kvittering og XCResult ligger uden for Git under
 `~/DeveloperBuildData/xDrip/local-runs/xdripswift/20261122T120659Z-10362/`.
-Der er ikke kørt en ny release, fysisk iPhone-test eller manuel visuel kontrol;
-ændringen tilføjer intet layout og er endnu ikke i TestFlight.
+
+Releasevalidering på det præcise checkpoint for 4369: 2.032/2.032 XCTest-tests
+bestod, inklusive alle 15 tests for “I går”; nul fejl og nul oversprungne tests.
+Desuden bestod 200 Python-tests, 30 + 24 syntetiske Watch-kontroller, begge
+simulatorbuilds samt unsigned iPhoneOS/arm64. Arkiv og eksporteret IPA blev
+verificeret mod kildecommit, alle fem bundle-identiteter, signaturer, profiler
+og indlejret Watch-app. Beviserne ligger uden for Git i
+`build/testflight-7.1.1-4369/`.
+
+Den parrede iPhone og Watch var ikke tilgængelige ved den læsende enhedskontrol.
+Der er derfor ikke udført fysisk eftertest, lokal installation eller manuel
+visuel kontrol af denne ændring. Layoutet er uændret; hastighed og batteriforbrug
+er ikke målt.
+
+Mac’ens pladsgrænse krævede ekstra klargøring før releasebygningen. Genererede
+kompilercacher samt 80 symbolfiler fra 40 ældre udgivelser blev komprimeret
+tabsfrit. Kildekode, arkiver og testbeviser beholdt deres kontrollerede indhold;
+ingen arkiv- eller symbolfil blev fjernet. Planer, hashkontroller og resultater
+ligger i `build/testflight-7.1.1-4369/maintenance/`.
+
+Efter bekræftet Internal / Testing stoppede den automatiske oprydningskontrol
+ved et HTTP 500-svar fra Apples API. Udgivelsen er afsluttet; uploaden blev ikke
+gentaget. Den særskilte blokering er registreret lokalt i
+`build/release-automation/cleanup/blocked-1795353437727812000.json`.
 
 ## Dosis fordelt ved ampulskift — 19. november 2026
 
