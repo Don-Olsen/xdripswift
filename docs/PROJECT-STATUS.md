@@ -10,6 +10,34 @@
 
 De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
 
+## Rettelse og opdatering af “I går” — 22. november 2026 (releasekandidat)
+
+Måltidsgenvejen valgte også gemte hurtige kulhydrater fra dagen før. Udvælgelsen
+udelader nu både typen Hurtig og registreringer med den eksisterende hurtige
+30-minutters optagelsestid. Den nærmeste normale/langsomme registrering inden for
+det samme tidsvindue kan stadig foreslås; uden en egnet registrering skjules
+knappen. Dette gælder kun genvejen. Behandlingshistorik, COB og dosisregler er
+uændrede, og madtypen bruges ikke som bevis for hypobehandling.
+
+Fire nye regressionstests kører gennem produktions-viewmodellen og databaseopslag:
+almindeligt måltid frem for nærmere hurtige kulhydrater, kun hurtige poster ved
+genåbning, gamle poster uden metadata samt ændret type/varighed før trykket.
+Den eksisterende test for manuelt indtastet insulin bruger nu Langsom i stedet
+for Hurtig; alle dens kontrolpunkter for brugerens dosis og planlagte tid bevares.
+Som en afgrænset optimering publiceres et genlæst forslag kun, når dets værdi
+ændres. Alle databaseopslag og kontrollen ved tryk bevares. En yderligere test
+kontrollerer nul publikationer ved uændrede minut-/tvungne opslag samt én
+publikation pr. ændring af mængde, madtype og sletning. Ingen hastigheds- eller
+batterigevinst er målt på enheden.
+
+Indledende validering før optimering og nyt buildnummer: hele XCTest-suiten
+bestod med 2.031/2.031 tests og nul fejl, herunder
+alle 14 tests for “I går”. iPhone-simulatorappen blev bygget af testkørslen.
+Kvittering og XCResult ligger uden for Git under
+`~/DeveloperBuildData/xDrip/local-runs/xdripswift/20261122T120659Z-10362/`.
+Der er ikke kørt en ny release, fysisk iPhone-test eller manuel visuel kontrol;
+ændringen tilføjer intet layout og er endnu ikke i TestFlight.
+
 ## Dosis fordelt ved ampulskift — 19. november 2026
 
 Beregneren kan knytte én faktisk dosis til et ampulskift. “Skift ampul under dosis”

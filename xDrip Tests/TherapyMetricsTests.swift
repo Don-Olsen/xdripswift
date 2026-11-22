@@ -3735,6 +3735,105 @@ final class TreatmentListRefreshTests: XCTestCase {
         XCTAssertEqual(f.count, 4)
     }
 
+    func testNearestFastCarbsDoNotReplaceAnOrdinaryYesterdayMeal() throws {
+        for kind: TreatmentMealKind in [.normal, .slow] {
+            let f = try Fixture(); defer { f.cleanup() }
+            let ordinary = f.meal(10, at: f.date("2026-10-20T11:45:00+02:00"), kind: kind)
+            let fast = f.meal(45, kind: .fast)
+            f.save()
+            let vm = f.calculator()
+            vm.refreshYesterdayMeal(now: f.now)
+            XCTAssertEqual(vm.yesterdayMeal?.objectID, ordinary.objectID,
+                "Meal selection uses absorption kind, not an arbitrary carbohydrate amount")
+            XCTAssertTrue(vm.useYesterdayMeal(now: f.now))
+            XCTAssertEqual(vm.carbohydratesText, "10")
+            XCTAssertEqual(vm.mealKind, kind)
+            XCTAssertTrue(fast.isConfirmedMeal)
+            XCTAssertEqual(fast.value, 45)
+            XCTAssertEqual(fast.effectiveCarbohydrateDurationMinutes, TreatmentMealKind.fast.durationMinutes)
+            XCTAssertFalse(fast.hasChanges, "Excluding the shortcut must not alter treatment/COB input")
+            XCTAssertEqual(f.count, 2)
+            XCTAssertNil(vm.confirmationDraft)
+        }
+    }
+
+    func testFastOnlyHistoryNeverOffersOrAppliesShortcutOnReopening() throws {
+        let f = try Fixture(); defer { f.cleanup() }
+        for duration: Double? in [nil, TreatmentMealKind.fast.durationMinutes, 120] {
+            let fast = f.meal(45, kind: .fast)
+            fast.carbohydrateDurationMinutes = duration.map { NSNumber(value: $0) }
+        }
+        for kind: TreatmentMealKind in [.normal, .slow] {
+            f.meal(45, kind: kind).carbohydrateDurationMinutes = NSNumber(value: TreatmentMealKind.fast.durationMinutes)
+        }
+        let legacyFast = f.meal(45)
+        legacyFast.mealKindRaw = nil
+        legacyFast.carbohydrateDurationMinutes = NSNumber(value: TreatmentMealKind.fast.durationMinutes)
+        f.save()
+        let vm = f.calculator(); defer { vm.stop() }
+        vm.carbohydratesText = "12"
+        vm.insulinToLogText = "2,5"
+        for _ in 0..<2 {
+            vm.start(now: f.now)
+            XCTAssertNil(vm.yesterdayMeal)
+            XCTAssertFalse(vm.useYesterdayMeal(now: f.now))
+            XCTAssertEqual(vm.carbohydratesText, "12")
+            XCTAssertEqual(vm.insulinToLogText, "2,5")
+            XCTAssertEqual(vm.mealKind, .normal)
+            XCTAssertNil(vm.confirmationDraft)
+            XCTAssertEqual(f.count, 6)
+            vm.stop()
+        }
+    }
+
+    func testLegacyNormalMealRemainsEligibleWithoutChangingMetadata() throws {
+        let f = try Fixture(); defer { f.cleanup() }
+        let legacy = f.meal(35)
+        legacy.mealKindRaw = nil
+        legacy.carbohydrateDurationMinutes = nil
+        legacy.plannedMealStateRaw = nil
+        f.meal(45, kind: .fast)
+        f.save()
+        let vm = f.calculator()
+        vm.refreshYesterdayMeal(now: f.now)
+        XCTAssertEqual(vm.yesterdayMeal?.objectID, legacy.objectID)
+        XCTAssertTrue(vm.useYesterdayMeal(now: f.now))
+        XCTAssertEqual(vm.carbohydratesText, "35")
+        XCTAssertEqual(vm.mealKind, .normal)
+        XCTAssertNil(legacy.mealKindRaw)
+        XCTAssertNil(legacy.carbohydrateDurationMinutes)
+        XCTAssertNil(legacy.plannedMealStateRaw)
+        XCTAssertFalse(legacy.hasChanges)
+        XCTAssertEqual(f.count, 2)
+    }
+
+    func testTapRejectsMealChangedToFastWithoutReplacingCurrentInputs() throws {
+        for changeDurationOnly in [false, true] {
+            let f = try Fixture(); defer { f.cleanup() }
+            let selected = f.meal(45)
+            let fallback = f.meal(30, at: f.date("2026-10-20T11:45:00+02:00"), kind: .slow)
+            f.save()
+            let vm = f.calculator()
+            vm.carbohydratesText = "12"
+            vm.insulinToLogText = "2,5"
+            vm.refreshYesterdayMeal(now: f.now)
+            XCTAssertEqual(vm.yesterdayMeal?.objectID, selected.objectID)
+            if changeDurationOnly {
+                selected.carbohydrateDurationMinutes = NSNumber(value: TreatmentMealKind.fast.durationMinutes)
+            } else {
+                selected.mealKindRaw = TreatmentMealKind.fast.rawValue
+            }
+            f.save()
+            XCTAssertFalse(vm.useYesterdayMeal(now: f.now))
+            XCTAssertEqual(vm.yesterdayMeal?.objectID, fallback.objectID)
+            XCTAssertEqual(vm.carbohydratesText, "12")
+            XCTAssertEqual(vm.insulinToLogText, "2,5")
+            XCTAssertEqual(vm.mealKind, .normal)
+            XCTAssertNil(vm.confirmationDraft)
+            XCTAssertEqual(f.count, 2)
+        }
+    }
+
     func testNoMatchPlannedDeletedInvalidAndUncommittedMealsProduceNoShortcut() throws {
         let f = try Fixture(); defer { f.cleanup() }
         f.meal(10).plannedMealStateRaw = TreatmentMealState.planned.rawValue
@@ -3821,7 +3920,7 @@ final class TreatmentListRefreshTests: XCTestCase {
 
     func testTapPreservesManualInsulinIncludingZeroOrClearingAndCurrentPlannedTime() async throws {
         let f = try Fixture(); defer { f.cleanup() }
-        f.meal(45, kind: .fast); f.save()
+        f.meal(45, kind: .slow); f.save()
         for manual in ["2,5", "0", ""] {
             let vm = f.calculator(); defer { vm.stop() }
             vm.start(now: f.now)
@@ -3835,7 +3934,7 @@ final class TreatmentListRefreshTests: XCTestCase {
             XCTAssertEqual(vm.insulinToLogText, manual)
             XCTAssertFalse(vm.usesAutomaticMealDose)
             XCTAssertEqual(vm.carbohydratesText, "45")
-            XCTAssertEqual(vm.mealKind, .fast)
+            XCTAssertEqual(vm.mealKind, .slow)
             XCTAssertEqual(vm.plannedDate, planned)
             XCTAssertTrue(vm.isPlannedMeal)
             XCTAssertNil(vm.confirmationDraft)
@@ -3887,6 +3986,38 @@ final class TreatmentListRefreshTests: XCTestCase {
         vm.start(now: f.now)
         XCTAssertEqual(vm.yesterdayMeal?.objectID, old.objectID,
             "Reopening drops the deleted meal and selects the remaining eligible earlier meal")
+    }
+
+    func testFreshReadsPublishOnlyChangedYesterdayMeal() throws {
+        let f = try Fixture(); defer { f.cleanup() }
+        let row = f.meal(45); f.save()
+        let vm = f.calculator()
+        vm.refreshYesterdayMeal(now: f.now)
+        var publications: [YesterdayMealShortcut?] = []
+        let observation = vm.$yesterdayMeal.dropFirst().sink { publications.append($0) }
+        defer { observation.cancel() }
+
+        vm.refreshYesterdayMeal(now: f.now, force: true)
+        vm.refreshYesterdayMeal(now: f.now.addingTimeInterval(60))
+        XCTAssertTrue(publications.isEmpty, "Fresh forced/minute reads keep equal display state")
+        row.value = 50; f.save()
+        vm.refreshYesterdayMeal(now: f.now, force: true)
+        XCTAssertEqual(publications.count, 1)
+        XCTAssertEqual(vm.yesterdayMeal?.grams, 50, "The database is still re-read")
+        row.mealKindRaw = TreatmentMealKind.slow.rawValue; f.save()
+        vm.refreshYesterdayMeal(now: f.now, force: true)
+        XCTAssertEqual(publications.count, 2)
+        XCTAssertEqual(vm.yesterdayMeal?.kind, .slow)
+        row.treatmentdeleted = true; f.save()
+        vm.refreshYesterdayMeal(now: f.now, force: true)
+        XCTAssertEqual(publications.count, 3)
+        XCTAssertNil(vm.yesterdayMeal)
+        vm.refreshYesterdayMeal(now: f.now, force: true)
+        vm.refreshYesterdayMeal(now: f.now.addingTimeInterval(120))
+        XCTAssertEqual(publications.count, 3, "Repeated empty reads also avoid publication")
+        XCTAssertEqual(vm.carbohydratesText, "")
+        XCTAssertNil(vm.confirmationDraft)
+        XCTAssertEqual(f.count, 1, "Refresh does not create a treatment")
     }
 
     func testYesterdayBoundsDoNotWrapIntoTodayOrPreviousEvening() throws {

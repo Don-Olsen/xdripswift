@@ -1294,7 +1294,7 @@ struct YesterdayMealShortcut: Equatable {
     /// or source changes. Ordinary CGM refreshes and the 15-second clock reuse the snapshot.
     func refreshYesterdayMeal(now: Date = .now, force: Bool = false) {
         guard reminderMealUUID == nil, now.timeIntervalSince1970.isFinite else {
-            yesterdayMeal = nil
+            publishYesterdayMealIfChanged(nil)
             return
         }
         let calendar = mealShortcutCalendar()
@@ -1318,7 +1318,7 @@ struct YesterdayMealShortcut: Equatable {
         guard !key.pending, key.sourceIsConsistent,
               let window = YesterdayMealShortcut.window(at: now, calendar: calendar),
               let yesterday = calendar.date(byAdding: .day, value: -1, to: now) else {
-            yesterdayMeal = nil
+            publishYesterdayMealIfChanged(nil)
             return
         }
         let rows = TreatmentEntryAccessor(coreDataManager: coreDataManager).getTreatments(
@@ -1327,8 +1327,12 @@ struct YesterdayMealShortcut: Equatable {
         let eligible = TherapyMetricsManager.eligibleTreatments(rows,
             policy: policy, insulinSource: nil, carbsSource: key.carbsSource,
             insulinEnabled: false, carbsEnabled: key.importsCarbs, cutover: cutover)
+        // Fast absorption is not a repeat-meal shortcut. This only filters the suggestion;
+        // it neither classifies hypo treatment nor changes the recorded meal or its COB.
         let candidates = eligible.filter {
             $0.treatmentType == .Carbs && !$0.isDeleted && !$0.hasChanges && $0.isConfirmedMeal &&
+                $0.mealKind != .fast &&
+                $0.effectiveCarbohydrateDurationMinutes > TreatmentMealKind.fast.durationMinutes &&
                 $0.value.isFinite && $0.value > 0 && $0.value <= 500 &&
                 calendar.isDate($0.date, inSameDayAs: yesterday) &&
                 abs(YesterdayMealShortcut.clockSeconds($0.date, calendar: calendar) - target) <= 3600
@@ -1336,13 +1340,19 @@ struct YesterdayMealShortcut: Equatable {
             YesterdayMealShortcut(objectID: $0.objectID, date: $0.date, grams: $0.value,
                 kind: $0.mealKind, originalDurationMinutes: $0.effectiveCarbohydrateDurationMinutes)
         }
-        yesterdayMeal = candidates.min { lhs, rhs in
+        let candidate = candidates.min { lhs, rhs in
             let left = abs(YesterdayMealShortcut.clockSeconds(lhs.date, calendar: calendar) - target)
             let right = abs(YesterdayMealShortcut.clockSeconds(rhs.date, calendar: calendar) - target)
             if left != right { return left < right }
             if lhs.date != rhs.date { return lhs.date < rhs.date }
             return lhs.objectID.uriRepresentation().absoluteString < rhs.objectID.uriRepresentation().absoluteString
         }
+        publishYesterdayMealIfChanged(candidate)
+    }
+
+    private func publishYesterdayMealIfChanged(_ candidate: YesterdayMealShortcut?) {
+        guard yesterdayMeal != candidate else { return }
+        yesterdayMeal = candidate
     }
 
     /// Re-read before applying exactly what the user saw. A changed/deleted candidate updates
