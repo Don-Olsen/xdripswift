@@ -50,8 +50,44 @@ omfatter også ACL og resource fork. Projektets faktiske arkiver må først
 frigives efter samme kontrol. Alle 236 lokale Python-tests bestod, herunder
 25 nye arkiveringstests, 60 oprydningstests og 35 release-guardtests. Swift-
 hjælperen kompilerede, og shellsyntaks samt diff-kontrol bestod. Der er ikke
-kørt XCTest eller nye iPhone-/Watch-builds: appkoden er uændret. Resultater for den første rigtige arkivering
-registreres nedenfor efter gennemførsel.
+kørt XCTest eller nye iPhone-/Watch-builds: appkoden er uændret.
+
+Den faktiske arkivering er afsluttet: 77 releases, 83 oprindelige mapper og
+1.231.130 fil-/mappeposter er pakket i 29,68 GB i privat iCloud Drive under
+`xDrip-arkiv`. Alle pakker har gennemført upload, lokal frigivelse, genhentning
+og fuld kontrol af gendannet indhold/metadata før originalerne blev fjernet.
+Slutkontrollen bekræfter alle 77 som uploadet og uden lokale datablokke. Der er
+ingen efterladte lokale pakkefiler eller gendannelsesmapper fra kontrollen.
+Det lokale katalog med manifester, kontrolsummer og journaler bevares (ca. 2,50 GB).
+
+En Codex-opdatering afbrød kørslen efter ni afsluttede arkiver; genoptagelsen
+sprang disse over og fortsatte uden nulstilling. En midlertidig iCloud-fejl
+(NSCocoaErrorDomain/4355) blev afventet med originalerne bevaret, hvorefter
+arkiveringen fortsatte. Den dokumenterede `restore-archive`-kommando er også
+praktisk afprøvet på 4288: indhold og eksternt signeringsoutput blev gendannet
+og verificeret i en ny lokal testmappe. Testkopierne og arkivets lokale download
+blev derefter frigivet igen.
+
+Alle 231.032 poster i 4368, 4369 og de uafsluttede 4312, 4353 og 4357 er
+uændrede i den afsluttende metadata-/identitetskontrol; 36 kontrolfilers SHA-256
+og alle fem mappers indholdslister matcher også. Kildecheckout og Git er bevaret.
+
+Den målte ledige plads steg fra ca. 11,9 GB efter pilotarkiveringen til ca.
+33,0 GB efter slutkontrol og gendannelsesprøve. Dette er Mac'ens observerede
+nettoændring under forløbet, hvor en Codex-opdatering også fandt sted; det er
+ikke en isoleret måling af hver slettet fil. Forhåndsestimatet på 42–56 GB må
+ikke omtales som faktisk frigivet plads. Arkivkørslernes egne delmålinger er
+gemt i rapporterne.
+
+Lokal automatisk arkivering er aktiveret efter fremtidig fuldført releaseoprydning;
+normal iCloud-ventetid er 120 sekunder pr. trin. En udestående overførsel bevarer
+originalerne/journalen og kan genoptages ved næste kørsel. 4369 og 4368 bliver
+fortsat lokale; ved næste release flyttes beskyttelsen til de to nyeste.
+
+Vedligeholdelseskode: `6220e731`. Samlet kørselsrapport:
+`build/release-automation/archive/report-1795363198448395000.json`.
+Test-, gendannelses-, sky- og bevaringskontroller ligger uden for Git i
+`~/DeveloperBuildData/xDrip/maintenance/icloud-archive-20261122/`.
 
 ## Rettelse og opdatering af “I går” — 22. november 2026 (4369)
 

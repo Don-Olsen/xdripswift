@@ -362,6 +362,29 @@ Arkiver i iCloud kræver internet og ledig lokal plads ved gendannelse. De er
 synkroniserede filer: almindelig sletning i iCloud sletter skyfilen. Brug kun
 arkiveringsværktøjets lokale frigivelse eller Finders Fjern overførsel.
 
+Bevar det lokale katalog
+`build/release-automation/archive/<release>/{manifest.json,transaction.json}`
+og release-mappens `archive-receipt.json`: disse ignorerede kontrolfiler er
+nødvendige for gendannelseskommandoen og findes ikke i Git. Hver sky-pakke
+indeholder også `__xdrip_archive_manifest__.json`, så indhold og oprindelige
+placeringer er bevaret ved katalogtab. Automatisk genopbygning af et manglende
+katalog er ikke implementeret; det kræver særskilt verificeret gendannelse.
+
+`restore-archive --apply` kræver aktiveret lokal arkivkonfiguration og en helt
+ny, absolut lokal destinationssti. Den oprindelige mappestruktur gendannes
+under destinationen. `RESTORE-MAP.json` viser både release- og eksterne
+signeringsmapper. Absolutte symbolske links bevares nøjagtigt og kan derfor
+pege på en gammel, nu fjernet placering; brug den tilsvarende gendannede mappe
+fra kortet. Et afbrudt gendannelsesforsøg efterlader destinationen; inspicér den
+og vælg en ny destination før genforsøg. Gendannelse efterlader både de udpakkede
+filer og skyfilens lokale download. Frigiv sidstnævnte med Finders Fjern overførsel,
+når den ikke længere skal bruges.
+
+På denne Mac er arkivering aktiveret fra 22. november 2026 med normal ventetid
+på 120 sekunder pr. iCloud-trin. Den første engangskørsel brugte længere ventetid.
+Der oprettes ingen ny periodisk baggrundsservice; vedligeholdelsen følger den
+allerede eksisterende releaseprocedure.
+
 ## App Store Connect API-adgang
 
 Apples offentlige REST API kræver en Apple-udstedt ES256 `.p8`-nøgle; der findes ikke en understøttet
