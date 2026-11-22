@@ -314,8 +314,53 @@ Offline validering uden TestFlight-build: `scripts/local-build.sh python`.
 Oprydningstests bruger udelukkende syntetiske midlertidige mapper og mocked Apple;
 de tester bevaring, proces-/API-spærrer, manglende artefakter, forkert IPA,
 symlinks, hardlinks, ændrede filer, lås, gentagen kørsel og automatisk release-hook.
-Arkiver, IPA og diagnosehistorik vil fortsat vokse over tid. Flytning til et
-verificeret eksternt arkiv kræver en særskilt aftale og udføres ikke af denne regel.
+Arkiver, IPA og diagnosehistorik bevares. Den 22. november 2026 godkendte ejeren
+særskilt arkivering af ældre afsluttede releases i sin iCloud Drive. Det ændrer
+ikke cacheoprydningens sletteregler; arkivering har egne verificerede kvitteringer.
+
+### iCloud-arkiv og gendannelse
+
+Den aktive release og den seneste tidligere verificerede release bliver på Mac'en
+i fuld form. Ældre afsluttede releases kan pakkes enkeltvis sammen med deres
+registrerede eksterne signeringsoutput. Kildecheckout, Git, objektgendannelse,
+delte byggecaches og uafsluttede/ukendte releases flyttes ikke.
+
+Lokal aktivering sker i den ignorerede fil
+`build/release-automation/archive/config.json` med `enabled: true` og `icloudRoot`
+sat til `~/Library/Mobile Documents/com~apple~CloudDocs/xDrip-arkiv` som absolut sti.
+Efter en fuldført releaseoprydning forsøger releaseværktøjet også arkivering,
+når denne konfiguration er aktiveret. En arkiveringsfejl ændrer ikke Apples
+uploadstatus eller starter en ny udgivelse.
+
+```sh
+# Planlæg uden at flytte eller fjerne releasefiler:
+python3 -B scripts/release-testflight.py archive
+# Fortsæt den aktiverede arkivering med alle kontroller:
+python3 -B scripts/release-testflight.py archive --apply
+# Planlæg gendannelse af en valgt udgivelse til et nyt lokalt katalog:
+python3 -B scripts/release-testflight.py restore-archive testflight-7.1.1-4340 \
+  --destination ~/DeveloperBuildData/xDrip/restored/4340
+# Tilføj --apply for at hente og gendanne det kontrollerede arkiv.
+```
+
+Arkiver placeres i iCloud, mens et lille lokalt katalog og kvitteringsmapper
+bevarer udgivelsesidentitet, kontrolsummer og oprindelige filplaceringer.
+Almindelige builds og cachekontroller skal kunne genkende arkiverede releases
+uden at hente gamle arkiver fra skyen. Gendannelse sker til en lokal placering
+uden for File Provider, og overskriver ikke eksisterende arbejde.
+
+Den lille Swift-hjælper bruger offentlige Foundation-funktioner til uploadstatus,
+`evictUbiquitousItem` og `startDownloadingUbiquitousItem`. En uploadmarkering alene
+er ikke nok: filen skal have været frigivet lokalt og hentet tilbage med korrekt
+SHA-256, og gendannede filer skal matche før lokal fjernelse. Komprimerede macOS-
+symbolfiler, filattributter og godkendte links bevares. En afbrudt overførsel
+bevarer originalerne og kan genoptages; samme build får ikke en ny identitet.
+Den delte buildlås, den læsende Apple-kontrol samt proces- og filkontroller
+bevares. Kun den lokale download af det færdige iCloud-arkiv frigives.
+
+Arkiver i iCloud kræver internet og ledig lokal plads ved gendannelse. De er
+synkroniserede filer: almindelig sletning i iCloud sletter skyfilen. Brug kun
+arkiveringsværktøjets lokale frigivelse eller Finders Fjern overførsel.
 
 ## App Store Connect API-adgang
 

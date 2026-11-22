@@ -22,6 +22,37 @@ De følgende afsnit bevarer integrations- og testhistorikken før denne udgivels
 
 De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
 
+## iCloud-arkivering af gamle releasebeviser — 22. november 2026
+
+Ejeren har godkendt, at ældre afsluttede releases flyttes til sit private
+iCloud Drive-arkiv, og at samme vedligeholdelse forsøges efter fremtidige releases.
+Det er en ændring af Mac'ens vedligeholdelsesværktøjer; iPhone-/Watch-appen,
+release-tagget og buildnummer 4369 ændres ikke.
+
+Aktiv 4369 og seneste tidligere verificerede 4368, aktive/historiske checkouts,
+Git-objektgendannelse og delte byggecaches forbliver lokale. Uafsluttede eller
+ukendte releases er ikke omfattet. For de 77 ældre afsluttede releases er der
+målt 55,92 GB allokerede filer, heraf 41,82 GB private APFS-blokke. Dette er en
+forhåndsopgørelse, ikke et bevis for faktisk frigivet plads.
+
+Vedligeholdelsen har en særskilt lokal opt-in-konfiguration, katalog,
+kontrolsummer og genoptagelsesjournal. Fuld upload, faktisk lokal frigivelse,
+genhentning og kontrol af gendannet indhold/metadata kræves før originalerne
+fjernes. iCloud-filen bevares; kun dens lokale download frigives. Buildlås,
+Apple-kontrol, fil-/proceskontroller og beskyttelse af de to nyeste releases
+genbruges. Almindelig oprydning genkender en lokal arkivkvittering uden at hente
+gamle pakker fra iCloud. Se MAC-BUILD.md for arkivering og gendannelse.
+
+En 256 KiB syntetisk fil har gennemført faktisk iCloud-upload, eviktion og
+SHA-256-identisk genhentning. Native tar-prøver har bevaret komprimerede filer,
+filrettigheder, tidsstempler, links og ekstra attributter; den uafhængige prøve
+omfatter også ACL og resource fork. Projektets faktiske arkiver må først
+frigives efter samme kontrol. Alle 236 lokale Python-tests bestod, herunder
+25 nye arkiveringstests, 60 oprydningstests og 35 release-guardtests. Swift-
+hjælperen kompilerede, og shellsyntaks samt diff-kontrol bestod. Der er ikke
+kørt XCTest eller nye iPhone-/Watch-builds: appkoden er uændret. Resultater for den første rigtige arkivering
+registreres nedenfor efter gennemførsel.
+
 ## Rettelse og opdatering af “I går” — 22. november 2026 (4369)
 
 Måltidsgenvejen valgte også gemte hurtige kulhydrater fra dagen før. Udvælgelsen

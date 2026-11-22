@@ -4,6 +4,7 @@ import contextlib
 import importlib.util
 import json
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -55,14 +56,14 @@ class CleanupTests(unittest.TestCase):
     def write(self, p, data):
         p.parent.mkdir(parents=True, exist_ok=True); p.write_text(json.dumps(data))
 
-    def make_release(self, number):
-        r = self.root / ("build/testflight-7.1.1-" + number)
+    def make_release(self, number, version="7.1.1"):
+        r = self.root / ("build/testflight-" + version + "-" + number)
         ipa = r / "build/export/xdrip.ipa"; ipa.parent.mkdir(parents=True); ipa.write_bytes(b"IPA")
         (r / "build/archive/xdrip.xcarchive/dSYMs").mkdir(parents=True)
         (r / "test/results/AllTests.xcresult").mkdir(parents=True)
         (r / "apple-status.json").write_text("{}")
-        tag = "testflight-7.1.1-" + number; self.git("tag", tag)
-        state = {"version":"7.1.1", "build":number, "step":"status-recorded", "appleStatus":"internal-testing",
+        tag = "testflight-" + version + "-" + number; self.git("tag", tag)
+        state = {"version":version, "build":number, "step":"status-recorded", "appleStatus":"internal-testing",
                  "tests":{"verificationPassed":True}, "tag":tag, "checkpoint":self.head,
                  "ipaSha256":c.hash_file(ipa), "appleObservation":{"buildRecord":{"id":"id-"+number}}}
         self.write(r / "release-state.json", state)
@@ -74,6 +75,79 @@ class CleanupTests(unittest.TestCase):
                      "CompilationCache.noindex/debug.log", "ModuleCache.noindex/unknown.txt"):
             p=dd/name; p.parent.mkdir(parents=True,exist_ok=True); p.write_bytes(b"preserve or cache"*100)
         return r
+
+    def archive_stub(self, folder):
+        # Receipt parsing has dedicated archive tests; this fixture isolates the
+        # cleanup contract: the validated stub is local and has no build output.
+        shutil.rmtree(folder)
+        folder.mkdir()
+        marker = folder / "archive-receipt.json"
+        marker.write_text('{"archivePath": "/unavailable-iCloud/archive.zip"}')
+        receipt = {"status": "archived", "releaseName": folder.name}
+        import release_archive
+        original = release_archive.inspect_stub
+        patch = mock.patch.object(release_archive, "inspect_stub", side_effect=
+                                  lambda path: receipt if path == folder else original(path))
+        patch.start()
+        self.addCleanup(patch.stop)
+        return marker
+
+    def test_archived_release_stub_does_not_require_cloud_or_original_artifacts(self):
+        other = self.make_release("98")
+        marker = self.archive_stub(self.old)
+        retained = marker.read_bytes()
+        current, previous = self.manifest(self.current), self.manifest(self.previous)
+        result = c.cleanup(self.root, self.client, True)
+        self.assertEqual(result["deletedFiles"], 4)
+        self.assertFalse(self.cache(other).exists())
+        self.assertEqual(marker.read_bytes(), retained)
+        self.assertEqual(self.manifest(self.current), current)
+        self.assertEqual(self.manifest(self.previous), previous)
+        self.assertTrue(any(row["path"] == str(self.old) and "archive receipt" in row["reason"]
+                            for row in result["kept"]))
+        self.assertEqual(result["retainedBefore"], result["retainedAfter"])
+
+    def test_latest_previous_release_stays_local_across_marketing_version_change(self):
+        newest = self.make_release("102", version="7.2.0")
+        before, newest_before = self.manifest(self.current), self.manifest(newest)
+        self.write(self.root / "build/release-automation/active.json", {"version": "7.2.0", "build": "102"})
+        snapshot = self.client.snapshot.return_value
+        snapshot["version"] = "7.2.0"
+        snapshot["builds"][0].update(version="7.2.0", build="102", id="id-102")
+        self.client._group_build_ids.return_value = {"id-102"}
+        result = c.cleanup(self.root, self.client, True)
+        self.assertEqual(result["deletedFiles"], 8)
+        self.assertEqual(self.manifest(self.current), before)
+        self.assertEqual(self.manifest(newest), newest_before)
+        self.assertTrue(self.cache(self.current).exists())
+        self.assertTrue(any(row["path"] == str(self.current) and row["reason"] == "latest previous verified build"
+                            for row in result["kept"]))
+        self.archive_stub(self.current)
+        with self.assertRaisesRegex(c.CleanupBlocked, "Latest previous verified release must remain fully local"):
+            c.cleanup(self.root, self.client, True)
+
+    def test_invalid_archive_receipt_blocks_before_any_cache_removal(self):
+        import release_archive
+        original = release_archive.inspect_stub
+        def inspect(path):
+            if path == self.old:
+                raise release_archive.ArchiveBlocked("archive receipt digest mismatch")
+            return original(path)
+        with mock.patch.object(release_archive, "inspect_stub", side_effect=inspect):
+            with self.assertRaisesRegex(c.CleanupBlocked, "Invalid archive receipt"):
+                c.cleanup(self.root, self.client, True)
+        self.assertTrue(self.cache().exists())
+
+    def test_current_or_latest_previous_archive_receipt_blocks_cleanup(self):
+        import release_archive
+        original = release_archive.inspect_stub
+        for protected in (self.current, self.previous):
+            with self.subTest(protected=protected.name), mock.patch.object(
+                    release_archive, "inspect_stub", side_effect=lambda path:
+                    {"status": "archived"} if path == protected else original(path)):
+                with self.assertRaisesRegex(c.CleanupBlocked, "must remain fully local"):
+                    c.cleanup(self.root, self.client, True)
+        self.assertTrue(self.cache().exists())
 
     def cache(self, r=None):
         return (r or self.old) / "test/DerivedData/all-tests/ModuleCache.noindex/test.pcm"

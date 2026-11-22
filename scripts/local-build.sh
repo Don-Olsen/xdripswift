@@ -142,6 +142,8 @@ run_python_checks() {
     | tee "$logs_dir/python-build-environment.log"
   python3 -B scripts/test_release_cleanup.py 2>&1 \
     | tee "$logs_dir/python-release-cleanup.log"
+  python3 -B scripts/test_release_archive.py 2>&1 \
+    | tee "$logs_dir/python-release-archive.log"
   set -o pipefail
   python3 -B scripts/test-check-apple-processing.py 2>&1 \
     | tee "$logs_dir/python-check-apple-processing.log"

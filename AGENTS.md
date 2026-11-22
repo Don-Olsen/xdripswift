@@ -54,3 +54,19 @@ Use `release-testflight.py cleanup` for a dry-run, `cleanup --apply` to execute.
 Never bypass the shared build lock, process/open-file checks or Apple checks.
 An uncertain or blocked cleanup does not imply an upload failure; never restart
 a release to retry cleanup. Historical/unknown build directories stay untouched.
+
+
+## Verified iCloud archive — owner authorized 22 November 2026
+
+Older completed releases may be archived to the owner's iCloud Drive using
+`scripts/release-testflight.py archive --apply`. Keep the active release and
+latest previous verified release fully local, plus active/historical source,
+Git recovery objects, shared build caches and incomplete releases. Never build
+from File Provider paths. The opt-in local archive configuration and catalog
+live under ignored `build/release-automation/archive/`; see MAC-BUILD.md.
+After successful release cleanup, enabled archiving is attempted automatically.
+Local originals may be removed only after verified upload, actual eviction and
+redownload, checksum and restoration checks, with the existing build lock and
+Apple/process/file guards. Missing cloud access leaves originals/pending work
+intact. Never delete the iCloud archive to free local space: evict its download.
+Archived receipt folders must remain recognizable without cloud downloads.

@@ -21,6 +21,7 @@ import time
 from apple_release import AppleClient, AppleError
 from build_lock import build_lock, pass_fds
 from release_cleanup import cleanup, CleanupBlocked
+import release_archive
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -766,30 +767,61 @@ def release_all():
     fail("repeated concurrent Apple build collisions; no further automatic upload attempts")
 
 
+def maintenance_stopped(kind, state, error):
+    # Maintenance must never re-run an upload or turn a completed release into
+    # a reported upload failure, including when its local report cannot be saved.
+    print(kind.capitalize() + " stopped; release remains completed: " + str(error), flush=True)
+    report = ROOT / ("build/release-automation/" + kind) / ("blocked-" + str(time.time_ns()) + ".json")
+    try:
+        save_state(report, {"status": "blocked", "observedAt": utc_now(),
+                            "reason": str(error), "currentBuild": state["build"]})
+    except OSError as report_error:
+        print("Cannot save " + kind + " report: " + str(report_error), flush=True)
+
+
 def cleanup_after_release(state):
     if state.get("step") != "status-recorded" or state.get("appleStatus") != "internal-testing":
         return
     try:
         cleanup(ROOT, apple_client(), apply=True)
-    except (CleanupBlocked, AppleError, OSError, ValueError, KeyError, RuntimeError) as error:
-        # A cleanup refusal must never re-run an upload or misreport release failure.
-        print("Cleanup stopped; release remains completed: " + str(error), flush=True)
-        report = ROOT / "build/release-automation/cleanup" / ("blocked-" + str(time.time_ns()) + ".json")
-        save_state(report, {"status": "blocked", "observedAt": utc_now(),
-                            "reason": str(error), "currentBuild": state["build"]})
+    except Exception as error:
+        maintenance_stopped("cleanup", state, error)
+        return
+    try:
+        # Only an explicit local configuration enables cloud archival. Its own
+        # operation repeats the host lock, fresh Apple and process/file gates.
+        if release_archive.load_config(ROOT) is not None:
+            release_archive.archive(ROOT, apple_client(), apply=True)
+    except Exception as error:
+        maintenance_stopped("archive", state, error)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("check", "apple-status", "prepare", "release", "checkpoint", "publish", "build", "verify", "upload", "status", "cleanup"))
-    parser.add_argument("--apply", action="store_true", help="Apply cleanup; cleanup defaults to dry-run")
+    parser.add_argument("command", choices=("check", "apple-status", "prepare", "release", "checkpoint", "publish", "build", "verify", "upload", "status", "cleanup", "archive", "restore-archive"))
+    parser.add_argument("target", nargs="?", help="Release name for restore-archive (testflight-<version>-<build>)")
+    parser.add_argument("--destination", type=Path, help="Local destination for restore-archive")
+    parser.add_argument("--apply", action="store_true", help="Apply cleanup/archive/restore; maintenance defaults to dry-run")
     args = parser.parse_args()
-    if args.apply and args.command != "cleanup":
-        parser.error("--apply is only valid for cleanup")
+    if args.apply and args.command not in ("cleanup", "archive", "restore-archive"):
+        parser.error("--apply is only valid for cleanup, archive or restore-archive")
+    if args.command == "restore-archive":
+        if not args.target or args.destination is None:
+            parser.error("restore-archive requires a release target and --destination")
+    elif args.target is not None or args.destination is not None:
+        parser.error("target and --destination are only valid for restore-archive")
     os.chdir(ROOT)
     ensure_origin()
     if args.command == "cleanup":
         cleanup(ROOT, apple_client(), apply=args.apply)
+        return
+    if args.command == "archive":
+        report = release_archive.archive(ROOT, apple_client(), apply=args.apply)
+        print(json.dumps(report, indent=2))
+        return
+    if args.command == "restore-archive":
+        report = release_archive.restore_archive(ROOT, args.target, destination=args.destination, apply=args.apply)
+        print(json.dumps(report, indent=2))
         return
     if args.command == "release":
         release_all()

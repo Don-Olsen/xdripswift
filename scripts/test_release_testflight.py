@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -661,13 +662,98 @@ class ReleaseGuardTests(unittest.TestCase):
         release.cleanup_after_release({"step":"status-recorded","appleStatus":"internal-testing","build":"4264"})
         self.cleanup_mock.assert_called_once_with(self.root,self.client,apply=True)
 
+    def test_archive_hook_is_disabled_without_explicit_local_configuration(self):
+        state = {"step": "status-recorded", "appleStatus": "internal-testing", "build": "4264"}
+        with mock.patch.object(release.release_archive, "archive") as archive:
+            release.cleanup_after_release(state)
+            archive.assert_not_called()
+
+    def test_archive_hook_runs_only_after_successful_cleanup_when_enabled(self):
+        state = {"step": "status-recorded", "appleStatus": "internal-testing", "build": "4264"}
+        order = []
+        self.cleanup_mock.side_effect = lambda *args, **kwargs: order.append("cleanup")
+        with mock.patch.object(release.release_archive, "load_config", return_value={"enabled": True}), \
+                mock.patch.object(release.release_archive, "archive", side_effect=
+                                  lambda *args, **kwargs: order.append("archive")) as archive:
+            release.cleanup_after_release(state)
+            archive.assert_called_once_with(self.root, self.client, apply=True)
+        self.assertEqual(order, ["cleanup", "archive"])
+
+    def test_archive_sync_failure_preserves_completed_release_and_never_uploads(self):
+        state = {"step": "status-recorded", "appleStatus": "internal-testing", "build": "4264"}
+        original = dict(state)
+        with mock.patch.object(release.release_archive, "load_config", return_value={"enabled": True}), \
+                mock.patch.object(release.release_archive, "archive", side_effect=
+                                  release.release_archive.ArchiveBlocked("iCloud upload is still pending")), \
+                mock.patch.object(release, "upload") as upload, \
+                mock.patch.object(release, "build") as build:
+            release.cleanup_after_release(state)
+            upload.assert_not_called()
+            build.assert_not_called()
+        self.assertEqual(state, original)
+        reports = list((self.root / "build/release-automation/archive").glob("blocked-*.json"))
+        self.assertEqual(len(reports), 1)
+        self.assertEqual(json.loads(reports[0].read_text())["status"], "blocked")
+
+    def test_cloud_helper_timeout_does_not_fail_completed_release(self):
+        state = {"step": "status-recorded", "appleStatus": "internal-testing", "build": "4264"}
+        with mock.patch.object(release.release_archive, "load_config", return_value={"enabled": True}), \
+                mock.patch.object(release.release_archive, "archive", side_effect=
+                                  subprocess.TimeoutExpired("icloud-helper", 30)):
+            release.cleanup_after_release(state)
+        reports = list((self.root / "build/release-automation/archive").glob("blocked-*.json"))
+        self.assertEqual(len(reports), 1)
+        self.assertEqual(state["appleStatus"], "internal-testing")
+
+    def test_archive_report_failure_does_not_turn_completed_release_into_failure(self):
+        state = {"step": "status-recorded", "appleStatus": "internal-testing", "build": "4264"}
+        with mock.patch.object(release.release_archive, "load_config", return_value={"enabled": True}), \
+                mock.patch.object(release.release_archive, "archive", side_effect=RuntimeError("cloud unavailable")), \
+                mock.patch.object(release, "save_state", side_effect=OSError("disk is full")):
+            release.cleanup_after_release(state)
+        self.assertEqual(state["appleStatus"], "internal-testing")
+
+    def test_archive_command_defaults_to_dry_run_without_build_or_upload(self):
+        for apply in (False, True):
+            argv = [str(SCRIPT), "archive"] + (["--apply"] if apply else [])
+            with self.subTest(apply=apply), mock.patch.object(sys, "argv", argv), \
+                    mock.patch.object(release, "ensure_origin"), mock.patch.object(release.os, "chdir"), \
+                    mock.patch.object(release.release_archive, "archive", return_value={"status": "synthetic"}) as archive, \
+                    mock.patch.object(release, "version_and_build", side_effect=AssertionError("no build selection")), \
+                    mock.patch.object(release, "release_all") as new_release:
+                release.main()
+                archive.assert_called_once_with(self.root, self.client, apply=apply)
+                new_release.assert_not_called()
+
+    def test_restore_archive_requires_target_and_destination_and_defaults_to_dry_run(self):
+        destination = self.root / "restored"
+        argv = [str(SCRIPT), "restore-archive", "testflight-7.0.0-4264", "--destination", str(destination)]
+        for apply in (False, True):
+            with self.subTest(apply=apply), mock.patch.object(sys, "argv", argv + (["--apply"] if apply else [])), \
+                    mock.patch.object(release, "ensure_origin"), mock.patch.object(release.os, "chdir"), \
+                    mock.patch.object(release.release_archive, "restore_archive", return_value={"status": "synthetic"}) as restore, \
+                    mock.patch.object(release, "apple_client") as apple, \
+                    mock.patch.object(release, "version_and_build", side_effect=AssertionError("no build selection")):
+                release.main()
+                restore.assert_called_once_with(self.root, "testflight-7.0.0-4264",
+                                                destination=destination, apply=apply)
+                apple.assert_not_called()
+        for args in (["restore-archive"], ["restore-archive", "testflight-7.0.0-4264"],
+                     ["archive", "testflight-7.0.0-4264"], ["build", "--apply"]):
+            with self.subTest(args=args), mock.patch.object(sys, "argv", [str(SCRIPT)] + args):
+                with self.assertRaises(SystemExit) as error:
+                    release.main()
+                self.assertEqual(error.exception.code, 2)
+
     def test_cleanup_refusal_records_block_without_changing_release_or_uploading(self):
         state={"step":"status-recorded","appleStatus":"internal-testing","build":"4264"}
         original=dict(state)
         self.cleanup_mock.side_effect=release.CleanupBlocked("Xcode is open")
-        with mock.patch.object(release,"upload") as upload:
+        with mock.patch.object(release,"upload") as upload, \
+                mock.patch.object(release.release_archive, "archive") as archive:
             release.cleanup_after_release(state)
             upload.assert_not_called()
+            archive.assert_not_called()
         self.assertEqual(state,original)
         reports=list((self.root/"build/release-automation/cleanup").glob("blocked-*.json"))
         self.assertEqual(json.loads(reports[0].read_text())["status"],"blocked")

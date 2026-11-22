@@ -260,12 +260,25 @@ def confirm_release_links(candidates):
                     and target.is_dir() and not target.is_symlink(),
                     "Release link changed during cleanup")
 
+def archived_release(folder):
+    """Validate a local archive receipt without opening or resolving cloud paths."""
+    from release_archive import ArchiveBlocked, inspect_stub
+    try:
+        return inspect_stub(folder)
+    except (ArchiveBlocked, OSError, ValueError, KeyError, TypeError) as error:
+        raise CleanupBlocked("Invalid archive receipt; preserve release: " + str(error)) from error
+
+
 def release_candidates(root, current):
     candidates, kept = [], []
-    completed_prior = []
+    completed_prior = {}
     for folder in (root / "build").glob("testflight-*"):
+        archived = archived_release(folder)
         match = re.fullmatch(r"testflight-(\d+(?:\.\d+)+)-(\d+)", folder.name)
-        if not match or match[1] != current["version"] or int(match[2]) >= int(current["build"]):
+        if not match or int(match[2]) >= int(current["build"]):
+            continue
+        if archived is not None:
+            completed_prior[folder] = int(match[2])
             continue
         try:
             state = read_json(folder / "release-state.json")
@@ -274,18 +287,25 @@ def release_candidates(root, current):
         if (state.get("version"), state.get("build")) == (match[1], match[2]) and (
                 state.get("step") == "status-recorded" and state.get("appleStatus") == "internal-testing"
                 and state.get("tests", {}).get("verificationPassed") is True):
-            completed_prior.append(int(match[2]))
-    latest_prior = max(completed_prior, default=None)
+            completed_prior[folder] = int(match[2])
+    latest_prior = max(completed_prior.values(), default=None)
+    for prior, number in completed_prior.items():
+        if number == latest_prior:
+            require(archived_release(prior) is None, "Latest previous verified release must remain fully local")
     protected = []
     for folder in (root / "build").glob("testflight-*"):
+        if archived_release(folder) is not None:
+            protected.append(folder)
+            continue
         match = re.fullmatch(r"testflight-(\d+(?:\.\d+)+)-(\d+)", folder.name)
-        if not match or int(match[2]) >= int(current["build"]) or (
-                match[1] == current["version"] and int(match[2]) == latest_prior):
+        if not match or int(match[2]) >= int(current["build"]) or int(match[2]) == latest_prior:
             protected.extend((folder.resolve(), (folder / "build").resolve(), (folder / "test").resolve()))
     for folder in sorted((root / "build").glob("testflight-*")):
+        if archived_release(folder) is not None:
+            kept.append({"path": str(folder), "reason": "verified archive receipt; local stub preserved"})
+            continue
         m = re.fullmatch(r"testflight-(\d+(?:\.\d+)+)-(\d+)", folder.name)
-        if not m or int(m[2]) >= int(current["build"]) or (
-                m[1] == current["version"] and int(m[2]) == latest_prior):
+        if not m or int(m[2]) >= int(current["build"]) or int(m[2]) == latest_prior:
             reason = "latest previous verified build" if m and int(m[2]) == latest_prior else "current/newer/unknown build"
             kept.append({"path": str(folder), "reason": reason})
             continue
@@ -384,6 +404,9 @@ def local_candidates(root, current):
     cutoff = current.get("statusRecordedAt")
     protected = [root, Path.home() / "DeveloperBuildData/xDrip/DerivedData"]
     for release in (root / "build").glob("testflight-*"):
+        if archived_release(release) is not None:
+            protected.append(release)
+            continue
         protected.extend((release.resolve(), (release / "build").resolve(),
                           (release / "test").resolve(), (release / "verify").resolve()))
     for registration in sorted(registry.glob("*.json")):
@@ -454,6 +477,7 @@ def preservation_inventory(root, deletions, local_outputs=()):
     """
     result = {}
     for release in sorted(set((root / "build").glob("testflight-*")) | set(local_outputs)):
+        archived_release(release)
         bases = {release.resolve()}
         for name in ("build", "verify"):
             child = release / name
@@ -496,6 +520,8 @@ def build_area_usage(root, snapshot, local_outputs=()):
             require(candidate.is_dir() and not candidate.is_symlink(), "Unknown worktree build root")
             paths.add(candidate.resolve())
     for folder in (root / "build").glob("testflight-*"):
+        if archived_release(folder) is not None:
+            continue
         out = folder / "build"
         if out.is_symlink():
             target = out.resolve()
@@ -526,6 +552,7 @@ def cleanup(root, client, apply=False):
         require(re.fullmatch(r"\d+(?:\.\d+)+", str(active.get("version", "")))
                 and re.fullmatch(r"[1-9]\d*", str(active.get("build", ""))), "Invalid active identity")
         current_root = root / ("build/testflight-%s-%s" % (active["version"], active["build"]))
+        require(archived_release(current_root) is None, "Current release must remain fully local")
         current = read_json(current_root / "release-state.json")
         require(current.get("step") == "status-recorded" and current.get("appleStatus") == "internal-testing",
                 "Current release is incomplete")
