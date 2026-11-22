@@ -356,6 +356,55 @@ import XCTest
         XCTAssertEqual((repaired.trigger as? UNTimeIntervalNotificationTrigger)?.timeInterval, 3100)
     }
 
+    func testHomeSplitEntryPreservesOldBalanceAndRejectsStaleOrUnavailablePresentation() async throws {
+        let f = Fixture()
+        defer { f.clean() }
+        f.now = Date().addingTimeInterval(-60)
+        let monitor = f.monitor()
+        XCTAssertTrue(monitor.start(remaining: 5, threshold: 1))
+        await monitor.refresh()?.value
+        let baseline = try XCTUnwrap(monitor.snapshot.baselineID)
+        let cartridge = monitor.snapshot.cartridgeID
+        var presentations = 0
+        func open(expected: UUID? = nil, enabled: Bool = true, ready: Bool = true,
+                  alreadyOpen: Bool = false) -> Bool {
+            RootHomeCalculatorQuickActionPresentation.openCartridgeAllocation(
+                expectedBaseline: expected, currentBaseline: monitor.snapshot.baselineID,
+                isEnabled: enabled, isReady: ready, isAlreadyPresented: alreadyOpen) {
+                    presentations += 1
+                }
+        }
+        XCTAssertFalse(open())
+        XCTAssertFalse(open(expected: UUID()))
+        XCTAssertFalse(open(expected: baseline, enabled: false))
+        XCTAssertFalse(open(expected: baseline, ready: false))
+        XCTAssertFalse(open(expected: baseline, alreadyOpen: true))
+        XCTAssertEqual(presentations, 0)
+        XCTAssertTrue(open(expected: baseline))
+        XCTAssertEqual(presentations, 1)
+        XCTAssertEqual(monitor.snapshot.baselineID, baseline)
+        XCTAssertEqual(monitor.snapshot.cartridgeID, cartridge)
+        XCTAssertEqual(monitor.snapshot.remainingUnits, 5)
+        XCTAssertNil(monitor.allocation)
+        XCTAssertTrue(f.entries.isEmpty)
+        let calculator = f.calculator(monitor)
+        defer { calculator.stop() }
+        XCTAssertNil(calculator.cartridgeAllocationRequest(), "An actual positive total is required")
+        calculator.insulinToLogText = "6"
+        let request = try XCTUnwrap(calculator.cartridgeAllocationRequest())
+        XCTAssertEqual(request.baselineID, baseline)
+        XCTAssertEqual(request.suggestedOldUnits, 3)
+        XCTAssertEqual(request.totalUnits, 6)
+        // Opening/cancelling either sheet does not confirm a switch or a treatment.
+        calculator.stop()
+        await monitor.refresh()?.value
+        XCTAssertEqual(monitor.snapshot.baselineID, baseline)
+        XCTAssertEqual(monitor.snapshot.remainingUnits, 5)
+        XCTAssertTrue(f.entries.isEmpty)
+        XCTAssertTrue(monitor.setRemaining(4))
+        XCTAssertFalse(open(expected: baseline), "An old Home confirmation cannot replace a newer count")
+    }
+
     func testCalculatorSplitPersistsBeforeLoggingAndLogsSixUnitsExactlyOnceAfterCancelledConfirmation() async throws {
         let f = Fixture()
         defer { f.clean() }

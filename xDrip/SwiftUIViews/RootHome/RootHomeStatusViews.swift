@@ -126,6 +126,18 @@ enum RootHomeCalculatorQuickActionPresentation {
             && TherapyMetricsManager.doseSourceIsReady(policy, cutover: cutover, defaults: defaults)
     }
 
+    /// Home's cartridge action opens the same calculator before any inventory change.
+    /// A stale confirmation must not allocate a dose against a newer cartridge/count.
+    @discardableResult
+    static func openCartridgeAllocation(expectedBaseline: UUID?, currentBaseline: UUID?,
+                                        isEnabled: Bool, isReady: Bool,
+                                        isAlreadyPresented: Bool, present: () -> Void) -> Bool {
+        guard isEnabled, let expectedBaseline, expectedBaseline == currentBaseline,
+              isReady, !isAlreadyPresented else { return false }
+        present()
+        return true
+    }
+
     static func open(request: UUID?, isReady: Bool, isAlreadyPresented: Bool,
                      isVisible: Bool,
                      present: () -> Void, consume: (UUID) -> Void) {

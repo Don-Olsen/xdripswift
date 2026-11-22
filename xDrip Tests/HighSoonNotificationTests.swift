@@ -639,35 +639,40 @@ final class HighSoonNotificationTests: XCTestCase {
     }
 
     func testColdStartHighSnoozeCompletesOnceAfterReadinessUsingTheRuleAtTheTap() throws {
-        let harness = Harness()
-        defer { harness.finish() }
-        let coordinator = RootApplicationCoordinator()
-        let tap = try XCTUnwrap(Calendar.current.date(bySettingHour: 12, minute: 29, second: 59, of: Date()))
-        let ready = tap.addingTimeInterval(4)
-        let subsequentType = AlertType(enabled: true, name: "Later rule", overrideMute: true,
-            snooze: true, snoozePeriod: 60, vibrate: false, soundName: "", alertEntries: nil,
-            nsManagedObjectContext: harness.core.mainManagedObjectContext)
-        _ = AlertEntry(isDisabled: false, value: 180, triggerValue: 0, alertKind: .high,
-            start: 12 * 60 + 30, alertType: subsequentType, nsManagedObjectContext: harness.core.mainManagedObjectContext)
-        var completions = 0
-        let delivered = tap.addingTimeInterval(-20)
-        for received in [tap, tap.addingTimeInterval(1)] {
-            XCTAssertTrue(coordinator.handleHighNotificationSnooze(notificationIdentifier: AlertKind.high.notificationIdentifier(),
-                actionIdentifier: AlertManager.snoozeActionIdentifier, deliveredAt: delivered, receivedAt: received) {
-                XCTAssertEqual(harness.manager.getSnoozeParameters(alertKind: .high).snoozeTimeStamp, tap)
-                completions += 1
-            })
+        for kind in [AlertKind.high, .fastrise] {
+            let harness = Harness()
+            defer { harness.finish() }
+            let initialEntry = try XCTUnwrap(AlertEntriesAccessor(coreDataManager: harness.core)
+                .getAllEntries(forAlertKind: kind, alertTypesAccessor: AlertTypesAccessor(coreDataManager: harness.core)).first)
+            initialEntry.alertType = harness.type
+            let coordinator = RootApplicationCoordinator()
+            let tap = try XCTUnwrap(Calendar.current.date(bySettingHour: 12, minute: 29, second: 59, of: Date()))
+            let ready = tap.addingTimeInterval(4)
+            let subsequentType = AlertType(enabled: true, name: "Later rule", overrideMute: true,
+                snooze: true, snoozePeriod: 60, vibrate: false, soundName: "", alertEntries: nil,
+                nsManagedObjectContext: harness.core.mainManagedObjectContext)
+            _ = AlertEntry(isDisabled: false, value: 180, triggerValue: 0, alertKind: kind,
+                start: 12 * 60 + 30, alertType: subsequentType, nsManagedObjectContext: harness.core.mainManagedObjectContext)
+            var completions = 0
+            let delivered = tap.addingTimeInterval(-20)
+            for received in [tap, tap.addingTimeInterval(1)] {
+                XCTAssertTrue(coordinator.handleHighNotificationSnooze(notificationIdentifier: kind.notificationIdentifier(),
+                    actionIdentifier: AlertManager.snoozeActionIdentifier, deliveredAt: delivered, receivedAt: received) {
+                    XCTAssertEqual(harness.manager.getSnoozeParameters(alertKind: kind).snoozeTimeStamp, tap)
+                    completions += 1
+                })
+            }
+            XCTAssertEqual(completions, 0)
+            XCTAssertNil(SelectiveAlarmSilence.until(defaults: harness.defaults))
+            coordinator.installAlertManager(harness.manager, at: ready)
+            XCTAssertEqual(completions, 2, "Each iOS response completes once")
+            XCTAssertEqual(harness.manager.getSnoozeParameters(alertKind: kind).snoozePeriodInMinutes, 15)
+            XCTAssertEqual(SelectiveAlarmSilence.until(defaults: harness.defaults), tap.addingTimeInterval(15 * 60))
+            let revision = SelectiveAlarmSilence.revision(defaults: harness.defaults)
+            coordinator.installAlertManager(harness.manager, at: ready)
+            XCTAssertEqual(SelectiveAlarmSilence.revision(defaults: harness.defaults), revision)
+            XCTAssertEqual(completions, 2)
         }
-        XCTAssertEqual(completions, 0)
-        XCTAssertNil(SelectiveAlarmSilence.until(defaults: harness.defaults))
-        coordinator.installAlertManager(harness.manager, at: ready)
-        XCTAssertEqual(completions, 2, "Each iOS response completes once")
-        XCTAssertEqual(harness.manager.getSnoozeParameters(alertKind: .high).snoozePeriodInMinutes, 15)
-        XCTAssertEqual(SelectiveAlarmSilence.until(defaults: harness.defaults), tap.addingTimeInterval(15 * 60))
-        let revision = SelectiveAlarmSilence.revision(defaults: harness.defaults)
-        coordinator.installAlertManager(harness.manager, at: ready)
-        XCTAssertEqual(SelectiveAlarmSilence.revision(defaults: harness.defaults), revision)
-        XCTAssertEqual(completions, 2)
     }
 
     func testReadyHighNotificationSnoozesImmediatelyAndOtherActionsKeepTheirOwnHandler() {
@@ -680,7 +685,7 @@ final class HighSoonNotificationTests: XCTestCase {
                                (.veryhigh, UNNotificationDismissActionIdentifier),
                                (.low, AlertManager.snoozeActionIdentifier),
                                (.lowSoon, AlertManager.lowSoonCalculatorActionIdentifier),
-                               (.fastrise, AlertManager.snoozeActionIdentifier)] {
+                               (.fastdrop, AlertManager.snoozeActionIdentifier)] {
             XCTAssertFalse(coordinator.handleHighNotificationSnooze(notificationIdentifier: kind.notificationIdentifier(),
                 actionIdentifier: action, deliveredAt: tap, receivedAt: tap) { XCTFail("Unrelated completion claimed") })
         }
@@ -696,31 +701,36 @@ final class HighSoonNotificationTests: XCTestCase {
     }
 
     func testDeferredHighSnoozeCannotReviveExpiredOrSupersededPauseOrStopNewLowSound() {
-        let tap = Date()
-        for newerDecision in [false, true] {
-            let player = PreviewSoundPlayer()
-            let harness = Harness(soundPlayer: player)
-            defer { harness.finish() }
-            let coordinator = RootApplicationCoordinator()
-            var completed = false
-            XCTAssertTrue(coordinator.handleHighNotificationSnooze(notificationIdentifier: AlertKind.high.notificationIdentifier(),
-                actionIdentifier: AlertManager.snoozeActionIdentifier, deliveredAt: tap, receivedAt: tap) { completed = true })
-            if newerDecision { SelectiveAlarmSilence.end(at: tap.addingTimeInterval(1), defaults: harness.defaults) }
-            harness.type.soundname = nil
-            harness.manager.applyImmediatePresentation(from: harness.type, to: UNMutableNotificationContent(), kind: .low)
-            let revision = SelectiveAlarmSilence.revision(defaults: harness.defaults)
-            coordinator.installAlertManager(harness.manager, at: tap.addingTimeInterval(newerDecision ? 2 : 15 * 60))
-            XCTAssertTrue(completed)
-            XCTAssertEqual(SelectiveAlarmSilence.revision(defaults: harness.defaults), revision)
-            XCTAssertNil(harness.manager.getSnoozeParameters(alertKind: .high).snoozeTimeStamp)
-            XCTAssertTrue(player.isPlaying())
-            XCTAssertEqual(player.stopCount, 0)
+        for kind in [AlertKind.high, .fastrise] {
+            let tap = Date()
+            for newerDecision in [false, true] {
+                let player = PreviewSoundPlayer()
+                let harness = Harness(soundPlayer: player)
+                defer { harness.finish() }
+                let entry = AlertEntriesAccessor(coreDataManager: harness.core)
+                    .getAllEntries(forAlertKind: kind, alertTypesAccessor: AlertTypesAccessor(coreDataManager: harness.core)).first
+                entry?.alertType = harness.type
+                let coordinator = RootApplicationCoordinator()
+                var completed = false
+                XCTAssertTrue(coordinator.handleHighNotificationSnooze(notificationIdentifier: kind.notificationIdentifier(),
+                    actionIdentifier: AlertManager.snoozeActionIdentifier, deliveredAt: tap, receivedAt: tap) { completed = true })
+                if newerDecision { SelectiveAlarmSilence.end(at: tap.addingTimeInterval(1), defaults: harness.defaults) }
+                harness.type.soundname = nil
+                harness.manager.applyImmediatePresentation(from: harness.type, to: UNMutableNotificationContent(), kind: .low)
+                let revision = SelectiveAlarmSilence.revision(defaults: harness.defaults)
+                coordinator.installAlertManager(harness.manager, at: tap.addingTimeInterval(newerDecision ? 2 : 15 * 60))
+                XCTAssertTrue(completed)
+                XCTAssertEqual(SelectiveAlarmSilence.revision(defaults: harness.defaults), revision)
+                XCTAssertNil(harness.manager.getSnoozeParameters(alertKind: kind).snoozeTimeStamp)
+                XCTAssertTrue(player.isPlaying())
+                XCTAssertEqual(player.stopCount, 0)
+            }
         }
     }
 
     func testUserHighSnoozePickerUsesExactDeadlineAndPreservesProtectedSnoozes() throws {
         let contents: [UNNotificationContent?] = [nil, UNMutableNotificationContent()]
-        for kind in [AlertKind.high, .veryhigh] {
+        for kind in [AlertKind.high, .veryhigh, .fastrise] {
             for content in contents {
                 let harness = Harness()
                 defer { harness.finish() }
@@ -842,20 +852,20 @@ final class HighSoonNotificationTests: XCTestCase {
     func testCancelingHighPickerAndConfirmingOtherKindsNeverStartSelectiveSilence() throws {
         let harness = Harness()
         defer { harness.finish() }
-        for kind in [AlertKind.high, .veryhigh] {
+        for kind in [AlertKind.high, .veryhigh, .fastrise] {
             let picker = harness.manager.createPickerViewData(forAlertKind: kind,
                 content: UNMutableNotificationContent(), actionHandler: nil, cancelHandler: nil)
             picker.cancelHandler?()
             XCTAssertNil(SelectiveAlarmSilence.until(defaults: harness.defaults))
             XCTAssertNil(harness.manager.getSnoozeParameters(alertKind: kind).snoozeTimeStamp)
         }
-        for kind in [AlertKind.low, .verylow, .lowSoon, .fastrise, .fastdrop, .calibration] {
+        for kind in [AlertKind.low, .verylow, .lowSoon, .fastdrop, .calibration] {
             let picker = harness.manager.createPickerViewData(forAlertKind: kind,
                 content: UNMutableNotificationContent(), actionHandler: nil, cancelHandler: nil)
             picker.actionHandler(try XCTUnwrap(ConstantsAlerts.snoozeValueMinutes.firstIndex(of: 30)))
             XCTAssertEqual(harness.manager.getSnoozeParameters(alertKind: kind).snoozePeriodInMinutes, 30)
             XCTAssertNil(SelectiveAlarmSilence.until(defaults: harness.defaults),
-                "Only an explicit high/very-high action starts the shared pause")
+                "Only an explicit high/very-high/fast-rise action starts the shared pause")
         }
         XCTAssertTrue(try harness.core.mainManagedObjectContext.fetch(TreatmentEntry.fetchRequest()).isEmpty)
     }
@@ -915,7 +925,7 @@ final class HighSoonNotificationTests: XCTestCase {
     }
 
     func testStaleHighPickerConfirmationAndCancelPreserveNewerProtectedAlarmSound() throws {
-        for highKind in [AlertKind.high, .veryhigh] {
+        for highKind in [AlertKind.high, .veryhigh, .fastrise] {
             for playingKind in [AlertKind.low, .verylow, .lowSoon, .missedreading, .sensorTransmitterFailure] {
                 let player = PreviewSoundPlayer()
                 let harness = Harness(soundPlayer: player)
@@ -957,6 +967,63 @@ final class HighSoonNotificationTests: XCTestCase {
         await drainCallbacks()
         XCTAssertEqual(highRetries, 0, "Ending the pause cannot revive an already invalidated high request")
         XCTAssertEqual(protectedReplies, protected)
+    }
+
+    func testHighAndFastRiseSnoozeEachOtherThroughTheScreenAndEndWithoutErasingOtherSnoozes() throws {
+        for trigger in [AlertKind.high, .fastrise] {
+            let harness = Harness()
+            defer { harness.finish() }
+            let model = SnoozeViewModel(alertManager: harness.manager)
+            let calibration = harness.manager.getSnoozeParameters(alertKind: .calibration)
+            calibration.snooze(snoozePeriodInMinutes: 120)
+            let independentStart = calibration.snoozeTimeStamp
+            model.handleAlertToggleChanged(alertKind: trigger, isOn: true)
+            let picker = try XCTUnwrap(model.pickerData?.pickerViewData)
+            picker.actionHandler(try XCTUnwrap(ConstantsAlerts.snoozeValueMinutes.firstIndex(of: 30)))
+            let until = try XCTUnwrap(SelectiveAlarmSilence.until(defaults: harness.defaults))
+            for kind in SelectiveAlarmSilence.kinds {
+                XCTAssertTrue(harness.manager.quietPeriodSuppresses(kind))
+                let own = harness.manager.getSnoozeParameters(alertKind: kind)
+                let deadline = own.snoozeTimeStamp.map { $0.addingTimeInterval(Double(own.snoozePeriodInMinutes) * 60) }
+                let row = SnoozeViewModel.Row(alertKind: kind, sectionTitle: "", individualUntil: deadline)
+                XCTAssertTrue(row.status(at: Date(), silenceUntil: until).isMuted)
+                XCTAssertEqual(row.status(at: Date(), silenceUntil: until).effectiveUntil,
+                    max(deadline ?? .distantPast, until))
+            }
+            for protected in [AlertKind.low, .verylow, .lowSoon, .missedreading, .sensorTransmitterFailure] {
+                XCTAssertFalse(harness.manager.quietPeriodSuppresses(protected))
+            }
+            // Ending a shared-only row must immediately end the shared pause, but may not
+            // erase the original alarm's individual deadline or another independent snooze.
+            let other: AlertKind = trigger == .high ? .fastrise : .high
+            model.handleAlertToggleChanged(alertKind: other, isOn: false)
+            XCTAssertNil(SelectiveAlarmSilence.until(defaults: harness.defaults))
+            XCTAssertFalse(harness.manager.getSnoozeParameters(alertKind: other).getSnoozeValue().isSnoozed)
+            XCTAssertTrue(harness.manager.getSnoozeParameters(alertKind: trigger).getSnoozeValue().isSnoozed)
+            XCTAssertEqual(calibration.snoozeTimeStamp, independentStart)
+            XCTAssertEqual(calibration.snoozePeriodInMinutes, 120)
+            XCTAssertTrue(try harness.core.mainManagedObjectContext.fetch(TreatmentEntry.fetchRequest()).isEmpty)
+        }
+    }
+
+    func testCancelSnoozeScreenPickerPreservesExistingIndividualAndSharedDeadlines() throws {
+        let harness = Harness()
+        defer { harness.finish() }
+        let model = SnoozeViewModel(alertManager: harness.manager)
+        let own = harness.manager.getSnoozeParameters(alertKind: .fastrise)
+        own.snooze(snoozePeriodInMinutes: 60)
+        let startedAt = own.snoozeTimeStamp
+        SelectiveAlarmSilence.start(until: Date().addingTimeInterval(1800), defaults: harness.defaults)
+        let revision = SelectiveAlarmSilence.revision(defaults: harness.defaults)
+        model.handleAlertToggleChanged(alertKind: .fastrise, isOn: true)
+        let picker = try XCTUnwrap(model.pickerData?.pickerViewData)
+        picker.cancelHandler?()
+        XCTAssertEqual(own.snoozeTimeStamp, startedAt)
+        XCTAssertEqual(own.snoozePeriodInMinutes, 60)
+        XCTAssertEqual(SelectiveAlarmSilence.revision(defaults: harness.defaults), revision)
+        model.handleAlertToggleChanged(alertKind: .low, isOn: false)
+        XCTAssertEqual(SelectiveAlarmSilence.revision(defaults: harness.defaults), revision,
+            "A protected row never ends the shared pause")
     }
 
     private func drainCallbacks() async {

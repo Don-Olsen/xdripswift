@@ -47,6 +47,9 @@ enum SelectiveAlarmSilence {
     static let defaultDurationMinutes = 60
     static var durationChoices: [Int] { ConstantsAlerts.snoozeValueMinutes.filter { $0 <= 120 } }
 
+    /// Only an explicit user snooze of these alerts starts the existing shared pause.
+    static let userSnoozeTriggers: Set<AlertKind> = [.high, .veryhigh, .fastrise]
+
     static let kinds: Set<AlertKind> = [.high, .veryhigh, .fastrise, .fastdrop, .calibration,
         .batterylow, .dexcomG5BatteryLow, .dexcomG7BatteryLow, .phonebatterylow, .notlooping]
 
@@ -89,7 +92,7 @@ enum SelectiveAlarmSilence {
         store(until: expiry, changedAt: now, defaults: defaults)
     }
 
-    /// An explicit high snooze starts or extends the pause; it never toggles an active pause off.
+    /// An explicit shared-group snooze starts or extends the pause; it never toggles an active pause off.
     @MainActor static func start(until expiry: Date, at now: Date = .now,
                                  defaults: UserDefaults = .standard) {
         guard now.timeIntervalSince1970.isFinite, expiry.timeIntervalSince1970.isFinite,

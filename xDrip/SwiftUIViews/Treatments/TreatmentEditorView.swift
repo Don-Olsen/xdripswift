@@ -466,16 +466,18 @@ struct PenDoseCalculatorScreen: View {
 
     let coreDataManager: CoreDataManager
     let refreshRequestRevision: Int
+    let startsCartridgeChange: Bool
     let onSave: () -> Void
     let onCancel: () -> Void
 
     private enum InputField: Hashable { case carbohydrates, insulin, glucose }
 
     init(coreDataManager: CoreDataManager, reminderMealUUID: String? = nil,
-         refreshRequestRevision: Int = 0,
+         refreshRequestRevision: Int = 0, startsCartridgeChange: Bool = false,
          onSave: @escaping () -> Void, onCancel: @escaping () -> Void) {
         self.coreDataManager = coreDataManager
         self.refreshRequestRevision = refreshRequestRevision
+        self.startsCartridgeChange = startsCartridgeChange
         self.onSave = onSave
         self.onCancel = onCancel
         _viewModel = StateObject(wrappedValue: PenDoseCalculatorViewModel(
@@ -570,9 +572,10 @@ struct PenDoseCalculatorScreen: View {
                 viewModel.scheduleCalculation(debounce: false)
             }
             .task {
-                // Ordinary opening leaves both fields unfocused so a correction cannot
-                // accidentally start in carbohydrates. Keep explicit meal-reassessment focus.
-                guard viewModel.reminderMealUUID != nil, !didSetInitialFocus else { return }
+                // Ordinary opening stays unfocused. Both explicit intents start in insulin;
+                // a cartridge request never opens or confirms an allocation automatically.
+                guard viewModel.reminderMealUUID != nil || startsCartridgeChange,
+                      !didSetInitialFocus else { return }
                 didSetInitialFocus = true
                 await Task.yield()
                 focusedField = .insulin
@@ -805,7 +808,12 @@ struct PenDoseCalculatorScreen: View {
                     .accessibilityLabel("Insulin, enheder")
                 Text("E").font(.title3).foregroundStyle(.secondary)
             }
-            if viewModel.canAdjustCartridgeAllocation {
+            if startsCartridgeChange && viewModel.cartridgeAllocationSummary == nil {
+                Text("Angiv hele den dosis, du tager, også delen fra den gamle ampul. Fordel derefter mellem ampullerne. Er dosis allerede logget, skal du åbne den i Treatments i stedet.")
+                    .font(.footnote).foregroundStyle(.secondary)
+                    .accessibilityIdentifier("calculator.cartridgeGuidance")
+            }
+            if startsCartridgeChange || viewModel.canAdjustCartridgeAllocation {
                 Button {
                     focusedField = nil
                     cartridgeAllocation = viewModel.cartridgeAllocationRequest()
@@ -816,7 +824,8 @@ struct PenDoseCalculatorScreen: View {
                                 .font(.footnote).foregroundStyle(.orange)
                         }
                         Text(viewModel.cartridgeAllocationSummary == nil
-                             ? "Skift ampul under dosis" : "Ret ampulfordeling")
+                             ? (startsCartridgeChange ? "Fordel mellem ampuller" : "Skift ampul under dosis")
+                             : "Ret ampulfordeling")
                         if let summary = viewModel.cartridgeAllocationSummary {
                             Text(summary).font(.footnote).foregroundStyle(.secondary)
                         }
@@ -827,6 +836,7 @@ struct PenDoseCalculatorScreen: View {
                 .font(.subheadline)
                 .buttonStyle(.plain)
                 .foregroundStyle(ConstantsAppColors.accent)
+                .disabled(!viewModel.canAdjustCartridgeAllocation)
                 .accessibilityIdentifier("calculator.cartridgeAllocation")
             }
             if viewModel.usesAutomaticMealDose {

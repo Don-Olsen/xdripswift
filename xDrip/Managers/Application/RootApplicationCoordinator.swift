@@ -3669,7 +3669,7 @@ extension RootApplicationCoordinator: @preconcurrency UNUserNotificationCenterDe
                                       deliveredAt: Date, receivedAt: Date = Date(),
                                       completion: @escaping () -> Void) -> Bool {
         guard actionIdentifier == AlertManager.snoozeActionIdentifier,
-              let kind = [AlertKind.high, .veryhigh].first(where: { $0.notificationIdentifier() == notificationIdentifier })
+              let kind = SelectiveAlarmSilence.userSnoozeTriggers.first(where: { $0.notificationIdentifier() == notificationIdentifier })
         else { return false }
         if let alertManager {
             alertManager.applyHighNotificationSnooze(kind, receivedAt: receivedAt, now: receivedAt)

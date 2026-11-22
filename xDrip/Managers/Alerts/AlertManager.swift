@@ -706,7 +706,7 @@ public class AlertManager: NSObject {
                     trace("in userNotificationCenter, received actionIdentifier : snoozeActionIdentifier, snoozing alert %{public}@ for %{public}@ minutes (3)", log: log, category: ConstantsLog.categoryAlertManager, type: .info, alertKind.descriptionForLogging(), Int(currentAlertEntry.alertType.snoozeperiod).description)
                     
                     snooze(alertKind: alertKind, snoozePeriodInMinutes: Int(currentAlertEntry.alertType.snoozeperiod), response: response)
-                    silenceAfterUserHighSnooze(alertKind: alertKind)
+                    silenceAfterUserGroupSnooze(alertKind: alertKind)
                     
                     // save changes in coredata
                     coreDataManager.saveChanges()
@@ -818,9 +818,13 @@ public class AlertManager: NSObject {
     }
     
     /// to unSnooze an already snoozed alert
-    public func unSnooze(alertKind: AlertKind) {
+    @MainActor public func unSnooze(alertKind: AlertKind, includingSelectiveSilence: Bool = false) {
         // unsnooze
         getSnoozeParameters(alertKind: alertKind).unSnooze()
+        if includingSelectiveSilence, SelectiveAlarmSilence.kinds.contains(alertKind),
+           SelectiveAlarmSilence.isActive(defaults: silenceDefaults) {
+            SelectiveAlarmSilence.end(defaults: silenceDefaults)
+        }
         
         // save changes in coredata
         coreDataManager.saveChanges()
@@ -872,7 +876,7 @@ public class AlertManager: NSObject {
             
                                   // save changes in coredata
                                   self.coreDataManager.saveChanges()
-                                  self.silenceAfterUserHighSnooze(alertKind: alertKind)
+                                  self.silenceAfterUserGroupSnooze(alertKind: alertKind)
             
                                   // if it's a missed reading alert, then cancel any planned missed reading alerts and reschedule
                                   // if content is not nil, then it means a missed reading alert went off, the user clicked it, app opens, user clicks snooze, snoozing must be set
@@ -903,15 +907,16 @@ public class AlertManager: NSObject {
                               }, didSelectRowHandler: nil, largePresentationTitle: alertKind.largeSnoozeTitle())
     }
     
-    /// A stale high notification/picker must not stop a newer protected alarm's sound.
+    /// A stale shared-group notification/picker must not stop a newer protected alarm's sound.
     private func stopSoundForUserAction(alertKind: AlertKind) {
-        if (alertKind == .high || alertKind == .veryhigh), let playingAlarmKind,
+        if SelectiveAlarmSilence.kinds.contains(alertKind), let playingAlarmKind,
            !SelectiveAlarmSilence.kinds.contains(playingAlarmKind) { return }
         soundPlayer?.stopPlaying()
     }
 
-    /// The coordinator accepts only explicit High/Very High notification snoozes here.
+    /// The coordinator accepts only explicit High/Very High/Fast Rise snoozes here.
     @MainActor func applyHighNotificationSnooze(_ kind: AlertKind, receivedAt: Date, now: Date) {
+        guard SelectiveAlarmSilence.userSnoozeTriggers.contains(kind) else { return }
         let snooze = getSnoozeParameters(alertKind: kind)
         guard receivedAt > (snooze.snoozeTimeStamp ?? .distantPast),
               receivedAt > (SelectiveAlarmSilence.lastChangedAt(defaults: silenceDefaults) ?? .distantPast) else { return }
@@ -921,13 +926,13 @@ public class AlertManager: NSObject {
         guard receivedAt == now || receivedAt.addingTimeInterval(TimeInterval(minutes) * 60) > now else { return }
         stopSoundForUserAction(alertKind: kind)
         self.snooze(alertKind: kind, snoozePeriodInMinutes: minutes, response: nil, notificationActionAt: receivedAt)
-        silenceAfterUserHighSnooze(alertKind: kind)
+        silenceAfterUserGroupSnooze(alertKind: kind)
     }
 
     /// Called only from the user's notification action or confirmed Snooze picker.
     /// Generic snooze()/automatic repeat throttling deliberately never enter this path.
-    private func silenceAfterUserHighSnooze(alertKind: AlertKind) {
-        guard alertKind == .high || alertKind == .veryhigh else { return }
+    private func silenceAfterUserGroupSnooze(alertKind: AlertKind) {
+        guard SelectiveAlarmSilence.userSnoozeTriggers.contains(alertKind) else { return }
         let snooze = getSnoozeParameters(alertKind: alertKind)
         guard let startedAt = snooze.snoozeTimeStamp, snooze.snoozePeriodInMinutes > 0 else { return }
         let expiry = startedAt.addingTimeInterval(Double(snooze.snoozePeriodInMinutes) * 60)

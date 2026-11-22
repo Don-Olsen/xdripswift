@@ -22,6 +22,49 @@ De følgende afsnit bevarer integrations- og testhistorikken før denne udgivels
 
 De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
 
+## Ampulskift fra Home og fælles snooze — 22. november 2026
+
+Indledende validering før release; faktisk udgivelse fremgår af TestFlight-afsnittet øverst.
+
+Home-knappen “Ny ampul” tilbød kun en ny fuld ampul, selv om fordeling af en
+faktisk dosis allerede fandtes i beregneren og behandlingseditoren. Dialogen har
+nu også “Skift under dosis”, som åbner den samme beregner med fokus på insulin
+og kort vejledning. Gammel rest/baseline bevares indtil den eksisterende
+fordelingsbekræftelse. En forældet baseline, manglende lokal kilde/readiness,
+skærmlås eller allerede åben beregner må ikke omgås. Almindeligt ampulskift er
+bevaret. En allerede logget dosis rettes fortsat gennem Treatments; åbning af
+den nye genvej registrerer intet og ændrer ingen tidligere behandling.
+
+Fælles “Lydløs” blev kun startet ved brugerens snooze af Høj/Akut høj. Hurtig
+stigning var udtrykkeligt undtaget i både kode og tests. Den starter nu samme
+fælles pause gennem varighedsvælgeren og notifikationshandlingen, også før
+appafhængighederne er klar. Automatisk alarmgentagelse starter fortsat ikke
+fælles pause. Den eksisterende gruppe og beskyttelsen af Lav, Akut lav, Snart
+lavt, manglende målinger og sensorfejl er uændrede; ingen Watch-protokol ændres.
+Kontakterne viser nu den effektive snooze og seneste relevante sluttid. Slås
+en dæmpet række fra, afsluttes fælles pause og rækkens egen snooze; andre
+selvstændige snoozes bevares. Annullering af en varighedsvælger sletter ikke en
+eksisterende snooze. Et gammelt høj-/stigningsvarsel må ikke stoppe en nyere
+beskyttet alarms lyd.
+
+Validering: `scripts/local-build.sh release-test` bestod med 2035/2035 XCTest,
+0 fejl/skipped, alle otte krævede Watch/Libre-suiter, 236 Python-tests samt
+30 og 24 syntetiske Watch-kontroller. Begge simulatorbuilds bestod. Tests for
+Hurtig stigning er tilføjet til de tidligere Høj-scenarier; forventningen om,
+at Hurtig stigning aldrig starter fælles pause, er bevidst ændret. Der er 47
+alarmnotifikationstests og 45 ampultests, inklusive ny Home-start uden
+lagerændring, eksisterende logning/fordeling, begge snooze-retninger, koldstart,
+annullering og uafhængige deadlines. Diff-kontrollen bestod.
+
+Kvittering og testbilleder ligger uden for Git:
+`~/DeveloperBuildData/xDrip/local-runs/xdripswift/20261122T173208Z-14456/`.
+Beregneren er renderet i simulatorens UIHosting-vindue med normal/stor tekst,
+og det eksplicitte insulinfokus er kontrolleret. Dette er ikke en fysisk test
+af Home-dialogens tryk eller af alarmlevering/lyd på iPhone og Watch. Ved den
+indledende validering var der ikke udført installation, signeret arkiv, unsigned
+iPhoneOS-build eller upload. Releaseforløbet vælger særskilt buildnummer og
+tester det præcise release-checkpoint som normalt.
+
 ## iCloud-arkivering af gamle releasebeviser — 22. november 2026
 
 Ejeren har godkendt, at ældre afsluttede releases flyttes til sit private

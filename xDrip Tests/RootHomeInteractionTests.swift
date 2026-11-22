@@ -3365,40 +3365,45 @@ extension RootHomeInteractionTests {
             window.rootViewController = nil
             previous?.makeKey()
         }
-        for size in [DynamicTypeSize.large, .accessibility3] {
-            let appeared = expectation(description: "Synthetic calculator appears at \(size)")
-            let screen = PenDoseCalculatorScreen(coreDataManager: sourceHarness.core,
-                onSave: { XCTFail("Visual check must not save") }, onCancel: {})
-                .environment(\.dynamicTypeSize, size)
-                .environment(\.colorScheme, .dark)
-                .onAppear { appeared.fulfill() }
-            let host = UIHostingController(rootView: screen)
-            window.rootViewController = host
-            window.makeKeyAndVisible()
-            await fulfillment(of: [appeared], timeout: 2)
-            try await Task.sleep(nanoseconds: 200_000_000)
-            host.view.layoutIfNeeded()
-            if size.isAccessibilitySize,
-               let scroll = calculatorScrollView(in: host.view) {
-                scroll.setContentOffset(CGPoint(x: 0,
-                    y: max(0, scroll.contentSize.height - scroll.bounds.height + scroll.adjustedContentInset.bottom)),
-                    animated: false)
-                try await Task.sleep(nanoseconds: 150_000_000)
+        for startsCartridgeChange in [false, true] {
+            for size in [DynamicTypeSize.large, .accessibility3] {
+                let appeared = expectation(description: "Synthetic calculator appears at \(size)")
+                let screen = PenDoseCalculatorScreen(coreDataManager: sourceHarness.core, startsCartridgeChange: startsCartridgeChange,
+                    onSave: { XCTFail("Visual check must not save") }, onCancel: {})
+                    .environment(\.dynamicTypeSize, size)
+                    .environment(\.colorScheme, .dark)
+                    .onAppear { appeared.fulfill() }
+                let host = UIHostingController(rootView: screen)
+                window.rootViewController = host
+                window.makeKeyAndVisible()
+                await fulfillment(of: [appeared], timeout: 2)
+                try await Task.sleep(nanoseconds: 200_000_000)
                 host.view.layoutIfNeeded()
+                if size.isAccessibilitySize,
+                   let scroll = calculatorScrollView(in: host.view) {
+                    scroll.setContentOffset(CGPoint(x: 0,
+                        y: max(0, scroll.contentSize.height - scroll.bounds.height + scroll.adjustedContentInset.bottom)),
+                        animated: false)
+                    try await Task.sleep(nanoseconds: 150_000_000)
+                    host.view.layoutIfNeeded()
+                }
+                addCalculatorLayoutAttachment(host.view, name: "Synthetic calculator status cartridge=\(startsCartridgeChange) \(size)")
+                if size == .large {
+                    let insulin = try XCTUnwrap(calculatorTextFields(in: host.view)
+                        .first { $0.placeholder == "0,0" })
+                    if startsCartridgeChange {
+                        XCTAssertTrue(insulin.isFirstResponder, "Home's explicit cartridge action focuses the actual insulin total")
+                    }
+                    XCTAssertTrue(insulin.becomeFirstResponder())
+                    try await Task.sleep(nanoseconds: 500_000_000)
+                    host.view.layoutIfNeeded()
+                    XCTAssertTrue(insulin.isFirstResponder)
+                    addCalculatorLayoutAttachment(host.view, name: "Synthetic calculator status cartridge=\(startsCartridgeChange) with focused insulin")
+                    window.endEditing(true)
+                }
+                window.rootViewController = nil
+                await Task.yield()
             }
-            addCalculatorLayoutAttachment(host.view, name: "Synthetic calculator status \(size)")
-            if size == .large {
-                let insulin = try XCTUnwrap(calculatorTextFields(in: host.view)
-                    .first { $0.placeholder == "0,0" })
-                XCTAssertTrue(insulin.becomeFirstResponder())
-                try await Task.sleep(nanoseconds: 500_000_000)
-                host.view.layoutIfNeeded()
-                XCTAssertTrue(insulin.isFirstResponder)
-                addCalculatorLayoutAttachment(host.view, name: "Synthetic calculator status with focused insulin")
-                window.endEditing(true)
-            }
-            window.rootViewController = nil
-            await Task.yield()
         }
         XCTAssertTrue(try sourceHarness.core.mainManagedObjectContext.fetch(TreatmentEntry.fetchRequest()).isEmpty)
         XCTAssertFalse(sourceHarness.core.mainManagedObjectContext.hasChanges)

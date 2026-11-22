@@ -143,6 +143,7 @@ struct PenCartridgeHomeRow: View {
     let baselineID: UUID?
     let openDetails: () -> Void
     let replace: (UUID?) -> Bool
+    var splitDuringDose: ((UUID?) -> Bool)? = nil
 
     var body: some View {
         ViewThatFits(in: .horizontal) {
@@ -184,7 +185,8 @@ struct PenCartridgeHomeRow: View {
     }
 
     private var replaceButton: some View {
-        PenCartridgeReplacementButton(baselineID: baselineID, replace: replace)
+        PenCartridgeReplacementButton(baselineID: baselineID, replace: replace,
+                                      splitDuringDose: splitDuringDose)
             .foregroundStyle(ConstantsAppColors.accent)
     }
 }
@@ -192,6 +194,7 @@ struct PenCartridgeHomeRow: View {
 private struct PenCartridgeReplacementButton: View {
     let baselineID: UUID?
     let replace: (UUID?) -> Bool
+    var splitDuringDose: ((UUID?) -> Bool)? = nil
     @State private var showsConfirmation = false
     @State private var expectedBaseline: UUID?
     @State private var failed = false
@@ -206,11 +209,18 @@ private struct PenCartridgeReplacementButton: View {
         .accessibilityIdentifier("penCartridge.replace")
         .alert("Ny ampul på 300 E?", isPresented: $showsConfirmation) {
             Button("Annuller", role: .cancel) {}
+            if let splitDuringDose {
+                Button("Skift under dosis") {
+                    failed = !splitDuringDose(expectedBaseline)
+                }
+            }
             Button("Start ny ampul") {
                 failed = !replace(expectedBaseline)
             }
         } message: {
-            Text("Bekræft, når du har sat en ny, fuld ampul i pennen.")
+            Text(splitDuringDose == nil
+                 ? "Bekræft, når du har sat en ny, fuld ampul i pennen."
+                 : "Skifter du midt i en dosis, vælg Skift under dosis. Ellers bekræfter du en ny, fuld ampul på 300 E.")
         }
         .alert("Ampullen kunne ikke skiftes", isPresented: $failed) {
             Button("OK", role: .cancel) {}

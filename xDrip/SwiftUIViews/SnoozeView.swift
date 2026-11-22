@@ -152,26 +152,19 @@ struct SnoozeView: View {
     }
     
     @ViewBuilder private func alarmRow(for row: SnoozeViewModel.Row, status: SnoozeViewModel.Row.Status, at now: Date) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            if let until = status.silenceUntil {
-                Label("Lydløs til \(formattedDeadline(until, at: now))", systemImage: "speaker.slash.fill")
+        Toggle(isOn: Binding(
+            get: { status.isMuted },
+            set: { viewModel.handleAlertToggleChanged(alertKind: row.alertKind, isOn: $0) }
+        )) {
+            if let until = status.effectiveUntil {
+                Text("\(TextsSnooze.snoozed_until) \(formattedDeadline(until, at: now))")
                     .foregroundStyle(Color(.colorPrimary))
+            } else {
+                Text(TextsSnooze.not_snoozed)
+                    .foregroundStyle(Color(.colorTertiary))
             }
-            Toggle(isOn: Binding(
-                get: { status.individualUntil != nil },
-                set: { viewModel.handleAlertToggleChanged(alertKind: row.alertKind, isOn: $0) }
-            )) {
-                if let until = status.individualUntil {
-                    let prefix = status.silenceUntil == nil ? TextsSnooze.snoozed_until : "Egen snooze til"
-                    Text("\(prefix) \(formattedDeadline(until, at: now))")
-                        .foregroundStyle(Color(.colorPrimary))
-                } else {
-                    Text(status.silenceUntil == nil ? TextsSnooze.not_snoozed : "Egen snooze")
-                        .foregroundStyle(Color(.colorTertiary))
-                }
-            }
-            .tint(.green)
         }
+        .tint(.green)
         .padding(.vertical, 6)
     }
 
@@ -211,7 +204,8 @@ struct SnoozeView: View {
         struct Status {
             let individualUntil: Date?
             let silenceUntil: Date?
-            var isMuted: Bool { individualUntil != nil || silenceUntil != nil }
+            var effectiveUntil: Date? { [individualUntil, silenceUntil].compactMap { $0 }.max() }
+            var isMuted: Bool { effectiveUntil != nil }
         }
 
         func status(at now: Date, silenceUntil: Date?) -> Status {
@@ -287,14 +281,14 @@ struct SnoozeView: View {
                     content: nil,
                     actionHandler: { self.refresh() },
                     cancelHandler: {
-                        self.alertManager.unSnooze(alertKind: alertKind)
+                        // Opening the picker changes nothing; cancel must preserve both deadlines.
                         self.refresh()
                     }
                 )
             )
         } else {
             // Changing from on to off means user wants to unsnooze.
-            alertManager.unSnooze(alertKind: alertKind)
+            alertManager.unSnooze(alertKind: alertKind, includingSelectiveSilence: true)
             refresh()
         }
     }

@@ -244,6 +244,7 @@ struct RootHomeView: View {
     @ObservedObject private var cartridge = PenCartridgeMonitor.shared
     @State private var showsCartridgeDetails = false
     @State private var showsPenCalculator = false
+    @State private var opensCalculatorForCartridgeChange = false
     @State private var penCalculatorSheetVisible = false
     @State private var calculatorApplicationIsActive = UIApplication.shared.applicationState == .active
     @State private var healthTherapySelectionSignature = ""
@@ -630,10 +631,14 @@ struct RootHomeView: View {
         .fullScreenCover(isPresented: $showsExpandedIPadChart, onDismiss: MealPlanReminderCoordinator.presentationFinished) {
             expandedIPadChart
         }
-        .sheet(isPresented: $showsPenCalculator, onDismiss: MealPlanReminderCoordinator.presentationFinished) {
+        .sheet(isPresented: $showsPenCalculator, onDismiss: {
+            opensCalculatorForCartridgeChange = false
+            MealPlanReminderCoordinator.presentationFinished()
+        }) {
             PenDoseCalculatorScreen(coreDataManager: coreDataManager,
                 reminderMealUUID: nil,
                 refreshRequestRevision: penCalculatorQuickActionDeliveryRevision,
+                startsCartridgeChange: opensCalculatorForCartridgeChange,
                 onSave: {
                     showsPenCalculator = false
                     actions.refreshPumpAndLoopStatus()
@@ -1424,7 +1429,16 @@ struct RootHomeView: View {
                 replace: { expectedBaseline in
                     guard cartridge.isEnabled, cartridge.snapshot.baselineID == expectedBaseline else { return false }
                     return cartridge.newCartridge()
-                })
+                }, splitDuringDose: calculatorQuickActionIsReady ? { expectedBaseline in
+                    RootHomeCalculatorQuickActionPresentation.openCartridgeAllocation(
+                        expectedBaseline: expectedBaseline, currentBaseline: cartridge.snapshot.baselineID,
+                        isEnabled: cartridge.isEnabled,
+                        isReady: calculatorQuickActionIsReady && !state.isScreenLocked,
+                        isAlreadyPresented: showsPenCalculator) {
+                            opensCalculatorForCartridgeChange = true
+                            showsPenCalculator = true
+                        }
+                } : nil)
         }
     }
 
