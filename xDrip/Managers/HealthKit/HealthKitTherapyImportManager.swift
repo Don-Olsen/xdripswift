@@ -1084,31 +1084,46 @@ final class HealthKitLocalTherapyWriter {
 
     private let store: HealthLocalTherapyWriting
     private let defaults: UserDefaults
+    private let statusStore: HealthKitExportStatusStore
+    private let pendingCount: (NSManagedObjectContext, NSFetchRequest<TreatmentEntry>) throws -> Int
     private let acknowledgementSaver: (NSManagedObjectContext) throws -> Void
     private let deletionIsVerified: @MainActor (CoreDataManager) -> Bool
     private let queue = DispatchQueue(label: "health.therapy.local.write", qos: .utility)
     private var coreDataManager: CoreDataManager?
     private var saveObserver: NSObjectProtocol?
+    private var mergeObserver: NSObjectProtocol?
     private var foregroundObserver: NSObjectProtocol?
     private var protectedDataObserver: NSObjectProtocol?
     private var authorizationObserver: NSObjectProtocol?
     private var inFlight = false
     private var failedOnce = false
     private var retryScheduled = false
+    // Owned by queue, independently of the actual export/retry worker.
+    private var pendingCountRevision: UInt64 = 0
+    private var pendingCountsInFlight = false
+    private var pendingCountsDirty = true
+    private var pendingCountCutover: TreatmentSourceCutover?
 
     init(store: HealthLocalTherapyWriting, defaults: UserDefaults = .standard,
          acknowledgementSaver: @escaping (NSManagedObjectContext) throws -> Void = { try $0.save() },
          deletionIsVerified: @escaping @MainActor (CoreDataManager) -> Bool = {
              PenDoseLogJournal.shared.recoveryState(coreDataManager: $0) == .ready
+         },
+         statusStore: HealthKitExportStatusStore = .shared,
+         pendingCount: @escaping (NSManagedObjectContext, NSFetchRequest<TreatmentEntry>) throws -> Int = {
+             try $0.count(for: $1)
          }) {
         self.store = store
         self.defaults = defaults
+        self.statusStore = statusStore
+        self.pendingCount = pendingCount
         self.acknowledgementSaver = acknowledgementSaver
         self.deletionIsVerified = deletionIsVerified
     }
 
     deinit {
         if let saveObserver { NotificationCenter.default.removeObserver(saveObserver) }
+        if let mergeObserver { NotificationCenter.default.removeObserver(mergeObserver) }
         if let foregroundObserver { NotificationCenter.default.removeObserver(foregroundObserver) }
         if let protectedDataObserver { NotificationCenter.default.removeObserver(protectedDataObserver) }
         if let authorizationObserver { NotificationCenter.default.removeObserver(authorizationObserver) }
@@ -1121,7 +1136,33 @@ final class HealthKitLocalTherapyWriter {
             self.saveObserver = NotificationCenter.default.addObserver(
                 forName: .NSManagedObjectContextDidSave,
                 object: coreDataManager.privateManagedObjectContext,
-                queue: nil) { [weak self] _ in self?.retryPending() }
+                queue: nil) { [weak self] note in
+                    // Inspect managed objects on the saving context's queue; only pass a Bool.
+                    let treatmentsChanged = [NSInsertedObjectsKey, NSUpdatedObjectsKey, NSDeletedObjectsKey]
+                        .contains { key in
+                            (note.userInfo?[key] as? Set<NSManagedObject>)?
+                                .contains { $0.entity.name == "TreatmentEntry" } == true
+                        }
+                    self?.queue.async { [weak self] in
+                        guard let self else { return }
+                        self.requestPendingCounts(force: treatmentsChanged)
+                        // An unrelated durable save is still an existing export retry opportunity.
+                        self.attemptNext()
+                    }
+                }
+            if let mergeObserver = self.mergeObserver { NotificationCenter.default.removeObserver(mergeObserver) }
+            self.mergeObserver = NotificationCenter.default.addObserver(
+                forName: NSManagedObjectContext.didMergeChangesObjectIDsNotification,
+                object: coreDataManager.privateManagedObjectContext, queue: nil) { [weak self] note in
+                    // Housekeeping merges batch deletions without a context save. Refresh only
+                    // the affected counts; this is not a new Health export/retry trigger.
+                    let treatmentsChanged = [NSInsertedObjectIDsKey, NSUpdatedObjectIDsKey, NSDeletedObjectIDsKey]
+                        .contains { key in
+                            (note.userInfo?[key] as? Set<NSManagedObjectID>)?
+                                .contains { $0.entity.name == "TreatmentEntry" } == true
+                        }
+                    if treatmentsChanged { self?.refreshPendingCounts() }
+                }
             if self.foregroundObserver == nil {
                 self.foregroundObserver = NotificationCenter.default.addObserver(
                     forName: UIApplication.didBecomeActiveNotification,
@@ -1139,14 +1180,14 @@ final class HealthKitLocalTherapyWriter {
                     forName: .healthKitPhoneAuthorizationDidChange,
                     object: nil, queue: nil) { [weak self] _ in self?.retryAfterAvailabilityChange() }
             }
-            self.refreshPendingCounts()
+            self.requestPendingCounts(force: true)
             self.attemptNext()
         }
     }
 
     func retryPending() {
         queue.async {
-            self.refreshPendingCounts()
+            self.requestPendingCounts(force: true)
             self.attemptNext()
         }
     }
@@ -1154,51 +1195,78 @@ final class HealthKitLocalTherapyWriter {
     private func retryAfterAvailabilityChange() {
         queue.async {
             self.failedOnce = false
-            self.refreshPendingCounts()
+            self.requestPendingCounts(force: true)
             self.attemptNext()
         }
     }
 
-    /// Counts the complete durable queue without loading treatment values into diagnostics.
-    /// Settings may request a refresh on presentation; saves and completed operations refresh it too.
+    /// Explicit settings/retry requests refresh the whole durable queue. Glucose-only saves
+    /// reuse its latest successful count; concurrent requests collapse into one follow-up pass.
     func refreshPendingCounts() {
-        queue.async {
-            guard let coreDataManager = self.coreDataManager,
-                  let coordinator = coreDataManager.privateManagedObjectContext.persistentStoreCoordinator else { return }
-            let context = NSManagedObjectContext(concurrencyType: .privateQueueConcurrencyType)
-            context.persistentStoreCoordinator = coordinator
-            context.perform {
-                let cutover = TreatmentSourceCutover.current(defaults: self.defaults)
-                let counts = HealthTherapyImportKind.allCases.map { kind -> (HealthTherapyImportKind, Int, Int)? in
-                    let writes: NSFetchRequest<TreatmentEntry> = TreatmentEntry.fetchRequest()
-                    var writeParts: [NSPredicate] = [NSPredicate(format:
-                        "localTreatmentUUID != nil AND localTreatmentUUID != '' AND healthKitSampleUUID == nil AND watchSourceUUID == nil AND (treatmentdeleted == NO OR treatmentdeleted == nil) AND treatmentType == %d AND (healthKitSyncStateRaw == %@ OR healthKitSyncStateRaw BEGINSWITH %@)",
-                        kind.treatmentType.rawValue, "pending", "pending.")]
-                    if let cutover {
-                        writeParts.append(NSPredicate(format: "date >= %@", cutover.cutoff as NSDate))
-                    }
-                    if kind == .carbohydrates {
-                        writeParts.append(NSPredicate(format:
-                            "plannedMealStateRaw == nil OR plannedMealStateRaw == %@",
-                            TreatmentMealState.confirmed.rawValue))
-                    }
-                    writes.predicate = NSCompoundPredicate(andPredicateWithSubpredicates: writeParts)
-                    let deletions: NSFetchRequest<TreatmentEntry> = TreatmentEntry.fetchRequest()
-                    deletions.predicate = NSPredicate(format:
-                        "localTreatmentUUID != nil AND localTreatmentUUID != '' AND healthKitSampleUUID == nil AND watchSourceUUID == nil AND treatmentdeleted == YES AND treatmentType == %d AND healthKitSyncVersion > 0 AND (healthKitSyncStateRaw != %@ OR healthKitSyncStateRaw == nil)",
-                        kind.treatmentType.rawValue, HealthLocalTherapySyncState.deleted)
-                    guard let writeCount = try? context.count(for: writes),
-                          let deleteCount = try? context.count(for: deletions) else { return nil }
-                    return (kind, writeCount, deleteCount)
+        queue.async { self.requestPendingCounts(force: true) }
+    }
+
+    private func requestPendingCounts(force: Bool) {
+        let cutover = TreatmentSourceCutover.current(defaults: defaults)
+        if force || cutover != pendingCountCutover {
+            pendingCountRevision &+= 1
+            pendingCountsDirty = true
+            pendingCountCutover = cutover
+        }
+        guard pendingCountsDirty, !pendingCountsInFlight else { return }
+        guard let coreDataManager,
+              let coordinator = coreDataManager.privateManagedObjectContext.persistentStoreCoordinator,
+              !coordinator.persistentStores.isEmpty else {
+            HealthTherapyImportKind.allCases.forEach { statusStore.clearPending(kind: $0.exportKind) }
+            return
+        }
+        pendingCountsInFlight = true
+        let revision = pendingCountRevision
+        let context = NSManagedObjectContext(concurrencyType: .privateQueueConcurrencyType)
+        context.persistentStoreCoordinator = coordinator
+        context.perform {
+            let counts = HealthTherapyImportKind.allCases.map { kind -> (HealthTherapyImportKind, Int, Int)? in
+                let writes: NSFetchRequest<TreatmentEntry> = TreatmentEntry.fetchRequest()
+                var writeParts: [NSPredicate] = [NSPredicate(format:
+                    "localTreatmentUUID != nil AND localTreatmentUUID != '' AND healthKitSampleUUID == nil AND watchSourceUUID == nil AND (treatmentdeleted == NO OR treatmentdeleted == nil) AND treatmentType == %d AND (healthKitSyncStateRaw == %@ OR healthKitSyncStateRaw BEGINSWITH %@)",
+                    kind.treatmentType.rawValue, "pending", "pending.")]
+                if let cutover {
+                    writeParts.append(NSPredicate(format: "date >= %@", cutover.cutoff as NSDate))
                 }
-                DispatchQueue.main.async {
-                    for (kind, writes, deletes) in counts.compactMap({ $0 }) {
-                        HealthKitExportStatusStore.shared.setPending(kind: kind.exportKind,
-                            writes: writes, deletes: deletes)
-                    }
-                    // A failed count must not be represented as a confirmed zero.
-                    for kind in HealthTherapyImportKind.allCases where !counts.contains(where: { $0?.0 == kind }) {
-                        HealthKitExportStatusStore.shared.clearPending(kind: kind.exportKind)
+                if kind == .carbohydrates {
+                    writeParts.append(NSPredicate(format:
+                        "plannedMealStateRaw == nil OR plannedMealStateRaw == %@",
+                        TreatmentMealState.confirmed.rawValue))
+                }
+                writes.predicate = NSCompoundPredicate(andPredicateWithSubpredicates: writeParts)
+                let deletions: NSFetchRequest<TreatmentEntry> = TreatmentEntry.fetchRequest()
+                deletions.predicate = NSPredicate(format:
+                    "localTreatmentUUID != nil AND localTreatmentUUID != '' AND healthKitSampleUUID == nil AND watchSourceUUID == nil AND treatmentdeleted == YES AND treatmentType == %d AND healthKitSyncVersion > 0 AND (healthKitSyncStateRaw != %@ OR healthKitSyncStateRaw == nil)",
+                    kind.treatmentType.rawValue, HealthLocalTherapySyncState.deleted)
+                guard let writeCount = try? self.pendingCount(context, writes),
+                      let deleteCount = try? self.pendingCount(context, deletions) else { return nil }
+                return (kind, writeCount, deleteCount)
+            }
+            self.queue.async {
+                self.pendingCountsInFlight = false
+                guard self.coreDataManager === coreDataManager,
+                      coreDataManager.privateManagedObjectContext.persistentStoreCoordinator === coordinator,
+                      !coordinator.persistentStores.isEmpty,
+                      self.pendingCountRevision == revision,
+                      TreatmentSourceCutover.current(defaults: self.defaults) == cutover else {
+                    self.pendingCountsDirty = true
+                    self.requestPendingCounts(force: false)
+                    return
+                }
+                self.pendingCountsDirty = counts.contains { $0 == nil }
+                // Publish on the same serial queue as invalidation. The status store posts its
+                // notifications on main itself, so an old queued UI callback cannot overwrite
+                // a more recent count. A failed datatype stays unknown and retryable.
+                for kind in HealthTherapyImportKind.allCases {
+                    if let value = counts.compactMap({ $0 }).first(where: { $0.0 == kind }) {
+                        self.statusStore.setPending(kind: kind.exportKind, writes: value.1, deletes: value.2)
+                    } else {
+                        self.statusStore.clearPending(kind: kind.exportKind)
                     }
                 }
             }
@@ -1232,11 +1300,11 @@ final class HealthKitLocalTherapyWriter {
                     self.store.save(write) { success, error in
                         self.queue.async {
                             if success && error == nil {
-                                HealthKitExportStatusStore.shared.recordSuccess(kind: write.kind.exportKind,
+                                self.statusStore.recordSuccess(kind: write.kind.exportKind,
                                     operation: "skrivning")
                                 self.markSynced(write, in: coreDataManager)
                             } else {
-                                HealthKitExportStatusStore.shared.recordFailure(kind: write.kind.exportKind,
+                                self.statusStore.recordFailure(kind: write.kind.exportKind,
                                     operation: "skrivning", error: error)
                                 self.stopAfterFailure()
                             }
@@ -1253,11 +1321,11 @@ final class HealthKitLocalTherapyWriter {
                             self.store.delete(deletion) { success, error in
                                 self.queue.async {
                                     if success && error == nil {
-                                        HealthKitExportStatusStore.shared.recordSuccess(kind: deletion.kind.exportKind,
+                                        self.statusStore.recordSuccess(kind: deletion.kind.exportKind,
                                             operation: "sletning")
                                         self.markDeleted(deletion, in: coreDataManager)
                                     } else {
-                                        HealthKitExportStatusStore.shared.recordFailure(kind: deletion.kind.exportKind,
+                                        self.statusStore.recordFailure(kind: deletion.kind.exportKind,
                                             operation: "sletning", error: error)
                                         self.stopAfterFailure()
                                     }
@@ -1315,7 +1383,9 @@ final class HealthKitLocalTherapyWriter {
 
     private func stopAfterFailure() {
         inFlight = false
-        refreshPendingCounts()
+        // A failed Health operation does not change the durable queue. A failed count is
+        // still dirty, so this also retains the existing opportunity to retry that read.
+        requestPendingCounts(force: false)
         // A bounded delayed retry covers a transient Health or local acknowledgement
         // failure. Persistent failures wait for foreground or another durable save.
         guard !failedOnce, !retryScheduled else { return }
@@ -1367,13 +1437,13 @@ final class HealthKitLocalTherapyWriter {
             let localError = acknowledgementError
             self.queue.async {
                 if let localError {
-                    HealthKitExportStatusStore.shared.recordFailure(kind: sent.kind.exportKind,
+                    self.statusStore.recordFailure(kind: sent.kind.exportKind,
                         operation: "skrivekvittering", error: localError)
                 }
                 if didAcknowledge || newerEditIsPending || deletionIsPending {
                     self.inFlight = false
                     self.failedOnce = false
-                    self.refreshPendingCounts()
+                    self.requestPendingCounts(force: false)
                     self.attemptNext()
                 } else {
                     self.stopAfterFailure()
@@ -1417,7 +1487,7 @@ final class HealthKitLocalTherapyWriter {
             let localError = acknowledgementError
             self.queue.async {
                 if let localError {
-                    HealthKitExportStatusStore.shared.recordFailure(kind: sent.kind.exportKind,
+                    self.statusStore.recordFailure(kind: sent.kind.exportKind,
                         operation: "slettekvittering", error: localError)
                 }
                 if didAcknowledge {

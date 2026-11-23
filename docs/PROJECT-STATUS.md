@@ -34,6 +34,47 @@ De følgende afsnit bevarer integrations- og testhistorikken før denne udgivels
 
 De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
 
+## Lettere køstatus til Apple Sundhed — 23. november 2026
+
+Behandlingseksporten genoptalte tidligere insulin-/kulhydratkøen ved enhver
+varig databasegemning, også glukose alene. En skrivekvittering kunne desuden
+udløse samme optælling både gennem save-observeren og sin egen callback.
+Den eksisterende writer genbruger nu den seneste vellykkede optælling, når
+behandlingerne er uændrede. Kun optællingen samles; glukosegemningen er fortsat
+et genforsøgssignal for selve Sundhedseksporten.
+
+Relevante behandlingsændringer, eksplicit statusopdatering, tilgængelighed,
+kildeskift og slettekvitteringer giver frisk optælling. Samtidige forespørgsler
+samles på den eksisterende kø; resultater fra en ældre revision, datakontekst
+eller cutoff afvises. Læsefejl giver ukendt status og kan genforsøges. De samme
+fire tælleforespørgsler og hele køens omfang bevares. Eksportens udvælgelse,
+skrive-/sletningsrækkefølge, stabile ID'er, versionsnumre, kvitteringer,
+indstillinger og genforsøgsregler er uændrede. Glukoseeksporten er ikke ændret.
+
+Otte nye tests bruger den faktiske writer og syntetiske databaser. De dækker
+12 glukosegemninger uden ekstra optælling, relevante oprettelser/rettelser/
+sletninger, 20 overlappende forespørgsler, afvist gammelt resultat, delvis
+læsefejl og genforsøg, ændret cutoff/kontekst, autorisationsopdatering samt
+fælles optælling efter skrivekvittering. En rigtig SQLite-batchsletning med
+merge uden save giver også frisk status; glukose-only merge gør ikke. Fire eksportforsøg ved fejlede
+Sundhedsskrivninger bevares med kun én optælling af den uændrede kø.
+
+Indledende validering: 2042/2042 XCTest bestået, herunder de syv nye tests,
+0 fejl/skipped; 236 Python-tests og 30 + 24 syntetiske Watch-kontroller bestod.
+XCTest-kvittering: `~/DeveloperBuildData/xDrip/local-runs/xdripswift/20261123T054412Z-63049/`.
+Slutgennemgangen tilføjer særskilt dækning af batchsletning, som ikke sender
+en almindelig save-hændelse. Første releasekørsel med 4371 stoppede på den nye
+tests antagelse om `hasChanges == false` efter merge; de øvrige kontroller
+bestod. Testen kontrollerer nu direkte fravær af save-hændelsen, da merge kan
+ændre registrerede relationer uden en gemning. Den fejlede kvittering bevares
+under `build/testflight-7.1.1-4371/test-failed-context-assumption/`.
+Den endelige kode gentestes med Apples valgte buildnummer; faktisk resultat
+og Apple-status registreres ved udgivelsen.
+Læsende kontrol fandt xDrip4iO5 7.1.1 (4370), bundle
+`com.GFZ896KN66.xdripswift`, på den parrede iPhone. Der er ikke udført lokal
+installation eller fysisk afprøvning af den ændrede kode; faktisk HealthKit-
+levering og hastigheds-/batterigevinst er ikke målt i denne opgave.
+
 ## Ampulskift fra Home og fælles snooze — 22. november 2026
 
 Indledende validering før release; faktisk udgivelse fremgår af TestFlight-afsnittet øverst.

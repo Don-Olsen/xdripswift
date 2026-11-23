@@ -145,6 +145,25 @@ the original reader and check the reduced materialization on a 5,000-row backlog
 This establishes less database-object work in the tested path, not a measured
 improvement in phone responsiveness or battery life.
 
+## Treatment export status counts (23 November 2026)
+
+The local treatment writer reuses its last successful pending counts after a
+committed save containing no treatment changes. The same save still triggers
+the existing export retry worker. Counts are refreshed for treatment changes,
+explicit status/retry requests, configuration and availability changes, and
+successful deletion acknowledgements. Merged treatment object IDs also
+invalidate counts after a durable batch deletion without a context save;
+this does not introduce an export retry trigger. Concurrent count requests share one
+active scan and at most one follow-up for the latest revision. Results from a
+superseded store or source cutoff are discarded; a failed datatype is unknown
+and remains eligible for a later count attempt.
+
+Only status counting is optimized. Glucose export, treatment selection,
+write/delete order, durable acknowledgements, sync IDs/versions and retry
+behavior retain their existing rules. No treatment/sample values are added
+to diagnostic status. Actual device speed and battery impact require separate
+measurement.
+
 ## Physical acceptance checks still required
 
 Automated tests use synthetic samples in isolated stores. They cannot establish

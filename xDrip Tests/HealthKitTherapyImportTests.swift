@@ -1477,6 +1477,326 @@ final class HealthKitTherapyImportTests: XCTestCase {
             syncIdentifier: own.syncIdentifier))
     }
 
+    private final class PendingCountProbe {
+        private let lock = NSLock()
+        private var calls = 0
+        private var held: [Int: DispatchSemaphore] = [:]
+        private var failures = Set<Int>()
+        var callCount: Int { lock.lock(); defer { lock.unlock() }; return calls }
+
+        func holdNext() -> DispatchSemaphore {
+            lock.lock(); defer { lock.unlock() }
+            let gate = DispatchSemaphore(value: 0)
+            held[calls + 1] = gate
+            return gate
+        }
+
+        func failNext() {
+            lock.lock(); defer { lock.unlock() }
+            failures.insert(calls + 1)
+        }
+
+        func count(_ context: NSManagedObjectContext, _ request: NSFetchRequest<TreatmentEntry>) throws -> Int {
+            lock.lock()
+            calls += 1
+            let gate = held.removeValue(forKey: calls)
+            let fails = failures.remove(calls) != nil
+            lock.unlock()
+            if fails { throw ReadFailure.locked }
+            let result = try context.count(for: request)
+            // Hold an already-read old result while the real store/settings can change.
+            if let gate { _ = gate.wait(timeout: .now() + 5) }
+            return result
+        }
+    }
+
+    private final class PendingStatusDefaults: UserDefaults {
+        private let lock = NSLock()
+        private var writes: [String: [Int]] = [:]
+        private var errorWrites = 0
+        override func set(_ value: Any?, forKey key: String) {
+            lock.lock()
+            if key.hasSuffix("pendingWrites"), let count = value as? Int {
+                writes[key, default: []].append(count)
+            }
+            if key.hasSuffix("errorCode") { errorWrites += 1 }
+            lock.unlock()
+            super.set(value, forKey: key)
+        }
+        var insulinPublications: [Int] {
+            lock.lock(); defer { lock.unlock() }
+            return writes["healthKitExportStatus.insulin.pendingWrites"] ?? []
+        }
+        var failureCount: Int { lock.lock(); defer { lock.unlock() }; return errorWrites }
+    }
+
+    private func pendingCountDefaults() throws -> PendingStatusDefaults {
+        let name = "PendingTherapyCounts." + UUID().uuidString
+        let defaults = try XCTUnwrap(PendingStatusDefaults(suiteName: name))
+        addTeardownBlock { defaults.removePersistentDomain(forName: name) }
+        return defaults
+    }
+
+    @discardableResult
+    private func pendingTherapy(_ core: CoreDataManager, kind: TreatmentType = .Insulin,
+                                at date: Date = Date().addingTimeInterval(-30)) -> TreatmentEntry {
+        let row = TreatmentEntry(date: date, value: 2, treatmentType: kind,
+            nightscoutEventType: nil, enteredBy: "xDrip", nsManagedObjectContext: core.mainManagedObjectContext)
+        row.localTreatmentUUID = UUID().uuidString
+        row.healthKitSyncVersion = NSNumber(value: 1)
+        row.healthKitSyncStateRaw = "pending"
+        return row
+    }
+
+    @MainActor private func saveCountTestGlucose(_ core: CoreDataManager, index: Int) {
+        let sensor = Sensor(startDate: Date().addingTimeInterval(-3600),
+            nsManagedObjectContext: core.mainManagedObjectContext)
+        _ = exportRow("count-test-\(index)", at: Date(), sensor: sensor,
+            context: core.mainManagedObjectContext)
+        XCTAssertTrue(core.saveChangesSynchronously())
+    }
+
+    @MainActor func testTherapyCountsReuseGlucoseOnlySavesAndRefreshDurableTreatmentChanges() throws {
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let insulin = pendingTherapy(core)
+        XCTAssertTrue(core.saveChangesSynchronously())
+        let defaults = try pendingCountDefaults()
+        let status = HealthKitExportStatusStore(defaults: defaults)
+        let probe = PendingCountProbe()
+        let writer = HealthKitLocalTherapyWriter(store: FakeWriteStore(), defaults: defaults,
+            deletionIsVerified: { _ in false }, statusStore: status, pendingCount: probe.count)
+        writer.configure(coreDataManager: core)
+        waitUntil("initial whole treatment count") { status.snapshot(.insulin).pendingWrites == 1 }
+        XCTAssertEqual(probe.callCount, 4)
+        for index in 0..<12 { saveCountTestGlucose(core, index: index) }
+        // A forced settings read also drains all previously enqueued save callbacks.
+        writer.refreshPendingCounts()
+        waitUntil("explicit settings refresh") { defaults.insulinPublications.count == 2 }
+        XCTAssertEqual(probe.callCount, 8, "Glucose-only commits must not repeat the four counts")
+
+        insulin.healthKitSyncStateRaw = "synced"
+        XCTAssertTrue(core.saveChangesSynchronously())
+        waitUntil("sync edit counted") { status.snapshot(.insulin).pendingWrites == 0 }
+        XCTAssertEqual(probe.callCount, 12)
+        let carbs = pendingTherapy(core, kind: .Carbs)
+        XCTAssertTrue(core.saveChangesSynchronously())
+        waitUntil("new carbs counted") { status.snapshot(.carbohydrates).pendingWrites == 1 }
+        XCTAssertEqual(probe.callCount, 16)
+        core.mainManagedObjectContext.delete(carbs)
+        insulin.treatmentdeleted = true
+        XCTAssertTrue(core.saveChangesSynchronously())
+        waitUntil("physical deletion and tombstone counted") {
+            status.snapshot(.carbohydrates).pendingWrites == 0 && status.snapshot(.insulin).pendingDeletes == 1
+        }
+        XCTAssertEqual(probe.callCount, 20)
+    }
+
+    @MainActor func testTherapyCountsTrackSQLiteBatchDeletionWithoutCountingGlucoseOnlyMerges() throws {
+        let core = try exportSQLiteStack()
+        pendingTherapy(core)
+        saveCountTestGlucose(core, index: 0)
+        let defaults = try pendingCountDefaults()
+        let status = HealthKitExportStatusStore(defaults: defaults)
+        let probe = PendingCountProbe()
+        let store = FakeWriteStore()
+        let writer = HealthKitLocalTherapyWriter(store: store, defaults: defaults,
+            statusStore: status, pendingCount: probe.count)
+        writer.configure(coreDataManager: core)
+        waitUntil("initial persisted queue counted") { status.snapshot(.insulin).pendingWrites == 1 }
+        XCTAssertEqual(probe.callCount, 4)
+
+        let unexpectedSave = expectation(description: "Batch status refresh does not require a context save")
+        unexpectedSave.isInverted = true
+        let saveObserver = NotificationCenter.default.addObserver(
+            forName: .NSManagedObjectContextDidSave, object: core.privateManagedObjectContext, queue: nil
+        ) { _ in unexpectedSave.fulfill() }
+        defer { NotificationCenter.default.removeObserver(saveObserver) }
+
+        func batchDelete(_ entity: String) throws -> Int {
+            let context = core.privateManagedObjectContext
+            return try context.performAndWait {
+                let request = NSBatchDeleteRequest(fetchRequest: NSFetchRequest<NSFetchRequestResult>(entityName: entity))
+                request.resultType = .resultTypeObjectIDs
+                let result = try XCTUnwrap(try context.execute(request) as? NSBatchDeleteResult)
+                let ids = try XCTUnwrap(result.result as? [NSManagedObjectID])
+                // This is DataManagementService's real SQLite path: merge durable deletions,
+                // without saving either context or manually refreshing Health status.
+                NSManagedObjectContext.mergeChanges(fromRemoteContextSave: [NSDeletedObjectsKey: ids], into: [context])
+                // Merging can dirty registered relationships without a save. The observer
+                // below verifies the actual no-save contract instead of context.hasChanges.
+                return ids.count
+            }
+        }
+
+        XCTAssertEqual(try batchDelete("BgReading"), 1)
+        writer.refreshPendingCounts()
+        waitUntil("explicit read after glucose merge") { defaults.insulinPublications.count == 2 }
+        XCTAssertEqual(probe.callCount, 8, "The glucose-only batch merge must not start its own count")
+        XCTAssertEqual(try batchDelete("TreatmentEntry"), 1)
+        waitUntil("treatment batch deletion invalidates status without a save") { status.snapshot(.insulin).pendingWrites == 0 }
+        XCTAssertEqual(probe.callCount, 12)
+        XCTAssertTrue(store.requests.isEmpty)
+        XCTAssertTrue(store.deletionRequests.isEmpty)
+        wait(for: [unexpectedSave], timeout: 0.1)
+    }
+
+    @MainActor func testTherapyCountsCoalesceRequestsAndNeverPublishSupersededStoreResult() throws {
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let defaults = try pendingCountDefaults()
+        let status = HealthKitExportStatusStore(defaults: defaults)
+        let probe = PendingCountProbe()
+        let gate = probe.holdNext()
+        defer { gate.signal() }
+        let writer = HealthKitLocalTherapyWriter(store: FakeWriteStore(), defaults: defaults,
+            statusStore: status, pendingCount: probe.count)
+        writer.configure(coreDataManager: core)
+        waitUntil("old count held") { probe.callCount == 1 }
+        pendingTherapy(core)
+        XCTAssertTrue(core.saveChangesSynchronously())
+        for _ in 0..<20 { writer.refreshPendingCounts() }
+        gate.signal()
+        waitUntil("latest count published") { status.snapshot(.insulin).pendingWrites == 1 }
+        XCTAssertEqual(probe.callCount, 8, "One in-flight scan and one fresh follow-up cover the burst")
+        XCTAssertEqual(defaults.insulinPublications, [1], "The old zero must never reach the status store")
+    }
+
+    @MainActor func testTherapyCountsFailedDatatypeIsUnknownAndGlucoseSaveRetriesIt() throws {
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        pendingTherapy(core)
+        pendingTherapy(core, kind: .Carbs)
+        XCTAssertTrue(core.saveChangesSynchronously())
+        let defaults = try pendingCountDefaults()
+        let status = HealthKitExportStatusStore(defaults: defaults)
+        status.setPending(kind: .insulin, writes: 99, deletes: 99)
+        let probe = PendingCountProbe()
+        probe.failNext()
+        let writer = HealthKitLocalTherapyWriter(store: FakeWriteStore(), defaults: defaults,
+            statusStore: status, pendingCount: probe.count)
+        writer.configure(coreDataManager: core)
+        waitUntil("partial failure is unknown") {
+            status.snapshot(.insulin).pendingWrites == nil &&
+                status.snapshot(.carbohydrates).pendingWrites == 1
+        }
+        XCTAssertNil(status.snapshot(.insulin).pendingDeletes)
+        XCTAssertEqual(probe.callCount, 3)
+        saveCountTestGlucose(core, index: 0)
+        waitUntil("failed read retried by existing save trigger") { status.snapshot(.insulin).pendingWrites == 1 }
+        XCTAssertEqual(probe.callCount, 7)
+        XCTAssertEqual(status.snapshot(.insulin).pendingDeletes, 0)
+        XCTAssertEqual(status.snapshot(.carbohydrates).pendingWrites, 1)
+    }
+
+    @MainActor func testTherapyCountsRejectCutoverChangedDuringRead() throws {
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let date = Date().addingTimeInterval(-600)
+        pendingTherapy(core, at: date)
+        XCTAssertTrue(core.saveChangesSynchronously())
+        let defaults = try pendingCountDefaults()
+        let status = HealthKitExportStatusStore(defaults: defaults)
+        let probe = PendingCountProbe()
+        let gate = probe.holdNext()
+        defer { gate.signal() }
+        let writer = HealthKitLocalTherapyWriter(store: FakeWriteStore(), defaults: defaults,
+            statusStore: status, pendingCount: probe.count)
+        writer.configure(coreDataManager: core)
+        waitUntil("pre-cutover count held") { probe.callCount == 1 }
+        XCTAssertTrue(TreatmentSourceCutover.persist(.init(cutoff: date.addingTimeInterval(1),
+            insulinSourceBundleID: "synthetic.insulin", carbohydrateSourceBundleID: "synthetic.carbs"),
+            defaults: defaults))
+        gate.signal()
+        waitUntil("count reflects changed cutover") { status.snapshot(.insulin).pendingWrites == 0 }
+        XCTAssertEqual(probe.callCount, 8)
+        XCTAssertEqual(defaults.insulinPublications, [0])
+        defaults.removeObject(forKey: TreatmentSourceCutover.defaultsKey)
+        saveCountTestGlucose(core, index: 0)
+        waitUntil("removed cutover invalidates otherwise unchanged cache") { status.snapshot(.insulin).pendingWrites == 1 }
+        XCTAssertEqual(probe.callCount, 12)
+    }
+
+    @MainActor func testTherapyCountsRejectOldConfiguredStoreAndForceAvailabilityRefresh() throws {
+        let oldCore = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        let currentCore = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        pendingTherapy(currentCore)
+        pendingTherapy(currentCore, kind: .Carbs)
+        XCTAssertTrue(currentCore.saveChangesSynchronously())
+        let defaults = try pendingCountDefaults()
+        let status = HealthKitExportStatusStore(defaults: defaults)
+        let probe = PendingCountProbe()
+        let gate = probe.holdNext()
+        defer { gate.signal() }
+        let writer = HealthKitLocalTherapyWriter(store: FakeWriteStore(), defaults: defaults,
+            statusStore: status, pendingCount: probe.count)
+        writer.configure(coreDataManager: oldCore)
+        waitUntil("old configured store held") { probe.callCount == 1 }
+        writer.configure(coreDataManager: currentCore)
+        gate.signal()
+        waitUntil("current configured store counted") { status.snapshot(.insulin).pendingWrites == 1 }
+        XCTAssertEqual(defaults.insulinPublications, [1])
+        XCTAssertEqual(probe.callCount, 8)
+        NotificationCenter.default.post(name: .healthKitPhoneAuthorizationDidChange, object: nil)
+        waitUntil("authorization refresh remains explicit") { defaults.insulinPublications.count == 2 }
+        XCTAssertEqual(probe.callCount, 12)
+    }
+
+    @MainActor func testTherapyCountsPreserveGlucoseTriggeredWriteRetryWithoutRecountingUnchangedFailure() throws {
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        pendingTherapy(core)
+        XCTAssertTrue(core.saveChangesSynchronously())
+        let defaults = try pendingCountDefaults()
+        XCTAssertTrue(TreatmentSourceCutover.persist(.init(cutoff: Date().addingTimeInterval(-3600),
+            insulinSourceBundleID: "synthetic.insulin", carbohydrateSourceBundleID: "synthetic.carbs"),
+            defaults: defaults))
+        let status = HealthKitExportStatusStore(defaults: defaults)
+        let probe = PendingCountProbe()
+        let store = FakeWriteStore()
+        store.failNext = true
+        let writer = HealthKitLocalTherapyWriter(store: store, defaults: defaults,
+            statusStore: status, pendingCount: probe.count)
+        writer.configure(coreDataManager: core)
+        waitUntil("failed write and initial count settled") {
+            defaults.failureCount == 1 && status.snapshot(.insulin).pendingWrites == 1
+        }
+        for index in 0..<3 {
+            store.failNext = true
+            saveCountTestGlucose(core, index: index)
+            waitUntil("existing retry opportunity retained") { defaults.failureCount == index + 2 }
+        }
+        XCTAssertEqual(store.requests.count, 4)
+        XCTAssertEqual(probe.callCount, 4, "Unchanged failures must not re-count on every CGM save")
+        XCTAssertNil(status.snapshot(.insulin).lastConfirmedWrite)
+        XCTAssertEqual(status.snapshot(.insulin).lastErrorOperation, "skrivning")
+        writer.refreshPendingCounts()
+        waitUntil("forced refresh still reads after failure") { defaults.insulinPublications.count == 2 }
+        XCTAssertEqual(probe.callCount, 8)
+    }
+
+    @MainActor func testTherapyCountsWriteAcknowledgementObserverAndCallbackShareOneScan() throws {
+        let core = CoreDataManager(inMemoryModelName: ConstantsCoreData.modelName)
+        pendingTherapy(core)
+        XCTAssertTrue(core.saveChangesSynchronously())
+        let defaults = try pendingCountDefaults()
+        XCTAssertTrue(TreatmentSourceCutover.persist(.init(cutoff: Date().addingTimeInterval(-3600),
+            insulinSourceBundleID: "synthetic.insulin", carbohydrateSourceBundleID: "synthetic.carbs"),
+            defaults: defaults))
+        let status = HealthKitExportStatusStore(defaults: defaults)
+        let probe = PendingCountProbe()
+        let store = FakeWriteStore()
+        store.holdNext = true
+        let writer = HealthKitLocalTherapyWriter(store: store, defaults: defaults,
+            statusStore: status, pendingCount: probe.count)
+        writer.configure(coreDataManager: core)
+        waitUntil("held write with counted queue") { store.requests.count == 1 && status.snapshot(.insulin).pendingWrites == 1 }
+        let gate = probe.holdNext()
+        defer { gate.signal() }
+        store.completeHeld()
+        waitUntil("acknowledgement scan held") { probe.callCount == 5 }
+        gate.signal()
+        waitUntil("acknowledged queue empty") { status.snapshot(.insulin).pendingWrites == 0 }
+        XCTAssertEqual(probe.callCount, 8)
+        XCTAssertEqual(store.requests.count, 1)
+        XCTAssertNotNil(status.snapshot(.insulin).lastConfirmedWrite)
+    }
+
     func testLocalHealthWriteRetryKeepsLocalPostAndStableIdentity() throws {
         let suite = "HealthLocalTherapyWriter.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
