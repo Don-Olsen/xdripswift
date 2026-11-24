@@ -9,9 +9,21 @@
 import CoreFoundation
 import Foundation
 
-/// Direct Libre readings can have a current glucose value without a comparable previous reading.
-/// Keep a missing change distinct from measured zero across the Watch display and complication.
+/// A current glucose reading can exist without a comparable previous reading.
 enum WatchGlucoseDelta {
+    /// Phone payloads include the two readings used for the reported change, newest first.
+    /// Older senders also send zero when there is no previous reading.
+    static func fromPhone(_ reported: Double?, valuesMgDl: [Double], dates: [Double]) -> Double? {
+        guard let reported, reported.isFinite,
+              valuesMgDl.count == dates.count, dates.count >= 2,
+              valuesMgDl[0] > 0, valuesMgDl[1] > 0,
+              abs(valuesMgDl[0] - valuesMgDl[1]) <= 100 else { return nil }
+        let interval = dates[0] - dates[1]
+        guard interval > 0, interval <= Double(ConstantsBGGraphBuilder.maxSlopeInMinutes * 60)
+        else { return nil }
+        return reported
+    }
+
     static func inUserUnit(directMgDl: Double?, isMgDl: Bool) -> Double? {
         directMgDl.map { isMgDl ? $0 : $0 / 18.0182 }
     }
@@ -40,11 +52,15 @@ struct ComplicationSharedUserDefaultsModel: Codable, Equatable {
 
     static func decodeStoredData(_ data: Data?) -> Self? {
         guard let data,
-              let model = try? JSONDecoder().decode(Self.self, from: data),
+              var model = try? JSONDecoder().decode(Self.self, from: data),
               model.bgReadingValues.count == model.bgReadingDatesAsDouble.count,
               model.bgReadingValues.allSatisfy({ $0.isFinite && $0 > 0 }),
               model.bgReadingDatesAsDouble.allSatisfy(\.isFinite)
         else { return nil }
+        if model.readingSource != .directLibre {
+            model.deltaValueInUserUnit = WatchGlucoseDelta.fromPhone(model.deltaValueInUserUnit,
+                valuesMgDl: model.bgReadingValues, dates: model.bgReadingDatesAsDouble)
+        }
         return model
     }
 

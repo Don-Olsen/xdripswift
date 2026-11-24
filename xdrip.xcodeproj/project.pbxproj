@@ -142,6 +142,7 @@
 		478A923E2B8B64DE0084C394 /* ConstantsHomeView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F8A1586622EDB8BF007F5B5D /* ConstantsHomeView.swift */; };
 		478A92422B8CCF8F0084C394 /* ConstantsLiveActivity.swift in Sources */ = {isa = PBXBuildFile; fileRef = 47B7313F2B83DC0200B0A450 /* ConstantsLiveActivity.swift */; };
 		478A92552B8FA1D80084C394 /* ConstantsBGGraphBuilder.swift in Sources */ = {isa = PBXBuildFile; fileRef = F8A1585022EDB597007F5B5D /* ConstantsBGGraphBuilder.swift */; };
+		83D3BC417E7C4B5A860C73C2 /* ConstantsBGGraphBuilder.swift in Sources */ = {isa = PBXBuildFile; fileRef = F8A1585022EDB597007F5B5D /* ConstantsBGGraphBuilder.swift */; };
 		478A92562B8FA1D80084C394 /* ConstantsBloodGlucose.swift in Sources */ = {isa = PBXBuildFile; fileRef = F8A1585222EDB602007F5B5D /* ConstantsBloodGlucose.swift */; };
 		478A92572B8FA1E30084C394 /* ConstantsBGGraphBuilder.swift in Sources */ = {isa = PBXBuildFile; fileRef = F8A1585022EDB597007F5B5D /* ConstantsBGGraphBuilder.swift */; };
 		478A92582B8FA1F20084C394 /* Date.swift in Sources */ = {isa = PBXBuildFile; fileRef = F8EA6C8121B723BC0082976B /* Date.swift */; };
@@ -4615,6 +4616,7 @@
 				DE59C307960F40F880724B66 /* xDrip/Constants/TherapyMetrics.swift in Sources */,
 				4715C32F2C9ED5E10052215F /* LiveActivityType.swift in Sources */,
 				474606642B95E48D00AC9214 /* ComplicationSharedUserDefaultsModel.swift in Sources */,
+				83D3BC417E7C4B5A860C73C2 /* ConstantsBGGraphBuilder.swift in Sources */,
 				474606902B963EA100AC9214 /* View.swift in Sources */,
 				47EDD1462BDD565A00C5A286 /* TextsWatchApp.swift in Sources */,
 				47A6AC372B7D3E650047A4BA /* GlucoseChartType.swift in Sources */,

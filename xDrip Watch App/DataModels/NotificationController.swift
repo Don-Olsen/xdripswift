@@ -63,13 +63,14 @@ class NotificationController: WKUserNotificationHostingController<NotificationVi
         bgReadingValues = userInfo["bgReadingValues"] as? [Double] ?? [0]
         isMgDl = userInfo["isMgDl"] as? Bool ?? true
         slopeOrdinal = userInfo["slopeOrdinal"] as? Int ?? 0
-        deltaValueInUserUnit = userInfo["deltaValueInUserUnit"] as? Double ?? 0
         urgentLowLimitInMgDl = userInfo["urgentLowLimitInMgDl"] as? Double ?? 0
         lowLimitInMgDl = userInfo["lowLimitInMgDl"] as? Double ?? 0
         highLimitInMgDl = userInfo["highLimitInMgDl"] as? Double ?? 0
         urgentHighLimitInMgDl = userInfo["urgentHighLimitInMgDl"] as? Double ?? 0
         
         let bgReadingDatesFromDictionary: [Double] = userInfo["bgReadingDatesAsDouble"] as? [Double] ?? [0]
+        deltaValueInUserUnit = WatchGlucoseDelta.fromPhone(userInfo["deltaValueInUserUnit"] as? Double,
+            valuesMgDl: bgReadingValues ?? [], dates: bgReadingDatesFromDictionary)
         bgReadingDates = bgReadingDatesFromDictionary.map { (bgReadingDateAsDouble) -> Date in
             return Date(timeIntervalSince1970: bgReadingDateAsDouble)
         }

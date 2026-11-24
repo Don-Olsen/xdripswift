@@ -274,6 +274,76 @@ extension LibreWatchValuePipelineTests {
             urgentHighLimitInMgDl: 250, keepAliveIsDisabled: false, readingSource: source)
     }
 
+    func testPhoneDeltaNeedsComparableReadingsAndKeepsTheReportedUnit() {
+        let time = 10_000.0
+        XCTAssertNil(WatchGlucoseDelta.fromPhone(0, valuesMgDl: [120], dates: [time]))
+        XCTAssertNil(WatchGlucoseDelta.fromPhone(-3.3, valuesMgDl: [90, 150], dates: [time, time - 30 * 60]))
+        XCTAssertNil(WatchGlucoseDelta.fromPhone(0.2, valuesMgDl: [124, 120], dates: [time, time]))
+        XCTAssertNil(WatchGlucoseDelta.fromPhone(6, valuesMgDl: [221, 120], dates: [time, time - 60]))
+        XCTAssertNil(WatchGlucoseDelta.fromPhone(nil, valuesMgDl: [120, 120], dates: [time, time - 60]))
+
+        let validDates = [time, time - 60]
+        XCTAssertEqual(WatchGlucoseDelta.fromPhone(0, valuesMgDl: [120, 120], dates: validDates), 0)
+        XCTAssertEqual(WatchGlucoseDelta.fromPhone(100, valuesMgDl: [220, 120], dates: validDates), 100)
+        XCTAssertEqual(WatchGlucoseDelta.fromPhone(-0.3, valuesMgDl: [115, 120, 140],
+                                                  dates: [time, time - 5 * 60, time - 60 * 60]), -0.3)
+        XCTAssertEqual(WatchGlucoseDelta.fromPhone(4, valuesMgDl: [124, 120], dates: [time, time - 21 * 60]), 4)
+        XCTAssertNil(WatchGlucoseDelta.fromPhone(4, valuesMgDl: [124, 120], dates: [time, time - 21 * 60 - 1]))
+    }
+
+    func testLegacyPhoneSnapshotKeepsGlucoseWhenRestoringUnknownDeltaAndThenMeasuredZero() throws {
+        let (defaults, suite) = displaySnapshotDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let start = Date(timeIntervalSince1970: 1_800_000_000)
+        var publication = ComplicationPublicationState()
+        for index in 0...1 {
+            let hasPrevious = index == 1
+            let now = start.addingTimeInterval(TimeInterval(index * 60))
+            let dates = hasPrevious ? [now.timeIntervalSince1970, start.timeIntervalSince1970] : [now.timeIntervalSince1970]
+            let values = hasPrevious ? [120.0, 120.0] : [120.0]
+            var legacy = displayBGSnapshot(at: now)
+            legacy["bgReadingDatesAsDouble"] = dates
+            legacy["bgReadingValues"] = values
+            legacy["deltaValueInUserUnit"] = 0.0
+            XCTAssertTrue(WatchPhoneSnapshotStore.accept(legacy, stream: .bgReadings, sessionID: nil,
+                                                         at: now, defaults: defaults))
+            let stored = try XCTUnwrap(WatchPhoneSnapshotStore.stored(.bgReadings, defaults: defaults))
+            let storedValues = try XCTUnwrap(stored["bgReadingValues"] as? [Double])
+            let storedDates = try XCTUnwrap(stored["bgReadingDatesAsDouble"] as? [Double])
+            var model = complicationSnapshot(at: now)
+            model.isMgDl = false
+            model.bgReadingValues = storedValues
+            model.bgReadingDatesAsDouble = storedDates
+            model.deltaValueInUserUnit = WatchGlucoseDelta.fromPhone(stored["deltaValueInUserUnit"] as? Double,
+                                                                     valuesMgDl: storedValues, dates: storedDates)
+            var written: Data?
+            XCTAssertTrue(publication.publishIfChanged(model, at: now, write: { written = $0 }, reload: {}))
+            let restored = try XCTUnwrap(ComplicationSharedUserDefaultsModel.decodeStoredData(written))
+            XCTAssertTrue(restored.readingIsCurrent(at: now))
+            XCTAssertEqual(restored.bgReadingValues, values)
+            XCTAssertEqual(restored.bgReadingDatesAsDouble, dates)
+            XCTAssertEqual(WatchGlucoseDelta.formatted(restored.deltaValueInUserUnit, isMgDl: false),
+                           hasPrevious ? "+0.0" : nil)
+        }
+    }
+
+    func testOldComplicationCacheWithOneReadingDropsOnlyTheUnverifiedPhoneDelta() throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        for source: ComplicationReadingSource? in [nil, .phone, .directLibre] {
+            var cached = complicationSnapshot(at: now)
+            cached.bgReadingValues = [120]
+            cached.bgReadingDatesAsDouble = [now.timeIntervalSince1970]
+            cached.readingSource = source
+            // Direct Libre can supply a separate delta even if only its latest point was cached.
+            cached.deltaValueInUserUnit = source == .directLibre ? -4 : 0
+            let restored = try XCTUnwrap(ComplicationSharedUserDefaultsModel.decodeStoredData(JSONEncoder().encode(cached)))
+            XCTAssertEqual(restored.deltaValueInUserUnit, source == .directLibre ? -4 : nil)
+            XCTAssertEqual(restored.bgReadingValues, [120])
+            XCTAssertEqual(restored.readingSource, source)
+            XCTAssertTrue(restored.readingIsCurrent(at: now))
+        }
+    }
+
     func testComplicationUnchangedStatusPublishesOnceAndWritesBeforeReload() throws {
         let now = Date(timeIntervalSince1970: 1_800_000_000)
         let model = complicationSnapshot(at: now)

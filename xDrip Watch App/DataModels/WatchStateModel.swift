@@ -2831,7 +2831,7 @@ final class WatchStateModel: NSObject, ObservableObject {
         bgReadingDates = dates.map(Date.init(timeIntervalSince1970:))
         bgReadingValues = values
         slopeOrdinal = slope
-        deltaValueInUserUnit = delta
+        deltaValueInUserUnit = WatchGlucoseDelta.fromPhone(delta, valuesMgDl: values, dates: dates)
         // This is measurement freshness. A regenerated status envelope cannot update it.
         updatedDate = Date(timeIntervalSince1970: latest)
         if !restoring { lastPhoneGraphReceivedAt = Date() }

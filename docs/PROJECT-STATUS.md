@@ -8,6 +8,16 @@
 - Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
 <!-- testflight-7.1.1-4371:end -->
 
+## Apple Watch · ændring siden sidste måling
+
+Når iPhone leverer målingerne, viser uret kun en ændring, hvis de to seneste
+punkter har forskellige måletidspunkter, ligger højst 21 minutter fra hinanden
+og højst 100 mg/dL fra hinanden. Ved en enkelt måling eller et hul i historikken
+kan man fortsat se glukosetallet. To ens, sammenlignelige værdier viser et
+målt nul. Kontrollen gælder også den udvidede Watch-notifikation og data, som
+urskiven har gemt fra en tidligere telefonversion. Fysisk visning på det
+opdaterede ur afventer installation fra TestFlight.
+
 De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
 
 <!-- testflight-7.1.1-4370:start -->
