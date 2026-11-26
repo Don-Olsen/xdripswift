@@ -1278,8 +1278,8 @@ struct InitialCalibrationRequestGate {
                 loopManager.glucoseData = [GlucoseData]()
             }
             
-            // initialize latest3BgReadings
-            var latest3BgReadings = bgReadingsAccessor.getLatestBgReadings(limit: 3, howOld: nil, forSensor: activeSensor, ignoreRawData: false, ignoreCalculatedValue: false, includingSuppressed: true)
+            // Consecutive Loop-only frames share calibration history until a stored reading changes it.
+            var delayedLoopHistory: [BgReading]?
             
             // iterate through array, elements are ordered by timestamp, first is the youngest, we need to start with the oldest
             for (index, glucose) in glucoseData.enumerated().reversed() {
@@ -1404,8 +1404,7 @@ struct InitialCalibrationRequestGate {
                         existingBgReadingsInIncomingRange.append(newReading)
                         existingBgReadingsInIncomingRange.sort { $0.timeStamp < $1.timeStamp }
                         
-                        // reset latest3BgReadings
-                        latest3BgReadings = bgReadingsAccessor.getLatestBgReadings(limit: 3, howOld: nil, forSensor: activeSensor, ignoreRawData: false, ignoreCalculatedValue: false, includingSuppressed: true)
+                        delayedLoopHistory = nil
                         
                         if !isHistoricalGapFill, isValidForDownstream, let loopManager = loopManager, LoopManager.osAidSharingPermitted, LoopManager.loopDelay() > 0 && abs(Date().timeIntervalSince(timeStampLastCalibrationForActiveSensor)) > LoopManager.loopDelay() + TimeInterval(minutes: 5.5) {
                             loopManager.glucoseData.insert(GlucoseData(timeStamp: newReading.timeStamp, glucoseLevelRaw: round(newReading.loopShareValue), slopeOrdinal: newReading.slopeOrdinal(), slopeName: newReading.slopeName), at: 0)
@@ -1414,10 +1413,9 @@ struct InitialCalibrationRequestGate {
                         trace("in processNewGlucoseData, reading skipped, rawValue <= 0, looks like a faulty sensor", log: self.log, category: ConstantsLog.categoryRootView, type: .info, troubleshooting: .standard(.sensor(.unusableReading)))
                     }
                 } else if !historicalWatchOnly, let loopManager = loopManager, LoopManager.osAidSharingPermitted, LoopManager.loopDelay() > 0 && glucose.glucoseLevelRaw > 0 && abs(Date().timeIntervalSince(timeStampLastCalibrationForActiveSensor)) >  LoopManager.loopDelay() + TimeInterval(minutes: 5.5) {
-                    // loopdelay > 0, LoopManager will use loopShareGoucoseData
-                    // create a reading just to be able to fill up loopShareGoucoseData, to have them per minute
-                    
+                    var latest3BgReadings = delayedLoopHistory ?? bgReadingsAccessor.getLatestBgReadings(limit: 3, howOld: nil, forSensor: activeSensor, ignoreRawData: false, ignoreCalculatedValue: false, includingSuppressed: true)
                     let newReading = calibrator.createNewBgReading(rawData: glucose.glucoseLevelRaw, timeStamp: glucose.timeStamp, sensor: activeSensor, last3Readings: &latest3BgReadings, lastCalibrationsForActiveSensorInLastXDays: &lastCalibrationsForActiveSensorInLastXDays, firstCalibration: firstCalibrationForActiveSensor, lastCalibration: lastCalibrationForActiveSensor, deviceName: self.getCGMTransmitterDeviceName(for: cgmTransmitter), nsManagedObjectContext: coreDataManager.mainManagedObjectContext)
+                    delayedLoopHistory = latest3BgReadings
 
                     let isValidForDownstream = BgReadingDownstreamPolicy.validity(
                         calculatedValue: newReading.calculatedValue,

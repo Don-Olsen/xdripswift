@@ -8,6 +8,15 @@
 - Åbne problemer og fysisk testbehov: se de øvrige afsnit i dette dokument; TestFlight-uploaden løser dem ikke.
 <!-- testflight-7.1.1-4372:end -->
 
+## Kortere arbejde ved modtagelse af glukose på iPhone
+
+På iPhone med build 4372 måltes pauser på 0,77 og 1,51 sekunder ved modtagelse
+af Libre-data. Begge profiler viste opslag efter tre seneste målinger både før
+og efter lagring. De opslag bruges til forsinket Loop-deling. Historikken hentes
+nu først ved en måling, der skal deles ad denne vej, og læses på ny efter en
+vellykket lagring, hvis Loop igen får brug for den. Tidsgevinsten på en fysisk
+iPhone afventer en måling med den nye version.
+
 De følgende afsnit bevarer integrations- og testhistorikken før denne udgivelse.
 
 <!-- testflight-7.1.1-4371:start -->
